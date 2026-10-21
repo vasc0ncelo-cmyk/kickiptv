@@ -1,13 +1,17 @@
-// TESTE 3a - REDE (HTTP) + diagnostico na tela. Mantem o menu do Teste 2.
-//   QUADRADO = roda o teste de rede e mostra o resultado na tela | O = voltar ao menu | OPTIONS = sair
-// Modulos de rede carregados via sceSysmoduleLoadModuleInternal; Makefile liga -lSceNet -lSceSsl -lSceHttp -lSceSysmodule.
-// Precisa do src/font8x16.hpp (o mesmo do Teste 2).
+// TESTE 3c - PLAYER (video apenas, sem audio) com AvPlayer + diagnostico.
+//   Aba Kick: X = assistir @dekin021 (fixo neste teste)
+//   Durante o video: TRIANGULO = muda o "modo de stride" do desenho (se a imagem sair torta) | O = voltar | OPTIONS = sair
+//   Menu: QUADRADO = teste de rede
+// Precisa do src/font8x16.hpp (o mesmo do Teste 2). Makefile liga tambem -lSceAvPlayer.
 #include <orbis/libkernel.h>
 #include <orbis/VideoOut.h>
 #include <orbis/UserService.h>
 #include <orbis/Pad.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+#include <map>
 #include <string>
 #include <vector>
 #include "ui.hpp"
@@ -116,17 +120,15 @@ static NetClient g_net;
 // ---------- Plataforma ----------
 struct Ps4Platform : Platform {
     App *app = nullptr;
+    std::string pendingText;                 // pedido de "digitar @streamer" (teclado ainda nao existe: usa fixo)
+    std::string pendingPlayUrl, pendingPlayTitle;
     bool httpGet(const std::string &url, std::string &body) override {
         int st = 0;
         bool ok = g_net.get(url, body, st);
         return ok && st >= 200 && st < 300;
     }
-    void play(const std::string &, const std::string &title) override {
-        if (app) app->say("Tocaria: " + title + "  (player entra no Teste 3c)");
-    }
-    void requestText(const std::string &) override {
-        if (app) app->say("Teclado na tela entra no Teste 3b");
-    }
+    void play(const std::string &url, const std::string &title) override { pendingPlayUrl = url; pendingPlayTitle = title; }
+    void requestText(const std::string &) override { pendingText = "dekin021"; }
 };
 
 // ---------- Renderer (igual ao Teste 2) ----------
@@ -234,11 +236,188 @@ static void fillDemo(App &app) {
             m += "#EXTINF:-1 group-title=\"Series\",Dark S0" + std::to_string(s) + "E0" + std::to_string(e) + "\nhttp://exemplo/series/d" +
                  std::to_string(s * 10 + e) + ".mp4\n";
     app.list = buildPlaylist(m);
-    app.say("TESTE 3a-2 | QUADRADO = teste de rede | OPTIONS sai");
+    app.say("TESTE 3c | Kick: X = assistir dekin021 | QUADRADO = rede | OPTIONS sai");
 }
 
+// ---------- AvPlayer (libSceAvPlayer) - structs proprias para nao depender do header ----------
+typedef void *(*KAvAlloc)(void *arg, uint32_t align, uint32_t size);
+typedef void (*KAvFree)(void *arg, void *mem);
+struct KAvInitData {
+    void *memObj; KAvAlloc allocate; KAvFree deallocate; KAvAlloc allocateTexture; KAvFree deallocateTexture;   // memoryReplacement
+    void *fileObj; void *fOpen; void *fClose; void *fRead; void *fSize;                                          // fileReplacement
+    void *eventObj; void *eventCb;                                                                              // eventReplacement
+    int32_t debugLevel;
+    uint32_t basePriority;
+    int32_t numOutputVideoFrameBuffers;
+    bool autoStart;
+    uint8_t reserved[3];
+    const char *defaultLanguage;
+};
+struct KAvFrameInfo {
+    uint8_t *pData;
+    uint32_t reserved;
+    uint64_t timeStamp;
+    uint8_t details[216];      // union de detalhes (video: width@0 height@4; audio: ch@0 rate@4 size@8)
+};
+typedef uintptr_t KAvHandle;
+extern "C" {
+int sceSysmoduleLoadModule(uint16_t id);
+KAvHandle sceAvPlayerInit(KAvInitData *init);
+int sceAvPlayerAddSource(KAvHandle h, const char *url);
+bool sceAvPlayerIsActive(KAvHandle h);
+bool sceAvPlayerGetVideoData(KAvHandle h, KAvFrameInfo *fi);
+bool sceAvPlayerGetAudioData(KAvHandle h, KAvFrameInfo *fi);
+int sceAvPlayerStop(KAvHandle h);
+int sceAvPlayerClose(KAvHandle h);
+}
+
+static void *alignedAlloc(size_t align, size_t size) {
+    if (align < 16) align = 16;
+    void *raw = malloc(size + align + sizeof(void *));
+    if (!raw) return NULL;
+    uintptr_t a = ((uintptr_t)raw + sizeof(void *) + align - 1) & ~(uintptr_t)(align - 1);
+    ((void **)a)[-1] = raw;
+    return (void *)a;
+}
+static void alignedFree(void *p) { if (p) free(((void **)p)[-1]); }
+static void *avAlloc(void *, uint32_t align, uint32_t size) { return alignedAlloc(align, size); }
+static void avFree(void *, void *p) { alignedFree(p); }
+
+// memoria "de textura" (os quadros de video): memoria direta mapeada, como nos samples da Sony
+struct TexMem { off_t phys; size_t size; };
+static std::map<void *, TexMem> g_tex;
+static void *avAllocTex(void *, uint32_t align, uint32_t size) {
+    size_t al = align < 0x10000 ? 0x10000 : align;
+    size_t sz = (size + 0xFFFF) & ~(size_t)0xFFFF;
+    off_t phys = 0; void *addr = NULL;
+    if (sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), sz, al, 3, &phys) < 0) return NULL;
+    if (sceKernelMapDirectMemory(&addr, sz, 0x33, 0, phys, al) < 0) return NULL;
+    g_tex[addr] = {phys, sz};
+    return addr;
+}
+static void avFreeTex(void *, void *p) {
+    auto it = g_tex.find(p);
+    if (it == g_tex.end()) return;
+    sceKernelReleaseDirectMemory(it->second.phys, it->second.size);
+    g_tex.erase(it);
+}
+
+// ---------- NV12 -> BGRA (vizinho mais proximo, com escala) ----------
+static int g_yTab[256], g_rv[256], g_gu[256], g_gv[256], g_bu[256];
+static bool g_tabInit = false;
+static void initTabs() {
+    if (g_tabInit) return;
+    for (int i = 0; i < 256; i++) {
+        int y = ((i - 16) * 298) >> 8; g_yTab[i] = y < 0 ? 0 : y;
+        int c = i - 128;
+        g_rv[i] = (409 * c) >> 8;   // BT.709 aproximado
+        g_gu[i] = (100 * c) >> 8;
+        g_gv[i] = (208 * c) >> 8;
+        g_bu[i] = (516 * c) >> 8;
+    }
+    g_tabInit = true;
+}
+static inline int clamp255(int v) { return v < 0 ? 0 : (v > 255 ? 255 : v); }
+static void blitNV12(const uint8_t *src, int sw, int sh, int pitch, int yRows, uint32_t *dst, int dw, int dh) {
+    initTabs();
+    static std::vector<int> xmap; static int xmapW = 0, xmapS = 0;
+    if (xmapW != dw || xmapS != sw) { xmap.resize(dw); for (int x = 0; x < dw; x++) xmap[x] = (int)((long long)x * sw / dw); xmapW = dw; xmapS = sw; }
+    const uint8_t *Y = src, *UV = src + (size_t)pitch * yRows;
+    for (int y = 0; y < dh; y++) {
+        int sy = (int)((long long)y * sh / dh);
+        const uint8_t *yr = Y + (size_t)sy * pitch, *uvr = UV + (size_t)(sy >> 1) * pitch;
+        uint32_t *o = dst + (size_t)y * dw;
+        for (int x = 0; x < dw; x++) {
+            int sx = xmap[x];
+            int yy = g_yTab[yr[sx]];
+            int u = uvr[sx & ~1], v = uvr[(sx & ~1) + 1];
+            int r = clamp255(yy + g_rv[v]), g = clamp255(yy - g_gu[u] - g_gv[v]), b = clamp255(yy + g_bu[u]);
+            o[x] = 0xFF000000u | (r << 16) | (g << 8) | b;
+        }
+    }
+}
+
+static double nowSec() { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec + ts.tv_nsec / 1e9; }
+
+struct Player {
+    KAvHandle h = 0;
+    bool active = false;
+    std::vector<std::string> log;
+    int frames = 0, strideMode = 0;
+    unsigned vw = 0, vh = 0;
+    double t0 = 0, lastFps = 0; int fpsFrames = 0; double fps = 0;
+
+    bool start(const std::string &url, const std::string &title) {
+        log.clear(); frames = 0; vw = vh = 0; fps = 0; fpsFrames = 0;
+        char b[64];
+        log.push_back("Reproduzindo: " + title);
+        g_net.log = nullptr;
+        g_net.init();
+        snprintf(b, sizeof b, "%08X", (unsigned)sceSysmoduleLoadModule(0x00A5)); log.push_back(std::string("modulo AvPlayer (0xA5): ") + b);
+        snprintf(b, sizeof b, "%08X", (unsigned)sceSysmoduleLoadModuleInternal(0x80000050)); log.push_back(std::string("modulo AvPlayerStreaming: ") + b);
+        KAvInitData id; memset(&id, 0, sizeof id);
+        id.memObj = NULL; id.allocate = avAlloc; id.deallocate = avFree; id.allocateTexture = avAllocTex; id.deallocateTexture = avFreeTex;
+        id.debugLevel = 0; id.basePriority = 700; id.numOutputVideoFrameBuffers = 3; id.autoStart = true; id.defaultLanguage = "eng";
+        h = sceAvPlayerInit(&id);
+        snprintf(b, sizeof b, "%llX", (unsigned long long)h); log.push_back(std::string("sceAvPlayerInit: handle=") + b);
+        if (!h) return false;
+        int rc = sceAvPlayerAddSource(h, url.c_str());
+        snprintf(b, sizeof b, "%08X", (unsigned)rc); log.push_back(std::string("sceAvPlayerAddSource: ") + b);
+        if (rc < 0) { sceAvPlayerClose(h); h = 0; return false; }
+        active = true; t0 = lastFps = nowSec();
+        return true;
+    }
+    void stop() {
+        if (h) { sceAvPlayerStop(h); sceAvPlayerClose(h); }
+        h = 0; active = false;
+    }
+    // chama a cada iteracao; retorna true se desenhou um quadro novo
+    bool poll(FbRenderer &r) {
+        KAvFrameInfo fi; memset(&fi, 0, sizeof fi);
+        bool drew = false;
+        if (sceAvPlayerGetVideoData(h, &fi) && fi.pData) {
+            uint32_t w = *(uint32_t *)(fi.details + 0), hh = *(uint32_t *)(fi.details + 4);
+            if (w > 0 && hh > 0 && w <= 4096 && hh <= 4096) {
+                vw = w; vh = hh;
+                int a16h = (hh + 15) & ~15;
+                int pitch = w, yRows = hh;
+                switch (strideMode) {
+                case 1: yRows = a16h; break;
+                case 2: pitch = (w + 63) & ~63; yRows = a16h; break;
+                case 3: pitch = (w + 255) & ~255; yRows = a16h; break;
+                }
+                blitNV12(fi.pData, w, hh, pitch, yRows, r.fb, r.W, r.H);
+                frames++; fpsFrames++;
+                drew = true;
+            }
+        }
+        // consome (e descarta) o audio para o relogio do player nao travar
+        for (int i = 0; i < 8; i++) { KAvFrameInfo au; memset(&au, 0, sizeof au); if (!sceAvPlayerGetAudioData(h, &au)) break; }
+        double t = nowSec();
+        if (t - lastFps >= 1.0) { fps = fpsFrames / (t - lastFps); fpsFrames = 0; lastFps = t; }
+        return drew;
+    }
+    void overlay(FbRenderer &r) {
+        char b[160];
+        snprintf(b, sizeof b, " AvPlayer ativo=%d  video=%ux%u  quadros=%d  ~%.0f fps  stride-modo=%d (TRIANGULO)  O=voltar ", sceAvPlayerIsActive(h) ? 1 : 0, vw, vh, frames, fps, strideMode);
+        r.fillRect(0, 0, r.W, 22, 0xFF000000);
+        r.drawText(8, 3, b, 0xFFFFFF00, 16);
+    }
+    void renderWaiting(FbRenderer &r) {
+        r.fillRect(0, 0, r.W, r.H, 0xFF101018);
+        r.drawText(40, 20, "Player", 0xFF53FC18, 28);
+        int y = 70;
+        for (auto &l : log) { r.drawText(40, y, l, 0xFFFFFFFF, 20); y += 26; }
+        char b[160];
+        snprintf(b, sizeof b, "aguardando quadros... %.0fs   ativo=%d   (O volta)", nowSec() - t0, h && sceAvPlayerIsActive(h) ? 1 : 0);
+        r.drawText(40, y + 10, b, 0xFFAAAAAA, 20);
+    }
+};
+
 static const uint32_t B_OPTIONS = 0x0008, B_UP = 0x0010, B_DOWN = 0x0040, B_L2 = 0x0100, B_R2 = 0x0200,
-                      B_L1 = 0x0400, B_R1 = 0x0800, B_SQUARE = 0x8000, B_CIRCLE = 0x2000, B_CROSS = 0x4000;
+                      B_L1 = 0x0400, B_R1 = 0x0800, B_TRIANGLE = 0x1000, B_SQUARE = 0x8000, B_CIRCLE = 0x2000, B_CROSS = 0x4000;
+
+enum class Mode { Menu, Diag, Play };
 
 int main() {
     Ps4Platform pf;
@@ -267,17 +446,18 @@ int main() {
     if (sceVideoOutRegisterBuffers(vh, 0, bufs, 2, &attr) < 0) return 4;
 
     std::vector<std::string> diag;
-    bool diagMode = false;
+    Mode mode = Mode::Menu;
+    Player player;
+    bool gotFrame = false;
+    double lastWaitDraw = 0;
     uint32_t prev = 0;
     int heldFrames = 0, back = 0;
     bool dirty = true;
 
-    auto present = [&](bool running) {
-        FbRenderer r(bufs[back], W, H);
-        if (diagMode) renderDiag(r, diag, running); else ui.render(r);
-        sceVideoOutSubmitFlip(vh, back, ORBIS_VIDEO_OUT_FLIP_VSYNC, 0);
-        back ^= 1;
-    };
+    auto flip = [&]() { sceVideoOutSubmitFlip(vh, back, ORBIS_VIDEO_OUT_FLIP_VSYNC, 0); back ^= 1; };
+    auto presentMenu = [&]() { FbRenderer r(bufs[back], W, H); ui.render(r); flip(); };
+    auto presentDiag = [&](bool running) { FbRenderer r(bufs[back], W, H); renderDiag(r, diag, running); flip(); };
+    auto presentWait = [&]() { FbRenderer r(bufs[back], W, H); player.renderWaiting(r); flip(); };
 
     for (;;) {
         OrbisPadData d;
@@ -287,36 +467,58 @@ int main() {
         uint32_t pressed = now & ~prev;
         prev = now;
 
-        if (diagMode) {
-            if (pressed & B_CIRCLE) { diagMode = false; dirty = true; }
-            if (pressed & B_SQUARE) { // rodar de novo
-                diag.assign(1, "Executando...");
-                present(true);
-                runNetTest(diag);
-                dirty = true;
-            }
-        } else {
-            if (now & (B_UP | B_DOWN)) {
-                heldFrames++;
-                if (heldFrames > 20 && heldFrames % 4 == 0) pressed |= now & (B_UP | B_DOWN);
-            } else heldFrames = 0;
-            if (pressed & B_UP)     { ui.handle(Input::Up);       dirty = true; }
-            if (pressed & B_DOWN)   { ui.handle(Input::Down);     dirty = true; }
-            if (pressed & B_L1)     { ui.handle(Input::PrevTab);  dirty = true; }
-            if (pressed & B_R1)     { ui.handle(Input::NextTab);  dirty = true; }
-            if (pressed & B_L2)     { ui.handle(Input::PageUp);   dirty = true; }
-            if (pressed & B_R2)     { ui.handle(Input::PageDown); dirty = true; }
-            if (pressed & B_CROSS)  { ui.handle(Input::Confirm);  dirty = true; }
-            if (pressed & B_CIRCLE) { ui.handle(Input::Back);     dirty = true; }
-            if (pressed & B_SQUARE) {
-                diagMode = true;
-                diag.assign(1, "Executando...");
-                present(true);        // mostra "Executando" antes de bloquear na rede
-                runNetTest(diag);
-                dirty = true;
-            }
+        if (mode == Mode::Play) {
+            if (pressed & B_CIRCLE) { player.stop(); mode = Mode::Menu; dirty = true; sceKernelUsleep(16000); continue; }
+            if (pressed & B_TRIANGLE) player.strideMode = (player.strideMode + 1) % 4;
+            if (player.h) {
+                FbRenderer r(bufs[back], W, H);
+                if (player.poll(r)) { gotFrame = true; player.overlay(r); flip(); }
+                else if (!gotFrame && nowSec() - lastWaitDraw > 0.5) { lastWaitDraw = nowSec(); presentWait(); }
+            } else if (nowSec() - lastWaitDraw > 0.5) { lastWaitDraw = nowSec(); presentWait(); }
+            sceKernelUsleep(4000);
+            continue;
         }
-        if (dirty) { present(false); dirty = false; }
+
+        if (mode == Mode::Diag) {
+            if (pressed & B_CIRCLE) { mode = Mode::Menu; dirty = true; }
+            if (pressed & B_SQUARE) { diag.assign(1, "Executando..."); presentDiag(true); runNetTest(diag); dirty = true; }
+            if (dirty) { presentDiag(false); dirty = false; }
+            sceKernelUsleep(16000);
+            continue;
+        }
+
+        // ---- Menu ----
+        if (now & (B_UP | B_DOWN)) {
+            heldFrames++;
+            if (heldFrames > 20 && heldFrames % 4 == 0) pressed |= now & (B_UP | B_DOWN);
+        } else heldFrames = 0;
+        if (pressed & B_UP)     { ui.handle(Input::Up);       dirty = true; }
+        if (pressed & B_DOWN)   { ui.handle(Input::Down);     dirty = true; }
+        if (pressed & B_L1)     { ui.handle(Input::PrevTab);  dirty = true; }
+        if (pressed & B_R1)     { ui.handle(Input::NextTab);  dirty = true; }
+        if (pressed & B_L2)     { ui.handle(Input::PageUp);   dirty = true; }
+        if (pressed & B_R2)     { ui.handle(Input::PageDown); dirty = true; }
+        if (pressed & B_CROSS)  { ui.handle(Input::Confirm);  dirty = true; }
+        if (pressed & B_CIRCLE) { ui.handle(Input::Back);     dirty = true; }
+        if (pressed & B_SQUARE) { mode = Mode::Diag; diag.assign(1, "Executando..."); presentDiag(true); runNetTest(diag); dirty = true; }
+
+        if (!pf.pendingText.empty()) {            // X na aba Kick: busca o canal fixo
+            std::string slug = pf.pendingText; pf.pendingText.clear();
+            app.say("Buscando @" + slug + " na Kick...");
+            presentMenu();
+            ui.onText(slug);                     // httpGet + (se ao vivo) play()
+            dirty = true;
+        }
+        if (!pf.pendingPlayUrl.empty()) {
+            std::string url = pf.pendingPlayUrl, title = pf.pendingPlayTitle;
+            pf.pendingPlayUrl.clear();
+            mode = Mode::Play; gotFrame = false; lastWaitDraw = 0;
+            presentWait();                       // mostra "Player" antes de bloquear
+            player.start(url, title);
+            presentWait();
+            continue;
+        }
+        if (dirty) { presentMenu(); dirty = false; }
         sceKernelUsleep(16000);
     }
     return 0;
