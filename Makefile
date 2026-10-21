@@ -15,7 +15,7 @@ OBJS := $(patsubst src/%.cpp,build/%.o,$(SRCS))
 CXXFLAGS := --target=x86_64-pc-freebsd12-elf -std=c++17 -D_GNU_SOURCE -fPIC -funwind-tables -c -isysroot $(OO) \
             -isystem $(OO)/include -isystem $(OO)/include/c++/v1
 LDFLAGS  := -m elf_x86_64 -pie --script $(OO)/link.x --eh-frame-hdr -L$(OO)/lib
-LIBS     := -lc -lc++ -lkernel -lSceVideoOut -lSceUserService -lScePad
+LIBS     := -lc -lc++ -lkernel -lSceVideoOut -lSceUserService -lScePad -lSceSysmodule -lSceNet -lSceSsl -lSceHttp
 
 all: build/$(CONTENT_ID).pkg
 
