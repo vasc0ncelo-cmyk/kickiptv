@@ -1,12 +1,13 @@
-# Build do PKG (rodado pelo GitHub Actions). Baseado nos samples do OpenOrbis; pode precisar de ajustes.
+# Build do PKG (rodado pelo GitHub Actions). Baseado nos samples do OpenOrbis.
 # Requer: OO_PS4_TOOLCHAIN, clang, ld.lld, dotnet.
 .RECIPEPREFIX = >
 OO  := $(OO_PS4_TOOLCHAIN)
 BIN := $(OO)/bin/linux
 PKGTOOL := $(BIN)/PkgTool.Core
 
-CONTENT_ID := IV0000-BREW00000_00-HELLOWORLD000000
-TITLE_ID := BREW00000
+# IDs proprios (o Title ID tem 9 caracteres; o Content ID tem 36)
+CONTENT_ID := IV0000-KICK00001_00-KICKIPTV00000000
+TITLE_ID := KICK00001
 TITLE := Kick IPTV
 SRCS := $(wildcard src/*.cpp)
 OBJS := $(patsubst src/%.cpp,build/%.o,$(SRCS))
@@ -14,7 +15,7 @@ OBJS := $(patsubst src/%.cpp,build/%.o,$(SRCS))
 CXXFLAGS := --target=x86_64-pc-freebsd12-elf -std=c++17 -D_GNU_SOURCE -fPIC -funwind-tables -c -isysroot $(OO) \
             -isystem $(OO)/include -isystem $(OO)/include/c++/v1
 LDFLAGS  := -m elf_x86_64 -pie --script $(OO)/link.x --eh-frame-hdr -L$(OO)/lib
-LIBS     := -lc -lc++ -lkernel
+LIBS     := -lc -lc++ -lkernel -lSceVideoOut -lSceUserService -lScePad
 
 all: build/$(CONTENT_ID).pkg
 
@@ -28,7 +29,10 @@ build/app.elf: $(OBJS)
 build/eboot.bin: build/app.elf
 > $(BIN)/create-fself -in=build/app.elf -out=build/app.oelf --eboot=build/eboot.bin --paid 0x3800000000000011
 
-sce_sys/param.sfo: Makefile
+# Sempre regenera o param.sfo (o do sample copiado pelo script teria o ID antigo)
+.PHONY: sfo
+sfo:
+> rm -f sce_sys/param.sfo
 > $(PKGTOOL) sfo_new sce_sys/param.sfo
 > $(PKGTOOL) sfo_setentry sce_sys/param.sfo APP_TYPE --type Integer --maxsize 4 --value 0
 > $(PKGTOOL) sfo_setentry sce_sys/param.sfo APP_VER --type Utf8 --maxsize 8 --value '01.00'
@@ -41,7 +45,7 @@ sce_sys/param.sfo: Makefile
 > $(PKGTOOL) sfo_setentry sce_sys/param.sfo TITLE_ID --type Utf8 --maxsize 12 --value '$(TITLE_ID)'
 > $(PKGTOOL) sfo_setentry sce_sys/param.sfo VERSION --type Utf8 --maxsize 8 --value '01.00'
 
-pkg.gp4: build/eboot.bin sce_sys/param.sfo
+pkg.gp4: build/eboot.bin sfo
 > cp build/eboot.bin eboot.bin
 > $(BIN)/create-gp4 -out pkg.gp4 --content-id=$(CONTENT_ID) --files "eboot.bin $$(find sce_sys sce_module -type f ! -name .gitkeep | tr '\n' ' ')"
 
