@@ -27,7 +27,7 @@ jobs:
           pip install pillow || true
           python3 scripts/make_icon.py || echo "icone padrao mantido"
       - name: Compilar PKG
-        run: make
+        run: make TITLE="Kick IPTV ${{ github.run_number }}"
       - name: Conferir o PKG
         run: |
           ls -l build/*.pkg
