@@ -1,27 +1,70 @@
-// CAMADA PS4 (OpenOrbis) - PRECISA SER COMPLETADA E TESTADA NO CONSOLE.
-// Nada aqui foi compilado contra o SDK. Confira os headers/assinaturas no seu OpenOrbis.
-//
-// httpGet : libSceNet + libSceSsl + libSceHttp (sceHttpCreateTemplate, sceHttpCreateConnectionWithURL,
-//           sceHttpCreateRequestWithURL, sceHttpSendRequest, sceHttpReadData). Exige sceSslInit/sceHttpInit.
-// play    : libSceAvPlayer (sceAvPlayerInit, sceAvPlayerAddSource, sceAvPlayerStart, sceAvPlayerGetVideoData)
-//           e renderizar os frames via libSceVideoOut/GNM ou um framebuffer simples.
-// input   : libScePad (scePadReadState) para D-pad/X/O e teclado na tela via libSceImeDialog.
-// UI      : src/ui.hpp ja faz navegacao e layout. Aqui so falta: (1) Renderer com fillRect/drawText
-//           sobre o framebuffer (fonte: ex. stb_truetype com uma TTF do sistema), (2) mapear o pad:
-//           D-pad->Up/Down, L1/R1->PrevTab/NextTab, X->Confirm, O->Back, L2/R2->PageUp/PageDown.
-#include "ui.hpp"
+// TESTE 1 - tela de cor solida + leitura do controle (OpenOrbis).
+// Objetivo: provar que o PKG instala, abre e fica na tela sem CE-34878-0.
+//   X = troca a cor | O = sai do app
+// ATENCAO: escrito sem acesso ao SDK; se o build reclamar de algum nome,
+// confira em $OO_PS4_TOOLCHAIN/include/orbis/ (VideoOut.h, Pad.h, UserService.h).
+#include <orbis/libkernel.h>
+#include <orbis/VideoOut.h>
+#include <orbis/UserService.h>
+#include <orbis/Pad.h>
+#include <stdint.h>
+#include "app.hpp"
 
+// Camada de plataforma (ainda vazia; entra nos testes 2 e 3).
 struct Ps4Platform : Platform {
-    bool httpGet(const std::string &, std::string &) override { /* TODO */ return false; }
-    void play(const std::string &, const std::string &) override { /* TODO */ }
-    void requestText(const std::string &) override { /* TODO: libSceImeDialog; ao confirmar chamar ui.onText(texto) */ }
+    bool httpGet(const std::string &, std::string &) override { return false; }
+    void play(const std::string &, const std::string &) override {}
+    void requestText(const std::string &) override {}
 };
+
+static const int W = 1920, H = 1080;
+static const uint32_t COLORS[] = {0xFF0000FF /*azul*/, 0xFF00AA00 /*verde*/, 0xFFCC0000 /*vermelho*/, 0xFF000000 /*preto*/};
+// formato B8G8R8A8: 0xAARRGGBB na memoria little-endian
 
 int main() {
     Ps4Platform pf;
     App app(pf);
-    // TODO: init de modulos, ler a URL da M3U de /data/kickiptv/config.txt,
-    // app.loadM3U(url); depois loop de input/render chamando app.watchKick(texto_do_IME)
-    // ou pf.play(entry.url) ao escolher um item.
+    (void)app;
+
+    // --- Controle ---
+    sceUserServiceInitialize(NULL);
+    int userId = 0;
+    sceUserServiceGetInitialUser(&userId);
+    scePadInit();
+    int pad = scePadOpen(userId, 0, 0, NULL);
+
+    // --- Video: 1 framebuffer linear 1920x1080 ---
+    int vh = sceVideoOutOpen(ORBIS_VIDEO_USER_MAIN, ORBIS_VIDEO_OUT_BUS_TYPE_MAIN, 0, NULL);
+    if (vh < 0) return 1;
+
+    const size_t fbSize = 0x800000; // 8 MB (>= 1920*1080*4), multiplo de 2 MB
+    off_t phys = 0;
+    void *fb = NULL;
+    if (sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), fbSize, 0x200000, 3, &phys) < 0) return 2;
+    if (sceKernelMapDirectMemory(&fb, fbSize, 0x33 /*CPU+GPU RW*/, 0, phys, 0x200000) < 0) return 3;
+
+    OrbisVideoOutBufferAttribute attr;
+    sceVideoOutSetBufferAttribute(&attr, ORBIS_VIDEO_OUT_PIXEL_FORMAT_B8_G8_R8_A8_SRGB,
+                                  ORBIS_VIDEO_OUT_TILING_MODE_LINEAR, ORBIS_VIDEO_OUT_ASPECT_RATIO_16_9, W, H, W);
+    void *addrs[1] = {fb};
+    if (sceVideoOutRegisterBuffers(vh, 0, addrs, 1, &attr) < 0) return 4;
+
+    int ci = 0;
+    bool prevX = false;
+    for (;;) {
+        uint32_t *px = (uint32_t *)fb;
+        uint32_t col = COLORS[ci];
+        for (int i = 0; i < W * H; i++) px[i] = col;
+        sceVideoOutSubmitFlip(vh, 0, ORBIS_VIDEO_OUT_FLIP_VSYNC, 0);
+
+        OrbisPadData d;
+        if (pad >= 0 && scePadReadState(pad, &d) == 0) {
+            bool x = d.buttons & ORBIS_PAD_BUTTON_CROSS;
+            if (x && !prevX) ci = (ci + 1) % 4;
+            prevX = x;
+            if (d.buttons & ORBIS_PAD_BUTTON_CIRCLE) break;
+        }
+        sceKernelUsleep(33000);
+    }
     return 0;
 }
