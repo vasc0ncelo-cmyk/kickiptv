@@ -1,4 +1,4 @@
-l// TESTE 5 - PLAYER com AvPlayer (video + audio) + teclado na tela + diagnostico.
+// TESTE 5 - PLAYER com AvPlayer (video + audio) + teclado na tela + diagnostico.
 //   HLS (.m3u8): o app baixa playlist/segmentos e entrega ao AvPlayer por callbacks de arquivo (hls.hpp / streambuf.hpp).
 //   Aba Kick (abre por padrao):
 //     X em "Digitar @streamer" = teclado na tela (D-pad move, X digita, QUADRADO apaga, R1 = OK, O = cancela)
@@ -6,25 +6,29 @@ l// TESTE 5 - PLAYER com AvPlayer (video + audio) + teclado na tela + diagnostic
 //   Durante o video: TRIANGULO = muda o "modo de stride" do desenho (se a imagem sair torta) | O = voltar | OPTIONS = sair
 //   Menu: QUADRADO = teste de rede
 // Precisa do src/font8x16.hpp. Makefile liga -lSceAvPlayer e -lSceAudioOut.
-#include <orbis/libkernel.h>
-#include <orbis/VideoOut.h>
-#include <orbis/UserService.h>
-#include <orbis/Pad.h>
-#include <orbis/AudioOut.h>
+// Headers do C++ primeiro (mesma ordem do sample "threading" do OpenOrbis): evita conflito de tipos com os headers orbis.
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <map>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <atomic>
-#include <map>
-#include <string>
-#include <thread>
-#include <vector>
-#include "ui.hpp"
-#include "font8x16.hpp"
 #include "hls.hpp"
 #include "streambuf.hpp"
+#include <orbis/libkernel.h>
+#include <orbis/VideoOut.h>
+#include <orbis/UserService.h>
+#include <orbis/Pad.h>
+#include <orbis/AudioOut.h>
+#include "ui.hpp"
+#include "font8x16.hpp"
 
 // ---------- Cliente HTTP (libSceNet + libSceSsl + libSceHttp, ligadas no link) ----------
 // Prototipos declarados aqui para nao depender dos nomes dos headers do toolchain.
@@ -273,7 +277,7 @@ struct KAvFrameInfo {
     uint64_t timeStamp;
     uint8_t details[216];      // union de detalhes (video: width@0 height@4; audio: ch@0 rate@4 size@8)
 };
-typedef uintptr_t KAvHandle;
+typedef unsigned long KAvHandle;          // 64 bits (LP64); nao usa uintptr_t
 extern "C" {
 int sceSysmoduleLoadModule(uint16_t id);
 KAvHandle sceAvPlayerInit(KAvInitData *init);
@@ -289,7 +293,7 @@ static void *alignedAlloc(size_t align, size_t size) {
     if (align < 16) align = 16;
     void *raw = malloc(size + align + sizeof(void *));
     if (!raw) return NULL;
-    uintptr_t a = ((uintptr_t)raw + sizeof(void *) + align - 1) & ~(uintptr_t)(align - 1);
+    unsigned long a = ((unsigned long)raw + sizeof(void *) + align - 1) & ~(unsigned long)(align - 1);
     ((void **)a)[-1] = raw;
     return (void *)a;
 }
