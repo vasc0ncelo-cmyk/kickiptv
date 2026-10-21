@@ -1149,11 +1149,18 @@ int main() {
     int heldFrames = 0, back = 0;
     bool dirty = true;
 
-    auto flip = [&]() { sceVideoOutSubmitFlip(vh, back, ORBIS_VIDEO_OUT_FLIP_VSYNC, 0); back ^= 1; };
-    auto presentMenu = [&]() { FbRenderer r(bufs[back], W, H); ui.render(r); flip(); };
-    auto presentDiag = [&](bool running) { FbRenderer r(bufs[back], W, H); renderDiag(r, diag, running); flip(); };
-    auto presentWait = [&]() { FbRenderer r(bufs[back], W, H); player.renderWaiting(r); flip(); };
-    auto presentKbd = [&]() { FbRenderer r(bufs[back], W, H); kbd.render(r); flip(); };
+    // A memoria de video e "write-combined": ESCREVER e rapido, mas LER e lentissimo. O desenho novo (transparencia,
+    // texto suave) le pixels, entao desenhamos tudo numa tela de rascunho na RAM normal e so copiamos para o video.
+    std::vector<uint32_t> shadow((size_t)W * H, 0xFF090B10u);
+    auto flip = [&]() {
+        memcpy(bufs[back], shadow.data(), (size_t)W * H * 4);          // copia sequencial (rapida)
+        sceVideoOutSubmitFlip(vh, back, ORBIS_VIDEO_OUT_FLIP_VSYNC, 0); back ^= 1;
+    };
+    auto presentMenu = [&]() { FbRenderer r(shadow.data(), W, H); ui.render(r); flip(); };
+    auto presentDiag = [&](bool running) { FbRenderer r(shadow.data(), W, H); renderDiag(r, diag, running); flip(); };
+    auto presentWait = [&]() { FbRenderer r(shadow.data(), W, H); player.renderWaiting(r); flip(); };
+    auto presentKbd = [&]() { FbRenderer r(shadow.data(), W, H); kbd.render(r); flip(); };
+    flip();                                                            // primeiro quadro imediato (tira a tela de abertura)
 
     for (;;) {
         OrbisPadData d;
@@ -1188,7 +1195,7 @@ int main() {
             if (pressed) player.hudUntil = nowSec() + 5;      // qualquer botao mostra o HUD por 5s
             if (pressed & B_TRIANGLE) player.strideMode = (player.strideMode + 1) % 4;
             if (player.h) {
-                FbRenderer r(bufs[back], W, H);
+                FbRenderer r(shadow.data(), W, H);
                 if (player.poll(r)) { gotFrame = true; player.overlay(r); flip(); }
                 else if (!gotFrame && nowSec() - lastWaitDraw > 0.12) { lastWaitDraw = nowSec(); presentWait(); }
             } else if (nowSec() - lastWaitDraw > 0.12) { lastWaitDraw = nowSec(); presentWait(); }
