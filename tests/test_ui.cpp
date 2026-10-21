@@ -43,6 +43,11 @@ int main() {
     ui.handle(Input::NextTab); assert(ui.tab == Tab::Kick);
     ui.handle(Input::Confirm); assert(f.asked == "@ do streamer");
     ui.onText("@Streamer"); assert(f.played == "https://k/a.m3u8" && a.lastStatus == "Assistindo @streamer");
+    // apos pesquisar, aparece o item "Ultimo" e os testes de player
+    { Rec k; ui.render(k); assert(k.has("Ultimo: @streamer  (X para assistir de novo)")); }
+    f.played.clear(); ui.handle(Input::Down); ui.handle(Input::Confirm); assert(f.played == "https://k/a.m3u8");
+    ui.handle(Input::Down); ui.handle(Input::Confirm); assert(f.played == kTestHlsHttps());
+    ui.handle(Input::Down); ui.handle(Input::Confirm); assert(f.played == kTestHlsHttp());
     ui.handle(Input::PrevTab); assert(ui.tab == Tab::Series && ui.level == 0);
     std::cout << "OK\n";
 }
