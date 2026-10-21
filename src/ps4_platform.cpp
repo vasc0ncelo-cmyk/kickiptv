@@ -16,6 +16,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -235,9 +236,9 @@ static void runNetTest(std::vector<std::string> &diag) {
 static void renderDiag(FbRenderer &r, const std::vector<std::string> &diag, bool running) {
     r.fillRect(0, 0, r.W, r.H, 0xFF101018);
     r.drawText(40, 20, running ? "Executando teste... (pode levar ate 1 minuto)" : "Diagnostico", 0xFF53FC18, 28);
-    int y = 70;
-    size_t start = diag.size() > 36 ? diag.size() - 36 : 0;
-    for (size_t i = start; i < diag.size(); i++) { r.drawText(40, y, diag[i], 0xFFFFFFFF, 20); y += 26; }
+    int y = 66;
+    size_t start = diag.size() > 38 ? diag.size() - 38 : 0;
+    for (size_t i = start; i < diag.size(); i++) { r.drawText(40, y, diag[i], 0xFFFFFFFF, 18); y += 24; }
     r.drawText(40, r.H - 50, "O voltar ao menu   OPTIONS sair", 0xFF777777, 22);
 }
 
@@ -290,7 +291,22 @@ bool sceAvPlayerGetVideoData(KAvHandle h, KAvFrameInfo *fi);
 bool sceAvPlayerGetAudioData(KAvHandle h, KAvFrameInfo *fi);
 int sceAvPlayerStop(KAvHandle h);
 int sceAvPlayerClose(KAvHandle h);
+typedef int (*KAvLogCb)(void *ud, const char *fmt, va_list ap);
+int sceAvPlayerSetLogCallback(KAvLogCb cb, void *ud);
 }
+
+// Log interno do AvPlayer (capturado para o diagnostico) e contadores dos alocadores
+static std::mutex g_avlogM;
+static std::vector<std::string> g_avlog;
+static int avLogCb(void *, const char *fmt, va_list ap) {
+    char b[256]; vsnprintf(b, sizeof b, fmt, ap);
+    std::string t = b;
+    while (!t.empty() && (t.back() == '\n' || t.back() == '\r')) t.pop_back();
+    std::lock_guard<std::mutex> l(g_avlogM);
+    if (g_avlog.size() < 400) g_avlog.push_back(t);
+    return 0;
+}
+static std::atomic<int> g_allocN{0}, g_allocFail{0}, g_texN{0}, g_texFail{0};
 
 static void *alignedAlloc(size_t align, size_t size) {
     if (align < 16) align = 16;
@@ -301,18 +317,19 @@ static void *alignedAlloc(size_t align, size_t size) {
     return (void *)a;
 }
 static void alignedFree(void *p) { if (p) free(((void **)p)[-1]); }
-static void *avAlloc(void *, uint32_t align, uint32_t size) { return alignedAlloc(align, size); }
+static void *avAlloc(void *, uint32_t align, uint32_t size) { g_allocN++; void *p = alignedAlloc(align, size); if (!p) g_allocFail++; return p; }
 static void avFree(void *, void *p) { alignedFree(p); }
 
 // memoria "de textura" (os quadros de video): memoria direta mapeada, como nos samples da Sony
 struct TexMem { off_t phys; size_t size; };
 static std::map<void *, TexMem> g_tex;
 static void *avAllocTex(void *, uint32_t align, uint32_t size) {
+    g_texN++;
     size_t al = align < 0x10000 ? 0x10000 : align;
     size_t sz = (size + 0xFFFF) & ~(size_t)0xFFFF;
     off_t phys = 0; void *addr = NULL;
-    if (sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), sz, al, 3, &phys) < 0) return NULL;
-    if (sceKernelMapDirectMemory(&addr, sz, 0x33, 0, phys, al) < 0) return NULL;
+    if (sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), sz, al, 3, &phys) < 0) { g_texFail++; return NULL; }
+    if (sceKernelMapDirectMemory(&addr, sz, 0x33, 0, phys, al) < 0) { g_texFail++; return NULL; }
     g_tex[addr] = {phys, sz};
     return addr;
 }
@@ -618,14 +635,23 @@ static void avAttempt(std::vector<std::string> &d, const std::function<void()> &
     refresh();
     KAvInitData id; memset(&id, 0, sizeof id);
     id.allocate = avAlloc; id.deallocate = avFree; id.allocateTexture = avAllocTex; id.deallocateTexture = avFreeTex;
-    id.debugLevel = 0; id.basePriority = 700; id.numOutputVideoFrameBuffers = 3; id.autoStart = autoStart; id.defaultLanguage = "eng";
+    id.debugLevel = 3; id.basePriority = 700; id.numOutputVideoFrameBuffers = 3; id.autoStart = autoStart; id.defaultLanguage = "eng";
+    { std::lock_guard<std::mutex> l(g_avlogM); g_avlog.clear(); }
+    g_allocN = g_allocFail = g_texN = g_texFail = 0;
+    sceAvPlayerSetLogCallback(avLogCb, NULL);
     if (repl) { id.fOpen = feedOpen; id.fClose = feedClose; id.fRead = feedRead; id.fSize = feedSize; }
     g_feed.join(); g_feed.opens = g_feed.reads = g_feed.segs = 0;
     if (hls) g_feed.start(hls);
     KAvHandle h = sceAvPlayerInit(&id);
     d.push_back("   Init: handle=" + hx((int)(h & 0xFFFFFFFF)) + (h ? "" : "  (FALHOU)"));
     int rc = h ? sceAvPlayerAddSource(h, path) : -1;
-    d.push_back("   AddSource(\"" + std::string(path).substr(0, 60) + "\") = " + hx(rc));
+    d.push_back("   AddSource(\"" + std::string(path).substr(0, 60) + "\") = " + hx(rc) + "   alloc=" + std::to_string(g_allocN.load()) + "(falhas " +
+                std::to_string(g_allocFail.load()) + ") textura=" + std::to_string(g_texN.load()) + "(falhas " + std::to_string(g_texFail.load()) + ")");
+    {   // mensagens internas do proprio AvPlayer (as primeiras)
+        std::lock_guard<std::mutex> l(g_avlogM);
+        for (size_t i = 0; i < g_avlog.size() && i < 3; i++) d.push_back("   [av] " + g_avlog[i].substr(0, 170));
+        if (g_avlog.size() > 3) d.push_back("   [av] ... (+" + std::to_string(g_avlog.size() - 3) + " mensagens)");
+    }
     refresh();
     if (h && rc >= 0) {
         double t0 = nowSec(); int frames = 0, vw = 0, vh = 0, act = 0; unsigned ach = 0, asr = 0; int aframes = 0;
@@ -657,12 +683,19 @@ static void runAvTest(std::vector<std::string> &d, const std::function<void()> &
     g_net.log = nullptr; g_net.init();
     d.push_back("modulo AvPlayer (0xA5): " + hx(sceSysmoduleLoadModule(0x00A5)));
     const char *hls = kTestHlsHttps();
-    avAttempt(d, refresh, "A) leitura propria + /app0/live.ts  (HLS publico baixado pelo app)", true, "/app0/live.ts", hls, true);
-    avAttempt(d, refresh, "B) leitura propria + live.ts (sem barra)", true, "live.ts", hls, true);
-    avAttempt(d, refresh, "C) leitura propria + /app0/live.ts, autoStart desligado", true, "/app0/live.ts", hls, false);
-    avAttempt(d, refresh, "D) sem leitura propria + arquivo local /app0/eboot.bin (existe, mas nao e video)", false, "/app0/eboot.bin", NULL, true);
-    avAttempt(d, refresh, "E) sem leitura propria + http direto (m3u8)", false, "http://devimages.apple.com/iphone/samples/bipbop/bipbopall.m3u8", NULL, true);
-    avAttempt(d, refresh, "F) sem leitura propria + https direto (m3u8)", false, kTestHlsHttps(), NULL, true);
+    avAttempt(d, refresh, "A) leitura propria + /app0/live.ts (HLS publico baixado pelo app)", true, "/app0/live.ts", hls, true);
+    avAttempt(d, refresh, "D) arquivo local /app0/eboot.bin (existe, nao e video), sem leitura propria", false, "/app0/eboot.bin", NULL, true);
+    // carrega modulos de decodificacao que o AvPlayer pode precisar e repete
+    static const struct { uint32_t id; const char *n; } mods[] = {
+        {0x0006, "Fiber"}, {0x0007, "Ult"}, {0x0088, "Audiodec"}, {0x008E, "Videodec"}, {0x00BD, "AudiodecCpu"}, {0x00C0, "M4aac"},
+        {0x00CF, "Videodec2"}, {0x00D0, "Vdecwrap"}, {0x00E5, "Vdecsw"}, {0x00FC, "DecArbitration"}, {0x00BA, "Random"}, {0x00B4, "AppContent"}};
+    std::string line = "modulos:";
+    for (auto &m : mods) { int rc = sceSysmoduleLoadModule((uint16_t)m.id); char b[48]; snprintf(b, sizeof b, " %s=%X", m.n, (unsigned)rc & 0xFFFFFFF); line += b; }
+    { int rc = sceSysmoduleLoadModuleInternal(0x80000015); char b[32]; snprintf(b, sizeof b, " VdecCore=%X", (unsigned)rc & 0xFFFFFFF); line += b; }
+    d.push_back(line.substr(0, 200));
+    if (line.size() > 200) d.push_back("   " + line.substr(200, 200));
+    avAttempt(d, refresh, "A2) igual a A, depois de carregar os modulos acima", true, "/app0/live.ts", hls, true);
+    avAttempt(d, refresh, "D2) igual a D, depois de carregar os modulos acima", false, "/app0/eboot.bin", NULL, true);
     d.push_back("Fim. Tire UM print desta tela e mande para o Claude.  (O volta ao menu)");
 }
 
