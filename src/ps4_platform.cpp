@@ -11,7 +11,6 @@
 #include <chrono>
 #include <condition_variable>
 #include <deque>
-#include <exception>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -338,11 +337,33 @@ static void renderDiag(FbRenderer &r, const std::vector<std::string> &diag, bool
 }
 
 // ---------- Dados de exemplo ----------
-// ---------- Heap do libc: permite alocacoes grandes (buffers de video/segmentos) ----------
-extern "C" {
-__attribute__((used)) unsigned int sceLibcHeapExtendedAlloc = 1;
-__attribute__((used)) size_t sceLibcHeapSize = (size_t)0xFFFFFFFFFFFFFFFFULL;   // sem limite
-}
+// ---------- Tela de inicializacao (escrita direta no video, sem ler nada) ----------
+// Mostra cada passo da abertura. Se o app travar/cair, a foto da tela mostra ate onde chegou.
+struct BootScreen {
+    uint32_t *fb = nullptr; int W = 0, H = 0, y = 40;
+    void init(void *p, int w, int h) {
+        fb = (uint32_t *)p; W = w; H = h;
+        for (size_t i = 0; i < (size_t)W * H; i++) fb[i] = 0xFF090B10u;
+        text(48, 28, "Kick IPTV", 0xFF53FC18u, 4);
+        y = 120;
+    }
+    void text(int x, int yy, const char *t, uint32_t c, int sc) {
+        for (; *t; t++, x += 8 * sc) {
+            unsigned ch = (unsigned char)*t;
+            if (ch < 32 || ch > 126) ch = '?';
+            const unsigned char *g = kFont8x16[ch - 32];
+            for (int r = 0; r < 16; r++)
+                for (int k = 0; k < 8; k++)
+                    if ((g[r] >> (7 - k)) & 1)
+                        for (int dy = 0; dy < sc; dy++)
+                            for (int dx = 0; dx < sc; dx++) {
+                                int px = x + k * sc + dx, py = yy + r * sc + dy;
+                                if (px >= 0 && px < W && py >= 0 && py < H) fb[(size_t)py * W + px] = c;
+                            }
+        }
+    }
+    void line(const std::string &t, uint32_t c = 0xFFE8ECF4u) { if (fb) { text(48, y, t.c_str(), c, 2); y += 40; } }
+};
 
 // ---------- Registro de passos em /data/kickiptv.log ----------
 // Se o app cair, na proxima abertura o menu mostra em qual passo ele parou.
@@ -1187,15 +1208,14 @@ int main() {
     OrbisVideoOutBufferAttribute attr;
     sceVideoOutSetBufferAttribute(&attr, 0x80000000, ORBIS_VIDEO_OUT_TILING_MODE_LINEAR, ORBIS_VIDEO_OUT_ASPECT_RATIO_16_9, W, H, W);
     if (sceVideoOutRegisterBuffers(vh, 0, bufs, 2, &attr) < 0) return 4;
-    {   // primeiro quadro: tela escura (so escrita, rapida). Se aparecer, o app esta vivo.
-        uint32_t *p0 = (uint32_t *)bufs[0];
-        for (size_t i = 0; i < (size_t)W * H; i++) p0[i] = 0xFF090B10u;
-        sceVideoOutSubmitFlip(vh, 0, ORBIS_VIDEO_OUT_FLIP_VSYNC, 0);
-    }
+    BootScreen boot;
+    boot.init(bufs[0], W, H);                                       // so escrita: igual ao codigo original
+    sceVideoOutSubmitFlip(vh, 0, ORBIS_VIDEO_OUT_FLIP_VSYNC, 0);
+    boot.line("[1] video aberto");
 
     traceInit();
     trace("video-ok");
-    std::set_terminate([] { trace("EXCECAO (terminate: provavel falta de memoria)"); abort(); });
+    if (!g_prevStage.empty()) boot.line("da ultima vez o app parou em: " + g_prevStage, 0xFFFFB020u);
     Ps4Platform pf;
     App app(pf);
     pf.app = &app;
@@ -1204,6 +1224,7 @@ int main() {
     ui.tab = Tab::Kick;                       // abre direto na aba Kick (os canais M3U sao so demonstracao)
     if (!g_prevStage.empty()) app.say("Aviso: da ultima vez o app parou no passo: " + g_prevStage);
     trace("estado-criado");
+    boot.line("[2] estado do app criado");
 
 
     std::vector<std::string> diag;
@@ -1229,6 +1250,7 @@ int main() {
         for (size_t i = 0; i < (size_t)W * H; i++) shadow[i] = 0xFF090B10u;
     }
     trace("rascunho-ok");
+    boot.line(shadow == shadowFallback.data() ? "[3] rascunho de tela: heap" : "[3] rascunho de tela: memoria direta");
     auto flip = [&]() {
         memcpy(bufs[back], shadow, (size_t)W * H * 4);          // copia sequencial (rapida)
         sceVideoOutSubmitFlip(vh, back, ORBIS_VIDEO_OUT_FLIP_VSYNC, 0); back ^= 1;
@@ -1237,7 +1259,8 @@ int main() {
     auto presentDiag = [&](bool running) { FbRenderer r(shadow, W, H); renderDiag(r, diag, running); flip(); };
     auto presentWait = [&]() { FbRenderer r(shadow, W, H); player.renderWaiting(r); flip(); };
     auto presentKbd = [&]() { FbRenderer r(shadow, W, H); kbd.render(r); flip(); };
-    flip();
+    boot.line("[4] abrindo a interface...");
+    sceKernelUsleep(400000);
     trace("abertura");
 
     {   // ---- abertura animada: logo sobe e aparece, titulo, barra de carregamento ----
@@ -1264,6 +1287,7 @@ int main() {
             sceKernelUsleep(8000);
         }
     }
+    trace("intro-ok");
 
     for (;;) {
         OrbisPadData d;
