@@ -34,7 +34,7 @@ int main() {
     int pad = scePadOpen(userId, 0, 0, NULL);
 
     // --- Video: 1 framebuffer linear 1920x1080 ---
-    int vh = sceVideoOutOpen(ORBIS_VIDEO_USER_MAIN, ORBIS_VIDEO_OUT_BUS_TYPE_MAIN, 0, NULL);
+    int vh = sceVideoOutOpen(ORBIS_VIDEO_USER_MAIN, 0, 0, NULL);
     if (vh < 0) return 1;
 
     const size_t fbSize = 0x800000; // 8 MB (>= 1920*1080*4), multiplo de 2 MB
@@ -44,7 +44,7 @@ int main() {
     if (sceKernelMapDirectMemory(&fb, fbSize, 0x33 /*CPU+GPU RW*/, 0, phys, 0x200000) < 0) return 3;
 
     OrbisVideoOutBufferAttribute attr;
-    sceVideoOutSetBufferAttribute(&attr, ORBIS_VIDEO_OUT_PIXEL_FORMAT_B8_G8_R8_A8_SRGB,
+    sceVideoOutSetBufferAttribute(&attr, 0x80000000,
                                   ORBIS_VIDEO_OUT_TILING_MODE_LINEAR, ORBIS_VIDEO_OUT_ASPECT_RATIO_16_9, W, H, W);
     void *addrs[1] = {fb};
     if (sceVideoOutRegisterBuffers(vh, 0, addrs, 1, &attr) < 0) return 4;
