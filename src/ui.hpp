@@ -29,19 +29,21 @@ struct UI {
     explicit UI(App &a) : app(a) {}
 
     // Itens da aba Kick (a ordem muda se ja existe um "ultimo streamer")
-    enum { KA_TYPE = 0, KA_LAST = 1, KA_TEST_HTTPS = 2, KA_TEST_HTTP = 3 };
+    enum { KA_TYPE = 0, KA_LAST = 1, KA_TEST_HTTPS = 2, KA_TEST_HTTP = 3, KA_AVDIAG = 4 };
     std::vector<int> kickActions() const {
         std::vector<int> a;
         a.push_back(KA_TYPE);
         if (!kickLast.empty()) a.push_back(KA_LAST);
         a.push_back(KA_TEST_HTTPS);
         a.push_back(KA_TEST_HTTP);
+        a.push_back(KA_AVDIAG);
         return a;
     }
     std::string kickLabel(int a) const {
         switch (a) {
         case KA_TYPE: return "[X] Digitar @streamer (teclado na tela)";
         case KA_LAST: return "Ultimo: @" + kickLast + "  (X para assistir de novo)";
+        case KA_AVDIAG: return "DIAGNOSTICO do AvPlayer (varios testes de uma vez)";
         case KA_TEST_HTTPS: return "TESTE do player: video HLS publico (https)";
         default: return "TESTE do player: video HLS publico (http)";
         }
@@ -130,6 +132,7 @@ private:
             if (c >= (int)acts.size()) return;
             switch (acts[c]) {
             case KA_LAST: app.watchKick(kickLast); break;
+            case KA_AVDIAG: app.pf.command("avdiag"); break;
             case KA_TEST_HTTPS: app.say("Teste de player (https)"); app.pf.play(kTestHlsHttps(), "Teste HLS publico (https)"); break;
             case KA_TEST_HTTP: app.say("Teste de player (http)"); app.pf.play(kTestHlsHttp(), "Teste HLS publico (http)"); break;
             default: app.pf.requestText("@ do streamer"); break;
