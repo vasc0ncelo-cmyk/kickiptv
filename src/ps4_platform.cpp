@@ -295,6 +295,17 @@ typedef int (*KAvLogCb)(void *ud, const char *fmt, va_list ap);
 int sceAvPlayerSetLogCallback(KAvLogCb cb, void *ud);
 }
 
+// Stop+Close em outra thread com limite de tempo: se o player travar, abandona o handle e segue em frente
+static bool avStopClose(KAvHandle h, int timeoutMs = 5000) {
+    if (!h) return true;
+    std::atomic<bool> *done = new std::atomic<bool>(false);
+    std::thread t([h, done] { sceAvPlayerStop(h); sceAvPlayerClose(h); done->store(true); });
+    for (int i = 0; i < timeoutMs / 50 && !done->load(); i++) sceKernelUsleep(50000);
+    if (done->load()) { t.join(); delete done; return true; }
+    t.detach();                               // vaza de proposito: a thread ainda usa 'done'
+    return false;
+}
+
 // Log interno do AvPlayer (capturado para o diagnostico) e contadores dos alocadores
 static std::mutex g_avlogM;
 static std::vector<std::string> g_avlog;
@@ -452,6 +463,8 @@ struct HlsFeeder {
     std::thread th;
     std::atomic<bool> run{false};
     std::atomic<int> segs{0}, opens{0}, reads{0}, failed{0};
+    FILE *outFile = nullptr;                    // modo "arquivo que cresce": segmentos vao para /data/live.ts
+    std::atomic<unsigned long long> outBytes{0};
     std::mutex lm;
     std::string status;
     std::string url;
@@ -502,7 +515,10 @@ struct HlsFeeder {
                     if (++errs > 6) { fail("segmento HTTP " + std::to_string(ss)); return; }
                     break;
                 }
-                sb.append((const uint8_t *)seg.data(), seg.size());
+                if (outFile) {
+                    fwrite(seg.data(), 1, seg.size(), outFile); fflush(outFile); outBytes += seg.size();
+                    if (outBytes > 1200000000ULL) { fail("limite de gravacao (1,2 GB) atingido"); return; }
+                } else sb.append((const uint8_t *)seg.data(), seg.size());
                 next = sg.seq + 1; segs++; got = true;
                 setStatus("ao vivo: segmento " + std::to_string(sg.seq) + " (" + std::to_string(seg.size() / 1024) + " KB)");
             }
@@ -517,6 +533,10 @@ static int feedClose(void *) { return 0; }
 static int feedRead(void *, uint8_t *dst, uint64_t pos, uint32_t len) { g_feed.reads++; return g_feed.sb.read(dst, pos, len); }
 static std::atomic<unsigned long long> g_feedSize{1ULL << 40};
 static uint64_t feedSize(void *) { return g_feedSize.load(); }   // ao vivo: tamanho "infinito"; MP4 de teste: tamanho real
+static void closeFeedFile() {                 // para o alimentador, fecha e apaga /data/live.ts
+    g_feed.join();
+    if (g_feed.outFile) { fclose(g_feed.outFile); g_feed.outFile = nullptr; remove("/data/live.ts"); }
+}
 
 static double nowSec() { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec + ts.tv_nsec / 1e9; }
 
@@ -548,20 +568,27 @@ struct Player {
         KAvInitData id; memset(&id, 0, sizeof id);
         id.memObj = NULL; id.allocate = avAlloc; id.deallocate = avFree; id.allocateTexture = avAllocTex; id.deallocateTexture = avFreeTex;
         useFeed = url.find(".m3u8") != std::string::npos;     // HLS: o app baixa e entrega os bytes ao player
-        if (useFeed) { id.fileObj = (void *)&g_feed; id.fOpen = feedOpen; id.fClose = feedClose; id.fRead = feedRead; id.fSize = feedSize; }
-        log.push_back(useFeed ? "modo: HLS baixado pelo app (leitura propria)" : "modo: URL direta no AvPlayer");
+        if (useFeed) {   // HLS: o app grava os segmentos em /data/live.ts (arquivo que cresce) e o player toca esse arquivo local
+            g_feed.join(); g_feed.opens = g_feed.reads = g_feed.segs = 0; g_feedSize = 1ULL << 40;
+            g_feed.outFile = fopen("/data/live.ts", "wb"); g_feed.outBytes = 0;
+            if (!g_feed.outFile) { failed = true; log.push_back("ERRO: nao consegui criar /data/live.ts"); return false; }
+            g_feed.start(url);
+            for (int i = 0; i < 100 && g_feed.segs.load() < 2 && !g_feed.failed.load(); i++) sceKernelUsleep(200000);
+            log.push_back("HLS: segmentos baixados=" + std::to_string(g_feed.segs.load()) + "  " + g_feed.getStatus());
+            if (g_feed.segs.load() == 0) { failed = true; log.push_back("ERRO: nenhum segmento baixado"); closeFeedFile(); return false; }
+        }
+        log.push_back(useFeed ? "modo: HLS gravado em arquivo local que cresce (/data/live.ts)" : "modo: URL direta no AvPlayer");
         id.debugLevel = 0; id.basePriority = 700; id.numOutputVideoFrameBuffers = 3; id.autoStart = true; id.defaultLanguage = "eng";
         h = sceAvPlayerInit(&id);
         snprintf(b, sizeof b, "%llX", (unsigned long long)h); log.push_back(std::string("sceAvPlayerInit: handle=") + b);
         if (!h) { failed = true; log.push_back("ERRO: sceAvPlayerInit falhou"); return false; }
-        if (useFeed) { g_feedSize = 1ULL << 40; g_feed.start(url); }
-        int rc = sceAvPlayerAddSource(h, useFeed ? "live.ts" : url.c_str());
+        int rc = sceAvPlayerAddSource(h, useFeed ? "/data/live.ts" : url.c_str());
         addRc = rc;
         snprintf(b, sizeof b, "%08X", (unsigned)rc); log.push_back(std::string("sceAvPlayerAddSource: ") + b);
         if (rc < 0) {
             failed = true;
             log.push_back("ERRO: o player nao conseguiu abrir esta URL (veja o codigo acima).");
-            g_feed.join();
+            closeFeedFile();
             sceAvPlayerClose(h); h = 0; return false;
         }
         audio.start(h);
@@ -571,8 +598,8 @@ struct Player {
     void stop() {
         g_feed.abort();                     // libera leituras bloqueadas do player (senao o Close poderia travar)
         audio.stop();                       // a thread de audio usa o handle: para antes de fechar
-        if (h) { sceAvPlayerStop(h); sceAvPlayerClose(h); }
-        g_feed.join();
+        avStopClose(h);
+        closeFeedFile();
         h = 0; active = false;
     }
     // chama a cada iteracao; retorna true se desenhou um quadro novo
@@ -631,7 +658,7 @@ static std::string hx(int v) { char b[16]; snprintf(b, sizeof b, "%08X", (unsign
 
 // repl: usa callbacks de arquivo | path: nome passado ao AddSource | hls: se != NULL, alimenta o buffer com este HLS
 static void avAttempt(std::vector<std::string> &d, const std::function<void()> &refresh, const char *name, bool repl, const char *path,
-                      const char *hls, bool autoStart, const std::string *blob = nullptr) {
+                      const char *hls, bool autoStart, const std::string *blob = nullptr, bool keepFeed = false) {
     d.push_back(std::string("-- ") + name);
     refresh();
     KAvInitData id; memset(&id, 0, sizeof id);
@@ -641,10 +668,12 @@ static void avAttempt(std::vector<std::string> &d, const std::function<void()> &
     g_allocN = g_allocFail = g_texN = g_texFail = 0;
     sceAvPlayerSetLogCallback(avLogCb, NULL);
     if (repl) { id.fileObj = (void *)&g_feed; id.fOpen = feedOpen; id.fClose = feedClose; id.fRead = feedRead; id.fSize = feedSize; }
-    g_feed.join(); g_feed.opens = g_feed.reads = g_feed.segs = 0;
-    g_feedSize = 1ULL << 40;
-    if (blob) { g_feed.sb.reset(); g_feed.sb.append((const uint8_t *)blob->data(), blob->size()); g_feedSize = blob->size(); }
-    if (hls) g_feed.start(hls);
+    if (!keepFeed) {
+        g_feed.join(); g_feed.opens = g_feed.reads = g_feed.segs = 0;
+        g_feedSize = 1ULL << 40;
+        if (blob) { g_feed.sb.reset(); g_feed.sb.append((const uint8_t *)blob->data(), blob->size()); g_feedSize = blob->size(); }
+        if (hls) g_feed.start(hls);
+    }
     KAvHandle h = sceAvPlayerInit(&id);
     d.push_back("   Init: handle=" + hx((int)(h & 0xFFFFFFFF)) + (h ? "" : "  (FALHOU)"));
     int rc = h ? sceAvPlayerAddSource(h, path) : -1;
@@ -660,7 +689,10 @@ static void avAttempt(std::vector<std::string> &d, const std::function<void()> &
     refresh();
     if (h && rc >= 0) {
         double t0 = nowSec(); int frames = 0, vw = 0, vh = 0, act = 0; unsigned ach = 0, asr = 0; int aframes = 0;
+        d.push_back("   (tocando...)"); size_t pi = d.size() - 1; int lastSec = 0;
         while (nowSec() - t0 < 7.0) {
+            int sec = (int)(nowSec() - t0);
+            if (sec != lastSec) { lastSec = sec; d[pi] = "   t=" + std::to_string(sec) + "s quadros=" + std::to_string(frames) + " audio=" + std::to_string(aframes); refresh(); }
             KAvFrameInfo fi; memset(&fi, 0, sizeof fi);
             if (sceAvPlayerGetVideoData(h, &fi) && fi.pData) { frames++; vw = *(int *)(fi.details + 0); vh = *(int *)(fi.details + 4); }
             KAvFrameInfo au; memset(&au, 0, sizeof au);
@@ -676,9 +708,26 @@ static void avAttempt(std::vector<std::string> &d, const std::function<void()> &
     } else if (hls) {
         d.push_back("   (open=" + std::to_string(g_feed.opens.load()) + " leituras=" + std::to_string(g_feed.reads.load()) + ")");
     }
+    refresh();
     g_feed.abort();
-    if (h) { sceAvPlayerStop(h); sceAvPlayerClose(h); }
-    g_feed.join();
+    bool okClose = avStopClose(h);
+    if (!okClose) d.push_back("   !! sceAvPlayerStop/Close travou (mais de 5s): seguindo adiante");
+    if (!keepFeed) g_feed.join();
+    refresh();
+}
+
+static void avTailAttempt(std::vector<std::string> &d, const std::function<void()> &refresh, const char *hls) {
+    d.push_back("-- I) HLS gravado em arquivo que cresce (/data/live.ts), sem leitura propria");
+    refresh();
+    g_feed.join(); g_feed.opens = g_feed.reads = g_feed.segs = 0; g_feedSize = 1ULL << 40;
+    g_feed.outFile = fopen("/data/live.ts", "wb"); g_feed.outBytes = 0;
+    if (!g_feed.outFile) { d.push_back("   nao consegui criar /data/live.ts"); refresh(); return; }
+    g_feed.start(hls);
+    for (int i = 0; i < 75 && g_feed.segs.load() < 2 && !g_feed.failed.load(); i++) sceKernelUsleep(200000);
+    d.push_back("   segmentos baixados=" + std::to_string(g_feed.segs.load()) + "  bytes=" + std::to_string(g_feed.outBytes.load()) + "  " + g_feed.getStatus());
+    refresh();
+    if (g_feed.segs.load() > 0) avAttempt(d, refresh, "   I2) AddSource do arquivo que cresce", false, "/data/live.ts", NULL, true, nullptr, true);
+    closeFeedFile();
     refresh();
 }
 
@@ -709,6 +758,7 @@ static void runAvTest(std::vector<std::string> &d, const std::function<void()> &
     avAttempt(d, refresh, "H) MP4 por URL https direta, sem leitura propria", false, mp4Url, NULL, true);
     // A) HLS publico pela leitura propria (o teste original)
     const char *hls = kTestHlsHttps();
+    avTailAttempt(d, refresh, hls);
     avAttempt(d, refresh, "A) HLS publico: leitura propria + /app0/live.ts", true, "/app0/live.ts", hls, true);
 
     // G) pode FECHAR o app (o teste equivalente antigo derrubava): da tempo de tirar o print antes
