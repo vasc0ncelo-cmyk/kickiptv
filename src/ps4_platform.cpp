@@ -1,4 +1,5 @@
-// TESTE 4 - PLAYER com AvPlayer (video + audio) + teclado na tela + diagnostico.
+l// TESTE 5 - PLAYER com AvPlayer (video + audio) + teclado na tela + diagnostico.
+//   HLS (.m3u8): o app baixa playlist/segmentos e entrega ao AvPlayer por callbacks de arquivo (hls.hpp / streambuf.hpp).
 //   Aba Kick (abre por padrao):
 //     X em "Digitar @streamer" = teclado na tela (D-pad move, X digita, QUADRADO apaga, R1 = OK, O = cancela)
 //     X em "TESTE do player"   = toca um video HLS publico (valida o player sem depender da Kick)
@@ -22,6 +23,8 @@
 #include <vector>
 #include "ui.hpp"
 #include "font8x16.hpp"
+#include "hls.hpp"
+#include "streambuf.hpp"
 
 // ---------- Cliente HTTP (libSceNet + libSceSsl + libSceHttp, ligadas no link) ----------
 // Prototipos declarados aqui para nao depender dos nomes dos headers do toolchain.
@@ -76,7 +79,7 @@ struct NetClient {
     }
 
     // GET simples. Retorna true se conseguiu falar com o servidor (mesmo com status de erro).
-    bool get(const std::string &url, std::string &body, int &status) {
+    bool get(const std::string &url, std::string &body, int &status, size_t maxBytes = 1536 * 1024) {
         status = 0; body.clear();
         if (!init()) return false;
         const char *ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
@@ -103,12 +106,12 @@ struct NetClient {
                 L("  SendRequest: " + hex(rc));
                 if (rc >= 0) {
                     sceHttpGetStatusCode(req, &status);
-                    char buf[4096];
+                    std::vector<char> buf(32 * 1024);
                     for (;;) {
-                        int n = sceHttpReadData(req, buf, sizeof buf);
+                        int n = sceHttpReadData(req, buf.data(), buf.size());
                         if (n <= 0) break;
-                        body.append(buf, n);
-                        if (body.size() > 1536 * 1024) break;
+                        body.append(buf.data(), n);
+                        if (body.size() > maxBytes) break;
                     }
                     ok = true;
                 }
@@ -243,15 +246,19 @@ static void fillDemo(App &app) {
             m += "#EXTINF:-1 group-title=\"Series\",Dark S0" + std::to_string(s) + "E0" + std::to_string(e) + "\nhttp://exemplo/series/d" +
                  std::to_string(s * 10 + e) + ".mp4\n";
     app.list = buildPlaylist(m);
-    app.say("TESTE 4 | Kick: X digita @streamer | QUADRADO = rede | OPTIONS sai");
+    app.say("TESTE 5 | Kick: X digita @streamer | QUADRADO = rede | OPTIONS sai");
 }
 
 // ---------- AvPlayer (libSceAvPlayer) - structs proprias para nao depender do header ----------
 typedef void *(*KAvAlloc)(void *arg, uint32_t align, uint32_t size);
 typedef void (*KAvFree)(void *arg, void *mem);
+typedef int (*KAvFileOpen)(void *arg, const char *name);
+typedef int (*KAvFileClose)(void *arg);
+typedef int (*KAvFileRead)(void *arg, uint8_t *buf, uint64_t pos, uint32_t len);
+typedef uint64_t (*KAvFileSize)(void *arg);
 struct KAvInitData {
     void *memObj; KAvAlloc allocate; KAvFree deallocate; KAvAlloc allocateTexture; KAvFree deallocateTexture;   // memoryReplacement
-    void *fileObj; void *fOpen; void *fClose; void *fRead; void *fSize;                                          // fileReplacement
+    void *fileObj; KAvFileOpen fOpen; KAvFileClose fClose; KAvFileRead fRead; KAvFileSize fSize;                // fileReplacement
     void *eventObj; void *eventCb;                                                                              // eventReplacement
     int32_t debugLevel;
     uint32_t basePriority;
@@ -413,6 +420,79 @@ struct AudioPump {
     }
 };
 
+// ---------- Alimentador HLS -> AvPlayer ----------
+// O AvPlayer do PS4 nao abre https/HLS direto (AddSource=806A0002). Entao o app baixa o HLS (playlist + segmentos .ts)
+// com o cliente HTTP proprio e entrega os bytes ao player pelos callbacks de arquivo ("fileReplacement").
+struct HlsFeeder {
+    StreamBuf sb;
+    std::thread th;
+    std::atomic<bool> run{false};
+    std::atomic<int> segs{0}, opens{0}, reads{0}, failed{0};
+    std::mutex lm;
+    std::string status;
+    std::string url;
+
+    void setStatus(const std::string &t) { std::lock_guard<std::mutex> l(lm); status = t; }
+    std::string getStatus() { std::lock_guard<std::mutex> l(lm); return status; }
+    void fail(const std::string &t) { setStatus("ERRO: " + t); failed = 1; }
+
+    void start(const std::string &u) {
+        join(); sb.reset();
+        url = u; segs = opens = reads = failed = 0; run = true; setStatus("iniciando");
+        th = std::thread([this] { loop(); });
+    }
+    void abort() { run = false; sb.abort(); }                // libera leituras bloqueadas do player
+    void join() { abort(); if (th.joinable()) th.join(); }
+
+    static void sleepMs(int ms, std::atomic<bool> &run) { for (int i = 0; i < ms / 50 && run; i++) sceKernelUsleep(50000); }
+
+    void loop() {
+        std::string body; int st = 0;
+        setStatus("baixando playlist mestre");
+        if (!g_net.get(url, body, st) || st < 200 || st >= 300) { fail("playlist mestre HTTP " + std::to_string(st) + (body.empty() ? " (sem resposta)" : "")); return; }
+        std::string mediaUrl = url;
+        if (hlsIsMaster(body)) {
+            auto v = hlsParseMaster(body);
+            int i = hlsPickVariant(v, 720);
+            if (i < 0) { fail("playlist mestre sem variantes"); return; }
+            mediaUrl = hlsResolve(url, v[i].uri);
+            setStatus("variante " + std::to_string(v[i].width) + "x" + std::to_string(v[i].height) + " bw=" + std::to_string(v[i].bandwidth));
+        }
+        unsigned long long next = 0; bool first = true; int errs = 0;
+        while (run) {
+            if (!g_net.get(mediaUrl, body, st) || st < 200 || st >= 300) {
+                if (++errs > 6) { fail("playlist de midia HTTP " + std::to_string(st)); return; }
+                sleepMs(1000, run); continue;
+            }
+            errs = 0;
+            HlsMedia md = hlsParseMedia(body);
+            if (md.hasMap) { fail("fMP4 (EXT-X-MAP) ainda nao suportado"); return; }
+            if (md.segs.empty()) { sleepMs(1000, run); continue; }
+            if (first) { size_t k = md.segs.size() > 3 ? md.segs.size() - 3 : 0; next = md.segs[k].seq; first = false; }
+            bool got = false;
+            for (auto &sg : md.segs) {
+                if (!run) break;
+                if (sg.seq < next) continue;
+                std::string seg; int ss = 0;
+                if (!g_net.get(hlsResolve(mediaUrl, sg.uri), seg, ss, 12u << 20) || ss < 200 || ss >= 300 || seg.empty()) {
+                    if (++errs > 6) { fail("segmento HTTP " + std::to_string(ss)); return; }
+                    break;
+                }
+                sb.append((const uint8_t *)seg.data(), seg.size());
+                next = sg.seq + 1; segs++; got = true;
+                setStatus("ao vivo: segmento " + std::to_string(sg.seq) + " (" + std::to_string(seg.size() / 1024) + " KB)");
+            }
+            if (md.endList && !got) { setStatus("fim da transmissao"); return; }
+            if (!got) { int ms = (int)(md.target * 500); sleepMs(ms < 300 ? 300 : (ms > 1500 ? 1500 : ms), run); }
+        }
+    }
+};
+static HlsFeeder g_feed;
+static int feedOpen(void *, const char *) { g_feed.opens++; return 0; }
+static int feedClose(void *) { return 0; }
+static int feedRead(void *, uint8_t *dst, uint64_t pos, uint32_t len) { g_feed.reads++; return g_feed.sb.read(dst, pos, len); }
+static uint64_t feedSize(void *) { return 1ULL << 40; }       // ao vivo: tamanho "infinito"
+
 static double nowSec() { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec + ts.tv_nsec / 1e9; }
 
 struct Player {
@@ -420,7 +500,7 @@ struct Player {
     bool active = false;
     AudioPump audio;
     int addRc = 0;
-    bool failed = false;
+    bool failed = false, useFeed = false;
     std::vector<std::string> log;
     int frames = 0, strideMode = 0;
     unsigned vw = 0, vh = 0;
@@ -442,16 +522,21 @@ struct Player {
         snprintf(b, sizeof b, "%08X", (unsigned)sceSysmoduleLoadModuleInternal(0x80000050)); log.push_back(std::string("modulo AvPlayerStreaming: ") + b);
         KAvInitData id; memset(&id, 0, sizeof id);
         id.memObj = NULL; id.allocate = avAlloc; id.deallocate = avFree; id.allocateTexture = avAllocTex; id.deallocateTexture = avFreeTex;
+        useFeed = url.find(".m3u8") != std::string::npos;     // HLS: o app baixa e entrega os bytes ao player
+        if (useFeed) { id.fileObj = NULL; id.fOpen = feedOpen; id.fClose = feedClose; id.fRead = feedRead; id.fSize = feedSize; }
+        log.push_back(useFeed ? "modo: HLS baixado pelo app (leitura propria)" : "modo: URL direta no AvPlayer");
         id.debugLevel = 0; id.basePriority = 700; id.numOutputVideoFrameBuffers = 3; id.autoStart = true; id.defaultLanguage = "eng";
         h = sceAvPlayerInit(&id);
         snprintf(b, sizeof b, "%llX", (unsigned long long)h); log.push_back(std::string("sceAvPlayerInit: handle=") + b);
         if (!h) { failed = true; log.push_back("ERRO: sceAvPlayerInit falhou"); return false; }
-        int rc = sceAvPlayerAddSource(h, url.c_str());
+        if (useFeed) g_feed.start(url);
+        int rc = sceAvPlayerAddSource(h, useFeed ? "live.ts" : url.c_str());
         addRc = rc;
         snprintf(b, sizeof b, "%08X", (unsigned)rc); log.push_back(std::string("sceAvPlayerAddSource: ") + b);
         if (rc < 0) {
             failed = true;
             log.push_back("ERRO: o player nao conseguiu abrir esta URL (veja o codigo acima).");
+            g_feed.join();
             sceAvPlayerClose(h); h = 0; return false;
         }
         audio.start(h);
@@ -459,8 +544,10 @@ struct Player {
         return true;
     }
     void stop() {
+        g_feed.abort();                     // libera leituras bloqueadas do player (senao o Close poderia travar)
         audio.stop();                       // a thread de audio usa o handle: para antes de fechar
         if (h) { sceAvPlayerStop(h); sceAvPlayerClose(h); }
+        g_feed.join();
         h = 0; active = false;
     }
     // chama a cada iteracao; retorna true se desenhou um quadro novo
@@ -493,6 +580,7 @@ struct Player {
                  sceAvPlayerIsActive(h) ? 1 : 0, vw, vh, frames, fps, strideMode, audio.state.load(), audio.rate.load(), audio.chans.load(), audio.chunks.load());
         r.fillRect(0, 0, r.W, 22, 0xFF000000);
         r.drawText(8, 3, b, 0xFFFFFF00, 16);
+        if (useFeed && g_feed.failed) { r.fillRect(0, 22, r.W, 22, 0xFF000000); r.drawText(8, 25, g_feed.getStatus(), 0xFFFF6060, 16); }
     }
     void renderWaiting(FbRenderer &r) {
         r.fillRect(0, 0, r.W, r.H, 0xFF101018);
@@ -504,6 +592,11 @@ struct Player {
         else snprintf(b, sizeof b, "aguardando quadros... %.0fs   ativo=%d   audio=%d (%uHz %uch)   (O volta)", nowSec() - t0,
                       h && sceAvPlayerIsActive(h) ? 1 : 0, audio.state.load(), audio.rate.load(), audio.chans.load());
         r.drawText(40, y + 10, b, failed ? 0xFFFF6060 : 0xFFAAAAAA, 20);
+        if (useFeed) {
+            snprintf(b, sizeof b, "HLS: segmentos=%d  bytes=%llu  open=%d  leituras=%d", g_feed.segs.load(), (unsigned long long)g_feed.sb.total(), g_feed.opens.load(), g_feed.reads.load());
+            r.drawText(40, y + 78, b, 0xFFAAAAAA, 20);
+            r.drawText(40, y + 104, "HLS: " + g_feed.getStatus(), g_feed.failed ? 0xFFFF6060 : 0xFFAAAAAA, 20);
+        }
         if (!failed && nowSec() - t0 > 15) r.drawText(40, y + 44, "Mais de 15s sem video: tire um print desta tela e mande para o Claude.", 0xFFFFFF00, 20);
     }
 };
