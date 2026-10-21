@@ -1,6 +1,6 @@
 // TESTE 3a - REDE (HTTP) + diagnostico na tela. Mantem o menu do Teste 2.
 //   QUADRADO = roda o teste de rede e mostra o resultado na tela | O = voltar ao menu | OPTIONS = sair
-// Os modulos de rede do PS4 sao carregados em tempo de execucao (sem precisar de -lSceHttp no link).
+// Modulos de rede carregados via sceSysmoduleLoadModuleInternal; Makefile liga -lSceNet -lSceSsl -lSceHttp -lSceSysmodule.
 // Precisa do src/font8x16.hpp (o mesmo do Teste 2).
 #include <orbis/libkernel.h>
 #include <orbis/VideoOut.h>
@@ -13,84 +13,52 @@
 #include "ui.hpp"
 #include "font8x16.hpp"
 
-// ---------- Cliente HTTP (libSceNet + libSceSsl + libSceHttp carregadas via dlsym) ----------
+// ---------- Cliente HTTP (libSceNet + libSceSsl + libSceHttp, ligadas no link) ----------
+// Prototipos declarados aqui para nao depender dos nomes dos headers do toolchain.
+extern "C" {
+int sceSysmoduleLoadModuleInternal(uint32_t id);
+int sceNetInit(void);
+int sceNetPoolCreate(const char *name, int size, int flags);
+int sceSslInit(size_t poolSize);
+int sceHttpInit(int libnetMemId, int libsslCtxId, size_t poolSize);
+int sceHttpCreateTemplate(int libhttpCtxId, const char *userAgent, int httpVer, int isAutoProxyConf);
+int sceHttpCreateConnectionWithURL(int tmplId, const char *url, int enableKeepalive);
+int sceHttpCreateRequestWithURL(int connId, int method, const char *url, unsigned long long contentLength);
+int sceHttpSendRequest(int reqId, const void *postData, size_t size);
+int sceHttpGetStatusCode(int reqId, int *statusCode);
+int sceHttpReadData(int reqId, void *data, size_t size);
+int sceHttpDeleteRequest(int id);
+int sceHttpDeleteConnection(int id);
+int sceHttpDeleteTemplate(int id);
+int sceHttpsDisableOption(int id, unsigned flags);
+int sceHttpSetAutoRedirect(int id, int enable);
+int sceHttpAddRequestHeader(int id, const char *name, const char *value, int mode);
+int sceHttpSetConnectTimeOut(int id, unsigned usec);
+int sceHttpSetSendTimeOut(int id, unsigned usec);
+int sceHttpSetRecvTimeOut(int id, unsigned usec);
+int sceHttpSetResolveTimeOut(int id, unsigned usec);
+}
+
 struct NetClient {
     std::vector<std::string> *log = nullptr;
     bool ready = false, failed = false;
     int httpCtx = -1;
 
-    int (*fNetInit)() = nullptr;
-    int (*fNetPoolCreate)(const char *, int, int) = nullptr;
-    int (*fSslInit)(size_t) = nullptr;
-    int (*fHttpInit)(int, int, size_t) = nullptr;
-    int (*fCreateTemplate)(int, const char *, int, int) = nullptr;
-    int (*fCreateConn)(int, const char *, int) = nullptr;
-    int (*fCreateReq)(int, int, const char *, unsigned long long) = nullptr;
-    int (*fSend)(int, const void *, size_t) = nullptr;
-    int (*fStatus)(int, int *) = nullptr;
-    int (*fRead)(int, void *, size_t) = nullptr;
-    int (*fDelReq)(int) = nullptr;
-    int (*fDelConn)(int) = nullptr;
-    int (*fDelTmpl)(int) = nullptr;
-    // opcionais
-    int (*fDisableOpt)(int, unsigned) = nullptr;
-    int (*fAutoRedirect)(int, int) = nullptr;
-    int (*fAddHeader)(int, const char *, const char *, int) = nullptr;
-    int (*fTmoConnect)(int, unsigned) = nullptr;
-    int (*fTmoSend)(int, unsigned) = nullptr;
-    int (*fTmoRecv)(int, unsigned) = nullptr;
-    int (*fTmoResolve)(int, unsigned) = nullptr;
-
     void L(const std::string &s) { if (log) log->push_back(s); }
     static std::string hex(int v) { char b[16]; snprintf(b, sizeof b, "%08X", (unsigned)v); return b; }
-
-    template <class T> bool sym(int mod, const char *name, T &out, bool required = true) {
-        void *p = nullptr;
-        int rc = (mod > 0) ? sceKernelDlsym(mod, name, &p) : -1;
-        if (rc < 0 || !p) { if (required) L(std::string("  FALTA: ") + name); return false; }
-        out = (T)p;
-        return true;
-    }
 
     bool init() {
         if (ready) return true;
         if (failed) { L("(inicializacao ja falhou acima)"); return false; }
         failed = true;
-        const char *paths[3] = {"/system/common/lib/libSceNet.sprx", "/system/common/lib/libSceSsl.sprx", "/system/common/lib/libSceHttp.sprx"};
-        const char *shortn[3] = {"Net", "Ssl", "Http"};
-        int h[3];
-        for (int i = 0; i < 3; i++) {
-            int res = 0;
-            h[i] = sceKernelLoadStartModule(paths[i], 0, NULL, 0, NULL, &res);
-            L(std::string("modulo ") + shortn[i] + ": handle=" + hex(h[i]));
-        }
-        bool ok = true;
-        ok &= sym(h[0], "sceNetInit", fNetInit);
-        ok &= sym(h[0], "sceNetPoolCreate", fNetPoolCreate);
-        ok &= sym(h[1], "sceSslInit", fSslInit);
-        ok &= sym(h[2], "sceHttpInit", fHttpInit);
-        ok &= sym(h[2], "sceHttpCreateTemplate", fCreateTemplate);
-        ok &= sym(h[2], "sceHttpCreateConnectionWithURL", fCreateConn);
-        ok &= sym(h[2], "sceHttpCreateRequestWithURL", fCreateReq);
-        ok &= sym(h[2], "sceHttpSendRequest", fSend);
-        ok &= sym(h[2], "sceHttpGetStatusCode", fStatus);
-        ok &= sym(h[2], "sceHttpReadData", fRead);
-        ok &= sym(h[2], "sceHttpDeleteRequest", fDelReq);
-        ok &= sym(h[2], "sceHttpDeleteConnection", fDelConn);
-        ok &= sym(h[2], "sceHttpDeleteTemplate", fDelTmpl);
-        sym(h[2], "sceHttpsDisableOption", fDisableOpt, false);
-        sym(h[2], "sceHttpSetAutoRedirect", fAutoRedirect, false);
-        sym(h[2], "sceHttpAddRequestHeader", fAddHeader, false);
-        sym(h[2], "sceHttpSetConnectTimeOut", fTmoConnect, false);
-        sym(h[2], "sceHttpSetSendTimeOut", fTmoSend, false);
-        sym(h[2], "sceHttpSetRecvTimeOut", fTmoRecv, false);
-        sym(h[2], "sceHttpSetResolveTimeOut", fTmoResolve, false);
-        if (!ok) { L("funcoes obrigatorias ausentes -> abortando"); return false; }
-
-        int rc = fNetInit();                       L("sceNetInit: " + hex(rc));
-        int netMem = fNetPoolCreate("kickiptv", 64 * 1024, 0); L("sceNetPoolCreate: " + hex(netMem));
-        int ssl = fSslInit(300 * 1024);            L("sceSslInit: " + hex(ssl));
-        httpCtx = fHttpInit(netMem, ssl, 128 * 1024); L("sceHttpInit: " + hex(httpCtx));
+        // IDs internos de modulo do PS4: NetCtl 0x80000009, Http 0x8000000A, Ssl 0x8000000B, Net 0x8000001C
+        const uint32_t ids[4] = {0x8000001C, 0x80000009, 0x8000000A, 0x8000000B};
+        const char *names[4] = {"Net", "NetCtl", "Http", "Ssl"};
+        for (int i = 0; i < 4; i++) L(std::string("carregar modulo ") + names[i] + ": " + hex(sceSysmoduleLoadModuleInternal(ids[i])));
+        int rc = sceNetInit();                         L("sceNetInit: " + hex(rc));
+        int netMem = sceNetPoolCreate("kickiptv", 64 * 1024, 0); L("sceNetPoolCreate: " + hex(netMem));
+        int ssl = sceSslInit(300 * 1024);              L("sceSslInit: " + hex(ssl));
+        httpCtx = sceHttpInit(netMem, ssl, 128 * 1024); L("sceHttpInit: " + hex(httpCtx));
         if (httpCtx < 0) return false;
         ready = true;
         failed = false;
@@ -102,45 +70,43 @@ struct NetClient {
         status = 0; body.clear();
         if (!init()) return false;
         const char *ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
-        int tmpl = fCreateTemplate(httpCtx, ua, 1 /*HTTP/1.1*/, 1);
+        int tmpl = sceHttpCreateTemplate(httpCtx, ua, 1 /*HTTP/1.1*/, 1);
         L("  CreateTemplate: " + hex(tmpl));
         if (tmpl < 0) return false;
-        if (fDisableOpt) fDisableOpt(tmpl, 0x1F);   // sem verificacao de certificado (o PS4 nao tem os CAs carregados aqui)
-        if (fAutoRedirect) fAutoRedirect(tmpl, 1);
+        sceHttpsDisableOption(tmpl, 0x1F);   // sem verificacao de certificado (o app nao carrega os CAs do PS4)
+        sceHttpSetAutoRedirect(tmpl, 1);
         const unsigned T = 15 * 1000 * 1000;
-        if (fTmoResolve) fTmoResolve(tmpl, T);
-        if (fTmoConnect) fTmoConnect(tmpl, T);
-        if (fTmoSend) fTmoSend(tmpl, T);
-        if (fTmoRecv) fTmoRecv(tmpl, T);
-        int conn = fCreateConn(tmpl, url.c_str(), 1);
+        sceHttpSetResolveTimeOut(tmpl, T);
+        sceHttpSetConnectTimeOut(tmpl, T);
+        sceHttpSetSendTimeOut(tmpl, T);
+        sceHttpSetRecvTimeOut(tmpl, T);
+        int conn = sceHttpCreateConnectionWithURL(tmpl, url.c_str(), 1);
         L("  CreateConnection: " + hex(conn));
         bool ok = false;
         if (conn >= 0) {
-            int req = fCreateReq(conn, 0 /*GET*/, url.c_str(), 0);
+            int req = sceHttpCreateRequestWithURL(conn, 0 /*GET*/, url.c_str(), 0);
             L("  CreateRequest: " + hex(req));
             if (req >= 0) {
-                if (fAddHeader) {
-                    fAddHeader(req, "Accept", "application/json, text/plain, */*", 0);
-                    fAddHeader(req, "Accept-Language", "pt-BR,pt;q=0.9,en;q=0.8", 0);
-                }
-                int rc = fSend(req, NULL, 0);
+                sceHttpAddRequestHeader(req, "Accept", "application/json, text/plain, */*", 0);
+                sceHttpAddRequestHeader(req, "Accept-Language", "pt-BR,pt;q=0.9,en;q=0.8", 0);
+                int rc = sceHttpSendRequest(req, NULL, 0);
                 L("  SendRequest: " + hex(rc));
                 if (rc >= 0) {
-                    fStatus(req, &status);
+                    sceHttpGetStatusCode(req, &status);
                     char buf[4096];
                     for (;;) {
-                        int n = fRead(req, buf, sizeof buf);
+                        int n = sceHttpReadData(req, buf, sizeof buf);
                         if (n <= 0) break;
                         body.append(buf, n);
                         if (body.size() > 256 * 1024) break;
                     }
                     ok = true;
                 }
-                fDelReq(req);
+                sceHttpDeleteRequest(req);
             }
-            fDelConn(conn);
+            sceHttpDeleteConnection(conn);
         }
-        fDelTmpl(tmpl);
+        sceHttpDeleteTemplate(tmpl);
         return ok;
     }
 };
@@ -268,7 +234,7 @@ static void fillDemo(App &app) {
             m += "#EXTINF:-1 group-title=\"Series\",Dark S0" + std::to_string(s) + "E0" + std::to_string(e) + "\nhttp://exemplo/series/d" +
                  std::to_string(s * 10 + e) + ".mp4\n";
     app.list = buildPlaylist(m);
-    app.say("TESTE 3a | QUADRADO = teste de rede | OPTIONS sai");
+    app.say("TESTE 3a-2 | QUADRADO = teste de rede | OPTIONS sai");
 }
 
 static const uint32_t B_OPTIONS = 0x0008, B_UP = 0x0010, B_DOWN = 0x0040, B_L2 = 0x0100, B_R2 = 0x0200,
