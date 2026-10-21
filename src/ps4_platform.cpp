@@ -10,6 +10,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <string>
@@ -135,6 +136,8 @@ struct Ps4Platform : Platform {
     App *app = nullptr;
     std::string pendingText;                 // texto digitado no teclado na tela (@streamer)
     bool kbdRequested = false;               // UI pediu o teclado
+    bool avDiagRequested = false;            // UI pediu o diagnostico do AvPlayer
+    void command(const std::string &c) override { if (c == "avdiag") avDiagRequested = true; }
     std::string pendingPlayUrl, pendingPlayTitle;
     bool httpGet(const std::string &url, std::string &body) override {
         int st = 0;
@@ -231,7 +234,7 @@ static void runNetTest(std::vector<std::string> &diag) {
 
 static void renderDiag(FbRenderer &r, const std::vector<std::string> &diag, bool running) {
     r.fillRect(0, 0, r.W, r.H, 0xFF101018);
-    r.drawText(40, 20, running ? "Executando teste de rede... (pode levar ate 1 minuto)" : "Diagnostico de rede", 0xFF53FC18, 28);
+    r.drawText(40, 20, running ? "Executando teste... (pode levar ate 1 minuto)" : "Diagnostico", 0xFF53FC18, 28);
     int y = 70;
     size_t start = diag.size() > 36 ? diag.size() - 36 : 0;
     for (size_t i = start; i < diag.size(); i++) { r.drawText(40, y, diag[i], 0xFFFFFFFF, 20); y += 26; }
@@ -605,6 +608,64 @@ struct Player {
     }
 };
 
+// ---------- Diagnostico do AvPlayer: tenta varias formas de abrir uma fonte e mostra cada resultado ----------
+static std::string hx(int v) { char b[16]; snprintf(b, sizeof b, "%08X", (unsigned)v); return b; }
+
+// repl: usa callbacks de arquivo | path: nome passado ao AddSource | hls: se != NULL, alimenta o buffer com este HLS
+static void avAttempt(std::vector<std::string> &d, const std::function<void()> &refresh, const char *name, bool repl, const char *path,
+                      const char *hls, bool autoStart) {
+    d.push_back(std::string("-- ") + name);
+    refresh();
+    KAvInitData id; memset(&id, 0, sizeof id);
+    id.allocate = avAlloc; id.deallocate = avFree; id.allocateTexture = avAllocTex; id.deallocateTexture = avFreeTex;
+    id.debugLevel = 0; id.basePriority = 700; id.numOutputVideoFrameBuffers = 3; id.autoStart = autoStart; id.defaultLanguage = "eng";
+    if (repl) { id.fOpen = feedOpen; id.fClose = feedClose; id.fRead = feedRead; id.fSize = feedSize; }
+    g_feed.join(); g_feed.opens = g_feed.reads = g_feed.segs = 0;
+    if (hls) g_feed.start(hls);
+    KAvHandle h = sceAvPlayerInit(&id);
+    d.push_back("   Init: handle=" + hx((int)(h & 0xFFFFFFFF)) + (h ? "" : "  (FALHOU)"));
+    int rc = h ? sceAvPlayerAddSource(h, path) : -1;
+    d.push_back("   AddSource(\"" + std::string(path).substr(0, 60) + "\") = " + hx(rc));
+    refresh();
+    if (h && rc >= 0) {
+        double t0 = nowSec(); int frames = 0, vw = 0, vh = 0, act = 0; unsigned ach = 0, asr = 0; int aframes = 0;
+        while (nowSec() - t0 < 7.0) {
+            KAvFrameInfo fi; memset(&fi, 0, sizeof fi);
+            if (sceAvPlayerGetVideoData(h, &fi) && fi.pData) { frames++; vw = *(int *)(fi.details + 0); vh = *(int *)(fi.details + 4); }
+            KAvFrameInfo au; memset(&au, 0, sizeof au);
+            if (sceAvPlayerGetAudioData(h, &au) && au.pData) { aframes++; ach = *(uint16_t *)(au.details + 0); asr = *(uint32_t *)(au.details + 4); }
+            if (sceAvPlayerIsActive(h)) act = 1;
+            sceKernelUsleep(8000);
+        }
+        char b[220];
+        snprintf(b, sizeof b, "   apos 7s: ativo=%d  video: quadros=%d %dx%d  audio: blocos=%d %uHz/%uch  open=%d leituras=%d segs=%d bytes=%llu",
+                 act, frames, vw, vh, aframes, asr, ach, g_feed.opens.load(), g_feed.reads.load(), g_feed.segs.load(), (unsigned long long)g_feed.sb.total());
+        d.push_back(b);
+        if (hls) d.push_back("   HLS: " + g_feed.getStatus());
+    } else if (hls) {
+        d.push_back("   (open=" + std::to_string(g_feed.opens.load()) + " leituras=" + std::to_string(g_feed.reads.load()) + ")");
+    }
+    g_feed.abort();
+    if (h) { sceAvPlayerStop(h); sceAvPlayerClose(h); }
+    g_feed.join();
+    refresh();
+}
+
+static void runAvTest(std::vector<std::string> &d, const std::function<void()> &refresh) {
+    d.clear();
+    d.push_back("== DIAGNOSTICO DO AVPLAYER ==  (cada teste leva ate ~10s)");
+    g_net.log = nullptr; g_net.init();
+    d.push_back("modulo AvPlayer (0xA5): " + hx(sceSysmoduleLoadModule(0x00A5)));
+    const char *hls = kTestHlsHttps();
+    avAttempt(d, refresh, "A) leitura propria + /app0/live.ts  (HLS publico baixado pelo app)", true, "/app0/live.ts", hls, true);
+    avAttempt(d, refresh, "B) leitura propria + live.ts (sem barra)", true, "live.ts", hls, true);
+    avAttempt(d, refresh, "C) leitura propria + /app0/live.ts, autoStart desligado", true, "/app0/live.ts", hls, false);
+    avAttempt(d, refresh, "D) sem leitura propria + arquivo local /app0/eboot.bin (existe, mas nao e video)", false, "/app0/eboot.bin", NULL, true);
+    avAttempt(d, refresh, "E) sem leitura propria + http direto (m3u8)", false, "http://devimages.apple.com/iphone/samples/bipbop/bipbopall.m3u8", NULL, true);
+    avAttempt(d, refresh, "F) sem leitura propria + https direto (m3u8)", false, kTestHlsHttps(), NULL, true);
+    d.push_back("Fim. Tire UM print desta tela e mande para o Claude.  (O volta ao menu)");
+}
+
 // ---------- Teclado na tela (para digitar o @streamer) ----------
 struct Keyboard {
     static const int COLS = 10, ROWS = 4;
@@ -758,6 +819,14 @@ int main() {
         if (pressed & B_CIRCLE) { ui.handle(Input::Back);     dirty = true; }
         if (pressed & B_SQUARE) { mode = Mode::Diag; diag.assign(1, "Executando..."); presentDiag(true); runNetTest(diag); dirty = true; }
 
+        if (pf.avDiagRequested) {                 // DIAGNOSTICO do AvPlayer
+            pf.avDiagRequested = false;
+            mode = Mode::Diag; diag.assign(1, "Executando...");
+            presentDiag(true);
+            runAvTest(diag, [&]() { presentDiag(true); });
+            dirty = true;
+            continue;
+        }
         if (pf.kbdRequested) {                    // X em "Digitar @streamer": abre o teclado na tela
             pf.kbdRequested = false;
             kbd.open(ui.kickLast);
