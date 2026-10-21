@@ -547,7 +547,7 @@ struct Player {
         KAvInitData id; memset(&id, 0, sizeof id);
         id.memObj = NULL; id.allocate = avAlloc; id.deallocate = avFree; id.allocateTexture = avAllocTex; id.deallocateTexture = avFreeTex;
         useFeed = url.find(".m3u8") != std::string::npos;     // HLS: o app baixa e entrega os bytes ao player
-        if (useFeed) { id.fileObj = NULL; id.fOpen = feedOpen; id.fClose = feedClose; id.fRead = feedRead; id.fSize = feedSize; }
+        if (useFeed) { id.fileObj = (void *)&g_feed; id.fOpen = feedOpen; id.fClose = feedClose; id.fRead = feedRead; id.fSize = feedSize; }
         log.push_back(useFeed ? "modo: HLS baixado pelo app (leitura propria)" : "modo: URL direta no AvPlayer");
         id.debugLevel = 0; id.basePriority = 700; id.numOutputVideoFrameBuffers = 3; id.autoStart = true; id.defaultLanguage = "eng";
         h = sceAvPlayerInit(&id);
@@ -639,18 +639,20 @@ static void avAttempt(std::vector<std::string> &d, const std::function<void()> &
     { std::lock_guard<std::mutex> l(g_avlogM); g_avlog.clear(); }
     g_allocN = g_allocFail = g_texN = g_texFail = 0;
     sceAvPlayerSetLogCallback(avLogCb, NULL);
-    if (repl) { id.fOpen = feedOpen; id.fClose = feedClose; id.fRead = feedRead; id.fSize = feedSize; }
+    if (repl) { id.fileObj = (void *)&g_feed; id.fOpen = feedOpen; id.fClose = feedClose; id.fRead = feedRead; id.fSize = feedSize; }
     g_feed.join(); g_feed.opens = g_feed.reads = g_feed.segs = 0;
     if (hls) g_feed.start(hls);
     KAvHandle h = sceAvPlayerInit(&id);
     d.push_back("   Init: handle=" + hx((int)(h & 0xFFFFFFFF)) + (h ? "" : "  (FALHOU)"));
     int rc = h ? sceAvPlayerAddSource(h, path) : -1;
+    sceKernelUsleep(400000);                       // mensagens do player chegam de outra thread
     d.push_back("   AddSource(\"" + std::string(path).substr(0, 60) + "\") = " + hx(rc) + "   alloc=" + std::to_string(g_allocN.load()) + "(falhas " +
-                std::to_string(g_allocFail.load()) + ") textura=" + std::to_string(g_texN.load()) + "(falhas " + std::to_string(g_texFail.load()) + ")");
+                std::to_string(g_allocFail.load()) + ") textura=" + std::to_string(g_texN.load()) + "(falhas " + std::to_string(g_texFail.load()) + ")  open=" +
+                std::to_string(g_feed.opens.load()) + " leituras=" + std::to_string(g_feed.reads.load()));
     {   // mensagens internas do proprio AvPlayer (as primeiras)
         std::lock_guard<std::mutex> l(g_avlogM);
-        for (size_t i = 0; i < g_avlog.size() && i < 3; i++) d.push_back("   [av] " + g_avlog[i].substr(0, 170));
-        if (g_avlog.size() > 3) d.push_back("   [av] ... (+" + std::to_string(g_avlog.size() - 3) + " mensagens)");
+        for (size_t i = 0; i < g_avlog.size() && i < 6; i++) d.push_back("   [av] " + g_avlog[i].substr(0, 170));
+        if (g_avlog.size() > 6) d.push_back("   [av] ... (+" + std::to_string(g_avlog.size() - 6) + " mensagens)");
     }
     refresh();
     if (h && rc >= 0) {
@@ -683,19 +685,10 @@ static void runAvTest(std::vector<std::string> &d, const std::function<void()> &
     g_net.log = nullptr; g_net.init();
     d.push_back("modulo AvPlayer (0xA5): " + hx(sceSysmoduleLoadModule(0x00A5)));
     const char *hls = kTestHlsHttps();
-    avAttempt(d, refresh, "A) leitura propria + /app0/live.ts (HLS publico baixado pelo app)", true, "/app0/live.ts", hls, true);
+    avAttempt(d, refresh, "A) leitura propria (objeto NAO nulo) + /app0/live.ts", true, "/app0/live.ts", hls, true);
+    avAttempt(d, refresh, "B) leitura propria + live.mp4 (testa se a extensao importa)", true, "live.mp4", hls, true);
+    avAttempt(d, refresh, "C) leitura propria + http://127.0.0.1/live.m3u8", true, "http://127.0.0.1/live.m3u8", hls, true);
     avAttempt(d, refresh, "D) arquivo local /app0/eboot.bin (existe, nao e video), sem leitura propria", false, "/app0/eboot.bin", NULL, true);
-    // carrega modulos de decodificacao que o AvPlayer pode precisar e repete
-    static const struct { uint32_t id; const char *n; } mods[] = {
-        {0x0006, "Fiber"}, {0x0007, "Ult"}, {0x0088, "Audiodec"}, {0x008E, "Videodec"}, {0x00BD, "AudiodecCpu"}, {0x00C0, "M4aac"},
-        {0x00CF, "Videodec2"}, {0x00D0, "Vdecwrap"}, {0x00E5, "Vdecsw"}, {0x00FC, "DecArbitration"}, {0x00BA, "Random"}, {0x00B4, "AppContent"}};
-    std::string line = "modulos:";
-    for (auto &m : mods) { int rc = sceSysmoduleLoadModule((uint16_t)m.id); char b[48]; snprintf(b, sizeof b, " %s=%X", m.n, (unsigned)rc & 0xFFFFFFF); line += b; }
-    { int rc = sceSysmoduleLoadModuleInternal(0x80000015); char b[32]; snprintf(b, sizeof b, " VdecCore=%X", (unsigned)rc & 0xFFFFFFF); line += b; }
-    d.push_back(line.substr(0, 200));
-    if (line.size() > 200) d.push_back("   " + line.substr(200, 200));
-    avAttempt(d, refresh, "A2) igual a A, depois de carregar os modulos acima", true, "/app0/live.ts", hls, true);
-    avAttempt(d, refresh, "D2) igual a D, depois de carregar os modulos acima", false, "/app0/eboot.bin", NULL, true);
     d.push_back("Fim. Tire UM print desta tela e mande para o Claude.  (O volta ao menu)");
 }
 
