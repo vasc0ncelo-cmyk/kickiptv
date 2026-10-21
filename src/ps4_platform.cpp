@@ -1,18 +1,24 @@
-// TESTE 3c - PLAYER (video apenas, sem audio) com AvPlayer + diagnostico.
-//   Aba Kick: X = assistir @dekin021 (fixo neste teste)
+// TESTE 4 - PLAYER com AvPlayer (video + audio) + teclado na tela + diagnostico.
+//   Aba Kick (abre por padrao):
+//     X em "Digitar @streamer" = teclado na tela (D-pad move, X digita, QUADRADO apaga, R1 = OK, O = cancela)
+//     X em "TESTE do player"   = toca um video HLS publico (valida o player sem depender da Kick)
 //   Durante o video: TRIANGULO = muda o "modo de stride" do desenho (se a imagem sair torta) | O = voltar | OPTIONS = sair
 //   Menu: QUADRADO = teste de rede
-// Precisa do src/font8x16.hpp (o mesmo do Teste 2). Makefile liga tambem -lSceAvPlayer.
+// Precisa do src/font8x16.hpp. Makefile liga -lSceAvPlayer e -lSceAudioOut.
 #include <orbis/libkernel.h>
 #include <orbis/VideoOut.h>
 #include <orbis/UserService.h>
 #include <orbis/Pad.h>
+#include <orbis/AudioOut.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
+#include <atomic>
 #include <map>
 #include <string>
+#include <thread>
 #include <vector>
 #include "ui.hpp"
 #include "font8x16.hpp"
@@ -102,7 +108,7 @@ struct NetClient {
                         int n = sceHttpReadData(req, buf, sizeof buf);
                         if (n <= 0) break;
                         body.append(buf, n);
-                        if (body.size() > 256 * 1024) break;
+                        if (body.size() > 1536 * 1024) break;
                     }
                     ok = true;
                 }
@@ -120,7 +126,8 @@ static NetClient g_net;
 // ---------- Plataforma ----------
 struct Ps4Platform : Platform {
     App *app = nullptr;
-    std::string pendingText;                 // pedido de "digitar @streamer" (teclado ainda nao existe: usa fixo)
+    std::string pendingText;                 // texto digitado no teclado na tela (@streamer)
+    bool kbdRequested = false;               // UI pediu o teclado
     std::string pendingPlayUrl, pendingPlayTitle;
     bool httpGet(const std::string &url, std::string &body) override {
         int st = 0;
@@ -128,7 +135,7 @@ struct Ps4Platform : Platform {
         return ok && st >= 200 && st < 300;
     }
     void play(const std::string &url, const std::string &title) override { pendingPlayUrl = url; pendingPlayTitle = title; }
-    void requestText(const std::string &) override { pendingText = "dekin021"; }
+    void requestText(const std::string &) override { kbdRequested = true; }
 };
 
 // ---------- Renderer (igual ao Teste 2) ----------
@@ -228,7 +235,7 @@ static void renderDiag(FbRenderer &r, const std::vector<std::string> &diag, bool
 static void fillDemo(App &app) {
     std::string m = "#EXTM3U\n";
     for (int i = 1; i <= 40; i++)
-        m += "#EXTINF:-1 group-title=\"Abertos\",Canal de Exemplo " + std::to_string(i) + "\nhttp://exemplo/live/" + std::to_string(i) + ".ts\n";
+        m += "#EXTINF:-1 group-title=\"Abertos\",[DEMO sem video] Canal de Exemplo " + std::to_string(i) + "\nhttp://exemplo/live/" + std::to_string(i) + ".ts\n";
     for (int i = 1; i <= 15; i++)
         m += "#EXTINF:-1 group-title=\"Filmes\",Filme de A\xC3\xA7\xC3\xA3o " + std::to_string(i) + "\nhttp://exemplo/movie/" + std::to_string(i) + ".mp4\n";
     for (int s = 1; s <= 2; s++)
@@ -236,7 +243,7 @@ static void fillDemo(App &app) {
             m += "#EXTINF:-1 group-title=\"Series\",Dark S0" + std::to_string(s) + "E0" + std::to_string(e) + "\nhttp://exemplo/series/d" +
                  std::to_string(s * 10 + e) + ".mp4\n";
     app.list = buildPlaylist(m);
-    app.say("TESTE 3c | Kick: X = assistir dekin021 | QUADRADO = rede | OPTIONS sai");
+    app.say("TESTE 4 | Kick: X digita @streamer | QUADRADO = rede | OPTIONS sai");
 }
 
 // ---------- AvPlayer (libSceAvPlayer) - structs proprias para nao depender do header ----------
@@ -337,20 +344,98 @@ static void blitNV12(const uint8_t *src, int sw, int sh, int pitch, int yRows, u
     }
 }
 
+// ---------- Audio: thread propria (sceAudioOutOutput bloqueia ate o buffer tocar) ----------
+// O AvPlayer entrega PCM S16 intercalado (1, 2 ou 6+ canais, 44.1k/48k). Aqui vira estereo 48k.
+struct AudioPump {
+    std::thread th;
+    std::atomic<bool> run{false};
+    std::atomic<int> state{0};          // 0 parado | 1 aguardando audio | 2 tocando | -1 erro ao abrir o audio
+    std::atomic<int> openRc{0};
+    std::atomic<unsigned> rate{0}, chans{0};
+    std::atomic<unsigned> chunks{0};
+    KAvHandle h = 0;
+    int port = -1;
+    static const int GRAIN = 1024;
+
+    void start(KAvHandle handle) {
+        stop();
+        h = handle; run = true; state = 1; chunks = 0; rate = chans = 0; openRc = 0;
+        th = std::thread([this] { loop(); });
+    }
+    void stop() {
+        run = false;
+        if (th.joinable()) th.join();
+        if (port > 0) { sceAudioOutClose(port); port = -1; }
+        state = 0;
+    }
+    static int16_t clip(float v) { return v > 32767.f ? 32767 : (v < -32768.f ? -32768 : (int16_t)v); }
+
+    void loop() {
+        std::vector<int16_t> acc;
+        float prevL = 0, prevR = 0, phase = 0;
+        while (run) {
+            KAvFrameInfo au; memset(&au, 0, sizeof au);
+            if (!sceAvPlayerGetAudioData(h, &au) || !au.pData) { sceKernelUsleep(3000); continue; }
+            unsigned ch = *(uint16_t *)(au.details + 0), sr = *(uint32_t *)(au.details + 4), sz = *(uint32_t *)(au.details + 8);
+            if (ch == 0 || ch > 8 || sr < 8000 || sr > 192000 || sz < 2u * ch) continue;
+            rate = sr; chans = ch;
+            if (port < 0 && state != -1) {
+                int p = sceAudioOutOpen(0xFF /*usuario do sistema*/, ORBIS_AUDIO_OUT_PORT_TYPE_MAIN, 0, GRAIN, 48000, ORBIS_AUDIO_OUT_PARAM_FORMAT_S16_STEREO);
+                openRc = p;
+                if (p > 0) { port = p; state = 2; } else state = -1;      // se falhar, so descarta o audio (o relogio do player continua)
+            }
+            if (port <= 0) continue;
+            const int16_t *in = (const int16_t *)au.pData;
+            size_t frames = sz / (2 * ch);
+            float step = (float)sr / 48000.0f;
+            for (size_t i = 0; i < frames; i++) {
+                const int16_t *f = in + i * ch;
+                float L, R;
+                if (ch == 1) L = R = f[0];
+                else if (ch == 2) { L = f[0]; R = f[1]; }
+                else if (ch >= 6) { L = f[0] + 0.707f * f[2] + 0.707f * f[4]; R = f[1] + 0.707f * f[2] + 0.707f * f[5]; }
+                else { L = f[0]; R = f[1]; }
+                while (phase < 1.0f) {
+                    acc.push_back(clip(prevL + (L - prevL) * phase));
+                    acc.push_back(clip(prevR + (R - prevR) * phase));
+                    phase += step;
+                }
+                phase -= 1.0f; prevL = L; prevR = R;
+            }
+            size_t used = 0;
+            while (run && acc.size() - used >= (size_t)GRAIN * 2) {
+                sceAudioOutOutput(port, acc.data() + used);
+                used += (size_t)GRAIN * 2; chunks++;
+            }
+            if (used) acc.erase(acc.begin(), acc.begin() + used);
+            if (acc.size() > 48000 * 2) acc.clear();            // seguranca: nunca acumula mais de ~1s
+        }
+    }
+};
+
 static double nowSec() { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec + ts.tv_nsec / 1e9; }
 
 struct Player {
     KAvHandle h = 0;
     bool active = false;
+    AudioPump audio;
+    int addRc = 0;
+    bool failed = false;
     std::vector<std::string> log;
     int frames = 0, strideMode = 0;
     unsigned vw = 0, vh = 0;
     double t0 = 0, lastFps = 0; int fpsFrames = 0; double fps = 0;
 
     bool start(const std::string &url, const std::string &title) {
-        log.clear(); frames = 0; vw = vh = 0; fps = 0; fpsFrames = 0;
+        log.clear(); frames = 0; vw = vh = 0; fps = 0; fpsFrames = 0; failed = false; addRc = 0;
         char b[64];
         log.push_back("Reproduzindo: " + title);
+        {   // host e tamanho da URL (o AvPlayer pode ter limite de tamanho; o link da Kick tem ~1000 caracteres)
+            size_t a = url.find("://"); a = a == std::string::npos ? 0 : a + 3;
+            size_t e = url.find('/', a);
+            log.push_back("URL: " + url.substr(0, 8) + "... host=" + url.substr(a, e == std::string::npos ? std::string::npos : e - a) +
+                          "  tamanho=" + std::to_string(url.size()));
+        }
         g_net.log = nullptr;
         g_net.init();
         snprintf(b, sizeof b, "%08X", (unsigned)sceSysmoduleLoadModule(0x00A5)); log.push_back(std::string("modulo AvPlayer (0xA5): ") + b);
@@ -360,14 +445,21 @@ struct Player {
         id.debugLevel = 0; id.basePriority = 700; id.numOutputVideoFrameBuffers = 3; id.autoStart = true; id.defaultLanguage = "eng";
         h = sceAvPlayerInit(&id);
         snprintf(b, sizeof b, "%llX", (unsigned long long)h); log.push_back(std::string("sceAvPlayerInit: handle=") + b);
-        if (!h) return false;
+        if (!h) { failed = true; log.push_back("ERRO: sceAvPlayerInit falhou"); return false; }
         int rc = sceAvPlayerAddSource(h, url.c_str());
+        addRc = rc;
         snprintf(b, sizeof b, "%08X", (unsigned)rc); log.push_back(std::string("sceAvPlayerAddSource: ") + b);
-        if (rc < 0) { sceAvPlayerClose(h); h = 0; return false; }
+        if (rc < 0) {
+            failed = true;
+            log.push_back("ERRO: o player nao conseguiu abrir esta URL (veja o codigo acima).");
+            sceAvPlayerClose(h); h = 0; return false;
+        }
+        audio.start(h);
         active = true; t0 = lastFps = nowSec();
         return true;
     }
     void stop() {
+        audio.stop();                       // a thread de audio usa o handle: para antes de fechar
         if (h) { sceAvPlayerStop(h); sceAvPlayerClose(h); }
         h = 0; active = false;
     }
@@ -391,15 +483,14 @@ struct Player {
                 drew = true;
             }
         }
-        // consome (e descarta) o audio para o relogio do player nao travar
-        for (int i = 0; i < 8; i++) { KAvFrameInfo au; memset(&au, 0, sizeof au); if (!sceAvPlayerGetAudioData(h, &au)) break; }
         double t = nowSec();
         if (t - lastFps >= 1.0) { fps = fpsFrames / (t - lastFps); fpsFrames = 0; lastFps = t; }
         return drew;
     }
     void overlay(FbRenderer &r) {
         char b[160];
-        snprintf(b, sizeof b, " AvPlayer ativo=%d  video=%ux%u  quadros=%d  ~%.0f fps  stride-modo=%d (TRIANGULO)  O=voltar ", sceAvPlayerIsActive(h) ? 1 : 0, vw, vh, frames, fps, strideMode);
+        snprintf(b, sizeof b, " ativo=%d video=%ux%u quadros=%d ~%.0ffps stride=%d(TRIANGULO) audio=%d %uHz/%uch blocos=%u O=voltar ",
+                 sceAvPlayerIsActive(h) ? 1 : 0, vw, vh, frames, fps, strideMode, audio.state.load(), audio.rate.load(), audio.chans.load(), audio.chunks.load());
         r.fillRect(0, 0, r.W, 22, 0xFF000000);
         r.drawText(8, 3, b, 0xFFFFFF00, 16);
     }
@@ -409,15 +500,59 @@ struct Player {
         int y = 70;
         for (auto &l : log) { r.drawText(40, y, l, 0xFFFFFFFF, 20); y += 26; }
         char b[160];
-        snprintf(b, sizeof b, "aguardando quadros... %.0fs   ativo=%d   (O volta)", nowSec() - t0, h && sceAvPlayerIsActive(h) ? 1 : 0);
-        r.drawText(40, y + 10, b, 0xFFAAAAAA, 20);
+        if (failed) snprintf(b, sizeof b, "FALHOU (AddSource=%08X).  O volta ao menu", (unsigned)addRc);
+        else snprintf(b, sizeof b, "aguardando quadros... %.0fs   ativo=%d   audio=%d (%uHz %uch)   (O volta)", nowSec() - t0,
+                      h && sceAvPlayerIsActive(h) ? 1 : 0, audio.state.load(), audio.rate.load(), audio.chans.load());
+        r.drawText(40, y + 10, b, failed ? 0xFFFF6060 : 0xFFAAAAAA, 20);
+        if (!failed && nowSec() - t0 > 15) r.drawText(40, y + 44, "Mais de 15s sem video: tire um print desta tela e mande para o Claude.", 0xFFFFFF00, 20);
     }
 };
 
-static const uint32_t B_OPTIONS = 0x0008, B_UP = 0x0010, B_DOWN = 0x0040, B_L2 = 0x0100, B_R2 = 0x0200,
+// ---------- Teclado na tela (para digitar o @streamer) ----------
+struct Keyboard {
+    static const int COLS = 10, ROWS = 4;
+    std::string text;
+    int cx = 0, cy = 0;
+    // 40 teclas: a-z, _ - 0-9, "<" (apagar), "OK"
+    static std::string keyAt(int x, int y) {
+        static const char *k[ROWS * COLS] = {
+            "a","b","c","d","e","f","g","h","i","j",
+            "k","l","m","n","o","p","q","r","s","t",
+            "u","v","w","x","y","z","_","-","0","1",
+            "2","3","4","5","6","7","8","9","<","OK"};
+        return k[y * COLS + x];
+    }
+    void open(const std::string &initial) { text = initial; cx = cy = 0; }
+    void move(int dx, int dy) { cx = (cx + dx + COLS) % COLS; cy = (cy + dy + ROWS) % ROWS; }
+    void backspace() { if (!text.empty()) text.pop_back(); }
+    // retorna true se confirmou (OK)
+    bool press() {
+        std::string k = keyAt(cx, cy);
+        if (k == "OK") return true;
+        if (k == "<") backspace();
+        else if (text.size() < 25) text += k;
+        return false;
+    }
+    void render(FbRenderer &r) const {
+        r.fillRect(0, 0, r.W, r.H, 0xFF101018);
+        r.drawText(40, 30, "Digite o @ do streamer da Kick", 0xFF53FC18, 32);
+        r.fillRect(40, 100, 900, 60, 0xFF2A2A38);
+        r.drawText(60, 112, "@" + text + "_", 0xFFFFFFFF, 36);
+        for (int y = 0; y < ROWS; y++)
+            for (int x = 0; x < COLS; x++) {
+                bool on = (x == cx && y == cy);
+                int px = 40 + x * 92, py = 200 + y * 80;
+                r.fillRect(px, py, 84, 70, on ? 0xFF53FC18 : 0xFF2A2A38);
+                r.drawText(px + 24, py + 20, keyAt(x, y), on ? 0xFF000000 : 0xFFFFFFFF, 32);
+            }
+        r.drawText(40, 560, "D-pad move   X digita   QUADRADO apaga   R1 ou tecla OK = confirmar   O cancela", 0xFFAAAAAA, 22);
+    }
+};
+
+static const uint32_t B_OPTIONS = 0x0008, B_UP = 0x0010, B_DOWN = 0x0040, B_LEFT = 0x0080, B_RIGHT = 0x0020, B_L2 = 0x0100, B_R2 = 0x0200,
                       B_L1 = 0x0400, B_R1 = 0x0800, B_TRIANGLE = 0x1000, B_SQUARE = 0x8000, B_CIRCLE = 0x2000, B_CROSS = 0x4000;
 
-enum class Mode { Menu, Diag, Play };
+enum class Mode { Menu, Diag, Play, Kbd };
 
 int main() {
     Ps4Platform pf;
@@ -425,11 +560,13 @@ int main() {
     pf.app = &app;
     UI ui(app);
     fillDemo(app);
+    ui.tab = Tab::Kick;                       // abre direto na aba Kick (os canais M3U sao so demonstracao)
 
     sceUserServiceInitialize(NULL);
     int userId = 0;
     sceUserServiceGetInitialUser(&userId);
     scePadInit();
+    sceAudioOutInit();
     int pad = scePadOpen(userId, 0, 0, NULL);
 
     const int W = 1920, H = 1080;
@@ -448,6 +585,7 @@ int main() {
     std::vector<std::string> diag;
     Mode mode = Mode::Menu;
     Player player;
+    Keyboard kbd;
     bool gotFrame = false;
     double lastWaitDraw = 0;
     uint32_t prev = 0;
@@ -458,6 +596,7 @@ int main() {
     auto presentMenu = [&]() { FbRenderer r(bufs[back], W, H); ui.render(r); flip(); };
     auto presentDiag = [&](bool running) { FbRenderer r(bufs[back], W, H); renderDiag(r, diag, running); flip(); };
     auto presentWait = [&]() { FbRenderer r(bufs[back], W, H); player.renderWaiting(r); flip(); };
+    auto presentKbd = [&]() { FbRenderer r(bufs[back], W, H); kbd.render(r); flip(); };
 
     for (;;) {
         OrbisPadData d;
@@ -466,6 +605,26 @@ int main() {
         if (now & B_OPTIONS) break;
         uint32_t pressed = now & ~prev;
         prev = now;
+
+        if (mode == Mode::Kbd) {
+            bool changed = false, done = false;
+            if (pressed & B_UP)     { kbd.move(0, -1); changed = true; }
+            if (pressed & B_DOWN)   { kbd.move(0, 1);  changed = true; }
+            if (pressed & B_LEFT)   { kbd.move(-1, 0); changed = true; }
+            if (pressed & B_RIGHT)  { kbd.move(1, 0);  changed = true; }
+            if (pressed & B_SQUARE) { kbd.backspace(); changed = true; }
+            if (pressed & B_CROSS)  { done = kbd.press(); changed = true; }
+            if (pressed & B_R1)     done = true;
+            if (pressed & B_CIRCLE) { mode = Mode::Menu; dirty = true; continue; }
+            if (done) {
+                mode = Mode::Menu; dirty = true;
+                if (!kbd.text.empty()) pf.pendingText = kbd.text;
+                continue;
+            }
+            if (changed || dirty) { presentKbd(); dirty = false; }
+            sceKernelUsleep(16000);
+            continue;
+        }
 
         if (mode == Mode::Play) {
             if (pressed & B_CIRCLE) { player.stop(); mode = Mode::Menu; dirty = true; sceKernelUsleep(16000); continue; }
@@ -502,7 +661,13 @@ int main() {
         if (pressed & B_CIRCLE) { ui.handle(Input::Back);     dirty = true; }
         if (pressed & B_SQUARE) { mode = Mode::Diag; diag.assign(1, "Executando..."); presentDiag(true); runNetTest(diag); dirty = true; }
 
-        if (!pf.pendingText.empty()) {            // X na aba Kick: busca o canal fixo
+        if (pf.kbdRequested) {                    // X em "Digitar @streamer": abre o teclado na tela
+            pf.kbdRequested = false;
+            kbd.open(ui.kickLast);
+            mode = Mode::Kbd; dirty = true;
+            continue;
+        }
+        if (!pf.pendingText.empty()) {            // texto confirmado no teclado: busca o canal
             std::string slug = pf.pendingText; pf.pendingText.clear();
             app.say("Buscando @" + slug + " na Kick...");
             presentMenu();
@@ -512,6 +677,11 @@ int main() {
         if (!pf.pendingPlayUrl.empty()) {
             std::string url = pf.pendingPlayUrl, title = pf.pendingPlayTitle;
             pf.pendingPlayUrl.clear();
+            if (url.compare(0, 15, "http://exemplo/") == 0) {   // item de demonstracao: nao existe video
+                app.say("Isto e um item de DEMONSTRACAO (sem video). Use a aba Kick.");
+                dirty = true;
+                continue;
+            }
             mode = Mode::Play; gotFrame = false; lastWaitDraw = 0;
             presentWait();                       // mostra "Player" antes de bloquear
             player.start(url, title);
