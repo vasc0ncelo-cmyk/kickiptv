@@ -515,7 +515,8 @@ static HlsFeeder g_feed;
 static int feedOpen(void *, const char *) { g_feed.opens++; return 0; }
 static int feedClose(void *) { return 0; }
 static int feedRead(void *, uint8_t *dst, uint64_t pos, uint32_t len) { g_feed.reads++; return g_feed.sb.read(dst, pos, len); }
-static uint64_t feedSize(void *) { return 1ULL << 40; }       // ao vivo: tamanho "infinito"
+static std::atomic<unsigned long long> g_feedSize{1ULL << 40};
+static uint64_t feedSize(void *) { return g_feedSize.load(); }   // ao vivo: tamanho "infinito"; MP4 de teste: tamanho real
 
 static double nowSec() { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec + ts.tv_nsec / 1e9; }
 
@@ -553,7 +554,7 @@ struct Player {
         h = sceAvPlayerInit(&id);
         snprintf(b, sizeof b, "%llX", (unsigned long long)h); log.push_back(std::string("sceAvPlayerInit: handle=") + b);
         if (!h) { failed = true; log.push_back("ERRO: sceAvPlayerInit falhou"); return false; }
-        if (useFeed) g_feed.start(url);
+        if (useFeed) { g_feedSize = 1ULL << 40; g_feed.start(url); }
         int rc = sceAvPlayerAddSource(h, useFeed ? "live.ts" : url.c_str());
         addRc = rc;
         snprintf(b, sizeof b, "%08X", (unsigned)rc); log.push_back(std::string("sceAvPlayerAddSource: ") + b);
@@ -630,7 +631,7 @@ static std::string hx(int v) { char b[16]; snprintf(b, sizeof b, "%08X", (unsign
 
 // repl: usa callbacks de arquivo | path: nome passado ao AddSource | hls: se != NULL, alimenta o buffer com este HLS
 static void avAttempt(std::vector<std::string> &d, const std::function<void()> &refresh, const char *name, bool repl, const char *path,
-                      const char *hls, bool autoStart) {
+                      const char *hls, bool autoStart, const std::string *blob = nullptr) {
     d.push_back(std::string("-- ") + name);
     refresh();
     KAvInitData id; memset(&id, 0, sizeof id);
@@ -641,6 +642,8 @@ static void avAttempt(std::vector<std::string> &d, const std::function<void()> &
     sceAvPlayerSetLogCallback(avLogCb, NULL);
     if (repl) { id.fileObj = (void *)&g_feed; id.fOpen = feedOpen; id.fClose = feedClose; id.fRead = feedRead; id.fSize = feedSize; }
     g_feed.join(); g_feed.opens = g_feed.reads = g_feed.segs = 0;
+    g_feedSize = 1ULL << 40;
+    if (blob) { g_feed.sb.reset(); g_feed.sb.append((const uint8_t *)blob->data(), blob->size()); g_feedSize = blob->size(); }
     if (hls) g_feed.start(hls);
     KAvHandle h = sceAvPlayerInit(&id);
     d.push_back("   Init: handle=" + hx((int)(h & 0xFFFFFFFF)) + (h ? "" : "  (FALHOU)"));
@@ -681,14 +684,40 @@ static void avAttempt(std::vector<std::string> &d, const std::function<void()> &
 
 static void runAvTest(std::vector<std::string> &d, const std::function<void()> &refresh) {
     d.clear();
-    d.push_back("== DIAGNOSTICO DO AVPLAYER ==  (cada teste leva ate ~10s)");
+    d.push_back("== DIAGNOSTICO DO AVPLAYER v2 ==  (cada teste leva ate ~10s)");
     g_net.log = nullptr; g_net.init();
     d.push_back("modulo AvPlayer (0xA5): " + hx(sceSysmoduleLoadModule(0x00A5)));
+    d.push_back("modulo AvPlayerStreaming: " + hx(sceSysmoduleLoadModuleInternal(0x80000050)));
+    refresh();
+
+    // E) baixa um MP4 pequeno e conhecido (H.264/AAC): serve de CONTROLE POSITIVO
+    const char *mp4Url = "https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4";
+    std::string mp4; int st = 0;
+    bool got = g_net.get(mp4Url, mp4, st, 8u << 20);
+    d.push_back("-- E) baixar flower.mp4: ok=" + std::to_string(got ? 1 : 0) + " http=" + std::to_string(st) + " bytes=" + std::to_string(mp4.size()));
+    refresh();
+    bool wrote = false;
+    if (got && st == 200 && mp4.size() > 10000) {
+        FILE *f = fopen("/data/teste.mp4", "wb");
+        if (f) { wrote = fwrite(mp4.data(), 1, mp4.size(), f) == mp4.size(); fclose(f); }
+        d.push_back(std::string("   gravado em /data/teste.mp4: ") + (wrote ? "sim" : "NAO"));
+        refresh();
+    }
+    // F) o teste que decide: MP4 local, sem callbacks proprios
+    if (wrote) avAttempt(d, refresh, "F) CONTROLE: MP4 local /data/teste.mp4, sem leitura propria", false, "/data/teste.mp4", NULL, true);
+    // H) o mesmo MP4 por URL https direta (o player abre a rede sozinho)
+    avAttempt(d, refresh, "H) MP4 por URL https direta, sem leitura propria", false, mp4Url, NULL, true);
+    // A) HLS publico pela leitura propria (o teste original)
     const char *hls = kTestHlsHttps();
-    avAttempt(d, refresh, "A) leitura propria (objeto NAO nulo) + /app0/live.ts", true, "/app0/live.ts", hls, true);
-    avAttempt(d, refresh, "B) leitura propria + live.mp4 (testa se a extensao importa)", true, "live.mp4", hls, true);
-    avAttempt(d, refresh, "C) leitura propria + http://127.0.0.1/live.m3u8", true, "http://127.0.0.1/live.m3u8", hls, true);
-    avAttempt(d, refresh, "D) arquivo local /app0/eboot.bin (existe, nao e video), sem leitura propria", false, "/app0/eboot.bin", NULL, true);
+    avAttempt(d, refresh, "A) HLS publico: leitura propria + /app0/live.ts", true, "/app0/live.ts", hls, true);
+
+    // G) pode FECHAR o app (o teste equivalente antigo derrubava): da tempo de tirar o print antes
+    if (got && st == 200 && mp4.size() > 10000) {
+        d.push_back("TIRE O PRINT AGORA. Em 10s comeca o teste G (pode fechar o app).");
+        refresh();
+        sceKernelUsleep(10 * 1000 * 1000);
+        avAttempt(d, refresh, "G) o MESMO MP4 pela leitura propria (callbacks), nome live.mp4", true, "live.mp4", NULL, true, &mp4);
+    }
     d.push_back("Fim. Tire UM print desta tela e mande para o Claude.  (O volta ao menu)");
 }
 
