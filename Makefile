@@ -31,8 +31,10 @@ build/pkg.gp4: build/eboot.bin
 >   --files "eboot.bin $(shell find sce_sys sce_module -type f 2>/dev/null | tr '\n' ' ')"
 
 build/$(CONTENT_ID).pkg: build/pkg.gp4
-> $(BIN)/PkgTool.Core pkg_build build/pkg.gp4 build
+> $(BIN)/PkgTool.Core pkg_build build/pkg.gp4 .
+> mv $(CONTENT_ID).pkg build/ .
 > @ls -la build
+
 
 clean:
 > rm -rf build eboot.bin
