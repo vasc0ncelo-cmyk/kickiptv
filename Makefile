@@ -8,7 +8,7 @@ CONTENT_ID := IV0000-BREW00000_00-HELLOWORLD000000
 SRCS := $(wildcard src/*.cpp)
 OBJS := $(patsubst src/%.cpp,build/%.o,$(SRCS))
 
-CXXFLAGS := --target=x86_64-pc-freebsd12-elf -std=c++17 -fPIC -funwind-tables -c -isysroot $(OO) \
+CXXFLAGS := --target=x86_64-pc-freebsd12-elf -std=c++17 -D_GNU_SOURCE -fPIC -funwind-tables -c -isysroot $(OO) \
             -isystem $(OO)/include -isystem $(OO)/include/c++/v1
 LDFLAGS  := -m elf_x86_64 -pie --script $(OO)/link.x --eh-frame-hdr -L$(OO)/lib
 LIBS     := -lc -lc++ -lkernel
