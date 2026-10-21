@@ -2,6 +2,8 @@ name: Build PKG
 on:
   push:
   workflow_dispatch:
+permissions:
+  contents: write
 jobs:
   build:
     runs-on: ubuntu-22.04
@@ -26,6 +28,18 @@ jobs:
           python3 scripts/make_icon.py || echo "icone padrao mantido"
       - name: Compilar PKG
         run: make
+      - name: Conferir o PKG
+        run: |
+          ls -l build/*.pkg
+          sha256sum build/*.pkg
+          head -c 4 build/*.pkg | xxd
+      - name: Publicar PKG numa Release (baixa o .pkg direto, sem zip)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Kick IPTV - build ${{ github.run_number }}
+          files: build/*.pkg
+          make_latest: true
       - uses: actions/upload-artifact@v4
         if: always()
         with:
