@@ -3,8 +3,11 @@
 .RECIPEPREFIX = >
 OO  := $(OO_PS4_TOOLCHAIN)
 BIN := $(OO)/bin/linux
+PKGTOOL := $(BIN)/PkgTool.Core
 
 CONTENT_ID := IV0000-BREW00000_00-HELLOWORLD000000
+TITLE_ID := BREW00000
+TITLE := Kick IPTV
 SRCS := $(wildcard src/*.cpp)
 OBJS := $(patsubst src/%.cpp,build/%.o,$(SRCS))
 
@@ -25,16 +28,27 @@ build/app.elf: $(OBJS)
 build/eboot.bin: build/app.elf
 > $(BIN)/create-fself -in=build/app.elf -out=build/app.oelf --eboot=build/eboot.bin --paid 0x3800000000000011
 
-build/pkg.gp4: build/eboot.bin
-> cp build/eboot.bin eboot.bin
-> $(BIN)/create-gp4 -out build/pkg.gp4 --content-id=$(CONTENT_ID) \
->   --files "eboot.bin $(shell find sce_sys sce_module -type f 2>/dev/null | tr '\n' ' ')"
+sce_sys/param.sfo: Makefile
+> $(PKGTOOL) sfo_new sce_sys/param.sfo
+> $(PKGTOOL) sfo_setentry sce_sys/param.sfo APP_TYPE --type Integer --maxsize 4 --value 0
+> $(PKGTOOL) sfo_setentry sce_sys/param.sfo APP_VER --type Utf8 --maxsize 8 --value '01.00'
+> $(PKGTOOL) sfo_setentry sce_sys/param.sfo ATTRIBUTE --type Integer --maxsize 4 --value 0
+> $(PKGTOOL) sfo_setentry sce_sys/param.sfo CATEGORY --type Utf8 --maxsize 4 --value 'gd'
+> $(PKGTOOL) sfo_setentry sce_sys/param.sfo CONTENT_ID --type Utf8 --maxsize 48 --value '$(CONTENT_ID)'
+> $(PKGTOOL) sfo_setentry sce_sys/param.sfo DOWNLOAD_DATA_SIZE --type Integer --maxsize 4 --value 0
+> $(PKGTOOL) sfo_setentry sce_sys/param.sfo SYSTEM_VER --type Integer --maxsize 4 --value 0
+> $(PKGTOOL) sfo_setentry sce_sys/param.sfo TITLE --type Utf8 --maxsize 128 --value '$(TITLE)'
+> $(PKGTOOL) sfo_setentry sce_sys/param.sfo TITLE_ID --type Utf8 --maxsize 12 --value '$(TITLE_ID)'
+> $(PKGTOOL) sfo_setentry sce_sys/param.sfo VERSION --type Utf8 --maxsize 8 --value '01.00'
 
-build/$(CONTENT_ID).pkg: build/pkg.gp4
-> $(BIN)/PkgTool.Core pkg_build build/pkg.gp4 .
-> mv $(CONTENT_ID).pkg build/ .
+pkg.gp4: build/eboot.bin sce_sys/param.sfo
+> cp build/eboot.bin eboot.bin
+> $(BIN)/create-gp4 -out pkg.gp4 --content-id=$(CONTENT_ID) --files "eboot.bin $$(find sce_sys sce_module -type f ! -name .gitkeep | tr '\n' ' ')"
+
+build/$(CONTENT_ID).pkg: pkg.gp4
+> $(PKGTOOL) pkg_build pkg.gp4 .
+> mv $(CONTENT_ID).pkg build/
 > @ls -la build
 
-
 clean:
-> rm -rf build eboot.bin
+> rm -rf build eboot.bin pkg.gp4 sce_sys/param.sfo
