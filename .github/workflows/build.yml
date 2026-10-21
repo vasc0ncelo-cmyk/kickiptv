@@ -20,6 +20,10 @@ jobs:
           g++ -std=c++17 -pthread -o h tests/test_hls.cpp && ./h
       - name: Toolchain OpenOrbis
         run: bash scripts/get_toolchain.sh
+      - name: Icone e fundo do app (nao quebra o build se falhar)
+        run: |
+          pip install pillow || true
+          python3 scripts/make_icon.py || echo "icone padrao mantido"
       - name: Compilar PKG
         run: make
       - uses: actions/upload-artifact@v4
