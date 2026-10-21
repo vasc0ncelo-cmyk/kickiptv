@@ -11,6 +11,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <deque>
+#include <exception>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -337,6 +338,34 @@ static void renderDiag(FbRenderer &r, const std::vector<std::string> &diag, bool
 }
 
 // ---------- Dados de exemplo ----------
+// ---------- Heap do libc: permite alocacoes grandes (buffers de video/segmentos) ----------
+extern "C" {
+__attribute__((used)) unsigned int sceLibcHeapExtendedAlloc = 1;
+__attribute__((used)) size_t sceLibcHeapSize = (size_t)0xFFFFFFFFFFFFFFFFULL;   // sem limite
+}
+
+// ---------- Registro de passos em /data/kickiptv.log ----------
+// Se o app cair, na proxima abertura o menu mostra em qual passo ele parou.
+static std::string g_prevStage;
+static void traceInit() {
+    FILE *f = fopen("/data/kickiptv.log", "rb");
+    if (f) {
+        std::string all; char b[256]; size_t n;
+        while ((n = fread(b, 1, sizeof b, f)) > 0) all.append(b, n);
+        fclose(f);
+        while (!all.empty() && (all.back() == '\n' || all.back() == '\r')) all.pop_back();
+        size_t p = all.rfind('\n');
+        std::string last = p == std::string::npos ? all : all.substr(p + 1);
+        if (!last.empty() && last != "fim") g_prevStage = last;
+    }
+    f = fopen("/data/kickiptv.log", "wb");
+    if (f) { fputs("inicio\n", f); fclose(f); }
+}
+static void trace(const char *stage) {
+    FILE *f = fopen("/data/kickiptv.log", "ab");
+    if (f) { fputs(stage, f); fputc('\n', f); fclose(f); }
+}
+
 static void fillDemo(App &app) {
     std::string m = "#EXTM3U\n";
     for (int i = 1; i <= 40; i++)
@@ -1139,12 +1168,16 @@ static const uint32_t B_OPTIONS = 0x0008, B_UP = 0x0010, B_DOWN = 0x0040, B_LEFT
 enum class Mode { Menu, Diag, Play, Kbd };
 
 int main() {
+    traceInit();
+    std::set_terminate([] { trace("EXCECAO (terminate: provavel falta de memoria)"); abort(); });
     Ps4Platform pf;
     App app(pf);
     pf.app = &app;
     UI ui(app);
     fillDemo(app);
     ui.tab = Tab::Kick;                       // abre direto na aba Kick (os canais M3U sao so demonstracao)
+    if (!g_prevStage.empty()) app.say("Aviso: da ultima vez o app parou no passo: " + g_prevStage);
+    trace("estado-criado");
 
     sceUserServiceInitialize(NULL);
     int userId = 0;
@@ -1165,6 +1198,12 @@ int main() {
     OrbisVideoOutBufferAttribute attr;
     sceVideoOutSetBufferAttribute(&attr, 0x80000000, ORBIS_VIDEO_OUT_TILING_MODE_LINEAR, ORBIS_VIDEO_OUT_ASPECT_RATIO_16_9, W, H, W);
     if (sceVideoOutRegisterBuffers(vh, 0, bufs, 2, &attr) < 0) return 4;
+    trace("video-registrado");
+    {   // primeiro quadro: tela escura (so escrita, rapida). Se aparecer, o app esta vivo.
+        uint32_t *p0 = (uint32_t *)bufs[0];
+        for (size_t i = 0; i < (size_t)W * H; i++) p0[i] = 0xFF090B10u;
+        sceVideoOutSubmitFlip(vh, 0, ORBIS_VIDEO_OUT_FLIP_VSYNC, 0);
+    }
 
     std::vector<std::string> diag;
     Mode mode = Mode::Menu;
@@ -1173,28 +1212,39 @@ int main() {
     bool gotFrame = false;
     double lastWaitDraw = 0;
     uint32_t prev = 0;
-    int heldFrames = 0, back = 0;
+    int heldFrames = 0, back = 1;
     bool dirty = true;
 
     // A memoria de video e "write-combined": ESCREVER e rapido, mas LER e lentissimo. O desenho novo (transparencia,
     // texto suave) le pixels, entao desenhamos tudo numa tela de rascunho na RAM normal e so copiamos para o video.
-    std::vector<uint32_t> shadow((size_t)W * H, 0xFF090B10u);
+    // O rascunho fica em memoria "cacheada" do sistema (tipo 0), fora do heap do libc.
+    uint32_t *shadow = NULL;
+    std::vector<uint32_t> shadowFallback;
+    {
+        off_t phys2 = 0; void *m2 = NULL;
+        if (sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), bufSize, 0x200000, 0, &phys2) >= 0 &&
+            sceKernelMapDirectMemory(&m2, bufSize, 0x33, 0, phys2, 0x200000) >= 0) shadow = (uint32_t *)m2;
+        if (!shadow) { shadowFallback.assign((size_t)W * H, 0); shadow = shadowFallback.data(); trace("rascunho-no-heap"); }
+        for (size_t i = 0; i < (size_t)W * H; i++) shadow[i] = 0xFF090B10u;
+    }
+    trace("rascunho-ok");
     auto flip = [&]() {
-        memcpy(bufs[back], shadow.data(), (size_t)W * H * 4);          // copia sequencial (rapida)
+        memcpy(bufs[back], shadow, (size_t)W * H * 4);          // copia sequencial (rapida)
         sceVideoOutSubmitFlip(vh, back, ORBIS_VIDEO_OUT_FLIP_VSYNC, 0); back ^= 1;
     };
-    auto presentMenu = [&]() { FbRenderer r(shadow.data(), W, H); ui.render(r); flip(); };
-    auto presentDiag = [&](bool running) { FbRenderer r(shadow.data(), W, H); renderDiag(r, diag, running); flip(); };
-    auto presentWait = [&]() { FbRenderer r(shadow.data(), W, H); player.renderWaiting(r); flip(); };
-    auto presentKbd = [&]() { FbRenderer r(shadow.data(), W, H); kbd.render(r); flip(); };
-    flip();                                                            // primeiro quadro imediato (tira a tela de abertura)
+    auto presentMenu = [&]() { FbRenderer r(shadow, W, H); ui.render(r); flip(); };
+    auto presentDiag = [&](bool running) { FbRenderer r(shadow, W, H); renderDiag(r, diag, running); flip(); };
+    auto presentWait = [&]() { FbRenderer r(shadow, W, H); player.renderWaiting(r); flip(); };
+    auto presentKbd = [&]() { FbRenderer r(shadow, W, H); kbd.render(r); flip(); };
+    flip();
+    trace("abertura");
 
     {   // ---- abertura animada: logo sobe e aparece, titulo, barra de carregamento ----
         double ti = nowSec();
         for (;;) {
             double e = nowSec() - ti;
             if (e > 1.8) break;
-            FbRenderer r(shadow.data(), W, H);
+            FbRenderer r(shadow, W, H);
             using namespace theme;
             uiBackground(r);
             float k = (float)(e / 0.7); if (k > 1.f) k = 1.f;
@@ -1247,7 +1297,7 @@ int main() {
             if (pressed) player.hudUntil = nowSec() + 5;      // qualquer botao mostra o HUD por 5s
             if (pressed & B_TRIANGLE) player.strideMode = (player.strideMode + 1) % 4;
             if (player.h) {
-                FbRenderer r(shadow.data(), W, H);
+                FbRenderer r(shadow, W, H);
                 if (player.poll(r)) { gotFrame = true; player.overlay(r); flip(); }
                 else if (!gotFrame && nowSec() - lastWaitDraw > 0.12) { lastWaitDraw = nowSec(); presentWait(); }
             } else if (nowSec() - lastWaitDraw > 0.12) { lastWaitDraw = nowSec(); presentWait(); }
@@ -1310,12 +1360,15 @@ int main() {
             mode = Mode::Play; gotFrame = false; lastWaitDraw = 0;
             presentWait();                       // mostra "Player" antes de bloquear
             player.presentCb = presentWait;
+            trace("player-start");
             player.start(url, title);
+            trace(player.failed ? "player-falhou" : "player-aberto");
             presentWait();
             continue;
         }
-        if (dirty) { presentMenu(); dirty = false; }
+        if (dirty) { presentMenu(); dirty = false; static bool once = false; if (!once) { once = true; trace("menu-ok"); } }
         sceKernelUsleep(16000);
     }
+    trace("fim");
     return 0;
 }
