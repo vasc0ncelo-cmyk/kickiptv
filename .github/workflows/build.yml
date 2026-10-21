@@ -1,4 +1,4 @@
-name: Build PKG
+lname: Build PKG
 on:
   push:
   workflow_dispatch:
@@ -17,6 +17,7 @@ jobs:
         run: |
           g++ -std=c++17 -o t tests/test_app.cpp src/m3u.cpp && ./t
           g++ -std=c++17 -o u tests/test_ui.cpp src/m3u.cpp && ./u
+          g++ -std=c++17 -pthread -o h tests/test_hls.cpp && ./h
       - name: Toolchain OpenOrbis
         run: bash scripts/get_toolchain.sh
       - name: Compilar PKG
