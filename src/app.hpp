@@ -12,6 +12,7 @@ struct Platform {
     virtual bool httpGet(const std::string &url, std::string &body) = 0;
     virtual void play(const std::string &url, const std::string &title) = 0;
     virtual void requestText(const std::string &prompt) = 0; // abre o teclado (IME); depois chame UI::onText
+    virtual void command(const std::string &) {}             // comandos de diagnostico (ex.: "avdiag")
 };
 
 struct App {
