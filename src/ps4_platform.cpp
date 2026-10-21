@@ -26,6 +26,7 @@
 #include <time.h>
 #include "hls.hpp"
 #include "streambuf.hpp"
+#include "tsmux.hpp"
 #include <orbis/libkernel.h>
 #include <orbis/VideoOut.h>
 #include <orbis/UserService.h>
@@ -650,7 +651,7 @@ struct Player {
 
     // ---- modo "pedacos": o AvPlayer toca arquivos locais (provado pelo teste F); no ao vivo, a cada fim de arquivo
     //      gravamos os segmentos mais novos em outro arquivo e abrimos de novo.
-    bool chunkMode = false;
+    bool chunkMode = false, remux = false;
     std::string chunkExt;
     int chunkIdx = 0;
     unsigned long long lastSeq = 0;
@@ -751,8 +752,28 @@ struct Player {
             bool ts = chunk.size() > 376 && (uint8_t)chunk[0] == 0x47 && (uint8_t)chunk[188] == 0x47 && (uint8_t)chunk[376] == 0x47;
             log.push_back("dados: " + std::to_string(n) + " segmentos, " + std::to_string(chunk.size() / 1024) + " KB, MPEG-TS valido=" + (ts ? "sim" : "NAO"));
         }
-        // Escada de tentativas: arquivo local com varias extensoes (sem leitura propria) e depois leitura propria (callbacks)
+        // Tentativa principal: converter o TS em MP4 (o AvPlayer toca MP4 local - provado pelo teste F)
+        remux = false;
+        {
+            std::string mp4, err; tsmux::Info ti;
+            double c0 = nowSec();
+            if (tsmux::convert(chunk, mp4, err, &ti)) {
+                char b[160];
+                snprintf(b, sizeof b, "conversao TS->MP4 ok: %dx%d, %d quadros, %d audio (%dHz), %.1fs, %d KB, %.0f ms",
+                         ti.width, ti.height, ti.vSamples, ti.aSamples, ti.sampleRate, ti.seconds, (int)(mp4.size() / 1024), (nowSec() - c0) * 1000);
+                log.push_back(b);
+                std::string path = chunkPath("mp4", 0);
+                log.push_back("Tentando MP4 convertido " + path + " ...");
+                presentCb();
+                if (writeFile(path, mp4) && openSource(path, false, 3, 7000, true)) {
+                    chunkMode = true; remux = true; chunkExt = "mp4"; chunkIdx = 0; lastSeq = last;
+                    log.push_back("OK: tocando MP4 convertido");
+                } else remove(path.c_str());
+            } else log.push_back("ERRO conversao TS->MP4: " + err);
+        }
+        // Plano B: escada de tentativas com o TS cru (varias extensoes) e depois leitura propria (callbacks)
         static const char *exts[] = {"mp4", "m2ts", "mpg", "ts", "mkv"};
+        if (!chunkMode)
         for (const char *ext : exts) {
             std::string path = chunkPath(ext, 0);
             log.push_back("Tentando arquivo " + path + " ...");
@@ -790,6 +811,11 @@ struct Player {
     bool restartChunk() {
         std::string data; unsigned long long last = lastSeq;
         if (gatherChunk(false, data, last) == 0) return false;
+        if (remux) {                                          // converte os segmentos novos em MP4
+            std::string mp4, err;
+            if (!tsmux::convert(data, mp4, err)) { lastSeq = last; return false; }   // segmento ruim: pula
+            data.swap(mp4);
+        }
         audio.stop();
         std::string old = chunkPath(chunkExt, chunkIdx);
         avStopClose(h); h = 0;
@@ -840,7 +866,8 @@ struct Player {
             if (inactive && inactiveSince == 0) inactiveSince = t;
             bool ended = inactive && t - inactiveSince > 0.25;
             bool stalled = t - lastFrameT > 3.0;
-            if (ended || stalled) restartChunk();
+            int fresh = 0; { std::lock_guard<std::mutex> l(g_feed.rm); for (auto &sg : g_feed.recent) if (sg.first > lastSeq) fresh++; }
+            if ((ended && (fresh >= 2 || t - inactiveSince > 2.0)) || (stalled && fresh >= 1)) restartChunk();
         }
         if (t - lastFps >= 1.0) { fps = fpsFrames / (t - lastFps); fpsFrames = 0; lastFps = t; }
         return drew;
@@ -1161,6 +1188,31 @@ int main() {
     auto presentWait = [&]() { FbRenderer r(shadow.data(), W, H); player.renderWaiting(r); flip(); };
     auto presentKbd = [&]() { FbRenderer r(shadow.data(), W, H); kbd.render(r); flip(); };
     flip();                                                            // primeiro quadro imediato (tira a tela de abertura)
+
+    {   // ---- abertura animada: logo sobe e aparece, titulo, barra de carregamento ----
+        double ti = nowSec();
+        for (;;) {
+            double e = nowSec() - ti;
+            if (e > 1.8) break;
+            FbRenderer r(shadow.data(), W, H);
+            using namespace theme;
+            uiBackground(r);
+            float k = (float)(e / 0.7); if (k > 1.f) k = 1.f;
+            float ease = 1.f - (1.f - k) * (1.f - k) * (1.f - k);
+            int cx = W / 2, cy = H / 2 - 70 + (int)((1.f - ease) * 40);
+            r.roundRect(cx - 100, cy - 100, 200, 200, 52, GREEN_GLOW);
+            uiLogo(r, cx - 84, cy - 84, 168);
+            uiCenter(r, cx, H / 2 + 80, "Kick IPTV", TEXT, 64, true);
+            uiCenter(r, cx, H / 2 + 138, "Lives da Kick direto no seu PS4", MUTED, 24);
+            float pg = (float)(e / 1.6); if (pg > 1.f) pg = 1.f;
+            r.roundRect(cx - 220, H / 2 + 200, 440, 10, 5, CARD2);
+            r.roundRect(cx - 220, H / 2 + 200, (int)(440 * pg) < 10 ? 10 : (int)(440 * pg), 10, 5, GREEN);
+            int fade = (int)(255.f * (1.f - ease));                      // entra do preto
+            if (fade > 0) r.fillRect(0, 0, W, H, ((unsigned)fade << 24) | 0x00090B10u);
+            flip();
+            sceKernelUsleep(8000);
+        }
+    }
 
     for (;;) {
         OrbisPadData d;
