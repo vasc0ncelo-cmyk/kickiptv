@@ -1168,17 +1168,6 @@ static const uint32_t B_OPTIONS = 0x0008, B_UP = 0x0010, B_DOWN = 0x0040, B_LEFT
 enum class Mode { Menu, Diag, Play, Kbd };
 
 int main() {
-    traceInit();
-    std::set_terminate([] { trace("EXCECAO (terminate: provavel falta de memoria)"); abort(); });
-    Ps4Platform pf;
-    App app(pf);
-    pf.app = &app;
-    UI ui(app);
-    fillDemo(app);
-    ui.tab = Tab::Kick;                       // abre direto na aba Kick (os canais M3U sao so demonstracao)
-    if (!g_prevStage.empty()) app.say("Aviso: da ultima vez o app parou no passo: " + g_prevStage);
-    trace("estado-criado");
-
     sceUserServiceInitialize(NULL);
     int userId = 0;
     sceUserServiceGetInitialUser(&userId);
@@ -1198,12 +1187,24 @@ int main() {
     OrbisVideoOutBufferAttribute attr;
     sceVideoOutSetBufferAttribute(&attr, 0x80000000, ORBIS_VIDEO_OUT_TILING_MODE_LINEAR, ORBIS_VIDEO_OUT_ASPECT_RATIO_16_9, W, H, W);
     if (sceVideoOutRegisterBuffers(vh, 0, bufs, 2, &attr) < 0) return 4;
-    trace("video-registrado");
     {   // primeiro quadro: tela escura (so escrita, rapida). Se aparecer, o app esta vivo.
         uint32_t *p0 = (uint32_t *)bufs[0];
         for (size_t i = 0; i < (size_t)W * H; i++) p0[i] = 0xFF090B10u;
         sceVideoOutSubmitFlip(vh, 0, ORBIS_VIDEO_OUT_FLIP_VSYNC, 0);
     }
+
+    traceInit();
+    trace("video-ok");
+    std::set_terminate([] { trace("EXCECAO (terminate: provavel falta de memoria)"); abort(); });
+    Ps4Platform pf;
+    App app(pf);
+    pf.app = &app;
+    UI ui(app);
+    fillDemo(app);
+    ui.tab = Tab::Kick;                       // abre direto na aba Kick (os canais M3U sao so demonstracao)
+    if (!g_prevStage.empty()) app.say("Aviso: da ultima vez o app parou no passo: " + g_prevStage);
+    trace("estado-criado");
+
 
     std::vector<std::string> diag;
     Mode mode = Mode::Menu;
