@@ -1,53 +1,46 @@
-#include "../src/ui.hpp"
-#include <cassert>
-#include <iostream>
+#pragma once
+// Logica do app independente de plataforma (testavel no PC).
+#include "kick.hpp"
+#include "m3u.hpp"
+#include <string>
 
-struct Fake : Platform {
-    std::string played, asked;
-    bool httpGet(const std::string &url, std::string &b) override {
-        if (url.find("kick.com") != std::string::npos) { b = "{\"playback_url\":\"https:\\/\\/k\\/a.m3u8\",\"livestream\":{\"id\":1}}"; return true; }
-        b = "#EXTM3U\n#EXTINF:-1 group-title=\"A\",Canal 1\nhttp://h/1\n"
-            "#EXTINF:-1 group-title=\"Filmes\",Filme 1\nhttp://h/movie/2\n"
-            "#EXTINF:-1 group-title=\"Series\",Dark S02E01\nhttp://h/series/3\n"
-            "#EXTINF:-1 group-title=\"Series\",Dark S01E02\nhttp://h/series/4\n"
-            "#EXTINF:-1 group-title=\"Series\",Dark S01E01\nhttp://h/series/5\n";
+enum class Tab { Kick = 0, Channels = 1, Movies = 2, Series = 3 };
+
+// A camada PS4 (src/ps4_platform.cpp) implementa isto.
+struct Platform {
+    virtual ~Platform() {}
+    virtual bool httpGet(const std::string &url, std::string &body) = 0;
+    virtual void play(const std::string &url, const std::string &title) = 0;
+    virtual void requestText(const std::string &prompt) = 0; // abre o teclado (IME); depois chame UI::onText
+    virtual void command(const std::string &) {}             // comandos de diagnostico (ex.: "avdiag")
+};
+
+struct App {
+    Platform &pf;
+    Playlist list;
+    std::string lastStatus = "Pronto";
+    explicit App(Platform &p) : pf(p) {}
+
+    void say(const std::string &m) { lastStatus = m; }
+
+    bool loadM3U(const std::string &url) {
+        std::string body;
+        if (!pf.httpGet(url, body)) { say("Falha ao baixar a lista M3U"); return false; }
+        list = buildPlaylist(body);
+        say("Canais: " + std::to_string(list.channels.size()) + " | Filmes: " + std::to_string(list.movies.size()) +
+            " | Series: " + std::to_string(list.seriesTree.size()));
         return true;
     }
-    void play(const std::string &u, const std::string &) override { played = u; }
-    void requestText(const std::string &p) override { asked = p; }
-};
-struct Rec : Renderer {
-    std::vector<std::string> texts; int rects = 0;
-    int width() const override { return 1920; }
-    int height() const override { return 1080; }
-    void fillRect(int, int, int, int, unsigned) override { rects++; }
-    void drawText(int, int, const std::string &t, unsigned, int) override { texts.push_back(t); }
-    bool has(const std::string &s) { for (auto &t : texts) if (t == s) return true; return false; }
-};
 
-int main() {
-    Fake f; App a(f); UI ui(a);
-    assert(a.loadM3U("http://lista"));
-    // Canais
-    ui.handle(Input::Confirm); assert(f.played == "http://h/1");
-    // Filmes
-    ui.handle(Input::NextTab); ui.handle(Input::Confirm); assert(f.played == "http://h/movie/2");
-    // Series: serie -> temporada 1 -> ep 1 (ordenado)
-    ui.handle(Input::NextTab); ui.handle(Input::Confirm);          // Dark
-    ui.handle(Input::Confirm);                                     // Temporada 1
-    Rec r; ui.render(r); assert(r.has("Ep 1 - Dark S01E01") && r.has("Ep 2 - Dark S01E02"));
-    ui.handle(Input::Confirm); assert(f.played == "http://h/series/5");
-    ui.handle(Input::Back); ui.handle(Input::Down); ui.handle(Input::Confirm); // Temporada 2
-    ui.handle(Input::Confirm); assert(f.played == "http://h/series/3");
-    // Kick
-    ui.handle(Input::NextTab); assert(ui.tab == Tab::Kick);
-    ui.handle(Input::Confirm); assert(f.asked == "@ do streamer");
-    ui.onText("@Streamer"); assert(f.played == "https://k/a.m3u8" && a.lastStatus == "Assistindo @streamer");
-    // apos pesquisar, aparece o item "Ultimo" e os testes de player
-    { Rec k; ui.render(k); assert(k.has("Ultimo: @streamer  (X para assistir de novo)")); }
-    f.played.clear(); ui.handle(Input::Down); ui.handle(Input::Confirm); assert(f.played == "https://k/a.m3u8");
-    ui.handle(Input::Down); ui.handle(Input::Confirm); assert(f.played == kTestHlsHttps());
-    ui.handle(Input::Down); ui.handle(Input::Confirm); assert(f.played == kTestHlsHttp());
-    ui.handle(Input::PrevTab); assert(ui.tab == Tab::Series && ui.level == 0);
-    std::cout << "OK\n";
-}
+    void watchKick(const std::string &input) {
+        std::string slug = kickSlug(input);
+        if (slug.empty()) { say("@ invalido"); return; }
+        std::string body;
+        if (!pf.httpGet(kickApiUrl(slug), body)) { say("Falha ao consultar a Kick"); return; }
+        if (!kickIsLive(body)) { say("@" + slug + " esta offline"); return; }
+        std::string hls = jsonString(body, "playback_url");
+        if (hls.empty()) { say("Stream nao encontrado"); return; }
+        say("Assistindo @" + slug);
+        pf.play(hls, "@" + slug);
+    }
+};
