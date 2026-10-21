@@ -1,4 +1,4 @@
-lname: Build PKG
+name: Build PKG
 on:
   push:
   workflow_dispatch:
