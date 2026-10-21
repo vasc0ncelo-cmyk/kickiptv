@@ -28,13 +28,31 @@ struct UI {
 
     explicit UI(App &a) : app(a) {}
 
+    // Itens da aba Kick (a ordem muda se ja existe um "ultimo streamer")
+    enum { KA_TYPE = 0, KA_LAST = 1, KA_TEST_HTTPS = 2, KA_TEST_HTTP = 3 };
+    std::vector<int> kickActions() const {
+        std::vector<int> a;
+        a.push_back(KA_TYPE);
+        if (!kickLast.empty()) a.push_back(KA_LAST);
+        a.push_back(KA_TEST_HTTPS);
+        a.push_back(KA_TEST_HTTP);
+        return a;
+    }
+    std::string kickLabel(int a) const {
+        switch (a) {
+        case KA_TYPE: return "[X] Digitar @streamer (teclado na tela)";
+        case KA_LAST: return "Ultimo: @" + kickLast + "  (X para assistir de novo)";
+        case KA_TEST_HTTPS: return "TESTE do player: video HLS publico (https)";
+        default: return "TESTE do player: video HLS publico (http)";
+        }
+    }
+
     std::vector<std::string> labels() const {
         std::vector<std::string> v;
         const Playlist &p = app.list;
         switch (tab) {
         case Tab::Kick:
-            v.push_back("[X] Pesquisar @streamer");
-            if (!kickLast.empty()) v.push_back("Ultimo: @" + kickLast + "  (X para assistir de novo)");
+            for (int a : kickActions()) v.push_back(kickLabel(a));
             break;
         case Tab::Channels: for (auto &e : p.channels) v.push_back(e.name); break;
         case Tab::Movies: for (auto &e : p.movies) v.push_back(e.name); break;
@@ -108,8 +126,14 @@ private:
         int t = (int)tab, c = cursor[t];
         const Playlist &p = app.list;
         if (tab == Tab::Kick) {
-            if (c == 1 && !kickLast.empty()) app.watchKick(kickLast);
-            else app.pf.requestText("@ do streamer");
+            auto acts = kickActions();
+            if (c >= (int)acts.size()) return;
+            switch (acts[c]) {
+            case KA_LAST: app.watchKick(kickLast); break;
+            case KA_TEST_HTTPS: app.say("Teste de player (https)"); app.pf.play(kTestHlsHttps(), "Teste HLS publico (https)"); break;
+            case KA_TEST_HTTP: app.say("Teste de player (http)"); app.pf.play(kTestHlsHttp(), "Teste HLS publico (http)"); break;
+            default: app.pf.requestText("@ do streamer"); break;
+            }
             return;
         }
         if (c >= n) return;
