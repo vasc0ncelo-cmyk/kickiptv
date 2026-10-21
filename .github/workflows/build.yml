@@ -1,0 +1,30 @@
+name: Build PKG
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+      DOTNET_ROLL_FORWARD: Major
+      DOTNET_SYSTEM_GLOBALIZATION_INVARIANT: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependencias
+        run: sudo apt-get update && sudo apt-get install -y clang lld unzip
+      - name: Testes da logica (PC)
+        run: |
+          g++ -std=c++17 -o t tests/test_app.cpp src/m3u.cpp && ./t
+          g++ -std=c++17 -o u tests/test_ui.cpp src/m3u.cpp && ./u
+      - name: Toolchain OpenOrbis
+        run: bash scripts/get_toolchain.sh
+      - name: Compilar PKG
+        run: make
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kickiptv-pkg
+          path: |
+            build/*.pkg
+            build/eboot.bin
