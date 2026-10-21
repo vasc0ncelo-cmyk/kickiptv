@@ -10,6 +10,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -19,6 +20,7 @@
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -150,6 +152,16 @@ struct Ps4Platform : Platform {
 };
 
 // ---------- Renderer (igual ao Teste 2) ----------
+static inline uint32_t blendPx(uint32_t d, uint32_t s, int a) {   // a: 0..255
+    if (a <= 0) return d;
+    if (a >= 255) return 0xFF000000u | (s & 0xFFFFFFu);
+    uint32_t ia = 255 - a;
+    uint32_t rr = (((s >> 16) & 255) * a + ((d >> 16) & 255) * ia) / 255;
+    uint32_t gg = (((s >> 8) & 255) * a + ((d >> 8) & 255) * ia) / 255;
+    uint32_t bb = ((s & 255) * a + (d & 255) * ia) / 255;
+    return 0xFF000000u | (rr << 16) | (gg << 8) | bb;
+}
+
 struct FbRenderer : Renderer {
     uint32_t *fb; int W, H;
     FbRenderer(void *p, int w, int h) : fb((uint32_t *)p), W(w), H(h) {}
@@ -158,14 +170,70 @@ struct FbRenderer : Renderer {
     void fillRect(int x, int y, int w, int h, unsigned argb) override {
         int x0 = x < 0 ? 0 : x, y0 = y < 0 ? 0 : y;
         int x1 = x + w > W ? W : x + w, y1 = y + h > H ? H : y + h;
+        int a = argb >> 24;
         for (int j = y0; j < y1; j++) {
             uint32_t *row = fb + (size_t)j * W;
-            for (int i = x0; i < x1; i++) row[i] = argb;
+            if (a >= 255) for (int i = x0; i < x1; i++) row[i] = argb;
+            else for (int i = x0; i < x1; i++) row[i] = blendPx(row[i], argb, a);
         }
     }
+    // retangulo com cantos arredondados (bordas suavizadas)
+    void roundRect(int x, int y, int w, int h, int rad, unsigned argb) override {
+        if (rad * 2 > h) rad = h / 2;
+        if (rad * 2 > w) rad = w / 2;
+        if (rad <= 0) { fillRect(x, y, w, h, argb); return; }
+        int a = argb >> 24;
+        int j0 = y < 0 ? 0 : y, j1 = y + h > H ? H : y + h;
+        for (int j = j0; j < j1; j++) {
+            uint32_t *row = fb + (size_t)j * W;
+            bool top = j < y + rad, bot = j >= y + h - rad;
+            int mx0 = x, mx1 = x + w;
+            if (top || bot) {
+                float cy = top ? (float)(y + rad) : (float)(y + h - rad);
+                float dy = (j + 0.5f) - cy;
+                mx0 = x + rad; mx1 = x + w - rad;
+                for (int side = 0; side < 2; side++) {
+                    int px0 = side ? x + w - rad : x, px1 = side ? x + w : x + rad;
+                    float cx = side ? (float)(x + w - rad) : (float)(x + rad);
+                    for (int i = px0; i < px1; i++) {
+                        if (i < 0 || i >= W) continue;
+                        float dx = (i + 0.5f) - cx;
+                        float cov = (float)rad - sqrtf(dx * dx + dy * dy) + 0.5f;
+                        if (cov <= 0.f) continue;
+                        if (cov > 1.f) cov = 1.f;
+                        row[i] = blendPx(row[i], argb, (int)(a * cov));
+                    }
+                }
+            }
+            int i0 = mx0 < 0 ? 0 : mx0, i1 = mx1 > W ? W : mx1;
+            if (a >= 255) for (int i = i0; i < i1; i++) row[i] = argb;
+            else for (int i = i0; i < i1; i++) row[i] = blendPx(row[i], argb, a);
+        }
+    }
+    void gradient(int x, int y, int w, int h, unsigned top, unsigned bot) override {
+        int x0 = x < 0 ? 0 : x, y0 = y < 0 ? 0 : y;
+        int x1 = x + w > W ? W : x + w, y1 = y + h > H ? H : y + h;
+        for (int j = y0; j < y1; j++) {
+            int t = h > 1 ? (j - y) * 255 / (h - 1) : 0;
+            uint32_t c = 0xFF000000u;
+            for (int sh = 0; sh <= 16; sh += 8) {
+                int a = (top >> sh) & 255, b = (bot >> sh) & 255;
+                c |= (uint32_t)((a * (255 - t) + b * t) / 255) << sh;
+            }
+            uint32_t *row = fb + (size_t)j * W;
+            for (int i = x0; i < x1; i++) row[i] = c;
+        }
+    }
+    int textWidth(const std::string &t, int size) const override {
+        int n = 0; for (unsigned char c : t) if ((c & 0xC0) != 0x80) n++;
+        return n * (int)(8 * (size / 16.0f) + 0.5f);
+    }
+    // texto com suavizacao (a fonte 8x16 e ampliada com interpolacao bilinear)
     void drawText(int x, int y, const std::string &text, unsigned argb, int size) override {
         float s = size / 16.0f;
         int adv = (int)(8 * s + 0.5f);
+        int gw = (int)(8 * s) + 2, gh = (int)(16 * s) + 2;
+        int A = argb >> 24;
         int cx = x;
         for (size_t i = 0; i < text.size();) {
             unsigned char c = text[i];
@@ -179,17 +247,29 @@ struct FbRenderer : Renderer {
             if (cp >= 32 && cp <= 126) gi = cp - 32;
             else if (cp >= 160 && cp <= 255) gi = 95 + (cp - 160);
             else gi = '?' - 32;
-            const unsigned char *g = kFont8x16[gi];
-            for (int gy = 0; gy < 16; gy++) {
-                unsigned char bits = g[gy];
-                if (!bits) continue;
-                int py0 = y + (int)(gy * s), py1 = y + (int)((gy + 1) * s);
-                if (py1 == py0) py1 = py0 + 1;
-                for (int gx = 0; gx < 8; gx++) {
-                    if (!(bits & (0x80 >> gx))) continue;
-                    int px0 = cx + (int)(gx * s), px1 = cx + (int)((gx + 1) * s);
-                    if (px1 == px0) px1 = px0 + 1;
-                    fillRect(px0, py0, px1 - px0, py1 - py0, argb);
+            if (cp != 32) {
+                const unsigned char *g = kFont8x16[gi];
+                auto bit = [&](int gx, int gy) -> float {
+                    if (gx < 0 || gx > 7 || gy < 0 || gy > 15) return 0.f;
+                    return (float)((g[gy] >> (7 - gx)) & 1);
+                };
+                for (int dy = 0; dy < gh; dy++) {
+                    int py = y + dy;
+                    if (py < 0 || py >= H) continue;
+                    float v = (dy + 0.5f) / s - 0.5f; int v0 = (int)floorf(v); float fv = v - v0;
+                    uint32_t *row = fb + (size_t)py * W;
+                    for (int dx = 0; dx < gw; dx++) {
+                        int px = cx + dx;
+                        if (px < 0 || px >= W) continue;
+                        float u = (dx + 0.5f) / s - 0.5f; int u0 = (int)floorf(u); float fu = u - u0;
+                        float cv = (bit(u0, v0) * (1 - fu) + bit(u0 + 1, v0) * fu) * (1 - fv) +
+                                   (bit(u0, v0 + 1) * (1 - fu) + bit(u0 + 1, v0 + 1) * fu) * fv;
+                        if (cv <= 0.03f) continue;
+                        cv = (cv - 0.12f) * 1.45f;                       // afina um pouco as bordas
+                        if (cv <= 0.f) continue;
+                        if (cv > 1.f) cv = 1.f;
+                        row[px] = blendPx(row[px], argb, (int)(A * cv));
+                    }
                 }
             }
             cx += adv;
@@ -234,12 +314,25 @@ static void runNetTest(std::vector<std::string> &diag) {
 }
 
 static void renderDiag(FbRenderer &r, const std::vector<std::string> &diag, bool running) {
-    r.fillRect(0, 0, r.W, r.H, 0xFF101018);
-    r.drawText(40, 20, running ? "Executando teste... (pode levar ate 1 minuto)" : "Diagnostico", 0xFF53FC18, 28);
-    int y = 66;
-    size_t start = diag.size() > 38 ? diag.size() - 38 : 0;
-    for (size_t i = start; i < diag.size(); i++) { r.drawText(40, y, diag[i], 0xFFFFFFFF, 18); y += 24; }
-    r.drawText(40, r.H - 50, "O voltar ao menu   OPTIONS sair", 0xFF777777, 22);
+    using namespace theme;
+    uiBackground(r);
+    uiLogo(r, 48, 28, 52);
+    uiText(r, 118, 30, running ? "Executando teste..." : "Diagnóstico", TEXT, 32, true);
+    uiText(r, 120, 68, running ? "pode levar até 1 minuto" : "tire um print e mande para o Claude", MUTED, 18);
+    r.roundRect(40, 100, r.W - 80, r.H - 200, 22, CARD);
+    int y = 122;
+    size_t start = diag.size() > 33 ? diag.size() - 33 : 0;
+    for (size_t i = start; i < diag.size(); i++) {
+        const std::string &l = diag[i];
+        unsigned c = TEXT; bool bold = false;
+        if (l.compare(0, 2, "--") == 0 || l.compare(0, 2, "==") == 0) { c = GREEN; bold = true; }
+        else if (l.find("ERRO") != std::string::npos || l.find("!!") != std::string::npos || l.find("FALHOU") != std::string::npos) c = RED;
+        else if (l.find("[av]") != std::string::npos) c = MUTED;
+        uiText(r, 66, y, uiFit(r, l, 18, r.W - 140), c, 18, bold);
+        y += 24;
+    }
+    int cy = r.H - 50;
+    uiHints(r, r.W - 48, cy, {{"O", "Voltar ao menu"}, {"OPTIONS", "Sair"}});
 }
 
 // ---------- Dados de exemplo ----------
@@ -254,7 +347,7 @@ static void fillDemo(App &app) {
             m += "#EXTINF:-1 group-title=\"Series\",Dark S0" + std::to_string(s) + "E0" + std::to_string(e) + "\nhttp://exemplo/series/d" +
                  std::to_string(s * 10 + e) + ".mp4\n";
     app.list = buildPlaylist(m);
-    app.say("TESTE 5 | Kick: X digita @streamer | QUADRADO = rede | OPTIONS sai");
+    app.say("Pronto");
 }
 
 // ---------- AvPlayer (libSceAvPlayer) - structs proprias para nao depender do header ----------
@@ -468,6 +561,8 @@ struct HlsFeeder {
     std::mutex lm;
     std::string status;
     std::string url;
+    std::mutex rm;                                                   // ultimos segmentos (para tocar em "pedacos")
+    std::deque<std::pair<unsigned long long, std::string>> recent;
 
     void setStatus(const std::string &t) { std::lock_guard<std::mutex> l(lm); status = t; }
     std::string getStatus() { std::lock_guard<std::mutex> l(lm); return status; }
@@ -475,6 +570,7 @@ struct HlsFeeder {
 
     void start(const std::string &u) {
         join(); sb.reset();
+        { std::lock_guard<std::mutex> l(rm); recent.clear(); }
         url = u; segs = opens = reads = failed = 0; run = true; setStatus("iniciando");
         th = std::thread([this] { loop(); });
     }
@@ -519,6 +615,7 @@ struct HlsFeeder {
                     fwrite(seg.data(), 1, seg.size(), outFile); fflush(outFile); outBytes += seg.size();
                     if (outBytes > 1200000000ULL) { fail("limite de gravacao (1,2 GB) atingido"); return; }
                 } else sb.append((const uint8_t *)seg.data(), seg.size());
+                { std::lock_guard<std::mutex> l(rm); recent.push_back({sg.seq, seg}); while (recent.size() > 8) recent.pop_front(); }
                 next = sg.seq + 1; segs++; got = true;
                 setStatus("ao vivo: segmento " + std::to_string(sg.seq) + " (" + std::to_string(seg.size() / 1024) + " KB)");
             }
@@ -551,11 +648,82 @@ struct Player {
     unsigned vw = 0, vh = 0;
     double t0 = 0, lastFps = 0; int fpsFrames = 0; double fps = 0;
 
+    // ---- modo "pedacos": o AvPlayer toca arquivos locais (provado pelo teste F); no ao vivo, a cada fim de arquivo
+    //      gravamos os segmentos mais novos em outro arquivo e abrimos de novo.
+    bool chunkMode = false;
+    std::string chunkExt;
+    int chunkIdx = 0;
+    unsigned long long lastSeq = 0;
+    double inactiveSince = 0, lastFrameT = 0, hudUntil = 0;
+    std::string title;
+
+    static std::string chunkPath(const std::string &ext, int idx) { return "/data/live" + std::to_string(idx) + "." + ext; }
+    static std::string hx8(int v) { char b[16]; snprintf(b, sizeof b, "%08X", (unsigned)v); return b; }
+
+    // junta segmentos: first=true -> os 3 mais novos; senao -> so os mais novos que lastSeq. Retorna quantos.
+    int gatherChunk(bool first, std::string &out, unsigned long long &lastOut) {
+        std::lock_guard<std::mutex> l(g_feed.rm);
+        size_t from = 0;
+        if (first) from = g_feed.recent.size() > 3 ? g_feed.recent.size() - 3 : 0;
+        int n = 0; out.clear();
+        for (size_t i = from; i < g_feed.recent.size(); i++) {
+            if (!first && g_feed.recent[i].first <= lastSeq) continue;
+            out += g_feed.recent[i].second; lastOut = g_feed.recent[i].first; n++;
+        }
+        return n;
+    }
+    static bool writeFile(const std::string &path, const std::string &data) {
+        FILE *f = fopen(path.c_str(), "wb"); if (!f) return false;
+        bool ok = fwrite(data.data(), 1, data.size(), f) == data.size(); fclose(f); return ok;
+    }
+
+    // Abre uma fonte. waitMs>0: so aceita se chegar um quadro de video nesse tempo. Guarda o handle em 'h'.
+    bool openSource(const std::string &path, bool cb, int dbg, int waitMs, bool note) {
+        KAvInitData id; memset(&id, 0, sizeof id);
+        id.allocate = avAlloc; id.deallocate = avFree; id.allocateTexture = avAllocTex; id.deallocateTexture = avFreeTex;
+        id.debugLevel = dbg; id.basePriority = 700; id.numOutputVideoFrameBuffers = 3; id.autoStart = true; id.defaultLanguage = "eng";
+        if (cb) { id.fileObj = (void *)&g_feed; id.fOpen = feedOpen; id.fClose = feedClose; id.fRead = feedRead; id.fSize = feedSize; }
+        { std::lock_guard<std::mutex> l(g_avlogM); g_avlog.clear(); }
+        if (dbg) sceAvPlayerSetLogCallback(avLogCb, NULL);
+        g_allocN = g_allocFail = g_texN = g_texFail = 0;
+        g_feed.opens = g_feed.reads = 0;
+        KAvHandle hh = sceAvPlayerInit(&id);
+        if (!hh) { if (note) log.push_back("   Init falhou"); return false; }
+        int rc = sceAvPlayerAddSource(hh, path.c_str());
+        addRc = rc;
+        sceKernelUsleep(300000);
+        if (note) {
+            log.push_back("   AddSource(" + path + ") = " + hx8(rc) + "  open=" + std::to_string(g_feed.opens.load()) + " leituras=" + std::to_string(g_feed.reads.load()));
+            std::lock_guard<std::mutex> l(g_avlogM);
+            int shown = 0;
+            for (auto &m : g_avlog) {
+                if (shown >= 3) break;
+                if (m.find("OpenCheck") != std::string::npos || m.find("rror") != std::string::npos || m.find("ail") != std::string::npos ||
+                    m.find("nsupport") != std::string::npos || m.find("nvalid") != std::string::npos) { log.push_back("      [av] " + m.substr(0, 150)); shown++; }
+            }
+        }
+        if (rc < 0) { avStopClose(hh); return false; }
+        if (waitMs > 0) {
+            double t0 = nowSec(); bool got = false;
+            while (nowSec() - t0 < waitMs / 1000.0 && !got) {
+                KAvFrameInfo fi; memset(&fi, 0, sizeof fi);
+                if (sceAvPlayerGetVideoData(hh, &fi) && fi.pData) got = true;
+                KAvFrameInfo au; memset(&au, 0, sizeof au);
+                sceAvPlayerGetAudioData(hh, &au);
+                sceKernelUsleep(8000);
+            }
+            if (note) log.push_back(got ? "      -> chegou video!" : "      -> aceitou, mas nenhum quadro em " + std::to_string(waitMs / 1000) + "s");
+            if (!got) { avStopClose(hh); return false; }
+        }
+        h = hh;
+        return true;
+    }
+
     bool start(const std::string &url, const std::string &title) {
-        log.clear(); frames = 0; vw = vh = 0; fps = 0; fpsFrames = 0; failed = false; addRc = 0;
-        char b[64];
+        log.clear(); frames = 0; vw = vh = 0; fps = 0; fpsFrames = 0; failed = false; addRc = 0; chunkMode = false; chunkIdx = 0; inactiveSince = 0;
+        this->title = title; hudUntil = nowSec() + 8;
         log.push_back("Reproduzindo: " + title);
-        {   // host e tamanho da URL (o AvPlayer pode ter limite de tamanho; o link da Kick tem ~1000 caracteres)
+        {   // host e tamanho da URL
             size_t a = url.find("://"); a = a == std::string::npos ? 0 : a + 3;
             size_t e = url.find('/', a);
             log.push_back("URL: " + url.substr(0, 8) + "... host=" + url.substr(a, e == std::string::npos ? std::string::npos : e - a) +
@@ -563,44 +731,87 @@ struct Player {
         }
         g_net.log = nullptr;
         g_net.init();
-        snprintf(b, sizeof b, "%08X", (unsigned)sceSysmoduleLoadModule(0x00A5)); log.push_back(std::string("modulo AvPlayer (0xA5): ") + b);
-        snprintf(b, sizeof b, "%08X", (unsigned)sceSysmoduleLoadModuleInternal(0x80000050)); log.push_back(std::string("modulo AvPlayerStreaming: ") + b);
-        KAvInitData id; memset(&id, 0, sizeof id);
-        id.memObj = NULL; id.allocate = avAlloc; id.deallocate = avFree; id.allocateTexture = avAllocTex; id.deallocateTexture = avFreeTex;
+        log.push_back("modulo AvPlayer (0xA5): " + hx8(sceSysmoduleLoadModule(0x00A5)));
+        log.push_back("modulo AvPlayerStreaming: " + hx8(sceSysmoduleLoadModuleInternal(0x80000050)));
         useFeed = url.find(".m3u8") != std::string::npos;     // HLS: o app baixa e entrega os bytes ao player
-        if (useFeed) {   // HLS: o app grava os segmentos em /data/live.ts (arquivo que cresce) e o player toca esse arquivo local
-            g_feed.join(); g_feed.opens = g_feed.reads = g_feed.segs = 0; g_feedSize = 1ULL << 40;
-            g_feed.outFile = fopen("/data/live.ts", "wb"); g_feed.outBytes = 0;
-            if (!g_feed.outFile) { failed = true; log.push_back("ERRO: nao consegui criar /data/live.ts"); return false; }
-            g_feed.start(url);
-            for (int i = 0; i < 100 && g_feed.segs.load() < 2 && !g_feed.failed.load(); i++) sceKernelUsleep(200000);
-            log.push_back("HLS: segmentos baixados=" + std::to_string(g_feed.segs.load()) + "  " + g_feed.getStatus());
-            if (g_feed.segs.load() == 0) { failed = true; log.push_back("ERRO: nenhum segmento baixado"); closeFeedFile(); return false; }
+        if (!useFeed) {                                         // URL direta (o PS4 normalmente recusa)
+            if (!openSource(url, false, 3, 0, true)) { failed = true; log.push_back("ERRO: o player nao abriu esta URL."); return false; }
+            audio.start(h); active = true; t0 = lastFps = lastFrameT = nowSec();
+            return true;
         }
-        log.push_back(useFeed ? "modo: HLS gravado em arquivo local que cresce (/data/live.ts)" : "modo: URL direta no AvPlayer");
-        id.debugLevel = 0; id.basePriority = 700; id.numOutputVideoFrameBuffers = 3; id.autoStart = true; id.defaultLanguage = "eng";
-        h = sceAvPlayerInit(&id);
-        snprintf(b, sizeof b, "%llX", (unsigned long long)h); log.push_back(std::string("sceAvPlayerInit: handle=") + b);
-        if (!h) { failed = true; log.push_back("ERRO: sceAvPlayerInit falhou"); return false; }
-        int rc = sceAvPlayerAddSource(h, useFeed ? "/data/live.ts" : url.c_str());
-        addRc = rc;
-        snprintf(b, sizeof b, "%08X", (unsigned)rc); log.push_back(std::string("sceAvPlayerAddSource: ") + b);
-        if (rc < 0) {
+        g_feed.join(); g_feed.opens = g_feed.reads = g_feed.segs = 0; g_feedSize = 1ULL << 40;
+        g_feed.start(url);                                      // sem outFile: segmentos vao para o buffer (callbacks) e para 'recent' (arquivos)
+        for (int i = 0; i < 100 && g_feed.segs.load() < 3 && !g_feed.failed.load(); i++) sceKernelUsleep(200000);
+        log.push_back("HLS: segmentos baixados=" + std::to_string(g_feed.segs.load()) + "  " + g_feed.getStatus());
+        if (g_feed.segs.load() == 0) { failed = true; log.push_back("ERRO: nenhum segmento baixado"); g_feed.join(); return false; }
+
+        std::string chunk; unsigned long long last = 0;
+        int n = gatherChunk(true, chunk, last);
+        {   // formato do que baixamos (um .ts valido tem 0x47 a cada 188 bytes)
+            bool ts = chunk.size() > 376 && (uint8_t)chunk[0] == 0x47 && (uint8_t)chunk[188] == 0x47 && (uint8_t)chunk[376] == 0x47;
+            log.push_back("dados: " + std::to_string(n) + " segmentos, " + std::to_string(chunk.size() / 1024) + " KB, MPEG-TS valido=" + (ts ? "sim" : "NAO"));
+        }
+        // Escada de tentativas: arquivo local com varias extensoes (sem leitura propria) e depois leitura propria (callbacks)
+        static const char *exts[] = {"mp4", "m2ts", "mpg", "ts", "mkv"};
+        for (const char *ext : exts) {
+            std::string path = chunkPath(ext, 0);
+            log.push_back("Tentando arquivo " + path + " ...");
+            presentCb();
+            if (!writeFile(path, chunk)) { log.push_back("   nao consegui gravar"); continue; }
+            if (openSource(path, false, 3, 5000, true)) {
+                chunkMode = true; chunkExt = ext; chunkIdx = 0; lastSeq = last;
+                log.push_back("OK: tocando por arquivos (." + std::string(ext) + ")");
+                break;
+            }
+            remove(path.c_str());
+        }
+        if (!chunkMode) {
+            static const char *names[] = {"live.mp4", "live.ts", "live.m2ts"};
+            for (const char *nm : names) {
+                log.push_back(std::string("Tentando leitura propria, nome ") + nm + " ...");
+                presentCb();
+                g_feedSize = 1ULL << 40;
+                if (openSource(nm, true, 3, 6000, true)) { log.push_back("OK: tocando por leitura propria"); break; }
+            }
+        }
+        if (!h) {
             failed = true;
-            log.push_back("ERRO: o player nao conseguiu abrir esta URL (veja o codigo acima).");
-            closeFeedFile();
-            sceAvPlayerClose(h); h = 0; return false;
+            log.push_back("ERRO: nenhuma forma funcionou. Tire print desta tela.");
+            g_feed.join();
+            return false;
         }
         audio.start(h);
-        active = true; t0 = lastFps = nowSec();
+        active = true; t0 = lastFps = lastFrameT = nowSec();
+        return true;
+    }
+    std::function<void()> presentCb = [] {};   // main liga isto para redesenhar a tela de espera durante as tentativas
+
+    // fim do arquivo atual: grava os segmentos novos em outro arquivo e abre de novo
+    bool restartChunk() {
+        std::string data; unsigned long long last = lastSeq;
+        if (gatherChunk(false, data, last) == 0) return false;
+        audio.stop();
+        std::string old = chunkPath(chunkExt, chunkIdx);
+        avStopClose(h); h = 0;
+        remove(old.c_str());
+        chunkIdx = (chunkIdx + 1) % 4;
+        std::string path = chunkPath(chunkExt, chunkIdx);
+        if (!writeFile(path, data)) return false;
+        lastSeq = last;
+        if (!openSource(path, false, 0, 0, false)) { failed = true; log.push_back("ERRO ao reabrir pedaco: " + hx8(addRc)); return false; }
+        audio.start(h);
+        inactiveSince = 0; lastFrameT = nowSec();
         return true;
     }
     void stop() {
         g_feed.abort();                     // libera leituras bloqueadas do player (senao o Close poderia travar)
         audio.stop();                       // a thread de audio usa o handle: para antes de fechar
         avStopClose(h);
-        closeFeedFile();
-        h = 0; active = false;
+        g_feed.join();
+        for (int i = 0; i < 4; i++) { static const char *e[] = {"mp4","m2ts","mpg","ts","mkv"}; for (const char *x : e) remove(chunkPath(x, i).c_str()); }
+        if (g_feed.outFile) { fclose(g_feed.outFile); g_feed.outFile = nullptr; }
+        remove("/data/live.ts");
+        h = 0; active = false; chunkMode = false;
     }
     // chama a cada iteracao; retorna true se desenhou um quadro novo
     bool poll(FbRenderer &r) {
@@ -623,33 +834,91 @@ struct Player {
             }
         }
         double t = nowSec();
+        if (drew) { lastFrameT = t; inactiveSince = 0; }
+        if (chunkMode && h && !failed) {      // ao vivo por pedacos: reabre quando o arquivo acaba
+            bool inactive = !sceAvPlayerIsActive(h);
+            if (inactive && inactiveSince == 0) inactiveSince = t;
+            bool ended = inactive && t - inactiveSince > 0.25;
+            bool stalled = t - lastFrameT > 3.0;
+            if (ended || stalled) restartChunk();
+        }
         if (t - lastFps >= 1.0) { fps = fpsFrames / (t - lastFps); fpsFrames = 0; lastFps = t; }
         return drew;
     }
+    // HUD moderno sobre o video (aparece nos primeiros segundos e quando qualquer botao e apertado)
     void overlay(FbRenderer &r) {
-        char b[160];
-        snprintf(b, sizeof b, " ativo=%d video=%ux%u quadros=%d ~%.0ffps stride=%d(TRIANGULO) audio=%d %uHz/%uch blocos=%u O=voltar ",
-                 sceAvPlayerIsActive(h) ? 1 : 0, vw, vh, frames, fps, strideMode, audio.state.load(), audio.rate.load(), audio.chans.load(), audio.chunks.load());
-        r.fillRect(0, 0, r.W, 22, 0xFF000000);
-        r.drawText(8, 3, b, 0xFFFFFF00, 16);
-        if (useFeed && g_feed.failed) { r.fillRect(0, 22, r.W, 22, 0xFF000000); r.drawText(8, 25, g_feed.getStatus(), 0xFFFF6060, 16); }
+        using namespace theme;
+        if (nowSec() > hudUntil && !(useFeed && g_feed.failed)) return;
+        if (nowSec() <= hudUntil) {
+            char b[96];
+            snprintf(b, sizeof b, "%ux%u  |  %.0f fps", vw, vh, fps);
+            std::string stats = b;
+            int tw = r.textWidth(title, 24), sw = r.textWidth(stats, 18);
+            int pw = 24 + 92 + 16 + tw + 24 + sw + 28;
+            r.roundRect(32, 28, pw, 60, 30, 0xB8000000);
+            r.roundRect(44, 42, 92, 32, 16, RED);
+            uiCenter(r, 44 + 46, 58, "AO VIVO", TEXT, 16, true);
+            uiText(r, 44 + 92 + 16, 58 - 12, title, TEXT, 24, true);
+            uiText(r, 44 + 92 + 16 + tw + 24, 58 - 9, stats, MUTED, 18);
+            int hw = r.textWidth("O  Sair     TRIÂNGULO  Ajustar imagem", 18) + 48;
+            r.roundRect(r.W - 32 - hw, r.H - 76, hw, 44, 22, 0xB8000000);
+            uiCenter(r, r.W - 32 - hw / 2, r.H - 54, "O  Sair     TRIÂNGULO  Ajustar imagem", SOFT, 18);
+            snprintf(b, sizeof b, "stride %d  |  audio %d %uHz", strideMode, audio.state.load(), audio.rate.load());
+            r.roundRect(32, r.H - 76, r.textWidth(b, 16) + 40, 40, 20, 0x90000000);
+            uiText(r, 52, r.H - 76 + 12, b, DIM, 16);
+        }
+        if (useFeed && g_feed.failed) {
+            std::string m = uiFit(r, g_feed.getStatus(), 20, r.W - 160);
+            r.roundRect(32, 100, r.textWidth(m, 20) + 48, 44, 22, 0xD0801520);
+            uiText(r, 56, 100 + 12, m, TEXT, 20);
+        }
     }
     void renderWaiting(FbRenderer &r) {
-        r.fillRect(0, 0, r.W, r.H, 0xFF101018);
-        r.drawText(40, 20, "Player", 0xFF53FC18, 28);
-        int y = 70;
-        for (auto &l : log) { r.drawText(40, y, l, 0xFFFFFFFF, 20); y += 26; }
-        char b[160];
-        if (failed) snprintf(b, sizeof b, "FALHOU (AddSource=%08X).  O volta ao menu", (unsigned)addRc);
-        else snprintf(b, sizeof b, "aguardando quadros... %.0fs   ativo=%d   audio=%d (%uHz %uch)   (O volta)", nowSec() - t0,
-                      h && sceAvPlayerIsActive(h) ? 1 : 0, audio.state.load(), audio.rate.load(), audio.chans.load());
-        r.drawText(40, y + 10, b, failed ? 0xFFFF6060 : 0xFFAAAAAA, 20);
-        if (useFeed) {
-            snprintf(b, sizeof b, "HLS: segmentos=%d  bytes=%llu  open=%d  leituras=%d", g_feed.segs.load(), (unsigned long long)g_feed.sb.total(), g_feed.opens.load(), g_feed.reads.load());
-            r.drawText(40, y + 78, b, 0xFFAAAAAA, 20);
-            r.drawText(40, y + 104, "HLS: " + g_feed.getStatus(), g_feed.failed ? 0xFFFF6060 : 0xFFAAAAAA, 20);
+        using namespace theme;
+        uiBackground(r);
+        // cabecalho: spinner (ou alerta) + titulo
+        const int scx = 96, scy = 112;
+        if (failed) {
+            r.roundRect(scx - 34, scy - 34, 68, 68, 34, RED);
+            uiCenter(r, scx, scy, "!", TEXT, 40, true);
+        } else {
+            double tt = nowSec();
+            for (int i = 0; i < 12; i++) {
+                float ang = i * 0.5235988f;
+                float ph = fmodf((float)tt * 1.3f - i / 12.0f + 4.0f, 1.0f);
+                int al = 40 + (int)(215 * (1.0f - ph));
+                int px = scx + (int)(30 * cosf(ang)), py = scy + (int)(30 * sinf(ang));
+                r.roundRect(px - 6, py - 6, 12, 12, 6, ((unsigned)al << 24) | 0x0053FC18);
+            }
         }
-        if (!failed && nowSec() - t0 > 15) r.drawText(40, y + 44, "Mais de 15s sem video: tire um print desta tela e mande para o Claude.", 0xFFFFFF00, 20);
+        uiText(r, 164, 70, failed ? "Não foi possível abrir" : "Conectando...", failed ? RED : TEXT, 38, true);
+        char b[160];
+        if (failed) snprintf(b, sizeof b, "AddSource = %08X   |   aperte O para voltar ao menu", (unsigned)addRc);
+        else snprintf(b, sizeof b, "%s   |   %.0fs   |   O para cancelar", title.c_str(), nowSec() - t0);
+        uiText(r, 166, 122, uiFit(r, b, 20, r.W - 240), MUTED, 20);
+        if (!failed && nowSec() - t0 > 15) uiText(r, 166, 150, "Demorando mais que o normal: tire um print desta tela e mande para o Claude.", AMBER, 20);
+
+        // cartao com o registro das tentativas
+        const int cy0 = 196, ch = r.H - cy0 - 110;
+        r.roundRect(48, cy0, r.W - 96, ch, 22, CARD);
+        int y = cy0 + 22;
+        size_t from = log.size() > 29 ? log.size() - 29 : 0;
+        for (size_t i = from; i < log.size(); i++) {
+            const std::string &l = log[i];
+            unsigned c = SOFT; bool bold = false;
+            if (l.compare(0, 4, "ERRO") == 0 || l.find("nenhum quadro") != std::string::npos) c = RED;
+            else if (l.compare(0, 2, "OK") == 0 || l.find("chegou video") != std::string::npos) { c = GREEN; bold = true; }
+            else if (l.compare(0, 8, "Tentando") == 0) c = AMBER;
+            else if (l.find("[av]") != std::string::npos) c = DIM;
+            else if (l.compare(0, 3, "   ") == 0) c = MUTED;
+            uiText(r, 76, y, uiFit(r, l, 18, r.W - 160), c, 18, bold);
+            y += 24;
+        }
+        if (useFeed) {
+            snprintf(b, sizeof b, "HLS: %d segmentos  |  %s", g_feed.segs.load(), g_feed.getStatus().c_str());
+            uiText(r, 52, r.H - 82, uiFit(r, b, 18, r.W - 420), g_feed.failed ? RED : MUTED, 18);
+        }
+        uiHints(r, r.W - 48, r.H - 50, {{"O", "Voltar"}});
     }
 };
 
@@ -797,18 +1066,43 @@ struct Keyboard {
         return false;
     }
     void render(FbRenderer &r) const {
-        r.fillRect(0, 0, r.W, r.H, 0xFF101018);
-        r.drawText(40, 30, "Digite o @ do streamer da Kick", 0xFF53FC18, 32);
-        r.fillRect(40, 100, 900, 60, 0xFF2A2A38);
-        r.drawText(60, 112, "@" + text + "_", 0xFFFFFFFF, 36);
+        using namespace theme;
+        uiBackground(r);
+        uiLogo(r, 48, 28, 52);
+        uiText(r, 118, 30, "Digite o @ do streamer", TEXT, 32, true);
+        uiText(r, 120, 68, "Canal da Kick que você quer assistir", MUTED, 18);
+        // campo de texto
+        r.roundRect(48, 120, 960, 84, 22, CARD);
+        r.roundRect(48, 120, 960, 84, 22, 0x1053FC18);
+        uiText(r, 78, 142, "@", GREEN, 40, true);
+        std::string shown = text;
+        uiText(r, 118, 142, shown, TEXT, 40, true);
+        if (((int)(nowSec() * 2)) % 2 == 0) r.roundRect(118 + r.textWidth(shown, 40) + 2, 140, 4, 44, 2, GREEN);
+        // teclas
         for (int y = 0; y < ROWS; y++)
             for (int x = 0; x < COLS; x++) {
                 bool on = (x == cx && y == cy);
-                int px = 40 + x * 92, py = 200 + y * 80;
-                r.fillRect(px, py, 84, 70, on ? 0xFF53FC18 : 0xFF2A2A38);
-                r.drawText(px + 24, py + 20, keyAt(x, y), on ? 0xFF000000 : 0xFFFFFFFF, 32);
+                int px = 48 + x * 96, py = 236 + y * 100;
+                std::string k = keyAt(x, y);
+                bool special = k == "<" || k == "OK";
+                if (on) r.roundRect(px - 4, py - 4, 94, 94, 20, GREEN_GLOW);
+                r.roundRect(px, py, 86, 86, 16, on ? GREEN : (k == "OK" ? 0xFF1F3A1B : CARD2));
+                std::string lab = k == "<" ? "Apagar" : k;
+                uiCenter(r, px + 43, py + 43, lab, on ? BLACK : (k == "OK" ? GREEN : TEXT), special ? 20 : 32, true);
             }
-        r.drawText(40, 560, "D-pad move   X digita   QUADRADO apaga   R1 ou tecla OK = confirmar   O cancela", 0xFFAAAAAA, 22);
+        // painel de controles
+        const int cx0 = 1060, cw = r.W - 48 - cx0;
+        r.roundRect(cx0, 120, cw, 516, 22, 0xFF111623);
+        uiText(r, cx0 + 32, 142, "Controles", GREEN, 24, true);
+        static const char *ks[5] = {"D-pad", "X", "QUADRADO", "R1", "O"};
+        static const char *ls[5] = {"mover pelas teclas", "digitar a letra", "apagar", "confirmar", "cancelar"};
+        for (int i = 0; i < 5; i++) {
+            int ry = 214 + i * 80;
+            int kw = r.textWidth(ks[i], 20) + 28;
+            r.roundRect(cx0 + 32, ry - 20, kw, 40, 12, KEY);
+            uiCenter(r, cx0 + 32 + kw / 2, ry, ks[i], TEXT, 20, true);
+            uiText(r, cx0 + 32 + kw + 18, ry - 11, ls[i], SOFT, 22);
+        }
     }
 };
 
@@ -891,12 +1185,13 @@ int main() {
 
         if (mode == Mode::Play) {
             if (pressed & B_CIRCLE) { player.stop(); mode = Mode::Menu; dirty = true; sceKernelUsleep(16000); continue; }
+            if (pressed) player.hudUntil = nowSec() + 5;      // qualquer botao mostra o HUD por 5s
             if (pressed & B_TRIANGLE) player.strideMode = (player.strideMode + 1) % 4;
             if (player.h) {
                 FbRenderer r(bufs[back], W, H);
                 if (player.poll(r)) { gotFrame = true; player.overlay(r); flip(); }
-                else if (!gotFrame && nowSec() - lastWaitDraw > 0.5) { lastWaitDraw = nowSec(); presentWait(); }
-            } else if (nowSec() - lastWaitDraw > 0.5) { lastWaitDraw = nowSec(); presentWait(); }
+                else if (!gotFrame && nowSec() - lastWaitDraw > 0.12) { lastWaitDraw = nowSec(); presentWait(); }
+            } else if (nowSec() - lastWaitDraw > 0.12) { lastWaitDraw = nowSec(); presentWait(); }
             sceKernelUsleep(4000);
             continue;
         }
@@ -955,6 +1250,7 @@ int main() {
             }
             mode = Mode::Play; gotFrame = false; lastWaitDraw = 0;
             presentWait();                       // mostra "Player" antes de bloquear
+            player.presentCb = presentWait;
             player.start(url, title);
             presentWait();
             continue;
