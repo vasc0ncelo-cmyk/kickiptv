@@ -30,6 +30,7 @@ int main() {
     assert(f.playedUrl == "https://x.live/a.m3u8");
     f.playedUrl.clear(); a.watchKick("@offline");
     assert(f.playedUrl.empty() && a.lastStatus.find("offline") != std::string::npos);
+    assert(jsonString("{\"playback_url\":\"https:\\/\\/h\\/a.m3u8?x=1\\u0026y=2\"}", "playback_url") == "https://h/a.m3u8?x=1&y=2");
     a.watchKick("@@@bad name!"); assert(a.lastStatus == "@ invalido");
     std::cout << "OK\n";
 }
