@@ -545,6 +545,9 @@ static void avFree(void *, void *p) { alignedFree(p); }
 
 // memoria "de textura" (os quadros de video): memoria direta mapeada, como nos samples da Sony
 struct TexMem { off_t phys; size_t size; };
+// Tipo da memoria dos quadros de video: 0 = WB_ONION (RAM comum COM cache: a CPU le rapido) | 3 = WC_GARLIC (memoria de GPU:
+// a CPU le a ~15 MB/s, foi o que travava o video). Comecamos com Onion; se o decoder nao entregar quadros, cai para Garlic.
+static std::atomic<int> g_texType{0};
 static std::map<void *, TexMem> g_tex;
 static std::mutex g_texM;                      // o AvPlayer chama alocar/liberar de threads proprias
 // Quantos bytes existem de 'p' ate o fim do bloco de textura que o contem (0 = nao e um bloco nosso). Evita ler alem do mapeado.
@@ -562,7 +565,7 @@ static void *avAllocTex(void *, uint32_t align, uint32_t size) {
     size_t al = align < 0x10000 ? 0x10000 : align;
     size_t sz = (size + 0xFFFF) & ~(size_t)0xFFFF;
     off_t phys = 0; void *addr = NULL;
-    if (sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), sz, al, 3, &phys) < 0) { g_texFail++; return NULL; }
+    if (sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), sz, al, g_texType.load(), &phys) < 0) { g_texFail++; return NULL; }
     if (sceKernelMapDirectMemory(&addr, sz, 0x33, 0, phys, al) < 0) { g_texFail++; return NULL; }
     { std::lock_guard<std::mutex> l(g_texM); g_tex[addr] = {phys, sz}; }
     return addr;
@@ -688,8 +691,9 @@ struct AudioPump {
     }
 };
 
-// Qualidade: 0 = "Fluido" (limita a 30 fps; o desenho do video e feito pela CPU e 60 fps pesa o dobro) | 1 = "Maxima" (ate 720p60)
-static std::atomic<int> g_quality{0};
+// Qualidade: 0 = "Fluido" (720p max, 30 fps) | 1 = "Maxima" (720p60) | 2 = "Ultra" (1080p60)
+static std::atomic<int> g_quality{1};
+static const char *kQualityName[3] = {"Fluido 30fps", "Maxima 720p60", "Ultra 1080p60"};
 
 // ---------- Alimentador HLS -> AvPlayer ----------
 // O AvPlayer do PS4 nao abre https/HLS direto (AddSource=806A0002). Entao o app baixa o HLS (playlist + segmentos .ts)
@@ -734,7 +738,7 @@ struct HlsFeeder {
         std::string mediaUrl = url;
         if (hlsIsMaster(body)) {
             auto v = hlsParseMaster(body);
-            int i = hlsPickVariant(v, 720, g_quality.load() == 0 ? 30 : 0);
+            int i = hlsPickVariant(v, g_quality.load() == 2 ? 1080 : 720, g_quality.load() == 0 ? 30 : 0);
             if (i < 0) { fail("playlist mestre sem variantes"); return; }
             mediaUrl = hlsResolve(url, v[i].uri);
             setStatus("variante " + std::to_string(v[i].width) + "x" + std::to_string(v[i].height) + " " + std::to_string((int)(v[i].fps + 0.5)) +
@@ -959,7 +963,13 @@ struct Player {
                 std::string path = chunkPath("mp4", 0);
                 log.push_back("Tentando MP4 convertido " + path + " ...");
                 presentCb();
-                if (writeFile(path, mp4) && openSource(path, false, 3, 7000, true)) {
+                bool okOpen = writeFile(path, mp4) && openSource(path, false, 3, 7000, true);
+                if (!okOpen && !cancelled && g_texType.load() == 0) {      // o decoder nao entregou quadros em memoria Onion: tenta Garlic
+                    log.push_back("memoria Onion sem quadros: tentando Garlic");
+                    g_texType = 3; presentCb();
+                    okOpen = openSource(path, false, 3, 7000, true);
+                }
+                if (okOpen) {
                     chunkMode = true; remux = true; chunkExt = "mp4"; chunkIdx = 0; lastSeq = last; curDur = ti.seconds;
                     log.push_back("OK: tocando MP4 convertido");
                 } else remove(path.c_str());
@@ -1126,8 +1136,13 @@ struct Player {
                 const uint8_t *src = fi.pData; size_t srcN = 0;
                 size_t avail = texAvail(fi.pData);
                 double b0 = nowSec();
-                if (avail >= (size_t)w * hh * 3 / 2) {
-                    // copia o quadro para RAM com cache. Enquanto o stride nao foi detectado, copia o maximo que cabe (todos os modos)
+                if (avail >= (size_t)w * hh * 3 / 2 && g_texType.load() == 0) {
+                    // memoria Onion (com cache): le direto, sem copiar
+                    size_t want = blit::strideBytes(strideLocked || !autoStride ? strideMode : 3, (int)w, (int)hh);
+                    if (!strideLocked && autoStride) { size_t m = blit::strideBytes(3, (int)w, (int)hh); if (m > want) want = m; }
+                    srcN = (want < avail ? want : avail) & ~(size_t)15;
+                } else if (avail >= (size_t)w * hh * 3 / 2) {
+                    // memoria Garlic (sem cache): copia o quadro para RAM com cache. Enquanto o stride nao foi detectado, copia o maximo que cabe (todos os modos)
                     size_t want = blit::strideBytes(strideLocked || !autoStride ? strideMode : 3, (int)w, (int)hh);
                     if (!strideLocked && autoStride) { size_t m = blit::strideBytes(3, (int)w, (int)hh); if (m > want) want = m; }
                     srcN = want < avail ? want : avail; srcN &= ~(size_t)15;
@@ -1169,7 +1184,7 @@ struct Player {
         if (nowSec() > hudUntil && !(useFeed && g_feed.failed)) return;
         if (nowSec() <= hudUntil) {
             char b[256];
-            snprintf(b, sizeof b, "%ux%u  |  %.0f fps  |  desenho %.0f+%.0f ms  |  %s", vw, vh, fps, copyMs, blitMs, g_quality.load() == 0 ? "Fluido" : "Maxima");
+            snprintf(b, sizeof b, "%ux%u  |  %.0f fps  |  desenho %.0f+%.0f ms  |  %s  |  %s", vw, vh, fps, copyMs, blitMs, kQualityName[g_quality.load() % 3], g_texType.load() == 0 ? "mem Onion" : "mem Garlic");
             std::string stats = b;
             int tw = r.textWidth(title, 24), sw = r.textWidth(stats, 18);
             int pw = 24 + 92 + 16 + tw + 24 + sw + 28;
@@ -1178,7 +1193,7 @@ struct Player {
             uiCenter(r, 44 + 46, 58, "AO VIVO", TEXT, 16, true);
             uiText(r, 44 + 92 + 16, 58 - 12, title, TEXT, 24, true);
             uiText(r, 44 + 92 + 16 + tw + 24, 58 - 9, stats, MUTED, 18);
-            const char *hint = "O  Sair     QUADRADO  Qualidade     TRIÂNGULO  Ajustar imagem";
+            const char *hint = "O  Sair     QUADRADO  Qualidade     L1  Memoria de video     TRIÂNGULO  Ajustar imagem";
             int hw = r.textWidth(hint, 18) + 48;
             r.roundRect(r.W - 32 - hw, r.H - 130, hw, 44, 22, 0xB8000000);   // acima da linha de diagnostico (que ficou mais longa)
             uiCenter(r, r.W - 32 - hw / 2, r.H - 108, hint, SOFT, 18);
@@ -1585,8 +1600,13 @@ int main() {
             if (pressed & B_CIRCLE) { player.stop(); mode = Mode::Menu; dirty = true; sceKernelUsleep(16000); continue; }
             if (pressed) player.hudUntil = nowSec() + 5;      // qualquer botao mostra o HUD por 5s
             if (pressed & B_TRIANGLE) { player.autoStride = false; player.strideMode = (player.strideMode + 1) % 4; }   // manual desliga a deteccao
-            if ((pressed & B_SQUARE) && !player.url.empty()) {     // QUADRADO: alterna Fluido (30 fps) <-> Maxima (60 fps) e reabre o canal
-                g_quality = g_quality.load() == 0 ? 1 : 0;
+            if ((pressed & B_L1) && !player.url.empty()) {         // L1: alterna a memoria dos quadros (Onion <-> Garlic) e reabre
+                g_texType = g_texType.load() == 0 ? 3 : 0;
+                pf.pendingPlayUrl = player.url; pf.pendingPlayTitle = player.title;
+                player.stop(); mode = Mode::Menu; dirty = true; sceKernelUsleep(16000); continue;
+            }
+            if ((pressed & B_SQUARE) && !player.url.empty()) {     // QUADRADO: Fluido -> Maxima -> Ultra e reabre o canal
+                g_quality = (g_quality.load() + 1) % 3;
                 pf.pendingPlayUrl = player.url; pf.pendingPlayTitle = player.title;
                 player.stop(); mode = Mode::Menu; dirty = true; sceKernelUsleep(16000); continue;
             }
