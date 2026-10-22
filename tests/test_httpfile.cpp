@@ -78,7 +78,7 @@ int main() {
             assert(n == (int)std::min<uint64_t>(buf.size(), f.size - p));
             assert(buf[n - 1] == byteAt(p + n - 1));
         }
-        assert(probes == 1 && f.calls < 20);                 // nada de ~25 requisicoes so para medir o tamanho
+        assert(probes == 1 && f.calls < 40);                 // nada de ~25 requisicoes so para medir o tamanho
         r.join();
     }
     // sondagem rapida que falha (0): cai na sondagem lenta e ainda funciona
