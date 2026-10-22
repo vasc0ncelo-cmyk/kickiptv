@@ -5,6 +5,7 @@
 #include <functional>
 #include <cstdio>
 #include <string>
+#include <vector>
 
 enum class Tab { Kick = 0, Channels = 1, Movies = 2, Series = 3 };
 
@@ -21,6 +22,9 @@ struct Platform {
     }
     virtual bool wasCancelled() { return false; }   // o ultimo httpStream foi cancelado pelo usuario?
     virtual void play(const std::string &url, const std::string &title) = 0;
+    // Opcional: lista de episodios da temporada (para L1/R1 pular no player). Padrao: limpa.
+    virtual void setEpisodeList(const std::vector<std::string> & /*urls*/,
+                                const std::vector<std::string> & /*titles*/, int /*index*/) {}
     virtual void requestText(const std::string &prompt) = 0; // abre o teclado (IME); depois chame UI::onText
     virtual std::string loadSetting(const std::string &) { return ""; }              // dados guardados (ex.: "m3u", "kick")
     virtual void saveSetting(const std::string &, const std::string &) {}
