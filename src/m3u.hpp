@@ -7,16 +7,15 @@
 enum class Kind { Channel, Movie, Series };
 
 struct Entry {
-    std::string name, url, group, logo, tvgId;   // (group/logo/tvgId so existem em parseM3U; a Playlist final nao guarda, para poupar memoria)
+    std::string name, url, group;   // (group so existe durante o parse; a Playlist final nao guarda, para poupar memoria)
     Kind kind = Kind::Channel;
-    // so para series
-    std::string seriesName;
-    int season = 0, episode = 0;
+    int season = 0, episode = 0;    // so para series
 };
 
 struct Playlist {
     std::vector<Entry> channels, movies;
     size_t seriesEpisodes = 0;   // total de episodios (os episodios em si ficam em seriesTree)
+    bool truncated = false;      // a lista tinha mais itens que o limite de memoria (os ultimos ficaram de fora)
     // serie -> temporada -> episodios
     std::map<std::string, std::map<int, std::vector<Entry>>> seriesTree;
     bool empty() const { return channels.empty() && movies.empty() && seriesTree.empty(); }
