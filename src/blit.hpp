@@ -14,7 +14,7 @@
 namespace blit {
 
 static int g_yTab[256], g_rv[256], g_gu[256], g_gv[256], g_bu[256];
-static uint8_t g_clamp[1024];                 // g_clamp[i + 256] = min(max(i, 0), 255), para i em [-256, 767]
+static uint8_t g_clamp[2048];                 // g_clamp[i + 512] = min(max(i, 0), 255), para i em [-512, 1535] (bu chega a -271: 1024 nao bastava)
 static bool g_init = false;
 
 inline void initTabs() {
@@ -27,13 +27,13 @@ inline void initTabs() {
         g_gv[i] = (136 * c) >> 8;
         g_bu[i] = (541 * c) >> 8;
     }
-    for (int i = 0; i < 1024; i++) { int v = i - 256; g_clamp[i] = (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v)); }
+    for (int i = 0; i < 2048; i++) { int v = i - 512; g_clamp[i] = (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v)); }
     g_init = true;
 }
 
 // Converte uma linha de origem (sw pixels) para RGB.
 inline void convRow(const uint8_t *yr, const uint8_t *uvr, int sw, uint32_t *out) {
-    const uint8_t *cl = g_clamp + 256;
+    const uint8_t *cl = g_clamp + 512;
     int x = 0;
     for (; x + 1 < sw; x += 2) {
         int u = uvr[x], v = uvr[x + 1];
@@ -68,7 +68,7 @@ inline void convRowSimd(const uint8_t *yr, const uint8_t *uvr, int sw, uint32_t 
         _mm_storeu_si128((__m128i *)(out + x + 4), _mm_unpackhi_epi16(bg, ra));                          // pixels 4..7
     }
     if (x < sw) {                                                                                  // sobra (largura nao multipla de 8)
-        const uint8_t *cl = g_clamp + 256;
+        const uint8_t *cl = g_clamp + 512;
         for (; x < sw; x++) {
             int u = uvr[x & ~1], v = uvr[(x & ~1) + 1], y0 = g_yTab[yr[x]];
             out[x] = 0xFF000000u | ((unsigned)cl[y0 + g_rv[v]] << 16) | ((unsigned)cl[y0 - g_gu[u] - g_gv[v]] << 8) | cl[y0 + g_bu[u]];
