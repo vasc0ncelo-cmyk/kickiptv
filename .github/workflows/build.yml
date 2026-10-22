@@ -19,6 +19,8 @@ jobs:
         run: |
           g++ -std=c++17 -o t tests/test_app.cpp src/m3u.cpp && ./t
           g++ -std=c++17 -o u tests/test_ui.cpp src/m3u.cpp && ./u
+          g++ -std=c++17 -o m tests/test_m3u.cpp src/m3u.cpp && ./m
+          g++ -std=c++17 -pthread -o n tests/test_netstream.cpp && ./n
           g++ -std=c++17 -o r tests/test_render.cpp && ./r
           g++ -std=c++17 -pthread -o h tests/test_hls.cpp && ./h
           g++ -std=c++17 -pthread -o b tests/test_blit.cpp && ./b
