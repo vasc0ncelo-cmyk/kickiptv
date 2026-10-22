@@ -23,7 +23,6 @@
 #include <string.h>
 #include <time.h>
 #include "hls.hpp"
-#include "netstream.hpp"
 #include "streambuf.hpp"
 #include "tsmux.hpp"
 #include "blit.hpp"
@@ -63,6 +62,9 @@ int sceHttpSetSendTimeOut(int id, unsigned usec);
 int sceHttpSetRecvTimeOut(int id, unsigned usec);
 int sceHttpSetResolveTimeOut(int id, unsigned usec);
 }
+
+static void trace(const char *stage);   // (definida mais abaixo)
+static double monoSec() { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec + ts.tv_nsec / 1e9; }
 
 struct NetClient {
     std::vector<std::string> *log = nullptr;
@@ -135,36 +137,50 @@ struct NetClient {
         return ok;
     }
 
-    // GET em streaming para downloads GRANDES (lista M3U com 10-15 mil itens = varios MB). Roda na thread de rede
-    // (netstream.hpp): entrega cada pedaco a 'push' em vez de montar tudo na memoria e nao tem o limite de 1,5 MB do get().
-    // Timeouts maiores: paineis IPTV podem levar 30-60 s para montar a lista antes de mandar o primeiro byte.
-    bool getStream(const std::string &url, const netstream::Push &push, int &status) {
-        status = 0;
-        if (!ready) return false;                       // init() e feito na thread principal antes de iniciar a thread
+    // GET em streaming para downloads GRANDES (lista M3U com 10-15 mil itens = varios MB). Nao tem o limite de 1,5 MB do get():
+    // entrega cada pedaco a 'sink' e nao guarda o arquivo todo. Mesmos passos do get() (que ja funciona no PS4), roda na thread principal.
+    // 'tick' roda ~7x/s entre os pedacos (redesenha o progresso / le o O); retornar true cancela.
+    bool getStream(const std::string &url, const std::function<bool(const char *, size_t)> &sink,
+                   const std::function<bool()> &tick, int &status, bool &cancelled) {
+        status = 0; cancelled = false;
+        if (!init()) return false;
         const char *ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
         int tmpl = sceHttpCreateTemplate(httpCtx, ua, 1 /*HTTP/1.1*/, 1);
+        trace("m3u-template");
         if (tmpl < 0) return false;
         sceHttpsDisableOption(tmpl, 0x1F);
         sceHttpSetAutoRedirect(tmpl, 1);
-        const unsigned T = 20 * 1000 * 1000, TR = 60 * 1000 * 1000;
+        const unsigned T = 20 * 1000 * 1000, TR = 60 * 1000 * 1000;   // paineis IPTV levam 30-60 s para montar a lista antes do 1o byte
         sceHttpSetResolveTimeOut(tmpl, T);
         sceHttpSetConnectTimeOut(tmpl, T);
         sceHttpSetSendTimeOut(tmpl, T);
         sceHttpSetRecvTimeOut(tmpl, TR);
         bool ok = false;
-        int conn = sceHttpCreateConnectionWithURL(tmpl, url.c_str(), 0 /*sem keep-alive: e um download unico*/);
+        int conn = sceHttpCreateConnectionWithURL(tmpl, url.c_str(), 1);
+        trace("m3u-conexao");
         if (conn >= 0) {
             int req = sceHttpCreateRequestWithURL(conn, 0 /*GET*/, url.c_str(), 0);
+            trace("m3u-requisicao");
             if (req >= 0) {
                 sceHttpAddRequestHeader(req, "Accept", "*/*", 0);
-                sceHttpAddRequestHeader(req, "Accept-Encoding", "identity", 0);   // sem gzip: o app le os bytes como vem
-                if (sceHttpSendRequest(req, NULL, 0) >= 0 && sceHttpGetStatusCode(req, &status) >= 0 && status >= 200 && status < 300) {
-                    std::vector<char> buf(64 * 1024);
-                    for (;;) {
-                        int n = sceHttpReadData(req, buf.data(), buf.size());
-                        if (n < 0) break;                                  // erro de rede no meio: ok continua false
-                        if (n == 0) { ok = true; break; }                  // fim normal
-                        if (!push(buf.data(), (size_t)n)) break;           // cancelado
+                int rc = sceHttpSendRequest(req, NULL, 0);
+                trace(rc >= 0 ? "m3u-enviado" : "m3u-envio-falhou");
+                if (rc >= 0 && sceHttpGetStatusCode(req, &status) >= 0) {
+                    char tb[32]; snprintf(tb, sizeof tb, "m3u-status-%d", status); trace(tb);
+                    if (status >= 200 && status < 300) {
+                        std::vector<char> buf(64 * 1024);
+                        size_t total = 0, nextMark = 1u << 20;
+                        double lastTick = 0;
+                        for (;;) {
+                            int n = sceHttpReadData(req, buf.data(), buf.size());
+                            if (n < 0) { trace("m3u-erro-leitura"); break; }       // rede caiu no meio: ok continua false
+                            if (n == 0) { ok = true; break; }                      // fim normal
+                            total += (size_t)n;
+                            if (total >= nextMark) { snprintf(tb, sizeof tb, "m3u-%uMB", (unsigned)(total >> 20)); trace(tb); nextMark += 1u << 20; }
+                            if (!sink(buf.data(), (size_t)n)) break;
+                            double tn = monoSec();
+                            if (tick && tn - lastTick > 0.15) { lastTick = tn; if (tick()) { cancelled = true; break; } }
+                        }
                     }
                 }
                 sceHttpDeleteRequest(req);
@@ -254,17 +270,17 @@ struct Ps4Platform : Platform {
         bool ok = g_net.get(url, body, st);
         return ok && st >= 200 && st < 300;
     }
-    // Download da lista M3U: roda em segundo plano; a thread principal processa os pedacos e redesenha (progressTick).
+    // Download da lista M3U em pedacos; entre os pedacos redesenha o progresso (progressTick).
     std::function<bool()> progressTick;      // chamado ~7x/s durante o download (redesenha o menu e le o O); true = cancelar
     bool cancelled = false;
     bool wasCancelled() override { return cancelled; }
     bool httpStream(const std::string &url, const std::function<bool(const char *, size_t)> &sink) override {
         cancelled = false;
-        if (!g_net.init()) return false;     // inicializa a rede aqui (thread principal), nao dentro da thread de download
+        trace("m3u-inicio");
         int st = 0;
-        std::string u = url;
-        return netstream::run([u](const netstream::Push &push, int &status) { return g_net.getStream(u, push, status); },
-                              sink, [this]() { return progressTick ? progressTick() : false; }, st, cancelled);
+        bool ok = g_net.getStream(url, sink, [this]() { return progressTick ? progressTick() : false; }, st, cancelled);
+        trace(ok ? "m3u-download-ok" : cancelled ? "m3u-cancelado" : "m3u-download-falhou");
+        return ok;
     }
     void play(const std::string &url, const std::string &title) override { pendingPlayUrl = url; pendingPlayTitle = title; }
     void requestText(const std::string &) override { kbdRequested = true; }
@@ -326,6 +342,17 @@ struct BootScreen {
 // Se o app cair, na proxima abertura o menu mostra em qual passo ele parou.
 static std::string g_prevStage;           // (leitura do log anterior removida: usava fread, que o app original nao importava)
 static void traceInit() {
+    // le o log da ultima vez (libkernel, como as configuracoes) para mostrar na tela em que passo o app parou
+    int fd = sceKernelOpen("/data/kickiptv.log", 0, 0);
+    if (fd >= 0) {
+        std::string all; char buf[1024];
+        for (;;) { long n = (long)sceKernelRead(fd, buf, sizeof buf); if (n <= 0) break; all.append(buf, (size_t)n); if (all.size() > 65536) break; }
+        sceKernelClose(fd);
+        while (!all.empty() && (all.back() == '\n' || all.back() == '\r')) all.pop_back();
+        size_t p = all.rfind('\n');
+        std::string last = p == std::string::npos ? all : all.substr(p + 1);
+        if (!last.empty() && last != "fim" && last != "saindo" && last != "menu-ok" && last != "inicio") g_prevStage = last;
+    }
     FILE *f = fopen("/data/kickiptv.log", "wb");
     if (f) { fwrite("inicio\n", 1, 7, f); fclose(f); }
 }
@@ -1442,6 +1469,7 @@ int main() {
             else app.say("Buscando @" + kickSlug(typed) + " na Kick...");
             presentMenu();
             ui.onText(typed);                    // httpGet + (se ao vivo) play()
+            trace("texto-processado");
             dirty = true;
         }
         if (!pf.pendingPlayUrl.empty()) {
