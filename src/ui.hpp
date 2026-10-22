@@ -7,6 +7,9 @@
 #include <string>
 #include <utility>
 #include <vector>
+#if defined(__SSE__) || defined(__x86_64__)
+#include <xmmintrin.h>
+#endif
 
 enum class Input { Up, Down, Left, Right, PrevTab, NextTab, Confirm, Back, PageUp, PageDown };
 enum class Screen { Home, Kick, List };
@@ -25,6 +28,9 @@ struct Renderer {
         int n = 0; for (unsigned char c : t) if ((c & 0xC0) != 0x80) n++;
         return (int)(n * (int)(8 * size / 16.0f + 0.5f));
     }
+    // Ganchos de desempenho (o PS4 implementa; quem nao implementar cai no desenho normal):
+    virtual bool blitBackground() { return false; }        // true = o fundo ja foi copiado pronto
+    virtual bool glow(int, int, int, int, int, unsigned, int, int, bool) { return false; }   // true = brilho desenhado
 };
 
 // ---------- Tema (cores ARGB) ----------
@@ -39,9 +45,13 @@ constexpr unsigned RED = 0xFFFF4D5A, AMBER = 0xFFFFB020;
 // ---------- Matematica simples (sem libm) ----------
 inline float uiSqrt(float v) {
     if (v <= 0.f) return 0.f;
+#if defined(__SSE__) || defined(__x86_64__)
+    return _mm_cvtss_f32(_mm_sqrt_ss(_mm_set_ss(v)));
+#else
     float g = v > 1.f ? v * 0.5f + 0.5f : 1.f;
     for (int i = 0; i < 8; i++) g = 0.5f * (g + v / g);
     return g;
+#endif
 }
 inline float uiAbs(float v) { return v < 0 ? -v : v; }
 inline unsigned uiAlpha(unsigned argb, int a) {                 // multiplica o alfa da cor por a/255
@@ -72,10 +82,15 @@ inline void uiCenterHeavy(Renderer &r, int cx, int cy, const std::string &t, uns
 // corta o texto com "..." para caber em maxW
 inline std::string uiFit(const Renderer &r, std::string s, int size, int maxW) {
     if (r.textWidth(s, size) <= maxW) return s;
+    int adv = r.textWidth("M", size); if (adv < 1) adv = 1;          // fonte monoespacada
+    int keep = maxW / adv - 3; if (keep < 0) keep = 0;
+    size_t i = 0; int cnt = 0;                                        // corta em 'keep' letras (UTF-8 inteiro)
+    while (i < s.size() && cnt < keep) { i++; while (i < s.size() && ((unsigned char)s[i] & 0xC0) == 0x80) i++; cnt++; }
+    s.resize(i);
     while (!s.empty() && r.textWidth(s + "...", size) > maxW) {
         s.pop_back();
         while (!s.empty() && ((unsigned char)s.back() & 0xC0) == 0x80) s.pop_back();
-        if (!s.empty() && ((unsigned char)s.back() & 0x80) && ((unsigned char)s.back() & 0xC0) == 0xC0) s.pop_back();
+        if (!s.empty() && ((unsigned char)s.back() & 0xC0) == 0xC0) s.pop_back();
     }
     return s + "...";
 }
@@ -166,7 +181,9 @@ inline float uiSdBox(float px, float py, float hx, float hy, float rad) {   // d
 inline float uiClamp01(float v) { return v < 0 ? 0 : v > 1 ? 1 : v; }
 
 // brilho suave em volta de um retangulo arredondado
-inline void uiGlow(Renderer &r, int x, int y, int w, int h, int rad, unsigned color, int spread, int peakAlpha) {
+// inside=false: o chamador desenha uma moldura/cor opaca por cima do retangulo logo em seguida, entao o miolo nao precisa do brilho.
+inline void uiGlow(Renderer &r, int x, int y, int w, int h, int rad, unsigned color, int spread, int peakAlpha, bool inside = true) {
+    if (r.glow(x, y, w, h, rad, color, spread, peakAlpha, inside)) return;
     for (int i = spread; i >= 1; i--) {
         int a = peakAlpha * (spread - i + 1) / (spread * 3);
         r.roundRect(x - i, y - i, w + 2 * i, h + 2 * i, rad + i, uiAlpha(color, a));
@@ -304,6 +321,7 @@ inline void uiIconTvRetro(Renderer &r, int x, int y, int s, unsigned c, unsigned
 
 // ---------- Fundo e cabecalho ----------
 inline void uiBackground(Renderer &r) {
+    if (r.blitBackground()) return;
     const int W = r.width(), H = r.height();
     r.fillRect(0, 0, W, H, theme::BG);
     // brilho verde sutil no canto inferior direito
@@ -380,30 +398,41 @@ struct UI {
     }
     static std::string kickIcon(int a) { return a == KA_LAST ? ">" : "@"; }
 
-    std::vector<std::string> labels() const {
-        std::vector<std::string> v;
+    // Quantidade de itens e nome de UM item, sem copiar a lista inteira.
+    // (Antes, cada aperto de botao e cada quadro copiavam o nome de TODOS os canais: com listas de milhares de canais isso travava.)
+    int itemCount() const {
         const Playlist &p = app.list;
         switch (tab) {
-        case Tab::Kick:
-            for (int a : kickActions()) v.push_back(kickLabel(a));
-            break;
-        case Tab::Channels: for (auto &e : p.channels) v.push_back(e.name); break;
-        case Tab::Movies: for (auto &e : p.movies) v.push_back(e.name); break;
-        case Tab::Series:
-            if (level == 0) { for (auto &s : p.seriesTree) v.push_back(s.first); }
-            else if (level == 1) {
-                auto it = p.seriesTree.find(curSeries);
-                if (it != p.seriesTree.end()) for (auto &t : it->second) v.push_back("Temporada " + std::to_string(t.first));
-            } else {
-                auto it = p.seriesTree.find(curSeries);
-                if (it != p.seriesTree.end()) {
-                    auto st = it->second.find(curSeason);
-                    if (st != it->second.end())
-                        for (auto &e : st->second) v.push_back(e.episode ? "Ep " + std::to_string(e.episode) + " - " + e.name : e.name);
-                }
-            }
-            break;
+        case Tab::Kick: return (int)kickActions().size();
+        case Tab::Channels: return (int)p.channels.size();
+        case Tab::Movies: return (int)p.movies.size();
+        case Tab::Series: break;
         }
+        if (level == 0) return (int)p.seriesTree.size();
+        auto it = p.seriesTree.find(curSeries);
+        if (it == p.seriesTree.end()) return 0;
+        if (level == 1) return (int)it->second.size();
+        auto st = it->second.find(curSeason);
+        return st == it->second.end() ? 0 : (int)st->second.size();
+    }
+    std::string itemLabel(int i) const {
+        const Playlist &p = app.list;
+        if (i < 0 || i >= itemCount()) return "";
+        switch (tab) {
+        case Tab::Kick: return kickLabel(kickActions()[i]);
+        case Tab::Channels: return p.channels[i].name;
+        case Tab::Movies: return p.movies[i].name;
+        case Tab::Series: break;
+        }
+        if (level == 0) { auto it = p.seriesTree.begin(); std::advance(it, i); return it->first; }
+        auto &seasons = p.seriesTree.find(curSeries)->second;
+        if (level == 1) { auto it = seasons.begin(); std::advance(it, i); return "Temporada " + std::to_string(it->first); }
+        const Entry &e = seasons.find(curSeason)->second[i];
+        return e.episode ? "Ep " + std::to_string(e.episode) + " - " + e.name : e.name;
+    }
+    std::vector<std::string> labels() const {         // so para testes/compatibilidade (copia tudo)
+        std::vector<std::string> v;
+        for (int i = 0, n = itemCount(); i < n; i++) v.push_back(itemLabel(i));
         return v;
     }
 
@@ -436,7 +465,7 @@ struct UI {
 
     void handle(Input in) {
         if (screen == Screen::Home) { handleHome(in); return; }
-        int t = (int)tab, n = (int)labels().size();
+        int t = (int)tab, n = itemCount();
         switch (in) {
         case Input::PrevTab: openTab(tileTab((tabTile(tab) + 3) % 4)); return;
         case Input::NextTab: openTab(tileTab((tabTile(tab) + 1) % 4)); return;
@@ -497,7 +526,7 @@ private:
         {
             const int x = mx, y = 169, w = fw, h = 337, rad = 28;
             bool on = homeRow == 0;
-            uiGlow(r, x, y, w, h, rad, GREEN, on ? 22 : 12, on ? 120 : 70);
+            uiGlow(r, x, y, w, h, rad, GREEN, on ? 22 : 12, on ? 120 : 70, false);
             uiFrame(r, x, y, w, h, rad, 3, GREEN, 0xFF020302);
             UiClip clip{x + 3, y + 3, w - 6, h - 6, rad - 3};
             // KICK desfocado ao fundo
@@ -545,7 +574,7 @@ private:
                 const int x = mx + i * (tw + gap);
                 bool sel = homeRow == 1 && homeCol == i;
                 unsigned fill = sel ? SEL : CARD;
-                if (sel) uiGlow(r, x, ty, tw, th, rad, GREEN, 18, 130);
+                if (sel) uiGlow(r, x, ty, tw, th, rad, GREEN, 18, 130, false);
                 uiFrame(r, x, ty, tw, th, rad, sel ? 4 : 2, sel ? GREEN : CARD_LINE, fill);
                 UiClip clip{x + 2, ty + 2, tw - 4, th - 4, rad - 2};
                 const float K0 = (float)(x + tw + ty + th), T = (float)ty, B = (float)(ty + th);
@@ -569,7 +598,7 @@ private:
         {
             const int x = mx, y = 865, w = fw, h = 140, rad = 26;
             bool sel = homeRow == 2;
-            if (sel) uiGlow(r, x, y, w, h, rad, GREEN, 18, 130);
+            if (sel) uiGlow(r, x, y, w, h, rad, GREEN, 18, 130, false);
             uiFrame(r, x, y, w, h, rad, sel ? 4 : 2, sel ? GREEN : CARD_LINE, sel ? SEL : CARD);
             uiIconLink(r, x + 84, y + 70, 78, TEXT);
             r.fillRect(x + 170, y + 40, 3, 62, GREEN_DK);
@@ -584,8 +613,7 @@ private:
     void renderList(Renderer &r) {
         using namespace theme;
         const int W = r.width();
-        auto v = labels();
-        int t = (int)tab, n = (int)v.size();
+        int t = (int)tab, n = itemCount();
         bool kick = tab == Tab::Kick;
         // titulo da secao
         std::string title;
@@ -610,21 +638,22 @@ private:
             if (idx >= n) break;
             int y = y0 + row * pitch;
             bool sel = idx == cursor[t];
-            if (sel) uiGlow(r, x, y, rw, rh, 18, GREEN, 10, 110);
+            if (sel) uiGlow(r, x, y, rw, rh, 18, GREEN, 10, 110, false);
             uiFrame(r, x, y, rw, rh, 18, sel ? 3 : 2, sel ? GREEN : CARD_LINE, sel ? SEL : CARD);
+            const std::string label = itemLabel(idx);
             std::string ic = "#";
             if (kick) ic = kickIcon(acts[idx]);
-            else for (unsigned char ch : v[idx]) if (std::isalnum(ch)) { ic = std::string(1, (char)((ch >= 'a' && ch <= 'z') ? ch - 32 : ch)); break; }
+            else for (unsigned char ch : label) if (std::isalnum(ch)) { ic = std::string(1, (char)((ch >= 'a' && ch <= 'z') ? ch - 32 : ch)); break; }
             int is = rh - 20;
             r.roundRect(x + 14, y + 10, is, is, 14, sel ? GREEN : CHIP);
             uiCenterHeavy(r, x + 14 + is / 2, y + rh / 2, ic, sel ? BLACK : MUTED, kick ? 34 : 28);
             unsigned tc = sel ? TEXT : SOFT;
             int tx = x + 14 + is + 22, textMax = rw - (tx - x) - 110;
             if (kick) {
-                uiHeavy(r, tx, y + 14, uiFit(r, v[idx], 30, textMax), tc, 30);
+                uiHeavy(r, tx, y + 14, uiFit(r, label, 30, textMax), tc, 30);
                 uiText(r, tx, y + 54, uiFit(r, kickSub(acts[idx]), 21, textMax), MUTED, 21);
             } else {
-                uiText(r, tx, y + (rh - 28) / 2, uiFit(r, v[idx], 28, textMax), tc, 28, sel);
+                uiText(r, tx, y + (rh - 28) / 2, uiFit(r, label, 28, textMax), tc, 28, sel);
             }
             if (sel) { r.roundRect(x + rw - 84, y + rh / 2 - 19, 56, 38, 12, KEY); uiCenter(r, x + rw - 56, y + rh / 2, "X", TEXT, 22, true); }
         }
