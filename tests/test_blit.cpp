@@ -19,7 +19,29 @@ static bool run(int w, int h, int mode, int expectPitch, int expectRows) {
     int dp, dr; blit::strideCandidate(d, w, h, dp, dr);
     return dp == expectPitch && dr == expectRows;
 }
+// A versao SSE2 deve dar o mesmo resultado da versao por tabelas (tolerancia de 2 niveis por canal)
+static void testSimd() {
+    blit::initTabs();
+    const int sw = 70;                                              // nao multiplo de 8: testa tambem a sobra
+    std::vector<uint8_t> y(sw + 16), uv(sw + 16);
+    unsigned seed = 12345;
+    for (int trial = 0; trial < 200; trial++) {
+        for (auto &v : y) { seed = seed * 1664525u + 1013904223u; v = (uint8_t)(seed >> 24); }
+        for (auto &v : uv) { seed = seed * 1664525u + 1013904223u; v = (uint8_t)(seed >> 24); }
+        if (trial == 0) { for (auto &v : y) v = 16; for (auto &v : uv) v = 128; }          // preto
+        if (trial == 1) { for (auto &v : y) v = 235; for (auto &v : uv) v = 128; }         // branco
+        std::vector<uint32_t> a(sw + 8), b(sw + 8);
+        blit::convRow(y.data(), uv.data(), sw, a.data());
+        blit::convRowSimd(y.data(), uv.data(), sw, b.data());
+        for (int i = 0; i < sw; i++) for (int sh = 0; sh < 24; sh += 8) {
+            int ca = (a[i] >> sh) & 255, cb = (b[i] >> sh) & 255;
+            assert(ca - cb <= 2 && cb - ca <= 2);
+            assert((b[i] >> 24) == 0xFF);
+        }
+    }
+}
 int main() {
+    testSimd();
     assert(run(1280, 720, 0, 1280, 720));        // 1280x720: layout igual em todos os modos
     assert(run(864, 480, 3, 1024, 480));         // caso do video: 864 alinhado a 256 -> 1024
     assert(run(864, 480, 2, 896, 480));          // 864 alinhado a 64 -> 896
