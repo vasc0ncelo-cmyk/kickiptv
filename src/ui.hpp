@@ -363,6 +363,8 @@ struct UI {
     int cursor[4] = {0, 0, 0, 0};
     int scroll[4] = {0, 0, 0, 0};
     int level = 0;            // so Series: 0 series, 1 temporadas, 2 episodios
+    int catCur[4] = {0, 0, 0, 0}, catScroll[4] = {0, 0, 0, 0};   // categoria escolhida (barra da esquerda) em cada aba
+    bool inItems = false;     // false = foco na barra de categorias, true = foco nos itens (Filmes/Series/Canais)
     std::string curSeries;
     int curSeason = 0;
     std::string kickLast;     // ultimo @ pesquisado
@@ -400,15 +402,28 @@ struct UI {
 
     // Quantidade de itens e nome de UM item, sem copiar a lista inteira.
     // (Antes, cada aperto de botao e cada quadro copiavam o nome de TODOS os canais: com listas de milhares de canais isso travava.)
+    static bool browsable(Tab t) { return t != Tab::Kick; }
+    const std::vector<Category> &cats(Tab t) const {
+        const Playlist &p = app.list;
+        return t == Tab::Channels ? p.channelCats : t == Tab::Movies ? p.movieCats : p.seriesCats;
+    }
+    int catCount() const { return browsable(tab) ? (int)cats(tab).size() : 0; }
+    const Category *curCat() const {
+        if (!browsable(tab)) return nullptr;
+        const auto &v = cats(tab); int c = catCur[(int)tab];
+        return c >= 0 && c < (int)v.size() ? &v[c] : nullptr;
+    }
+    std::string catLabel(int i) const { const auto &v = cats(tab); return i >= 0 && i < (int)v.size() ? v[i].name : ""; }
+    size_t catSize(int i) const { const auto &v = cats(tab); return i >= 0 && i < (int)v.size() ? v[i].size() : 0; }
+
+    // Itens da direita (da categoria escolhida), sem copiar a lista inteira.
     int itemCount() const {
         const Playlist &p = app.list;
-        switch (tab) {
-        case Tab::Kick: return (int)kickActions().size();
-        case Tab::Channels: return (int)p.channels.size();
-        case Tab::Movies: return (int)p.movies.size();
-        case Tab::Series: break;
-        }
-        if (level == 0) return (int)p.seriesTree.size();
+        if (tab == Tab::Kick) return (int)kickActions().size();
+        const Category *c = curCat();
+        if (!c) return 0;
+        if (tab != Tab::Series) return (int)c->items.size();
+        if (level == 0) return (int)c->series.size();
         auto it = p.seriesTree.find(curSeries);
         if (it == p.seriesTree.end()) return 0;
         if (level == 1) return (int)it->second.size();
@@ -418,13 +433,11 @@ struct UI {
     std::string itemLabel(int i) const {
         const Playlist &p = app.list;
         if (i < 0 || i >= itemCount()) return "";
-        switch (tab) {
-        case Tab::Kick: return kickLabel(kickActions()[i]);
-        case Tab::Channels: return p.channels[i].name;
-        case Tab::Movies: return p.movies[i].name;
-        case Tab::Series: break;
-        }
-        if (level == 0) { auto it = p.seriesTree.begin(); std::advance(it, i); return it->first; }
+        if (tab == Tab::Kick) return kickLabel(kickActions()[i]);
+        const Category *c = curCat();
+        if (tab == Tab::Channels) return p.channels[c->items[i]].name;
+        if (tab == Tab::Movies) return p.movies[c->items[i]].name;
+        if (level == 0) return c->series[i];
         auto &seasons = p.seriesTree.find(curSeries)->second;
         if (level == 1) { auto it = seasons.begin(); std::advance(it, i); return "Temporada " + std::to_string(it->first); }
         const Entry &e = seasons.find(curSeason)->second[i];
@@ -452,36 +465,44 @@ struct UI {
         url = a == std::string::npos ? "" : url.substr(a, b - a + 1);
         if (url.empty()) {                       // campo vazio = remover a lista
             m3uUrl.clear(); app.list = Playlist(); app.pf.saveSetting("m3u", "");
-            cursor[1] = cursor[2] = cursor[3] = scroll[1] = scroll[2] = scroll[3] = 0; level = 0;
+            resetBrowse();
             app.say("Lista M3U removida");
             return;
         }
         if (url.compare(0, 7, "http://") != 0 && url.compare(0, 8, "https://") != 0) url = "http://" + url;
         if (app.loadM3U(url)) {
             m3uUrl = url; app.pf.saveSetting("m3u", url);
-            cursor[1] = cursor[2] = cursor[3] = scroll[1] = scroll[2] = scroll[3] = 0; level = 0;
+            resetBrowse();
         }
     }
 
     void handle(Input in) {
         if (screen == Screen::Home) { handleHome(in); return; }
-        int t = (int)tab, n = itemCount();
+        int t = (int)tab;
         switch (in) {
         case Input::PrevTab: openTab(tileTab((tabTile(tab) + 3) % 4)); return;
         case Input::NextTab: openTab(tileTab((tabTile(tab) + 1) % 4)); return;
-        case Input::Up: cursor[t] = std::max(0, cursor[t] - 1); break;
-        case Input::Down: cursor[t] = std::min(std::max(0, n - 1), cursor[t] + 1); break;
-        case Input::PageUp: cursor[t] = std::max(0, cursor[t] - kRows); break;
-        case Input::PageDown: cursor[t] = std::min(std::max(0, n - 1), cursor[t] + kRows); break;
-        case Input::Left: case Input::Right: return;
-        case Input::Back:
-            if (tab == Tab::Series && level > 0) { level--; cursor[t] = 0; scroll[t] = 0; }
-            else screen = Screen::Home;
-            return;
-        case Input::Confirm: confirm(n); return;
+        default: break;
         }
-        if (cursor[t] < scroll[t]) scroll[t] = cursor[t];
-        if (cursor[t] >= scroll[t] + kRows) scroll[t] = cursor[t] - kRows + 1;
+        if (!browsable(tab)) { handleItems(in); return; }
+        if (inItems) {
+            if (in == Input::Left) { goBack(); return; }       // volta para as categorias (ou um nivel acima em Series)
+            handleItems(in); return;
+        }
+        // ---- foco na barra de categorias ----
+        int n = catCount(), before = catCur[t];
+        switch (in) {
+        case Input::Up: catCur[t] = std::max(0, catCur[t] - 1); break;
+        case Input::Down: catCur[t] = std::min(std::max(0, n - 1), catCur[t] + 1); break;
+        case Input::PageUp: catCur[t] = std::max(0, catCur[t] - kRows); break;
+        case Input::PageDown: catCur[t] = std::min(std::max(0, n - 1), catCur[t] + kRows); break;
+        case Input::Right: case Input::Confirm: if (itemCount() > 0) inItems = true; return;
+        case Input::Back: screen = Screen::Home; return;
+        default: return;
+        }
+        if (catCur[t] != before) { cursor[t] = scroll[t] = 0; level = 0; }   // outra categoria: itens desde o comeco
+        if (catCur[t] < catScroll[t]) catScroll[t] = catCur[t];
+        if (catCur[t] >= catScroll[t] + kRows) catScroll[t] = catCur[t] - kRows + 1;
     }
 
     // ---------- Desenho ----------
@@ -492,7 +513,34 @@ struct UI {
     }
 
 private:
-    void openTab(Tab t) { tab = t; screen = t == Tab::Kick ? Screen::Kick : Screen::List; level = 0; }
+    void openTab(Tab t) { tab = t; screen = t == Tab::Kick ? Screen::Kick : Screen::List; level = 0; inItems = false; }
+    void resetBrowse() {
+        for (int i = 0; i < 4; i++) cursor[i] = scroll[i] = catCur[i] = catScroll[i] = 0;
+        level = 0; inItems = false;
+    }
+    // O (ou seta esquerda): Series sobe um nivel; depois os itens voltam para as categorias; nas categorias volta ao inicio.
+    void goBack() {
+        int t = (int)tab;
+        if (screen == Screen::Kick || !browsable(tab)) { screen = Screen::Home; return; }
+        if (!inItems) { screen = Screen::Home; return; }
+        if (tab == Tab::Series && level > 0) { level--; cursor[t] = 0; scroll[t] = 0; }
+        else inItems = false;
+    }
+    void handleItems(Input in) {
+        int t = (int)tab, n = itemCount();
+        switch (in) {
+        case Input::Up: cursor[t] = std::max(0, cursor[t] - 1); break;
+        case Input::Down: cursor[t] = std::min(std::max(0, n - 1), cursor[t] + 1); break;
+        case Input::PageUp: cursor[t] = std::max(0, cursor[t] - kRows); break;
+        case Input::PageDown: cursor[t] = std::min(std::max(0, n - 1), cursor[t] + kRows); break;
+        case Input::Left: case Input::Right: return;
+        case Input::Back: goBack(); return;
+        case Input::Confirm: confirm(n); return;
+        default: return;
+        }
+        if (cursor[t] < scroll[t]) scroll[t] = cursor[t];
+        if (cursor[t] >= scroll[t] + kRows) scroll[t] = cursor[t] - kRows + 1;
+    }
     void requestM3U() { textKind = 2; app.pf.requestText("Endereço da lista M3U"); }
 
     void handleHome(Input in) {
@@ -610,8 +658,91 @@ private:
         }
     }
 
+    // Filmes / Series / Canais: barra de categorias (esquerda) + itens da categoria (direita)
+    void renderBrowse(Renderer &r) {
+        using namespace theme;
+        const int W = r.width();
+        int t = (int)tab, n = itemCount(), nc = catCount();
+        const Category *cat = curCat();
+        // titulo: FILMES > Comedia > ...
+        std::vector<std::string> parts;
+        parts.push_back(tab == Tab::Channels ? "CANAIS" : tab == Tab::Movies ? "FILMES" : "SÉRIES");
+        if (cat) parts.push_back(cat->name);
+        if (tab == Tab::Series && inItems && level >= 1) parts.push_back(curSeries);
+        if (tab == Tab::Series && inItems && level >= 2) parts.push_back("Temporada " + std::to_string(curSeason));
+        uiKMark(r, 73, 146, 40, 41, GREEN);
+        {
+            int tx = 130, maxX = W - 360;
+            for (size_t i = 0; i < parts.size(); i++) {
+                bool last = i + 1 == parts.size();
+                std::string seg = uiFit(r, parts[i], 36, std::max(80, (maxX - tx) / (int)(parts.size() - i)));
+                uiHeavy(r, tx, 152, seg, last && parts.size() > 1 ? GREEN : TEXT, 36);
+                tx += r.textWidth(seg, 36);
+                if (!last) { uiText(r, tx + 16, 152, ">", MUTED, 36, true); tx += 16 + r.textWidth(">", 36) + 16; }
+            }
+        }
+        r.fillRect(73, 196, W - 146, 2, 0xFF1C1C1C);
+        { std::string c = std::to_string(n) + (n == 1 ? " item" : " itens");
+          uiText(r, W - 73 - r.textWidth(c, 22), 158, c, MUTED, 22); }
+
+        const int y0 = 218, rh = 64, pitch = 74;
+        // ---- categorias ----
+        const int cx = 73, cw = 430;
+        for (int row = 0; row < kRows; row++) {
+            int idx = catScroll[t] + row;
+            if (idx >= nc) break;
+            int y = y0 + row * pitch;
+            bool cur = idx == catCur[t], sel = cur && !inItems;
+            if (sel) uiGlow(r, cx, y, cw, rh, 18, GREEN, 10, 110, false);
+            uiFrame(r, cx, y, cw, rh, 18, sel ? 3 : 2, sel ? GREEN : CARD_LINE, sel ? SEL : CARD);
+            if (cur && !sel) r.roundRect(cx + 10, y + 14, 5, rh - 28, 2, GREEN);        // categoria aberta (foco nos itens)
+            std::string cnt = std::to_string(catSize(idx));
+            int cwid = r.textWidth(cnt, 20);
+            uiText(r, cx + cw - 22 - cwid, y + (rh - 20) / 2, cnt, sel ? SOFT : MUTED, 20);
+            unsigned tc = cur ? (sel ? TEXT : GREEN) : SOFT;
+            uiText(r, cx + 30, y + (rh - 26) / 2, uiFit(r, catLabel(idx), 26, cw - 30 - 40 - cwid), tc, 26, cur);
+        }
+        if (nc > kRows) {
+            int th = kRows * pitch - 10;
+            r.roundRect(cx + cw + 8, y0, 6, th, 3, CARD2);
+            int kh = std::max(40, th * kRows / nc);
+            r.roundRect(cx + cw + 8, y0 + (th - kh) * catScroll[t] / std::max(1, nc - kRows), 6, kh, 3, GREEN_DK);
+        }
+        // ---- itens ----
+        const int x = cx + cw + 36, rw = W - 73 - 28 - x;
+        for (int row = 0; row < kRows; row++) {
+            int idx = scroll[t] + row;
+            if (idx >= n) break;
+            int y = y0 + row * pitch;
+            bool sel = inItems && idx == cursor[t];
+            if (sel) uiGlow(r, x, y, rw, rh, 18, GREEN, 10, 110, false);
+            uiFrame(r, x, y, rw, rh, 18, sel ? 3 : 2, sel ? GREEN : CARD_LINE, sel ? SEL : CARD);
+            const std::string label = itemLabel(idx);
+            std::string ic = "#";
+            for (unsigned char ch : label) if (std::isalnum(ch)) { ic = std::string(1, (char)((ch >= 'a' && ch <= 'z') ? ch - 32 : ch)); break; }
+            int is = rh - 20;
+            r.roundRect(x + 14, y + 10, is, is, 14, sel ? GREEN : CHIP);
+            uiCenterHeavy(r, x + 14 + is / 2, y + rh / 2, ic, sel ? BLACK : MUTED, 28);
+            int tx = x + 14 + is + 22, textMax = rw - (tx - x) - 110;
+            uiText(r, tx, y + (rh - 28) / 2, uiFit(r, label, 28, textMax), sel ? TEXT : SOFT, 28, sel);
+            if (sel) { r.roundRect(x + rw - 84, y + rh / 2 - 19, 56, 38, 12, KEY); uiCenter(r, x + rw - 56, y + rh / 2, "X", TEXT, 22, true); }
+        }
+        if (n > kRows) {
+            int th = kRows * pitch - 10;
+            r.roundRect(W - 52, y0, 8, th, 4, CARD2);
+            int kh = std::max(48, th * kRows / n);
+            r.roundRect(W - 52, y0 + (th - kh) * scroll[t] / std::max(1, n - kRows), 8, kh, 4, GREEN_DK);
+        }
+        if (nc == 0) {
+            bool noList = app.list.empty();
+            uiCenterHeavy(r, W / 2, y0 + 150, noList ? "Nenhuma lista M3U adicionada" : "Nada por aqui ainda", MUTED, 32);
+            if (noList) uiCenter(r, W / 2, y0 + 200, "Volte ao início e use LISTA M3U para adicionar a sua", DIM, 24);
+        }
+    }
+
     void renderList(Renderer &r) {
         using namespace theme;
+        if (browsable(tab)) { renderBrowse(r); return; }
         const int W = r.width();
         int t = (int)tab, n = itemCount();
         bool kick = tab == Tab::Kick;
@@ -686,6 +817,8 @@ private:
         const int W = r.width(), cy = 1043;
         std::vector<std::pair<std::string, std::string>> hints;
         if (screen == Screen::Home) hints = {{"D-pad", "Navegar"}, {"X", "Selecionar"}, {"OPTIONS", "Sair"}};
+        else if (browsable(tab) && !inItems) hints = {{"L1/R1", "Abas"}, {"D-pad", "Categorias"}, {"X", "Abrir"}, {"O", "Início"}};
+        else if (browsable(tab)) hints = {{"L1/R1", "Abas"}, {"X", "Selecionar"}, {"O", "Categorias"}};
         else hints = {{"L1/R1", "Abas"}, {"X", "Selecionar"}, {"O", "Voltar"}};
         int hx = uiHints(r, W - 73, cy, hints);
         const std::string &st = app.lastStatus;
@@ -706,10 +839,11 @@ private:
             else { textKind = 1; app.pf.requestText("@ do streamer"); }
             return;
         }
-        if (c >= n) return;
-        if (tab == Tab::Channels) app.pf.play(p.channels[c].url, p.channels[c].name);
-        else if (tab == Tab::Movies) app.pf.play(p.movies[c].url, p.movies[c].name);
-        else if (level == 0) { auto it = p.seriesTree.begin(); std::advance(it, c); curSeries = it->first; level = 1; cursor[t] = scroll[t] = 0; }
+        const Category *cat = curCat();
+        if (!cat || c >= n) return;
+        if (tab == Tab::Channels) { const Entry &e = p.channels[cat->items[c]]; app.pf.play(e.url, e.name); }
+        else if (tab == Tab::Movies) { const Entry &e = p.movies[cat->items[c]]; app.pf.play(e.url, e.name); }
+        else if (level == 0) { curSeries = cat->series[c]; level = 1; cursor[t] = scroll[t] = 0; }
         else if (level == 1) { auto &m = p.seriesTree.at(curSeries); auto it = m.begin(); std::advance(it, c); curSeason = it->first; level = 2; cursor[t] = scroll[t] = 0; }
         else { const Entry &e = p.seriesTree.at(curSeries).at(curSeason)[c]; app.pf.play(e.url, e.name); }
     }
