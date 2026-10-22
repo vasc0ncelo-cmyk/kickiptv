@@ -24,7 +24,7 @@ struct Fake : Platform {
 int main() {
     Fake f; App a(f);
     assert(a.loadM3U("http://lista"));
-    assert(a.list.channels.size() == 1 && a.list.movies.size() == 1 && a.list.series.size() == 2);
+    assert(a.list.channels.size() == 1 && a.list.movies.size() == 1 && a.list.seriesEpisodes == 2);
     assert(a.list.seriesTree["Dark"][1][0].episode == 1);
     a.watchKick("@Streamer");
     assert(f.playedUrl == "https://x.live/a.m3u8");
