@@ -104,6 +104,32 @@ static Kind classify(const Entry &e) {
     return Kind::Channel;
 }
 
+// "FILMES | Acao", "Series - Netflix", "CANAIS: Esportes" -> "Acao", "Netflix", "Esportes" (so tira prefixos que dizem o tipo).
+std::string cleanCategory(const std::string &group) {
+    std::string g = trim(group);
+    static const char *types[] = {"filmes", "filme", "series", "serie", "canais", "canal", "movies", "movie", "vod", "live", "tv", "novelas", "animes", "ao vivo"};
+    for (size_t i = 0; i < g.size(); i++) {
+        size_t skip = 0;
+        if (g[i] == '|' || g[i] == ':' || g[i] == '>' || g[i] == '/') skip = 1;
+        else if (g[i] == '-' && i > 0 && g[i - 1] == ' ' && i + 1 < g.size() && g[i + 1] == ' ') skip = 1;
+        if (!skip) continue;
+        std::string left = trim(fold(g.substr(0, i))), right = trim(g.substr(i + skip));
+        bool isType = false;
+        for (const char *t : types) if (left == t) { isType = true; break; }
+        if (isType && !right.empty()) { g = right; break; }
+        if (!isType) break;     // o primeiro separador decide
+    }
+    return g.empty() ? "Sem categoria" : g;
+}
+
+int PlaylistBuilder::catFor(std::vector<Category> &cats, std::unordered_map<std::string, int> &idx, const std::string &group) {
+    std::string name = cleanCategory(group);
+    auto it = idx.find(name);
+    if (it != idx.end()) return it->second;
+    cats.push_back(Category()); cats.back().name = name;
+    return idx[name] = (int)cats.size() - 1;
+}
+
 // Limites de seguranca: uma linha gigante (lixo/arquivo que nao e M3U) nao pode estourar a memoria.
 static const size_t kMaxLine = 8192;
 static const size_t kMaxEntries = 300000;   // listas de painel chegam a 200 mil+ itens (60 MB); sem os campos extras cada item ocupa menos que antes
@@ -135,6 +161,7 @@ void PlaylistBuilder::finish() {
     for (auto &s : p_.seriesTree)
         for (auto &t : s.second)
             std::stable_sort(t.second.begin(), t.second.end(), [](const Entry &a, const Entry &b) { return a.episode < b.episode; });
+    for (auto &c : p_.seriesCats) std::sort(c.series.begin(), c.series.end());   // mesma ordem do seriesTree
 }
 
 Playlist PlaylistBuilder::take() { return std::move(p_); }
@@ -167,16 +194,20 @@ void PlaylistBuilder::line(std::string &raw) {
     count_++;
 
     if (e.kind == Kind::Movie) {
+        p_.movieCats[catFor(p_.movieCats, movieIdx_, e.group)].items.push_back((uint32_t)p_.movies.size());
         e.group.clear(); p_.movies.push_back(std::move(e));
     } else if (e.kind == Kind::Series) {
         std::string s; int se = 1, ep = 0;
         if (parseEpisode(e.name, s, se, ep)) { e.season = se; e.episode = ep; }
         else s = e.group.empty() ? e.name : e.group;
+        bool isNew = p_.seriesTree.find(s) == p_.seriesTree.end();
+        if (isNew) p_.seriesCats[catFor(p_.seriesCats, seriesIdx_, e.group)].series.push_back(s);   // a serie fica na categoria do 1o episodio
         e.group.clear();
         p_.seriesEpisodes++;
         int season = e.season;
         p_.seriesTree[s][season].push_back(std::move(e));
     } else {
+        p_.channelCats[catFor(p_.channelCats, chanIdx_, e.group)].items.push_back((uint32_t)p_.channels.size());
         e.group.clear(); p_.channels.push_back(std::move(e));
     }
 }
