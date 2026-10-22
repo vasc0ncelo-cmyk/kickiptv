@@ -1,12 +1,9 @@
-// Durante o video: QUADRADO = alterna qualidade Fluido(30fps)/Maxima(60fps)
-// TESTE 5 - PLAYER com AvPlayer (video + audio) + teclado na tela + diagnostico.
+ Kick IPTV para PS4: lives da Kick (HLS) + lista M3U (canais, filmes, series).
+//   Home: banner + atalhos KICK TV / FILMES / SERIES / CANAIS + LISTA M3U  (D-pad navega, X seleciona, OPTIONS sai)
+//   Kick TV: X em "Digitar @streamer" abre o teclado na tela; o link da lista M3U tambem e digitado nele.
+//   Teclado: D-pad move, X digita, QUADRADO apaga, TRIANGULO insere https://, L2 limpa, R1 = OK, O cancela.
+//   Durante o video: QUADRADO = qualidade | TRIANGULO = ajuste de imagem | L1 = memoria de video | O = voltar
 //   HLS (.m3u8): o app baixa playlist/segmentos e entrega ao AvPlayer por callbacks de arquivo (hls.hpp / streambuf.hpp).
-//   Aba Kick (abre por padrao):
-//     X em "Digitar @streamer" = teclado na tela (D-pad move, X digita, QUADRADO apaga, R1 = OK, O = cancela)
-//     X em "TESTE do player"   = toca um video HLS publico (valida o player sem depender da Kick)
-//   Durante o video: TRIANGULO = muda o "modo de stride" do desenho (se a imagem sair torta) | O = voltar | OPTIONS = sair
-//   Menu: QUADRADO = teste de rede
-// Precisa do src/font8x16.hpp. Makefile liga -lSceAvPlayer e -lSceAudioOut.
 // Headers do C++ primeiro (mesma ordem do sample "threading" do OpenOrbis): evita conflito de tipos com os headers orbis.
 #include <atomic>
 #include <chrono>
@@ -35,7 +32,9 @@
 #include <orbis/Pad.h>
 #include <orbis/AudioOut.h>
 #include "ui.hpp"
-#include "font8x16.hpp"
+#include "fbrender.hpp"
+#include "keyboard.hpp"
+#include "clock.hpp"
 
 // ---------- Cliente HTTP (libSceNet + libSceSsl + libSceHttp, ligadas no link) ----------
 // Prototipos declarados aqui para nao depender dos nomes dos headers do toolchain.
@@ -204,10 +203,9 @@ static NetClient g_net;
 // ---------- Plataforma ----------
 struct Ps4Platform : Platform {
     App *app = nullptr;
-    std::string pendingText;                 // texto digitado no teclado na tela (@streamer)
+    std::string pendingText;                 // texto digitado no teclado na tela (@streamer ou link M3U)
+    bool hasPendingText = false;
     bool kbdRequested = false;               // UI pediu o teclado
-    bool avDiagRequested = false;            // UI pediu o diagnostico do AvPlayer
-    void command(const std::string &c) override { if (c == "avdiag") avDiagRequested = true; }
     std::string pendingPlayUrl, pendingPlayTitle;
     bool httpGet(const std::string &url, std::string &body) override {
         int st = 0;
@@ -216,209 +214,39 @@ struct Ps4Platform : Platform {
     }
     void play(const std::string &url, const std::string &title) override { pendingPlayUrl = url; pendingPlayTitle = title; }
     void requestText(const std::string &) override { kbdRequested = true; }
-};
-
-// ---------- Renderer (igual ao Teste 2) ----------
-// Matematica sem libm (o app original nao importava nenhuma funcao de matematica do libc)
-static inline int ifloor(float f) { int i = (int)f; return ((float)i > f) ? i - 1 : i; }
-static inline float fsqrt(float v) {
-    if (v <= 0.f) return 0.f;
-    float g = v > 1.f ? v * 0.5f + 0.5f : 1.f;
-    for (int i = 0; i < 8; i++) g = 0.5f * (g + v / g);
-    return g;
-}
-
-static inline uint32_t blendPx(uint32_t d, uint32_t s, int a) {   // a: 0..255
-    if (a <= 0) return d;
-    if (a >= 255) return 0xFF000000u | (s & 0xFFFFFFu);
-    uint32_t ia = 255 - a;
-    uint32_t rr = (((s >> 16) & 255) * a + ((d >> 16) & 255) * ia) / 255;
-    uint32_t gg = (((s >> 8) & 255) * a + ((d >> 8) & 255) * ia) / 255;
-    uint32_t bb = ((s & 255) * a + (d & 255) * ia) / 255;
-    return 0xFF000000u | (rr << 16) | (gg << 8) | bb;
-}
-
-struct FbRenderer : Renderer {
-    uint32_t *fb; int W, H;
-    FbRenderer(void *p, int w, int h) : fb((uint32_t *)p), W(w), H(h) {}
-    int width() const override { return W; }
-    int height() const override { return H; }
-    void fillRect(int x, int y, int w, int h, unsigned argb) override {
-        int x0 = x < 0 ? 0 : x, y0 = y < 0 ? 0 : y;
-        int x1 = x + w > W ? W : x + w, y1 = y + h > H ? H : y + h;
-        int a = argb >> 24;
-        for (int j = y0; j < y1; j++) {
-            uint32_t *row = fb + (size_t)j * W;
-            if (a >= 255) for (int i = x0; i < x1; i++) row[i] = argb;
-            else for (int i = x0; i < x1; i++) row[i] = blendPx(row[i], argb, a);
+    // dados guardados em /data (lista M3U, ultimo streamer). Leitura via libkernel (o app nao usa fread).
+    static std::string settingPath(const std::string &k) { return "/data/kickiptv_" + k + ".txt"; }
+    std::string loadSetting(const std::string &k) override {
+        int fd = sceKernelOpen(settingPath(k).c_str(), 0, 0);
+        if (fd < 0) return "";
+        std::string out; char buf[1024];
+        for (;;) {
+            long n = (long)sceKernelRead(fd, buf, sizeof buf);
+            if (n <= 0) break;
+            out.append(buf, (size_t)n);
+            if (out.size() > 4096) break;
         }
+        sceKernelClose(fd);
+        while (!out.empty() && (out.back() == '\n' || out.back() == '\r' || out.back() == ' ')) out.pop_back();
+        return out;
     }
-    // retangulo com cantos arredondados (bordas suavizadas)
-    void roundRect(int x, int y, int w, int h, int rad, unsigned argb) override {
-        if (rad * 2 > h) rad = h / 2;
-        if (rad * 2 > w) rad = w / 2;
-        if (rad <= 0) { fillRect(x, y, w, h, argb); return; }
-        int a = argb >> 24;
-        int j0 = y < 0 ? 0 : y, j1 = y + h > H ? H : y + h;
-        for (int j = j0; j < j1; j++) {
-            uint32_t *row = fb + (size_t)j * W;
-            bool top = j < y + rad, bot = j >= y + h - rad;
-            int mx0 = x, mx1 = x + w;
-            if (top || bot) {
-                float cy = top ? (float)(y + rad) : (float)(y + h - rad);
-                float dy = (j + 0.5f) - cy;
-                mx0 = x + rad; mx1 = x + w - rad;
-                for (int side = 0; side < 2; side++) {
-                    int px0 = side ? x + w - rad : x, px1 = side ? x + w : x + rad;
-                    float cx = side ? (float)(x + w - rad) : (float)(x + rad);
-                    for (int i = px0; i < px1; i++) {
-                        if (i < 0 || i >= W) continue;
-                        float dx = (i + 0.5f) - cx;
-                        float cov = (float)rad - fsqrt(dx * dx + dy * dy) + 0.5f;
-                        if (cov <= 0.f) continue;
-                        if (cov > 1.f) cov = 1.f;
-                        row[i] = blendPx(row[i], argb, (int)(a * cov));
-                    }
-                }
-            }
-            int i0 = mx0 < 0 ? 0 : mx0, i1 = mx1 > W ? W : mx1;
-            if (a >= 255) for (int i = i0; i < i1; i++) row[i] = argb;
-            else for (int i = i0; i < i1; i++) row[i] = blendPx(row[i], argb, a);
-        }
-    }
-    void gradient(int x, int y, int w, int h, unsigned top, unsigned bot) override {
-        int x0 = x < 0 ? 0 : x, y0 = y < 0 ? 0 : y;
-        int x1 = x + w > W ? W : x + w, y1 = y + h > H ? H : y + h;
-        for (int j = y0; j < y1; j++) {
-            int t = h > 1 ? (j - y) * 255 / (h - 1) : 0;
-            uint32_t c = 0xFF000000u;
-            for (int sh = 0; sh <= 16; sh += 8) {
-                int a = (top >> sh) & 255, b = (bot >> sh) & 255;
-                c |= (uint32_t)((a * (255 - t) + b * t) / 255) << sh;
-            }
-            uint32_t *row = fb + (size_t)j * W;
-            for (int i = x0; i < x1; i++) row[i] = c;
-        }
-    }
-    int textWidth(const std::string &t, int size) const override {
-        int n = 0; for (unsigned char c : t) if ((c & 0xC0) != 0x80) n++;
-        return n * (int)(8 * (size / 16.0f) + 0.5f);
-    }
-    // texto com suavizacao (a fonte 8x16 e ampliada com interpolacao bilinear)
-    void drawText(int x, int y, const std::string &text, unsigned argb, int size) override {
-        float s = size / 16.0f;
-        int adv = (int)(8 * s + 0.5f);
-        int gw = (int)(8 * s) + 2, gh = (int)(16 * s) + 2;
-        int A = argb >> 24;
-        int cx = x;
-        for (size_t i = 0; i < text.size();) {
-            unsigned char c = text[i];
-            unsigned cp;
-            if (c < 0x80) { cp = c; i += 1; }
-            else if ((c >> 5) == 6 && i + 1 < text.size()) { cp = ((c & 0x1F) << 6) | (text[i + 1] & 0x3F); i += 2; }
-            else if ((c >> 4) == 14 && i + 2 < text.size()) { cp = '?'; i += 3; }
-            else if ((c >> 3) == 30 && i + 3 < text.size()) { cp = '?'; i += 4; }
-            else { cp = '?'; i += 1; }
-            int gi;
-            if (cp >= 32 && cp <= 126) gi = cp - 32;
-            else if (cp >= 160 && cp <= 255) gi = 95 + (cp - 160);
-            else gi = '?' - 32;
-            if (cp != 32) {
-                const unsigned char *g = kFont8x16[gi];
-                auto bit = [&](int gx, int gy) -> float {
-                    if (gx < 0 || gx > 7 || gy < 0 || gy > 15) return 0.f;
-                    return (float)((g[gy] >> (7 - gx)) & 1);
-                };
-                for (int dy = 0; dy < gh; dy++) {
-                    int py = y + dy;
-                    if (py < 0 || py >= H) continue;
-                    float v = (dy + 0.5f) / s - 0.5f; int v0 = ifloor(v); float fv = v - v0;
-                    uint32_t *row = fb + (size_t)py * W;
-                    for (int dx = 0; dx < gw; dx++) {
-                        int px = cx + dx;
-                        if (px < 0 || px >= W) continue;
-                        float u = (dx + 0.5f) / s - 0.5f; int u0 = ifloor(u); float fu = u - u0;
-                        float cv = (bit(u0, v0) * (1 - fu) + bit(u0 + 1, v0) * fu) * (1 - fv) +
-                                   (bit(u0, v0 + 1) * (1 - fu) + bit(u0 + 1, v0 + 1) * fu) * fv;
-                        if (cv <= 0.03f) continue;
-                        cv = (cv - 0.12f) * 1.45f;                       // afina um pouco as bordas
-                        if (cv <= 0.f) continue;
-                        if (cv > 1.f) cv = 1.f;
-                        row[px] = blendPx(row[px], argb, (int)(A * cv));
-                    }
-                }
-            }
-            cx += adv;
-        }
+    void saveSetting(const std::string &k, const std::string &v) override {
+        FILE *f = fopen(settingPath(k).c_str(), "wb");
+        if (!f) return;
+        if (!v.empty()) fwrite(v.data(), 1, v.size(), f);
+        fclose(f);
     }
 };
 
-// ---------- Diagnostico ----------
-static std::string clean(const std::string &s, size_t maxLen) {
-    std::string o;
-    for (size_t i = 0; i < s.size() && o.size() < maxLen; i++) {
-        unsigned char c = s[i];
-        o += (c >= 32 && c < 127) ? (char)c : ' ';
-    }
-    return o;
-}
-static bool has(const std::string &hay, const char *needle) { return hay.find(needle) != std::string::npos; }
+// (FbRenderer agora vive em fbrender.hpp)
 
-static void runNetTest(std::vector<std::string> &diag) {
-    diag.clear();
-    g_net.log = &diag;
-    diag.push_back("== TESTE DE REDE ==");
-    struct T { const char *name; const char *url; };
-    T tests[] = {{"Controle (example.com)", "https://example.com/"},
-                 {"Kick API", "https://kick.com/api/v2/channels/xqc"}};
-    for (auto &t : tests) {
-        diag.push_back("");
-        diag.push_back(std::string("-- ") + t.name + ": " + t.url);
-        std::string body; int st = 0;
-        bool ok = g_net.get(t.url, body, st);
-        diag.push_back(std::string("   resultado: ") + (ok ? "respondeu" : "FALHOU") + "  status=" + std::to_string(st) + "  bytes=" + std::to_string(body.size()));
-        if (!body.empty()) {
-            std::string c = clean(body, 330);
-            for (size_t p = 0; p < c.size(); p += 110) diag.push_back("   > " + c.substr(p, 110));
-            if (has(body, "Just a moment") || has(body, "cloudflare") || has(body, "cf-chl")) diag.push_back("   >>> PARECE BLOQUEIO DO CLOUDFLARE");
-            if (has(body, "playback_url")) diag.push_back("   >>> ACHOU playback_url (a API respondeu!)");
-        }
-    }
-    diag.push_back("");
-    diag.push_back("Fim. Tire um print desta tela e mande para o Claude.");
-    g_net.log = nullptr;
-}
-
-static void renderDiag(FbRenderer &r, const std::vector<std::string> &diag, bool running) {
-    using namespace theme;
-    uiBackground(r);
-    uiLogo(r, 48, 28, 52);
-    uiText(r, 118, 30, running ? "Executando teste..." : "Diagnóstico", TEXT, 32, true);
-    uiText(r, 120, 68, running ? "pode levar até 1 minuto" : "tire um print e mande para o Claude", MUTED, 18);
-    r.roundRect(40, 100, r.W - 80, r.H - 200, 22, CARD);
-    int y = 122;
-    size_t start = diag.size() > 33 ? diag.size() - 33 : 0;
-    for (size_t i = start; i < diag.size(); i++) {
-        const std::string &l = diag[i];
-        unsigned c = TEXT; bool bold = false;
-        if (l.compare(0, 2, "--") == 0 || l.compare(0, 2, "==") == 0) { c = GREEN; bold = true; }
-        else if (l.find("ERRO") != std::string::npos || l.find("!!") != std::string::npos || l.find("FALHOU") != std::string::npos) c = RED;
-        else if (l.find("[av]") != std::string::npos) c = MUTED;
-        uiText(r, 66, y, uiFit(r, l, 18, r.W - 140), c, 18, bold);
-        y += 24;
-    }
-    int cy = r.H - 50;
-    uiHints(r, r.W - 48, cy, {{"O", "Voltar ao menu"}, {"OPTIONS", "Sair"}});
-}
-
-// ---------- Dados de exemplo ----------
 // ---------- Tela de inicializacao (escrita direta no video, sem ler nada) ----------
 // Mostra cada passo da abertura. Se o app travar/cair, a foto da tela mostra ate onde chegou.
 struct BootScreen {
     uint32_t *fb = nullptr; int W = 0, H = 0, y = 40;
     void init(void *p, int w, int h) {
         fb = (uint32_t *)p; W = w; H = h;
-        for (size_t i = 0; i < (size_t)W * H; i++) fb[i] = 0xFF090B10u;
+        for (size_t i = 0; i < (size_t)W * H; i++) fb[i] = 0xFF000000u;
         text(48, 28, "Kick IPTV", 0xFF53FC18u, 4);
         y = 120;
     }
@@ -450,20 +278,6 @@ static void traceInit() {
 static void trace(const char *stage) {
     FILE *f = fopen("/data/kickiptv.log", "ab");
     if (f) { fwrite(stage, 1, strlen(stage), f); fwrite("\n", 1, 1, f); fclose(f); }
-}
-
-static void fillDemo(App &app) {
-    std::string m = "#EXTM3U\n";
-    for (int i = 1; i <= 40; i++)
-        m += "#EXTINF:-1 group-title=\"Abertos\",[DEMO sem video] Canal de Exemplo " + std::to_string(i) + "\nhttp://exemplo/live/" + std::to_string(i) + ".ts\n";
-    for (int i = 1; i <= 15; i++)
-        m += "#EXTINF:-1 group-title=\"Filmes\",Filme de A\xC3\xA7\xC3\xA3o " + std::to_string(i) + "\nhttp://exemplo/movie/" + std::to_string(i) + ".mp4\n";
-    for (int s = 1; s <= 2; s++)
-        for (int e = 1; e <= 6; e++)
-            m += "#EXTINF:-1 group-title=\"Series\",Dark S0" + std::to_string(s) + "E0" + std::to_string(e) + "\nhttp://exemplo/series/d" +
-                 std::to_string(s * 10 + e) + ".mp4\n";
-    app.list = buildPlaylist(m);
-    app.say("Pronto");
 }
 
 // ---------- AvPlayer (libSceAvPlayer) - structs proprias para nao depender do header ----------
@@ -1264,6 +1078,17 @@ struct Player {
         uiText(r, 166, 122, uiFit(r, b, 20, r.W - 240), MUTED, 20);
         if (!failed && nowSec() - t0 > 15) uiText(r, 166, 150, "Demorando mais que o normal: tire um print desta tela e mande para o Claude.", AMBER, 20);
 
+        if (!failed && nowSec() - t0 <= 12) {      // conectando normalmente: tela limpa
+            using namespace theme;
+            int cx = r.W / 2, cy = r.H / 2 - 40;
+            int pulse = (int)(((int)(nowSec() * 3)) % 3);
+            uiGlow(r, cx - 60, cy - 61, 120, 122, 8, GREEN, 18 + pulse * 3, 120);
+            uiKMark(r, cx - 60, cy - 61, 120, 122, GREEN);
+            uiCenterHeavy(r, cx, cy + 130, uiFit(r, title, 38, r.W - 300), TEXT, 38);
+            uiCenter(r, cx, cy + 180, "Abrindo a transmissão...", MUTED, 24);
+            uiHints(r, r.W - 73, r.H - 50, {{"O", "Cancelar"}});
+            return;
+        }
         // cartao com o registro das tentativas
         const int cy0 = 196, ch = r.H - cy0 - 110;
         r.roundRect(48, cy0, r.W - 96, ch, 22, CARD);
@@ -1288,194 +1113,10 @@ struct Player {
     }
 };
 
-// ---------- Diagnostico do AvPlayer: tenta varias formas de abrir uma fonte e mostra cada resultado ----------
-static std::string hx(int v) { char b[16]; snprintf(b, sizeof b, "%08X", (unsigned)v); return b; }
-
-// repl: usa callbacks de arquivo | path: nome passado ao AddSource | hls: se != NULL, alimenta o buffer com este HLS
-static void avAttempt(std::vector<std::string> &d, const std::function<void()> &refresh, const char *name, bool repl, const char *path,
-                      const char *hls, bool autoStart, const std::string *blob = nullptr, bool keepFeed = false) {
-    d.push_back(std::string("-- ") + name);
-    refresh();
-    KAvInitData id; memset(&id, 0, sizeof id);
-    id.allocate = avAlloc; id.deallocate = avFree; id.allocateTexture = avAllocTex; id.deallocateTexture = avFreeTex;
-    id.debugLevel = 3; id.basePriority = 700; id.numOutputVideoFrameBuffers = 3; id.autoStart = autoStart; id.defaultLanguage = "eng";
-    { std::lock_guard<std::mutex> l(g_avlogM); g_avlog.clear(); }
-    g_allocN = g_allocFail = g_texN = g_texFail = 0;
-    sceAvPlayerSetLogCallback(avLogCb, NULL);
-    if (repl) { id.fileObj = (void *)&g_feed; id.fOpen = feedOpen; id.fClose = feedClose; id.fRead = feedRead; id.fSize = feedSize; }
-    if (!keepFeed) {
-        g_feed.join(); g_feed.opens = g_feed.reads = g_feed.segs = 0;
-        g_feedSize = 1ULL << 40;
-        if (blob) { g_feed.sb.reset(); g_feed.sb.append((const uint8_t *)blob->data(), blob->size()); g_feedSize = blob->size(); }
-        if (hls) g_feed.start(hls);
-    }
-    KAvHandle h = sceAvPlayerInit(&id);
-    d.push_back("   Init: handle=" + hx((int)(h & 0xFFFFFFFF)) + (h ? "" : "  (FALHOU)"));
-    int rc = h ? sceAvPlayerAddSource(h, path) : -1;
-    sceKernelUsleep(400000);                       // mensagens do player chegam de outra thread
-    d.push_back("   AddSource(\"" + std::string(path).substr(0, 60) + "\") = " + hx(rc) + "   alloc=" + std::to_string(g_allocN.load()) + "(falhas " +
-                std::to_string(g_allocFail.load()) + ") textura=" + std::to_string(g_texN.load()) + "(falhas " + std::to_string(g_texFail.load()) + ")  open=" +
-                std::to_string(g_feed.opens.load()) + " leituras=" + std::to_string(g_feed.reads.load()));
-    {   // mensagens internas do proprio AvPlayer (as primeiras)
-        std::lock_guard<std::mutex> l(g_avlogM);
-        for (size_t i = 0; i < g_avlog.size() && i < 6; i++) d.push_back("   [av] " + g_avlog[i].substr(0, 170));
-        if (g_avlog.size() > 6) d.push_back("   [av] ... (+" + std::to_string(g_avlog.size() - 6) + " mensagens)");
-    }
-    refresh();
-    if (h && rc >= 0) {
-        double t0 = nowSec(); int frames = 0, vw = 0, vh = 0, act = 0; unsigned ach = 0, asr = 0; int aframes = 0;
-        d.push_back("   (tocando...)"); size_t pi = d.size() - 1; int lastSec = 0;
-        while (nowSec() - t0 < 7.0) {
-            int sec = (int)(nowSec() - t0);
-            if (sec != lastSec) { lastSec = sec; d[pi] = "   t=" + std::to_string(sec) + "s quadros=" + std::to_string(frames) + " audio=" + std::to_string(aframes); refresh(); }
-            KAvFrameInfo fi; memset(&fi, 0, sizeof fi);
-            if (sceAvPlayerGetVideoData(h, &fi) && fi.pData) { frames++; vw = *(int *)(fi.details + 0); vh = *(int *)(fi.details + 4); }
-            KAvFrameInfo au; memset(&au, 0, sizeof au);
-            if (sceAvPlayerGetAudioData(h, &au) && au.pData) { aframes++; ach = *(uint16_t *)(au.details + 0); asr = *(uint32_t *)(au.details + 4); }
-            if (sceAvPlayerIsActive(h)) act = 1;
-            sceKernelUsleep(8000);
-        }
-        char b[220];
-        snprintf(b, sizeof b, "   apos 7s: ativo=%d  video: quadros=%d %dx%d  audio: blocos=%d %uHz/%uch  open=%d leituras=%d segs=%d bytes=%llu",
-                 act, frames, vw, vh, aframes, asr, ach, g_feed.opens.load(), g_feed.reads.load(), g_feed.segs.load(), (unsigned long long)g_feed.sb.total());
-        d.push_back(b);
-        if (hls) d.push_back("   HLS: " + g_feed.getStatus());
-    } else if (hls) {
-        d.push_back("   (open=" + std::to_string(g_feed.opens.load()) + " leituras=" + std::to_string(g_feed.reads.load()) + ")");
-    }
-    refresh();
-    g_feed.abort();
-    bool okClose = avStopClose(h);
-    if (!okClose) d.push_back("   !! sceAvPlayerStop/Close travou (mais de 5s): seguindo adiante");
-    if (!keepFeed) g_feed.join();
-    refresh();
-}
-
-static void avTailAttempt(std::vector<std::string> &d, const std::function<void()> &refresh, const char *hls) {
-    d.push_back("-- I) HLS gravado em arquivo que cresce (/data/live.ts), sem leitura propria");
-    refresh();
-    g_feed.join(); g_feed.opens = g_feed.reads = g_feed.segs = 0; g_feedSize = 1ULL << 40;
-    g_feed.outFile = fopen("/data/live.ts", "wb"); g_feed.outBytes = 0;
-    if (!g_feed.outFile) { d.push_back("   nao consegui criar /data/live.ts"); refresh(); return; }
-    g_feed.start(hls);
-    for (int i = 0; i < 75 && g_feed.segs.load() < 2 && !g_feed.failed.load(); i++) sceKernelUsleep(200000);
-    d.push_back("   segmentos baixados=" + std::to_string(g_feed.segs.load()) + "  bytes=" + std::to_string(g_feed.outBytes.load()) + "  " + g_feed.getStatus());
-    refresh();
-    if (g_feed.segs.load() > 0) avAttempt(d, refresh, "   I2) AddSource do arquivo que cresce", false, "/data/live.ts", NULL, true, nullptr, true);
-    closeFeedFile();
-    refresh();
-}
-
-static void runAvTest(std::vector<std::string> &d, const std::function<void()> &refresh) {
-    d.clear();
-    d.push_back("== DIAGNOSTICO DO AVPLAYER v2 ==  (cada teste leva ate ~10s)");
-    g_net.log = nullptr; g_net.init();
-    d.push_back("modulo AvPlayer (0xA5): " + hx(sceSysmoduleLoadModule(0x00A5)));
-    d.push_back("modulo AvPlayerStreaming: " + hx(sceSysmoduleLoadModuleInternal(0x80000050)));
-    refresh();
-
-    // E) baixa um MP4 pequeno e conhecido (H.264/AAC): serve de CONTROLE POSITIVO
-    const char *mp4Url = "https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4";
-    std::string mp4; int st = 0;
-    bool got = g_net.get(mp4Url, mp4, st, 8u << 20);
-    d.push_back("-- E) baixar flower.mp4: ok=" + std::to_string(got ? 1 : 0) + " http=" + std::to_string(st) + " bytes=" + std::to_string(mp4.size()));
-    refresh();
-    bool wrote = false;
-    if (got && st == 200 && mp4.size() > 10000) {
-        FILE *f = fopen("/data/teste.mp4", "wb");
-        if (f) { wrote = fwrite(mp4.data(), 1, mp4.size(), f) == mp4.size(); fclose(f); }
-        d.push_back(std::string("   gravado em /data/teste.mp4: ") + (wrote ? "sim" : "NAO"));
-        refresh();
-    }
-    // F) o teste que decide: MP4 local, sem callbacks proprios
-    if (wrote) avAttempt(d, refresh, "F) CONTROLE: MP4 local /data/teste.mp4, sem leitura propria", false, "/data/teste.mp4", NULL, true);
-    // H) o mesmo MP4 por URL https direta (o player abre a rede sozinho)
-    avAttempt(d, refresh, "H) MP4 por URL https direta, sem leitura propria", false, mp4Url, NULL, true);
-    // A) HLS publico pela leitura propria (o teste original)
-    const char *hls = kTestHlsHttps();
-    avTailAttempt(d, refresh, hls);
-    avAttempt(d, refresh, "A) HLS publico: leitura propria + /app0/live.ts", true, "/app0/live.ts", hls, true);
-
-    // G) pode FECHAR o app (o teste equivalente antigo derrubava): da tempo de tirar o print antes
-    if (got && st == 200 && mp4.size() > 10000) {
-        d.push_back("TIRE O PRINT AGORA. Em 10s comeca o teste G (pode fechar o app).");
-        refresh();
-        sceKernelUsleep(10 * 1000 * 1000);
-        avAttempt(d, refresh, "G) o MESMO MP4 pela leitura propria (callbacks), nome live.mp4", true, "live.mp4", NULL, true, &mp4);
-    }
-    d.push_back("Fim. Tire UM print desta tela e mande para o Claude.  (O volta ao menu)");
-}
-
-// ---------- Teclado na tela (para digitar o @streamer) ----------
-struct Keyboard {
-    static const int COLS = 10, ROWS = 4;
-    std::string text;
-    int cx = 0, cy = 0;
-    // 40 teclas: a-z, _ - 0-9, "<" (apagar), "OK"
-    static std::string keyAt(int x, int y) {
-        static const char *k[ROWS * COLS] = {
-            "a","b","c","d","e","f","g","h","i","j",
-            "k","l","m","n","o","p","q","r","s","t",
-            "u","v","w","x","y","z","_","-","0","1",
-            "2","3","4","5","6","7","8","9","<","OK"};
-        return k[y * COLS + x];
-    }
-    void open(const std::string &initial) { text = initial; cx = cy = 0; }
-    void move(int dx, int dy) { cx = (cx + dx + COLS) % COLS; cy = (cy + dy + ROWS) % ROWS; }
-    void backspace() { if (!text.empty()) text.pop_back(); }
-    // retorna true se confirmou (OK)
-    bool press() {
-        std::string k = keyAt(cx, cy);
-        if (k == "OK") return true;
-        if (k == "<") backspace();
-        else if (text.size() < 25) text += k;
-        return false;
-    }
-    void render(FbRenderer &r) const {
-        using namespace theme;
-        uiBackground(r);
-        uiLogo(r, 48, 28, 52);
-        uiText(r, 118, 30, "Digite o @ do streamer", TEXT, 32, true);
-        uiText(r, 120, 68, "Canal da Kick que você quer assistir", MUTED, 18);
-        // campo de texto
-        r.roundRect(48, 120, 960, 84, 22, CARD);
-        r.roundRect(48, 120, 960, 84, 22, 0x1053FC18);
-        uiText(r, 78, 142, "@", GREEN, 40, true);
-        std::string shown = text;
-        uiText(r, 118, 142, shown, TEXT, 40, true);
-        if (((int)(nowSec() * 2)) % 2 == 0) r.roundRect(118 + r.textWidth(shown, 40) + 2, 140, 4, 44, 2, GREEN);
-        // teclas
-        for (int y = 0; y < ROWS; y++)
-            for (int x = 0; x < COLS; x++) {
-                bool on = (x == cx && y == cy);
-                int px = 48 + x * 96, py = 236 + y * 100;
-                std::string k = keyAt(x, y);
-                bool special = k == "<" || k == "OK";
-                if (on) r.roundRect(px - 4, py - 4, 94, 94, 20, GREEN_GLOW);
-                r.roundRect(px, py, 86, 86, 16, on ? GREEN : (k == "OK" ? 0xFF1F3A1B : CARD2));
-                std::string lab = k == "<" ? "Apagar" : k;
-                uiCenter(r, px + 43, py + 43, lab, on ? BLACK : (k == "OK" ? GREEN : TEXT), special ? 20 : 32, true);
-            }
-        // painel de controles
-        const int cx0 = 1060, cw = r.W - 48 - cx0;
-        r.roundRect(cx0, 120, cw, 516, 22, 0xFF111623);
-        uiText(r, cx0 + 32, 142, "Controles", GREEN, 24, true);
-        static const char *ks[5] = {"D-pad", "X", "QUADRADO", "R1", "O"};
-        static const char *ls[5] = {"mover pelas teclas", "digitar a letra", "apagar", "confirmar", "cancelar"};
-        for (int i = 0; i < 5; i++) {
-            int ry = 214 + i * 80;
-            int kw = r.textWidth(ks[i], 20) + 28;
-            r.roundRect(cx0 + 32, ry - 20, kw, 40, 12, KEY);
-            uiCenter(r, cx0 + 32 + kw / 2, ry, ks[i], TEXT, 20, true);
-            uiText(r, cx0 + 32 + kw + 18, ry - 11, ls[i], SOFT, 22);
-        }
-    }
-};
-
 static const uint32_t B_OPTIONS = 0x0008, B_UP = 0x0010, B_DOWN = 0x0040, B_LEFT = 0x0080, B_RIGHT = 0x0020, B_L2 = 0x0100, B_R2 = 0x0200,
                       B_L1 = 0x0400, B_R1 = 0x0800, B_TRIANGLE = 0x1000, B_SQUARE = 0x8000, B_CIRCLE = 0x2000, B_CROSS = 0x4000;
 
-enum class Mode { Menu, Diag, Play, Kbd };
+enum class Mode { Menu, Play, Kbd };
 
 // Leitura do controle sem perder toques rapidos: o scePadRead guarda os estados recentes, entao um aperto curto
 // feito enquanto o app estava ocupado (carregando, trocando de pedaco) ainda e visto depois.
@@ -1530,14 +1171,12 @@ int main() {
     App app(pf);
     pf.app = &app;
     UI ui(app);
-    fillDemo(app);
-    ui.tab = Tab::Kick;                       // abre direto na aba Kick (os canais M3U sao so demonstracao)
+    ui.loadSaved();                           // ultimo streamer e lista M3U guardados
     if (!g_prevStage.empty()) app.say("Aviso: da ultima vez o app parou no passo: " + g_prevStage);
     trace("estado-criado");
     boot.line("[2] estado do app criado");
 
 
-    std::vector<std::string> diag;
     Mode mode = Mode::Menu;
     Player player;
     Keyboard kbd;
@@ -1565,7 +1204,7 @@ int main() {
         if (sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), bufSize, 0x200000, 0, &phys2) >= 0 &&
             sceKernelMapDirectMemory(&m2, bufSize, 0x33, 0, phys2, 0x200000) >= 0) shadow = (uint32_t *)m2;
         if (!shadow) { shadowFallback.assign((size_t)W * H, 0); shadow = shadowFallback.data(); trace("rascunho-no-heap"); }
-        for (size_t i = 0; i < (size_t)W * H; i++) shadow[i] = 0xFF090B10u;
+        for (size_t i = 0; i < (size_t)W * H; i++) shadow[i] = 0xFF000000u;
     }
     trace("rascunho-ok");
     boot.line(shadow == shadowFallback.data() ? "[3] rascunho de tela: heap" : "[3] rascunho de tela: memoria direta");
@@ -1574,14 +1213,20 @@ int main() {
         sceVideoOutSubmitFlip(vh, back, ORBIS_VIDEO_OUT_FLIP_VSYNC, 0); back = (back + 1) % 3;
     };
     auto presentMenu = [&]() { FbRenderer r(shadow, W, H); ui.render(r); flip(); };
-    auto presentDiag = [&](bool running) { FbRenderer r(shadow, W, H); renderDiag(r, diag, running); flip(); };
     auto presentWait = [&]() { FbRenderer r(shadow, W, H); player.renderWaiting(r); flip(); };
-    auto presentKbd = [&]() { FbRenderer r(shadow, W, H); kbd.render(r); flip(); };
+    auto presentKbd = [&]() { FbRenderer r(shadow, W, H); kbd.render(r, ((int)(nowSec() * 2)) % 2 == 0, ui.timeText, ui.dateText); flip(); };
+    auto updateClock = [&]() -> bool {         // true se o minuto mudou
+        struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+        std::string t, d; clockStrings((long long)ts.tv_sec, t, d);
+        if (t == ui.timeText && d == ui.dateText) return false;
+        ui.timeText = t; ui.dateText = d; return true;
+    };
+    updateClock();
     boot.line("[4] abrindo a interface...");
     sceKernelUsleep(400000);
     trace("abertura");
 
-    {   // ---- abertura animada: logo sobe e aparece, titulo, barra de carregamento ----
+    {   // ---- abertura animada: marca K aparece, titulo, barra de carregamento ----
         double ti = nowSec();
         for (;;) {
             double e = nowSec() - ti;
@@ -1591,21 +1236,28 @@ int main() {
             uiBackground(r);
             float k = (float)(e / 0.7); if (k > 1.f) k = 1.f;
             float ease = 1.f - (1.f - k) * (1.f - k) * (1.f - k);
-            int cx = W / 2, cy = H / 2 - 70 + (int)((1.f - ease) * 40);
-            r.roundRect(cx - 100, cy - 100, 200, 200, 52, GREEN_GLOW);
-            uiLogo(r, cx - 84, cy - 84, 168);
-            uiCenter(r, cx, H / 2 + 80, "Kick IPTV", TEXT, 64, true);
-            uiCenter(r, cx, H / 2 + 138, "Lives da Kick direto no seu PS4", MUTED, 24);
+            int cx = W / 2, cy = H / 2 - 90 + (int)((1.f - ease) * 40);
+            uiGlow(r, cx - 70, cy - 72, 140, 144, 8, GREEN, 26, 140);
+            uiKMark(r, cx - 70, cy - 72, 140, 144, GREEN);
+            int lh = 84, lw = uiLogoWidth(lh);
+            uiLogo(r, cx - lw / 2, H / 2 + 80, lh);
+            uiCenter(r, cx, H / 2 + 200, "Lives da Kick direto no seu PS4", MUTED, 24);
             float pg = (float)(e / 1.6); if (pg > 1.f) pg = 1.f;
-            r.roundRect(cx - 220, H / 2 + 200, 440, 10, 5, CARD2);
-            r.roundRect(cx - 220, H / 2 + 200, (int)(440 * pg) < 10 ? 10 : (int)(440 * pg), 10, 5, GREEN);
+            r.roundRect(cx - 220, H / 2 + 250, 440, 10, 5, CARD2);
+            r.roundRect(cx - 220, H / 2 + 250, (int)(440 * pg) < 10 ? 10 : (int)(440 * pg), 10, 5, GREEN);
             int fade = (int)(255.f * (1.f - ease));                      // entra do preto
-            if (fade > 0) r.fillRect(0, 0, W, H, ((unsigned)fade << 24) | 0x00090B10u);
+            if (fade > 0) r.fillRect(0, 0, W, H, ((unsigned)fade << 24));
             flip();
             sceKernelUsleep(8000);
         }
     }
     trace("intro-ok");
+    if (ui.hasSavedList()) {                  // reabre a lista M3U da ultima vez
+        app.say("Carregando sua lista M3U...");
+        presentMenu();
+        ui.loadSavedList();
+        trace("lista-m3u-carregada");
+    }
 
     for (;;) {
         pin.poll();
@@ -1615,20 +1267,25 @@ int main() {
 
         if (mode == Mode::Kbd) {
             bool changed = false, done = false;
-            if (pressed & B_UP)     { kbd.move(0, -1); changed = true; }
-            if (pressed & B_DOWN)   { kbd.move(0, 1);  changed = true; }
-            if (pressed & B_LEFT)   { kbd.move(-1, 0); changed = true; }
-            if (pressed & B_RIGHT)  { kbd.move(1, 0);  changed = true; }
-            if (pressed & B_SQUARE) { kbd.backspace(); changed = true; }
-            if (pressed & B_CROSS)  { done = kbd.press(); changed = true; }
-            if (pressed & B_R1)     done = true;
-            if (pressed & B_CIRCLE) { mode = Mode::Menu; dirty = true; continue; }
+            if (pressed & B_UP)       { kbd.move(0, -1); changed = true; }
+            if (pressed & B_DOWN)     { kbd.move(0, 1);  changed = true; }
+            if (pressed & B_LEFT)     { kbd.move(-1, 0); changed = true; }
+            if (pressed & B_RIGHT)    { kbd.move(1, 0);  changed = true; }
+            if (pressed & B_SQUARE)   { kbd.backspace(); changed = true; }
+            if (pressed & B_TRIANGLE) { kbd.insert("https://"); changed = true; }
+            if (pressed & B_L2)       { kbd.clear(); changed = true; }
+            if (pressed & B_CROSS)    { done = kbd.press(); changed = true; }
+            if (pressed & B_R1)       done = true;
+            if (pressed & B_CIRCLE)   { ui.textKind = 0; mode = Mode::Menu; dirty = true; continue; }
             if (done) {
                 mode = Mode::Menu; dirty = true;
-                if (!kbd.text.empty()) pf.pendingText = kbd.text;
+                if (!kbd.text.empty() || ui.textKind == 2) { pf.pendingText = kbd.text; pf.hasPendingText = true; }
+                else ui.textKind = 0;
                 continue;
             }
-            if (changed || dirty) { presentKbd(); dirty = false; }
+            int blinkNow = ((int)(nowSec() * 2)) % 2;
+            static int lastBlink = -1;
+            if (changed || dirty || blinkNow != lastBlink) { lastBlink = blinkNow; presentKbd(); dirty = false; }
             sceKernelUsleep(16000);
             continue;
         }
@@ -1679,14 +1336,6 @@ int main() {
             continue;
         }
 
-        if (mode == Mode::Diag) {
-            if (pressed & B_CIRCLE) { mode = Mode::Menu; dirty = true; }
-            if (pressed & B_SQUARE) { diag.assign(1, "Executando..."); presentDiag(true); runNetTest(diag); dirty = true; }
-            if (dirty) { presentDiag(false); dirty = false; }
-            sceKernelUsleep(16000);
-            continue;
-        }
-
         // ---- Menu ----
         if (now & (B_UP | B_DOWN)) {
             heldFrames++;
@@ -1694,43 +1343,33 @@ int main() {
         } else heldFrames = 0;
         if (pressed & B_UP)     { ui.handle(Input::Up);       dirty = true; }
         if (pressed & B_DOWN)   { ui.handle(Input::Down);     dirty = true; }
+        if (pressed & B_LEFT)   { ui.handle(Input::Left);     dirty = true; }
+        if (pressed & B_RIGHT)  { ui.handle(Input::Right);    dirty = true; }
         if (pressed & B_L1)     { ui.handle(Input::PrevTab);  dirty = true; }
         if (pressed & B_R1)     { ui.handle(Input::NextTab);  dirty = true; }
         if (pressed & B_L2)     { ui.handle(Input::PageUp);   dirty = true; }
         if (pressed & B_R2)     { ui.handle(Input::PageDown); dirty = true; }
         if (pressed & B_CROSS)  { ui.handle(Input::Confirm);  dirty = true; }
         if (pressed & B_CIRCLE) { ui.handle(Input::Back);     dirty = true; }
-        if (pressed & B_SQUARE) { mode = Mode::Diag; diag.assign(1, "Executando..."); presentDiag(true); runNetTest(diag); dirty = true; }
+        if (updateClock()) dirty = true;
 
-        if (pf.avDiagRequested) {                 // DIAGNOSTICO do AvPlayer
-            pf.avDiagRequested = false;
-            mode = Mode::Diag; diag.assign(1, "Executando...");
-            presentDiag(true);
-            runAvTest(diag, [&]() { presentDiag(true); });
-            dirty = true;
-            continue;
-        }
         if (pf.kbdRequested) {                    // X em "Digitar @streamer": abre o teclado na tela
             pf.kbdRequested = false;
-            kbd.open(ui.kickLast);
+            kbd.open(ui.textInitial(), ui.textKind == 2);
             mode = Mode::Kbd; dirty = true;
             continue;
         }
-        if (!pf.pendingText.empty()) {            // texto confirmado no teclado: busca o canal
-            std::string slug = pf.pendingText; pf.pendingText.clear();
-            app.say("Buscando @" + slug + " na Kick...");
+        if (pf.hasPendingText) {                  // texto confirmado no teclado: busca o canal ou baixa a lista M3U
+            std::string typed = pf.pendingText; pf.pendingText.clear(); pf.hasPendingText = false;
+            if (ui.textKind == 2) app.say(typed.empty() ? "Removendo a lista M3U..." : "Baixando a lista M3U...");
+            else app.say("Buscando @" + kickSlug(typed) + " na Kick...");
             presentMenu();
-            ui.onText(slug);                     // httpGet + (se ao vivo) play()
+            ui.onText(typed);                    // httpGet + (se ao vivo) play()
             dirty = true;
         }
         if (!pf.pendingPlayUrl.empty()) {
             std::string url = pf.pendingPlayUrl, title = pf.pendingPlayTitle;
             pf.pendingPlayUrl.clear();
-            if (url.compare(0, 15, "http://exemplo/") == 0) {   // item de demonstracao: nao existe video
-                app.say("Isto e um item de DEMONSTRACAO (sem video). Use a aba Kick.");
-                dirty = true;
-                continue;
-            }
             mode = Mode::Play; gotFrame = false; lastWaitDraw = 0;
             presentWait();                       // mostra "Player" antes de bloquear
             player.presentCb = presentWait;
