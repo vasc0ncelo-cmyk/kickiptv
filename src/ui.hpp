@@ -218,7 +218,7 @@ struct UI {
             // icone redondo com a inicial
             std::string ic = "#";
             if (tab == Tab::Kick) ic = kickIcon(acts[idx]);
-            else for (unsigned char ch : v[idx]) if (std::isalnum(ch)) { ic = std::string(1, (char)std::toupper(ch)); break; }
+            else for (unsigned char ch : v[idx]) if (std::isalnum(ch)) { ic = std::string(1, (char)((ch >= 'a' && ch <= 'z') ? ch - 32 : ch)); break; }
             r.roundRect(x + 22, y + 12, 44, 44, 22, sel ? GREEN : CHIP);
             uiCenter(r, x + 44, y + 34, ic, sel ? BLACK : MUTED, 24, true);
             unsigned tc = sel ? TEXT : SOFT;
