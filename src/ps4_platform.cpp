@@ -23,6 +23,7 @@
 #include <string.h>
 #include <time.h>
 #include "hls.hpp"
+#include "netstream.hpp"
 #include "streambuf.hpp"
 #include "tsmux.hpp"
 #include "blit.hpp"
@@ -134,6 +135,46 @@ struct NetClient {
         return ok;
     }
 
+    // GET em streaming para downloads GRANDES (lista M3U com 10-15 mil itens = varios MB). Roda na thread de rede
+    // (netstream.hpp): entrega cada pedaco a 'push' em vez de montar tudo na memoria e nao tem o limite de 1,5 MB do get().
+    // Timeouts maiores: paineis IPTV podem levar 30-60 s para montar a lista antes de mandar o primeiro byte.
+    bool getStream(const std::string &url, const netstream::Push &push, int &status) {
+        status = 0;
+        if (!ready) return false;                       // init() e feito na thread principal antes de iniciar a thread
+        const char *ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
+        int tmpl = sceHttpCreateTemplate(httpCtx, ua, 1 /*HTTP/1.1*/, 1);
+        if (tmpl < 0) return false;
+        sceHttpsDisableOption(tmpl, 0x1F);
+        sceHttpSetAutoRedirect(tmpl, 1);
+        const unsigned T = 20 * 1000 * 1000, TR = 60 * 1000 * 1000;
+        sceHttpSetResolveTimeOut(tmpl, T);
+        sceHttpSetConnectTimeOut(tmpl, T);
+        sceHttpSetSendTimeOut(tmpl, T);
+        sceHttpSetRecvTimeOut(tmpl, TR);
+        bool ok = false;
+        int conn = sceHttpCreateConnectionWithURL(tmpl, url.c_str(), 0 /*sem keep-alive: e um download unico*/);
+        if (conn >= 0) {
+            int req = sceHttpCreateRequestWithURL(conn, 0 /*GET*/, url.c_str(), 0);
+            if (req >= 0) {
+                sceHttpAddRequestHeader(req, "Accept", "*/*", 0);
+                sceHttpAddRequestHeader(req, "Accept-Encoding", "identity", 0);   // sem gzip: o app le os bytes como vem
+                if (sceHttpSendRequest(req, NULL, 0) >= 0 && sceHttpGetStatusCode(req, &status) >= 0 && status >= 200 && status < 300) {
+                    std::vector<char> buf(64 * 1024);
+                    for (;;) {
+                        int n = sceHttpReadData(req, buf.data(), buf.size());
+                        if (n < 0) break;                                  // erro de rede no meio: ok continua false
+                        if (n == 0) { ok = true; break; }                  // fim normal
+                        if (!push(buf.data(), (size_t)n)) break;           // cancelado
+                    }
+                }
+                sceHttpDeleteRequest(req);
+            }
+            sceHttpDeleteConnection(conn);
+        }
+        sceHttpDeleteTemplate(tmpl);
+        return ok;
+    }
+
     // ---- Sessao com conexao reaproveitada (keep-alive): o alimentador HLS baixa playlist + segmentos do MESMO servidor
     // varias vezes por segundo. Antes cada GET criava conexao nova (handshake TLS completo no CPU fraco do PS4).
     struct Session { int tmpl = -1, conn = -1; std::string origin; };
@@ -212,6 +253,18 @@ struct Ps4Platform : Platform {
         int st = 0;
         bool ok = g_net.get(url, body, st);
         return ok && st >= 200 && st < 300;
+    }
+    // Download da lista M3U: roda em segundo plano; a thread principal processa os pedacos e redesenha (progressTick).
+    std::function<bool()> progressTick;      // chamado ~7x/s durante o download (redesenha o menu e le o O); true = cancelar
+    bool cancelled = false;
+    bool wasCancelled() override { return cancelled; }
+    bool httpStream(const std::string &url, const std::function<bool(const char *, size_t)> &sink) override {
+        cancelled = false;
+        if (!g_net.init()) return false;     // inicializa a rede aqui (thread principal), nao dentro da thread de download
+        int st = 0;
+        std::string u = url;
+        return netstream::run([u](const netstream::Push &push, int &status) { return g_net.getStream(u, push, status); },
+                              sink, [this]() { return progressTick ? progressTick() : false; }, st, cancelled);
     }
     void play(const std::string &url, const std::string &title) override { pendingPlayUrl = url; pendingPlayTitle = title; }
     void requestText(const std::string &) override { kbdRequested = true; }
@@ -1250,6 +1303,13 @@ int main() {
         }
     }
     trace("intro-ok");
+    pf.progressTick = [&]() -> bool {         // durante o download da lista: redesenha o status e deixa cancelar com O
+        presentMenu();
+        pin.poll();
+        if (pin.pending & B_CIRCLE) { pin.pending &= ~B_CIRCLE; return true; }
+        if ((pin.held | pin.pending) & B_OPTIONS) { wantQuit = true; return true; }
+        return false;
+    };
     if (ui.hasSavedList()) {                  // reabre a lista M3U da ultima vez
         app.say("Carregando sua lista M3U...");
         presentMenu();
