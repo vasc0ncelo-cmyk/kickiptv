@@ -24,8 +24,11 @@ jobs:
         run: bash scripts/get_toolchain.sh
       - name: Icone e fundo do app (nao quebra o build se falhar)
         run: |
+          rm -f sce_sys/pic0.png sce_sys/pic1.png
           pip install pillow || true
           python3 scripts/make_icon.py || echo "icone padrao mantido"
+          rm -f sce_sys/pic0.png sce_sys/pic1.png
+          ls -la sce_sys
       - name: Compilar PKG
         run: make TITLE="Kick IPTV ${{ github.run_number }}"
       - name: Conferir o PKG
