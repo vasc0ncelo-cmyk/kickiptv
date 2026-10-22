@@ -1,4 +1,4 @@
- Kick IPTV para PS4: lives da Kick (HLS) + lista M3U (canais, filmes, series).
+// Kick IPTV para PS4: lives da Kick (HLS) + lista M3U (canais, filmes, series).
 //   Home: banner + atalhos KICK TV / FILMES / SERIES / CANAIS + LISTA M3U  (D-pad navega, X seleciona, OPTIONS sai)
 //   Kick TV: X em "Digitar @streamer" abre o teclado na tela; o link da lista M3U tambem e digitado nele.
 //   Teclado: D-pad move, X digita, QUADRADO apaga, TRIANGULO insere https://, L2 limpa, R1 = OK, O cancela.
