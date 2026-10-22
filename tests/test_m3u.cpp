@@ -78,5 +78,14 @@ int main() {
     assert(a.list.channels.size() == 9000); f.mode = 2; assert(!a.loadM3U("http://x") && a.list.channels.size() == 9000);
     f.mode = 0; f.data = "nao e uma lista"; // texto sem URL de verdade vira 1 item? -> so conta se tiver linha
     f.data = "#EXTM3U\n"; App a4(f); assert(!a4.loadM3U("http://x") && a4.lastStatus.find("Falha") == 0);
+    // categorias: prefixo do tipo some, o resto fica
+    assert(cleanCategory("FILMES | Comédia") == "Comédia" && cleanCategory("Séries - Netflix") == "Netflix" && cleanCategory("CANAIS: Esportes") == "Esportes");
+    assert(cleanCategory("Ação - Aventura") == "Ação - Aventura" && cleanCategory("") == "Sem categoria" && cleanCategory("Filmes") == "Filmes");
+    {   // as 3 abas ficam separadas por categoria e a soma bate com o total
+        Playlist p = buildPlaylist(text);
+        size_t n = 0; for (auto &c : p.channelCats) n += c.items.size(); assert(n == p.channels.size() && p.channelCats.size() == 1 && p.channelCats[0].name == "Canais, HD");
+        n = 0; for (auto &c : p.movieCats) n += c.items.size(); assert(n == p.movies.size() && p.movieCats[0].name == "Acao");
+        n = 0; for (auto &c : p.seriesCats) n += c.series.size(); assert(n == p.seriesTree.size() && p.seriesCats[0].name == "Drama");
+    }
     std::cout << "OK\n";
 }
