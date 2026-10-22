@@ -49,20 +49,28 @@ int main() {
     { Fake f2; f2.store = f.store; App a2(f2); UI u2(a2); u2.loadSaved(); assert(u2.hasSavedList()); u2.loadSavedList(); assert(a2.list.channels.size() == 1); }
     // --- Canais ---
     ui.handle(Input::Up); ui.handle(Input::Right); ui.handle(Input::Right); ui.handle(Input::Right);   // CANAIS
-    ui.handle(Input::Confirm); assert(ui.screen == Screen::List && ui.tab == Tab::Channels);
-    ui.handle(Input::Confirm); assert(f.played == "http://h/1");
+    ui.handle(Input::Confirm); assert(ui.screen == Screen::List && ui.tab == Tab::Channels && !ui.inItems);
+    { Rec r; ui.render(r); assert(r.has("CANAIS") && r.has("A")); }                      // barra de categorias mostra o grupo "A"
+    ui.handle(Input::Confirm); assert(ui.inItems && f.played.empty());                   // 1o X abre a categoria
+    ui.handle(Input::Confirm); assert(f.played == "http://h/1");                         // 2o X toca
+    ui.handle(Input::Back); assert(ui.screen == Screen::List && !ui.inItems);            // O volta para as categorias
     ui.handle(Input::Back); assert(ui.screen == Screen::Home);
     // --- Filmes ---
     ui.handle(Input::Left); ui.handle(Input::Left); ui.handle(Input::Confirm); assert(ui.tab == Tab::Movies);
+    ui.handle(Input::Right); assert(ui.inItems);                                         // seta direita tambem entra na categoria
+    ui.handle(Input::Left); assert(!ui.inItems); ui.handle(Input::Right);
     ui.handle(Input::Confirm); assert(f.played == "http://h/movie/2");
     // --- Series: serie -> temporada 1 -> ep 1 (ordenado) ---
-    ui.handle(Input::NextTab); assert(ui.tab == Tab::Series);
+    ui.handle(Input::NextTab); assert(ui.tab == Tab::Series && !ui.inItems);
+    ui.handle(Input::Confirm);          // abre a categoria "Series"
     ui.handle(Input::Confirm);          // Dark
     ui.handle(Input::Confirm);          // Temporada 1
     { Rec r; ui.render(r); assert(r.has("Ep 1 - Dark S01E01") && r.has("Ep 2 - Dark S01E02")); }
     ui.handle(Input::Confirm); assert(f.played == "http://h/series/5");
     ui.handle(Input::Back); ui.handle(Input::Down); ui.handle(Input::Confirm);   // Temporada 2
     ui.handle(Input::Confirm); assert(f.played == "http://h/series/3");
+    ui.handle(Input::Back); ui.handle(Input::Back); assert(ui.level == 0 && ui.inItems);   // episodios -> temporadas -> series
+    ui.handle(Input::Back); assert(!ui.inItems && ui.screen == Screen::List);              // series -> categorias
     // --- Kick TV ---
     ui.handle(Input::NextTab); assert(ui.tab == Tab::Channels);
     ui.handle(Input::NextTab); assert(ui.tab == Tab::Kick && ui.screen == Screen::Kick);
@@ -92,11 +100,43 @@ int main() {
         u3.level = 2; u3.curSeason = 1; assert(u3.itemCount() == 2 && u3.itemLabel(0) == "Ep 1 - Dark S01E01");
         assert(u3.itemLabel(99).empty() && u3.itemLabel(-1).empty());
     }
+    // --- varias categorias por aba: cada uma mostra so os seus itens; trocar de categoria zera o cursor ---
+    {
+        struct F5 : Fake { bool httpGet(const std::string &, std::string &b) override {
+            b = "#EXTM3U\n#EXTINF:-1 group-title=\"FILMES | Comédia\",Gente Grande\nhttp://h/movie/1.mp4\n"
+                "#EXTINF:-1 group-title=\"FILMES | Ação\",Duro de Matar\nhttp://h/movie/2.mp4\n"
+                "#EXTINF:-1 group-title=\"FILMES | Comédia\",Superbad\nhttp://h/movie/3.mp4\n"
+                "#EXTINF:-1 group-title=\"CANAIS | Esportes\",ESPN\nhttp://h/live/4.ts\n"
+                "#EXTINF:-1 group-title=\"CANAIS | Abertos\",Globo\nhttp://h/live/5.ts\n"
+                "#EXTINF:-1 group-title=\"SÉRIES | Netflix\",Dark S01E01\nhttp://h/series/6.mp4\n"
+                "#EXTINF:-1 group-title=\"SÉRIES | Netflix\",Dark S01E02\nhttp://h/series/7.mp4\n"
+                "#EXTINF:-1 group-title=\"SÉRIES | Disney\",Andor S01E01\nhttp://h/series/8.mp4\n"
+                "#EXTINF:-1 group-title=\"Todos\",Sem Url Pista\nhttp://h/movie/9.mp4\n";
+            return true; } };
+        F5 f5; App a5(f5); UI u5(a5); u5.setM3U("http://x/l.m3u");
+        u5.screen = Screen::List; u5.tab = Tab::Movies;
+        assert(u5.catCount() == 3 && u5.catLabel(0) == "Comédia" && u5.catLabel(1) == "Ação" && u5.catLabel(2) == "Todos");
+        assert(u5.catSize(0) == 2 && u5.itemCount() == 2 && u5.itemLabel(1) == "Superbad");
+        u5.handle(Input::Right); u5.handle(Input::Down); assert(u5.cursor[2] == 1);
+        u5.handle(Input::Left); u5.handle(Input::Down);                                   // categoria "Ação"
+        assert(u5.catCur[2] == 1 && u5.cursor[2] == 0 && u5.itemCount() == 1 && u5.itemLabel(0) == "Duro de Matar");
+        u5.handle(Input::Confirm); f5.played.clear(); u5.handle(Input::Confirm); assert(f5.played == "http://h/movie/2.mp4");
+        { Rec r; u5.render(r); assert(r.has("FILMES") && r.has("Ação") && r.has("Comédia") && r.has("Duro de Matar") && !r.has("Superbad")); }
+        u5.tab = Tab::Channels; u5.inItems = false;
+        assert(u5.catCount() == 2 && u5.catLabel(0) == "Esportes" && u5.itemLabel(0) == "ESPN");
+        u5.handle(Input::Down); assert(u5.itemLabel(0) == "Globo");
+        u5.tab = Tab::Series; u5.inItems = false; u5.level = 0;
+        assert(u5.catCount() == 2 && u5.catLabel(0) == "Netflix" && u5.catLabel(1) == "Disney");
+        assert(u5.itemCount() == 1 && u5.itemLabel(0) == "Dark");
+        u5.handle(Input::Down); assert(u5.itemLabel(0) == "Andor");
+        for (Tab t : {Tab::Channels, Tab::Movies, Tab::Series}) { u5.tab = t; Rec r; u5.render(r); }   // renderiza sem quebrar
+    }
     // --- lista grande: navegar nao pode depender do tamanho da lista ---
     {
         Fake f4; App a4(f4); UI u4(a4);
-        for (int i = 0; i < 50000; i++) { Entry e; e.name = "Canal " + std::to_string(i); a4.list.channels.push_back(e); }
-        u4.tab = Tab::Channels; u4.screen = Screen::List;
+        { std::string m = "#EXTM3U\n"; for (int i = 0; i < 50000; i++) m += "#EXTINF:-1 group-title=\"Canais | Todos\",Canal " + std::to_string(i) + "\nhttp://h/live/" + std::to_string(i) + ".ts\n";
+          a4.list = buildPlaylist(m); }
+        u4.tab = Tab::Channels; u4.screen = Screen::List; u4.inItems = true;
         u4.handle(Input::PageDown); assert(u4.cursor[1] == UI::kRows);
         for (int i = 0; i < 5000; i++) u4.handle(Input::Down);
         assert(u4.cursor[1] == UI::kRows + 5000 && u4.scroll[1] == u4.cursor[1] - UI::kRows + 1);
