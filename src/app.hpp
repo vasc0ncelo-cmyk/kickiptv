@@ -59,7 +59,7 @@ struct App {
         }
         if (total == 0) { say("Falha: o link nao devolveu uma lista M3U valida"); return false; }
         list = b.take();
-        say(summary());
+        say(list.truncated ? "Aviso: lista muito grande, so os primeiros itens foram carregados - " + summary() : summary());
         return true;
     }
 
