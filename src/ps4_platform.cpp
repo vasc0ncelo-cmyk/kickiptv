@@ -68,6 +68,11 @@ int sceHttpSetResolveTimeOut(int id, unsigned usec);
 }
 
 static void trace(const char *stage);   // (definida mais abaixo)
+// Marcadores finos do download da lista M3U: se o app fechar, a proxima abertura mostra o ULTIMO passo que foi gravado.
+static bool g_traceHttp = false;                 // so durante o download da lista M3U
+static const char *g_m3uTag = "m3u-t-";          // "t" = thread de rede | "s" = modo seguro (mesma thread)
+static bool g_safeM3U = false;                   // modo seguro: baixa a lista sem criar thread de rede
+static void traceHttp(const char *what) { if (g_traceHttp) { std::string s = std::string(g_m3uTag) + what; trace(s.c_str()); } }
 static double monoSec() { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec + ts.tv_nsec / 1e9; }
 
 struct NetClient {
@@ -151,18 +156,22 @@ struct NetClient {
         if (!init()) return -1;
         uint64_t offset = useRange ? pos : 0;
         const char *ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
+        traceHttp("tmpl");
         int tmpl = sceHttpCreateTemplate(httpCtx, ua, 1 /*HTTP/1.1*/, 1);
         if (tmpl < 0) return 0;
         sceHttpsDisableOption(tmpl, 0x1F);
         sceHttpSetAutoRedirect(tmpl, 1);
+        traceHttp("tmpl-ok");
         const unsigned T = 20 * 1000 * 1000;                         // resolver/conectar/enviar: 20 s
         sceHttpSetResolveTimeOut(tmpl, T);
         sceHttpSetConnectTimeOut(tmpl, T);
         sceHttpSetSendTimeOut(tmpl, T);
         sceHttpSetRecvTimeOut(tmpl, recvTimeoutSec * 1000u * 1000u);   // paineis IPTV levam 30-60 s para montar a lista antes do 1o byte
         int result = 0;
+        traceHttp("conn");
         int conn = sceHttpCreateConnectionWithURL(tmpl, url.c_str(), 1);
         if (conn >= 0) {
+            traceHttp("req");
             int req = sceHttpCreateRequestWithURL(conn, 0 /*GET*/, url.c_str(), 0);
             if (req >= 0) {
                 sceHttpAddRequestHeader(req, "Accept", "*/*", 0);
@@ -170,8 +179,11 @@ struct NetClient {
                     char rb[48]; snprintf(rb, sizeof rb, "bytes=%llu-", (unsigned long long)offset);
                     sceHttpAddRequestHeader(req, "Range", rb, 0);
                 }
+                traceHttp("send");
                 int rc = sceHttpSendRequest(req, NULL, 0);
+                traceHttp("sent");
                 if (rc >= 0 && sceHttpGetStatusCode(req, &status) >= 0) {
+                    traceHttp("status");
                     uint64_t skip = 0; bool go = false;
                     if (status == 206) go = true;
                     else if (status == 200) { go = true; skip = offset; }        // o servidor ignorou o Range e mandou tudo de novo: descarta o que ja tinhamos
@@ -179,13 +191,16 @@ struct NetClient {
                     else result = (offset > 0 || status >= 500 || status == 0) ? 0 : -1;   // 4xx logo de cara: recusado; depois de ja ter dados: tenta de novo
                     if (go) {
                         std::vector<char> buf(64 * 1024);
+                        bool firstData = true;
                         for (;;) {
+                            if (firstData) traceHttp("read");
                             int n = sceHttpReadData(req, buf.data(), buf.size());
                             if (n < 0) { result = 0; break; }                    // rede caiu no meio
                             if (n == 0) { result = 1; break; }                   // fim normal
                             size_t off = 0;
                             if (skip) { size_t k = (size_t)std::min<uint64_t>(skip, (uint64_t)n); skip -= k; off = k; }
                             if ((size_t)n > off) {
+                                if (firstData) { firstData = false; traceHttp("data"); }
                                 if (!onData(buf.data() + off, (size_t)n - off)) { result = -2; break; }
                                 pos += (uint64_t)n - off;
                             }
@@ -334,17 +349,41 @@ struct Ps4Platform : Platform {
         return ok;
     }
     // Entrega em pedacos para a thread principal (que continua desenhando; O cancela mesmo se o servidor demorar a responder).
-    bool httpStream(const std::string &url, const std::function<bool(const char *, size_t)> &sink) override {
+    bool httpStream(const std::string &url, const std::function<bool(const char *, size_t)> &sink0) override {
         cancelled = false; m3uRetry = 0;
-        trace("m3u-inicio");
-        g_net.init();                                             // inicializa a rede na thread principal (a thread de download so a usa)
-        netstream::Fetch fetch = [this, url](const netstream::Push &push, int &st) -> bool { return fetchM3U(url, push, st); };
-        int st = 0;
-        bool ok = netstream::run(fetch, sink, [this]() {
+        g_m3uTag = g_safeM3U ? "m3u-s-" : "m3u-t-";
+        trace(g_safeM3U ? "m3u-sync-inicio" : "m3u-inicio");
+        g_traceHttp = true;
+        g_net.init();                                             // inicializa a rede na thread principal
+        traceHttp("net-ok");
+        bool firstChunk = true;
+        std::function<bool(const char *, size_t)> sink = [&](const char *d, size_t n) {
+            if (firstChunk) { firstChunk = false; trace("m3u-parse"); }
+            return sink0(d, n);
+        };
+        std::function<bool()> tickFn = [this]() -> bool {
             int rt = m3uRetry.load();
             if (rt > 0 && app) app->say("Conexao caiu - retomando de onde parou (tentativa " + std::to_string(rt) + ")...  (O cancela)");
             return progressTick ? progressTick() : false;
-        }, st, cancelled);
+        };
+        int st = 0; bool ok = false;
+        if (g_safeM3U) {
+            // MODO SEGURO: baixa nesta mesma thread (sem thread de rede). O O so e lido entre um pedaco e outro.
+            if (tickFn()) cancelled = true;                       // mostra "Baixando..." logo de cara
+            double lastTick = monoSec();
+            netstream::Push push = [&](const char *d, size_t n) -> bool {
+                if (cancelled) return false;
+                if (n > 0 && !sink(d, n)) { cancelled = true; return false; }
+                double t = monoSec();
+                if (n == 0 || t - lastTick >= 0.15) { lastTick = t; if (tickFn()) { cancelled = true; return false; } }
+                return true;
+            };
+            if (!cancelled) ok = fetchM3U(url, push, st);
+        } else {
+            netstream::Fetch fetch = [this, url](const netstream::Push &push, int &st2) -> bool { return fetchM3U(url, push, st2); };
+            ok = netstream::run(fetch, sink, tickFn, st, cancelled);
+        }
+        g_traceHttp = false;
         trace(ok ? "m3u-download-ok" : cancelled ? "m3u-cancelado" : "m3u-download-falhou");
         return ok;
     }
@@ -422,7 +461,9 @@ static void traceInit() {
     FILE *f = fopen("/data/kickiptv.log", "wb");
     if (f) { fwrite("inicio\n", 1, 7, f); fclose(f); }
 }
+static std::mutex g_traceMu;
 static void trace(const char *stage) {
+    std::lock_guard<std::mutex> lk(g_traceMu);
     FILE *f = fopen("/data/kickiptv.log", "ab");
     if (f) { fwrite(stage, 1, strlen(stage), f); fwrite("\n", 1, 1, f); fclose(f); }
 }
@@ -1520,11 +1561,27 @@ int main() {
         if ((pin.held | pin.pending) & B_OPTIONS) { wantQuit = true; return true; }
         return false;
     };
-    if (ui.hasSavedList()) {                  // reabre a lista M3U da ultima vez
-        app.say("Carregando sua lista M3U...");
-        presentMenu();
-        ui.loadSavedList();
-        trace("lista-m3u-carregada");
+    // Protecao contra "fecha sempre ao abrir": se a ultima abertura caiu durante a lista M3U, muda de estrategia.
+    //  1a queda -> a proxima abertura usa o MODO SEGURO (baixa a lista sem thread de rede) e isso fica gravado;
+    //  caiu ate no modo seguro -> nao carrega a lista sozinho (o app abre normalmente e mostra o passo onde parou).
+    {
+        auto starts = [&](const char *p) { return g_prevStage.rfind(p, 0) == 0; };
+        bool crashM3u = starts("m3u-inicio") || starts("m3u-t-") || starts("m3u-sync") || starts("m3u-s-") || starts("m3u-parse");
+        bool wasSafe = pf.loadSetting("safem3u") == "1";
+        if (wasSafe) g_safeM3U = true;
+        bool skipAuto = false;
+        if (crashM3u) {
+            if (!wasSafe) { g_safeM3U = true; pf.saveSetting("safem3u", "1"); trace("modo-seguro-ligado"); }
+            else skipAuto = true;
+        }
+        if (ui.hasSavedList() && skipAuto) {
+            app.say("A lista M3U fechou o app na ultima vez (passo: " + g_prevStage + ") - nao carreguei sozinho. Abra LISTA M3U e aperte X.");
+        } else if (ui.hasSavedList()) {          // reabre a lista M3U da ultima vez
+            app.say(g_safeM3U ? "Carregando sua lista M3U (modo seguro)..." : "Carregando sua lista M3U...");
+            presentMenu();
+            ui.loadSavedList();
+            trace("lista-m3u-carregada");
+        }
     }
 
     for (;;) {
