@@ -80,5 +80,45 @@ int main() {
       k.cx = 0; k.cy = 1; k.press(); assert(k.text == "Q");
       k.insert("https://"); assert(k.text == "Qhttps://"); k.backspace(); k.clear(); assert(k.text.empty());
       k.open("", false); assert(k.maxLen == 25); }
+    // --- itemCount/itemLabel (sem copiar a lista toda) == labels() em todas as abas e niveis ---
+    {
+        Fake f3; App a3(f3); UI u3(a3); u3.setM3U("http://x/l.m3u");
+        for (Tab t : {Tab::Kick, Tab::Channels, Tab::Movies, Tab::Series}) {
+            u3.tab = t; u3.level = 0;
+            auto v = u3.labels(); assert((int)v.size() == u3.itemCount());
+            for (int i = 0; i < u3.itemCount(); i++) assert(u3.itemLabel(i) == v[i]);
+        }
+        u3.tab = Tab::Series; u3.level = 1; u3.curSeries = "Dark"; assert(u3.itemCount() == 2 && u3.itemLabel(0) == "Temporada 1");
+        u3.level = 2; u3.curSeason = 1; assert(u3.itemCount() == 2 && u3.itemLabel(0) == "Ep 1 - Dark S01E01");
+        assert(u3.itemLabel(99).empty() && u3.itemLabel(-1).empty());
+    }
+    // --- lista grande: navegar nao pode depender do tamanho da lista ---
+    {
+        Fake f4; App a4(f4); UI u4(a4);
+        for (int i = 0; i < 50000; i++) { Entry e; e.name = "Canal " + std::to_string(i); a4.list.channels.push_back(e); }
+        u4.tab = Tab::Channels; u4.screen = Screen::List;
+        u4.handle(Input::PageDown); assert(u4.cursor[1] == UI::kRows);
+        for (int i = 0; i < 5000; i++) u4.handle(Input::Down);
+        assert(u4.cursor[1] == UI::kRows + 5000 && u4.scroll[1] == u4.cursor[1] - UI::kRows + 1);
+        Rec r; u4.render(r); assert(r.has("Canal " + std::to_string(u4.cursor[1])));
+    }
+    // --- uiFit: corta com "..." sem estourar a largura e sem quebrar UTF-8 ---
+    {
+        Rec r; std::string longo(200, 'a');
+        std::string o = uiFit(r, longo, 28, 500); assert(r.textWidth(o, 28) <= 500 && o.size() > 10 && o.compare(o.size() - 3, 3, "...") == 0);
+        std::string u = uiFit(r, "çãõéíú çãõéíú çãõéíú çãõéíú çãõéíú", 28, 200);
+        assert(r.textWidth(u, 28) <= 200);
+        for (size_t i = 0; i < u.size();) { unsigned char c = u[i]; size_t n = c < 0x80 ? 1 : (c >> 5) == 6 ? 2 : (c >> 4) == 14 ? 3 : 4; assert(i + n <= u.size()); i += n; }
+        assert(uiFit(r, "curto", 28, 500) == "curto");
+    }
+    // --- Teclado: cursor piscando e posicao do campo ---
+    {
+        Keyboard k; k.open("abc", false);
+        Rec r; auto fld = k.field(r);
+        assert(fld.shown == "abc" && fld.caretX == fld.px + r.textWidth("abc", 36) + 3);
+        k.drawCaret(r, true); k.drawCaret(r, false);                      // nao pode quebrar
+        k.open(std::string(300, 'x'), true);
+        auto f2 = k.field(r); assert(f2.shown.compare(0, 3, "...") == 0 && f2.caretX < r.width());
+    }
     std::cout << "OK\n";
 }
