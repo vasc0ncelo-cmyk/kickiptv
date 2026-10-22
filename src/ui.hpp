@@ -1,5 +1,6 @@
 #pragma once
-// Navegacao e desenho das abas. Independente de plataforma: o PS4 so implementa Renderer + leitura do pad.
+// Navegacao e desenho das telas. Independente de plataforma: o PS4 so implementa Renderer + leitura do pad.
+// Telas: Home (banner + 4 atalhos + lista M3U), Kick TV (digitar @streamer) e listas (Filmes / Series / Canais).
 #include "app.hpp"
 #include <algorithm>
 #include <cctype>
@@ -7,7 +8,8 @@
 #include <utility>
 #include <vector>
 
-enum class Input { Up, Down, PrevTab, NextTab, Confirm, Back, PageUp, PageDown };
+enum class Input { Up, Down, Left, Right, PrevTab, NextTab, Confirm, Back, PageUp, PageDown };
+enum class Screen { Home, Kick, List };
 
 struct Renderer {
     virtual ~Renderer() {}
@@ -18,6 +20,7 @@ struct Renderer {
     // extras visuais (o PS4 implementa de verdade; nos testes caem no retangulo simples)
     virtual void roundRect(int x, int y, int w, int h, int /*raio*/, unsigned argb) { fillRect(x, y, w, h, argb); }
     virtual void gradient(int x, int y, int w, int h, unsigned top, unsigned /*bottom*/) { fillRect(x, y, w, h, top); }
+    virtual void pixel(int x, int y, unsigned argb) { fillRect(x, y, 1, 1, argb); }   // com transparencia
     virtual int textWidth(const std::string &t, int size) const {
         int n = 0; for (unsigned char c : t) if ((c & 0xC0) != 0x80) n++;
         return (int)(n * (int)(8 * size / 16.0f + 0.5f));
@@ -26,21 +29,45 @@ struct Renderer {
 
 // ---------- Tema (cores ARGB) ----------
 namespace theme {
-constexpr unsigned BG1 = 0xFF090B10, BG2 = 0xFF151A28;
-constexpr unsigned CARD = 0xFF161B27, CARD2 = 0xFF1C2333, SEL = 0xFF232C42, CHIP = 0xFF252D40, KEY = 0xFF2F384F;
-constexpr unsigned GREEN = 0xFF53FC18, GREEN_GLOW = 0x3353FC18, BLACK = 0xFF000000;
-constexpr unsigned TEXT = 0xFFF2F4F8, SOFT = 0xFFC9D0DF, MUTED = 0xFF8B94A8, DIM = 0xFF5B6478;
+constexpr unsigned BG = 0xFF000000;
+constexpr unsigned GREEN = 0xFF53FC18, GREEN_DK = 0xFF1F8A0C, GREEN_GLOW = 0x3353FC18, BLACK = 0xFF000000;
+constexpr unsigned CARD = 0xFF121212, CARD2 = 0xFF1A1A1A, CARD_LINE = 0xFF2A2A2A, SEL = 0xFF0A1408, KEY = 0xFF2E2E2E, CHIP = 0xFF222222;
+constexpr unsigned TEXT = 0xFFFFFFFF, SOFT = 0xFFD6D6D6, MUTED = 0xFF9A9A9A, DIM = 0xFF5E5E5E;
 constexpr unsigned RED = 0xFFFF4D5A, AMBER = 0xFFFFB020;
 }
 
-// ---------- Helpers de desenho ----------
+// ---------- Matematica simples (sem libm) ----------
+inline float uiSqrt(float v) {
+    if (v <= 0.f) return 0.f;
+    float g = v > 1.f ? v * 0.5f + 0.5f : 1.f;
+    for (int i = 0; i < 8; i++) g = 0.5f * (g + v / g);
+    return g;
+}
+inline float uiAbs(float v) { return v < 0 ? -v : v; }
+inline unsigned uiAlpha(unsigned argb, int a) {                 // multiplica o alfa da cor por a/255
+    if (a < 0) a = 0;
+    if (a > 255) a = 255;
+    unsigned A = ((argb >> 24) * (unsigned)a) / 255;
+    return (A << 24) | (argb & 0xFFFFFF);
+}
+
+// ---------- Helpers de texto ----------
 inline void uiText(Renderer &r, int x, int y, const std::string &t, unsigned c, int size, bool bold = false) {
     r.drawText(x, y, t, c, size);
     if (bold) r.drawText(x + 1, y, t, c, size);
 }
+// texto "pesado" (titulos): varias passadas deslocadas
+inline void uiHeavy(Renderer &r, int x, int y, const std::string &t, unsigned c, int size) {
+    r.drawText(x, y, t, c, size);
+    r.drawText(x + 1, y, t, c, size);
+    if (size >= 30) { r.drawText(x + 2, y, t, c, size); r.drawText(x + 1, y + 1, t, c, size); }
+}
 // centraliza em (cx, cy)
 inline void uiCenter(Renderer &r, int cx, int cy, const std::string &t, unsigned c, int size, bool bold = false) {
     uiText(r, cx - r.textWidth(t, size) / 2, cy - size / 2, t, c, size, bold);
+}
+inline void uiCenterHeavy(Renderer &r, int cx, int cy, const std::string &t, unsigned c, int size) {
+    uiHeavy(r, cx - r.textWidth(t, size) / 2, cy - size / 2, t, c, size);
 }
 // corta o texto com "..." para caber em maxW
 inline std::string uiFit(const Renderer &r, std::string s, int size, int maxW) {
@@ -64,57 +91,294 @@ inline int uiHints(Renderer &r, int rightX, int cy, const std::vector<std::pair<
     }
     return x + 30;
 }
-inline void uiBackground(Renderer &r) { r.gradient(0, 0, r.width(), r.height(), theme::BG1, theme::BG2); }
-inline void uiLogo(Renderer &r, int x, int y, int size) {   // quadrado verde com "K"
-    r.roundRect(x, y, size, size, size / 4, theme::GREEN);
-    uiCenter(r, x + size / 2, y + size / 2, "K", theme::BLACK, size * 3 / 5, true);
+
+// ---------- Formas ----------
+// Retangulo arredondado como area de recorte
+struct UiClip {
+    int x, y, w, h, rad;
+    bool span(int row, float &xl, float &xr) const {
+        if (row < y || row >= y + h) return false;
+        float cy = row + 0.5f, dy = 0.f;
+        if (cy < y + rad) dy = (y + rad) - cy; else if (cy > y + h - rad) dy = cy - (y + h - rad);
+        float inset = 0.f;
+        if (dy > 0.f) { float t = (float)rad * rad - dy * dy; inset = rad - uiSqrt(t < 0 ? 0 : t); }
+        xl = x + inset; xr = x + w - inset; return true;
+    }
+};
+struct UiPt { float x, y; };
+
+inline void uiSpan(Renderer &r, int row, float a, float b, unsigned c) {
+    if (b <= a) return;
+    if (a < 0) a = 0;
+    if (b < 0) return;
+    int xa = (int)a, xb = (int)b;
+    float fa = a - xa, fb = b - xb;
+    if (xa == xb) { r.pixel(xa, row, uiAlpha(c, (int)((b - a) * 255))); return; }
+    if (fa > 0.01f) { r.pixel(xa, row, uiAlpha(c, (int)((1.f - fa) * 255))); xa++; }
+    if (xb > xa) r.fillRect(xa, row, xb - xa, 1, c);
+    if (fb > 0.01f) r.pixel(xb, row, uiAlpha(c, (int)(fb * 255)));
+}
+// poligono (convexo ou simples), com recorte opcional em retangulo arredondado
+inline void uiPoly(Renderer &r, const UiPt *p, int n, unsigned c, const UiClip *clip = nullptr) {
+    float miny = p[0].y, maxy = p[0].y;
+    for (int i = 1; i < n; i++) { if (p[i].y < miny) miny = p[i].y; if (p[i].y > maxy) maxy = p[i].y; }
+    int y0 = (int)miny; if (y0 < 0) y0 = 0;
+    int y1 = (int)maxy + 1; if (y1 > r.height()) y1 = r.height();
+    for (int row = y0; row < y1; row++) {
+        float yc = row + 0.5f, xs[16]; int k = 0;
+        for (int i = 0; i < n && k < 16; i++) {
+            UiPt a = p[i], b = p[(i + 1) % n];
+            if (a.y == b.y) continue;
+            float lo = a.y < b.y ? a.y : b.y, hi = a.y < b.y ? b.y : a.y;
+            if (yc < lo || yc >= hi) continue;
+            xs[k++] = a.x + (yc - a.y) * (b.x - a.x) / (b.y - a.y);
+        }
+        for (int i = 1; i < k; i++) for (int j = i; j > 0 && xs[j] < xs[j - 1]; j--) std::swap(xs[j], xs[j - 1]);
+        float cl = -1e9f, cr = 1e9f;
+        if (clip && !clip->span(row, cl, cr)) continue;
+        for (int i = 0; i + 1 < k; i += 2) {
+            float a = xs[i] < cl ? cl : xs[i], b = xs[i + 1] > cr ? cr : xs[i + 1];
+            uiSpan(r, row, a, b, c);
+        }
+    }
+}
+// faixa diagonal a 45 graus (de baixo-esquerda para cima-direita) entre x+y = k0 e x+y = k1
+inline void uiBand(Renderer &r, float k0, float k1, float top, float bottom, unsigned c, const UiClip *clip) {
+    UiPt p[4] = {{k0 - top, top}, {k1 - top, top}, {k1 - bottom, bottom}, {k0 - bottom, bottom}};
+    uiPoly(r, p, 4, c, clip);
+}
+// pinta pixel a pixel por cobertura 0..1 (formas curvas)
+template <class F> inline void uiPaint(Renderer &r, int x0, int y0, int x1, int y1, unsigned col, F cov) {
+    for (int y = y0; y < y1; y++)
+        for (int x = x0; x < x1; x++) {
+            float c = cov(x + 0.5f, y + 0.5f);
+            if (c <= 0.02f) continue;
+            if (c > 1.f) c = 1.f;
+            r.pixel(x, y, uiAlpha(col, (int)(c * 255)));
+        }
+}
+inline float uiSdBox(float px, float py, float hx, float hy, float rad) {   // distancia ate um retangulo arredondado
+    float qx = uiAbs(px) - hx + rad, qy = uiAbs(py) - hy + rad;
+    float mx = qx > 0 ? qx : 0, my = qy > 0 ? qy : 0;
+    float in = qx > qy ? qx : qy; if (in > 0) in = 0;
+    return uiSqrt(mx * mx + my * my) + in - rad;
+}
+inline float uiClamp01(float v) { return v < 0 ? 0 : v > 1 ? 1 : v; }
+
+// brilho suave em volta de um retangulo arredondado
+inline void uiGlow(Renderer &r, int x, int y, int w, int h, int rad, unsigned color, int spread, int peakAlpha) {
+    for (int i = spread; i >= 1; i--) {
+        int a = peakAlpha * (spread - i + 1) / (spread * 3);
+        r.roundRect(x - i, y - i, w + 2 * i, h + 2 * i, rad + i, uiAlpha(color, a));
+    }
+}
+// contorno: preenche com a cor da borda e depois o miolo
+inline void uiFrame(Renderer &r, int x, int y, int w, int h, int rad, int bw, unsigned border, unsigned fill) {
+    r.roundRect(x, y, w, h, rad, border);
+    r.roundRect(x + bw, y + bw, w - 2 * bw, h - 2 * bw, rad > bw ? rad - bw : 0, fill);
+}
+
+// ---------- Marca Kick (estilo pixel) ----------
+// "K" em blocos, caixa w x h
+inline void uiKMark(Renderer &r, int x, int y, int w, int h, unsigned c) {
+    struct R { float x0, x1, y0, y1; };
+    static const R rs[8] = {{0, .370f, 0, 1}, {.370f, .491f, .245f, .764f}, {.491f, .620f, .136f, .882f}, {.620f, 1, 0, .318f},
+                            {.620f, .861f, .318f, .445f}, {.620f, .741f, .445f, .564f}, {.620f, .861f, .564f, .691f}, {.620f, 1, .691f, 1}};
+    for (const R &q : rs) {
+        int rx0 = x + (int)(q.x0 * w + 0.5f), rx1 = x + (int)(q.x1 * w + 0.5f);
+        int ry0 = y + (int)(q.y0 * h + 0.5f), ry1 = y + (int)(q.y1 * h + 0.5f);
+        r.fillRect(rx0, ry0, rx1 - rx0, ry1 - ry0, c);
+    }
+}
+// letras pesadas do wordmark (K I C P T V). Retorna a largura usada.
+inline int uiLetterW(char ch, int h) {
+    switch (ch) { case 'K': case 'C': case 'T': return h * 4 / 5; case 'I': return h * 17 / 50; case 'P': return h * 18 / 25; case 'V': return h * 9 / 10; default: return h * 7 / 20; }
+}
+inline int uiLetter(Renderer &r, char ch, int x, int y, int w, int h, unsigned c) {
+    int t = h * 27 / 100;
+    switch (ch) {
+    case 'K': uiKMark(r, x, y, w, h, c); break;
+    case 'I': r.fillRect(x, y, w, h, c); break;
+    case 'C':
+        r.fillRect(x, y, t, h, c); r.fillRect(x, y, w, t, c); r.fillRect(x, y + h - t, w, t, c);
+        r.fillRect(x + w - t * 4 / 5, y + t, t * 4 / 5, t / 2, c); r.fillRect(x + w - t * 4 / 5, y + h - t - t / 2, t * 4 / 5, t / 2, c);
+        break;
+    case 'P': {
+        int bh = h * 64 / 100;
+        r.fillRect(x, y, t, h, c); r.fillRect(x, y, w, t, c); r.fillRect(x, y + bh - t, w, t, c); r.fillRect(x + w - t, y, t, bh, c);
+        break; }
+    case 'T': r.fillRect(x, y, w, t, c); r.fillRect(x + (w - t) / 2, y, t, h, c); break;
+    case 'V': {
+        float tw = t * 1.15f, fx = (float)x, fy = (float)y, fw = (float)w, fh = (float)h;
+        UiPt a[4] = {{fx, fy}, {fx + tw, fy}, {fx + fw / 2 + tw / 2, fy + fh}, {fx + fw / 2 - tw / 2, fy + fh}};
+        UiPt b[4] = {{fx + fw - tw, fy}, {fx + fw, fy}, {fx + fw / 2 + tw / 2, fy + fh}, {fx + fw / 2 - tw / 2, fy + fh}};
+        uiPoly(r, a, 4, c); uiPoly(r, b, 4, c);
+        break; }
+    }
+    return w;
+}
+// palavra com letras pesadas; wScale em % da largura normal (100 = normal). Retorna a largura total.
+inline int uiWord(Renderer &r, const char *s, int x, int y, int h, unsigned c, int wScale = 100) {
+    int cx = x, gap = h / 9 + 1;
+    for (; *s; s++) {
+        if (*s == ' ') { cx += h * 3 / 10; continue; }
+        int w = uiLetterW(*s, h) * wScale / 100;
+        uiLetter(r, *s, cx, y, w, h, c);
+        cx += w + gap;
+    }
+    return cx - gap - x;
+}
+
+inline int uiWordWidth(const char *s, int h, int wScale = 100) {
+    int cx = 0, gap = h / 9 + 1;
+    for (; *s; s++) { if (*s == ' ') { cx += h * 3 / 10; continue; } cx += uiLetterW(*s, h) * wScale / 100 + gap; }
+    return cx - gap;
+}
+
+// ---------- Icones ----------
+inline void uiIconWifi(Renderer &r, int cx, int cy, int s, unsigned c) {   // (cx, cy) = ponto de baixo
+    float t = s * 0.13f;
+    for (int k = 1; k <= 3; k++) {
+        float R = s * (0.30f * k + 0.05f);
+        uiPaint(r, cx - (int)(R + 2), cy - (int)(R + 2), cx + (int)(R + 2), cy + 2, c, [&](float px, float py) {
+            float dx = px - cx, dy = py - cy;
+            if (dy > -s * 0.04f || uiAbs(dx) > -dy * 1.0f) return 0.f;
+            float d = uiSqrt(dx * dx + dy * dy);
+            return uiClamp01(0.5f - (uiAbs(d - R) - t * 0.5f));
+        });
+    }
+    r.roundRect(cx - (int)(s * 0.08f), cy - (int)(s * 0.08f), (int)(s * 0.16f), (int)(s * 0.16f), (int)(s * 0.08f), c);
+}
+inline void uiIconLink(Renderer &r, int cx, int cy, int s, unsigned c) {
+    const float k = 0.7071f, t = s * 0.085f, hx = s * 0.30f, hy = s * 0.17f;
+    uiPaint(r, cx - s / 2, cy - s / 2, cx + s / 2, cy + s / 2, c, [&](float px, float py) {
+        float dx = px - cx, dy = py - cy;
+        float u = (dx - dy) * k, v = (dx + dy) * k;
+        float best = 0.f;
+        for (int i = -1; i <= 1; i += 2) {
+            float sd = uiSdBox(u - i * s * 0.19f, v, hx, hy, hy);
+            float cv = uiClamp01(0.5f - (uiAbs(sd + t * 0.5f) - t * 0.5f));
+            if (cv > best) best = cv;
+        }
+        return best;
+    });
+}
+inline void uiIconClapper(Renderer &r, int x, int y, int s, unsigned c, unsigned bg) {
+    float S = (float)s, fx = (float)x, fy = (float)y;
+    r.roundRect(x, y + (int)(S * 0.50f), s, (int)(S * 0.50f), (int)(S * 0.07f), c);
+    UiPt arm[4] = {{fx, fy + S * 0.30f}, {fx + S * 0.88f, fy + S * 0.06f}, {fx + S * 0.93f, fy + S * 0.24f}, {fx + S * 0.03f, fy + S * 0.47f}};
+    uiPoly(r, arm, 4, c);
+    for (int i = 0; i < 3; i++) {   // listras escuras do claquete
+        float o = S * (0.14f + 0.22f * i);
+        UiPt st[4] = {{fx + o, fy + S * 0.28f - o * 0.27f}, {fx + o + S * 0.09f, fy + S * 0.255f - o * 0.27f},
+                      {fx + o + S * 0.02f, fy + S * 0.47f - o * 0.27f}, {fx + o - S * 0.07f, fy + S * 0.49f - o * 0.27f}};
+        uiPoly(r, st, 4, bg);
+    }
+    r.fillRect(x, y + (int)(S * 0.47f), s, (int)(S * 0.045f) + 1, bg);
+    r.roundRect(x + (int)(S * 0.22f), y + (int)(S * 0.62f), (int)(S * 0.16f), (int)(S * 0.06f), (int)(S * 0.03f), bg);
+    r.roundRect(x + (int)(S * 0.62f), y + (int)(S * 0.62f), (int)(S * 0.16f), (int)(S * 0.06f), (int)(S * 0.03f), bg);
+}
+inline void uiAntennas(Renderer &r, float cx, float baseY, float S, float t, unsigned c) {
+    UiPt a[4] = {{cx - S * 0.30f, baseY - S * 0.22f}, {cx - S * 0.30f + t, baseY - S * 0.22f}, {cx + t * 0.5f, baseY}, {cx - t * 0.5f, baseY}};
+    UiPt b[4] = {{cx + S * 0.30f - t, baseY - S * 0.22f}, {cx + S * 0.30f, baseY - S * 0.22f}, {cx + t * 0.5f, baseY}, {cx - t * 0.5f, baseY}};
+    uiPoly(r, a, 4, c); uiPoly(r, b, 4, c);
+}
+inline void uiIconTvPlay(Renderer &r, int x, int y, int s, unsigned c, unsigned bg) {
+    float S = (float)s;
+    uiAntennas(r, x + S * 0.5f, y + S * 0.22f, S, S * 0.07f, c);
+    r.roundRect(x, y + (int)(S * 0.20f), s, (int)(S * 0.68f), (int)(S * 0.09f), c);
+    r.roundRect(x + (int)(S * 0.065f), y + (int)(S * 0.265f), (int)(S * 0.87f), (int)(S * 0.55f), (int)(S * 0.04f), bg);
+    UiPt tri[3] = {{x + S * 0.42f, y + S * 0.38f}, {x + S * 0.42f, y + S * 0.70f}, {x + S * 0.67f, y + S * 0.54f}};
+    uiPoly(r, tri, 3, c);
+    r.roundRect(x + (int)(S * 0.28f), y + (int)(S * 0.93f), (int)(S * 0.44f), (int)(S * 0.065f), (int)(S * 0.03f), c);
+}
+inline void uiIconTvRetro(Renderer &r, int x, int y, int s, unsigned c, unsigned bg) {
+    float S = (float)s;
+    uiAntennas(r, x + S * 0.5f, y + S * 0.26f, S, S * 0.07f, c);
+    r.roundRect(x, y + (int)(S * 0.24f), s, (int)(S * 0.70f), (int)(S * 0.17f), c);
+    r.roundRect(x + (int)(S * 0.095f), y + (int)(S * 0.335f), (int)(S * 0.64f), (int)(S * 0.52f), (int)(S * 0.11f), bg);
+    r.roundRect(x + (int)(S * 0.83f), y + (int)(S * 0.575f), (int)(S * 0.06f), (int)(S * 0.06f), (int)(S * 0.03f), bg);
+    r.roundRect(x + (int)(S * 0.17f), y + (int)(S * 0.925f), (int)(S * 0.16f), (int)(S * 0.06f), (int)(S * 0.03f), c);
+    r.roundRect(x + (int)(S * 0.67f), y + (int)(S * 0.925f), (int)(S * 0.16f), (int)(S * 0.06f), (int)(S * 0.03f), c);
+}
+
+// ---------- Fundo e cabecalho ----------
+inline void uiBackground(Renderer &r) {
+    const int W = r.width(), H = r.height();
+    r.fillRect(0, 0, W, H, theme::BG);
+    // brilho verde sutil no canto inferior direito
+    for (int i = 18; i >= 1; i--) {
+        int rad = 70 + i * 28;
+        r.roundRect(W - rad + 60, H - rad + 60, rad * 2, rad * 2, rad, 0x0653FC18);
+    }
+    // faixa diagonal discreta no topo
+    UiPt p[4] = {{1330, 0}, {1470, 0}, {1230, 190}, {1090, 190}};
+    uiPoly(r, p, 4, 0x12FFFFFF);
+}
+inline int uiLogoWidth(int h) { return uiWordWidth("KICK", h) + h * 3 / 8 + uiWordWidth("IPTV", h); }
+inline void uiLogo(Renderer &r, int x, int y, int h) {      // "KICK IPTV"
+    int w = uiWord(r, "KICK", x, y, h, theme::GREEN);
+    uiWord(r, "IPTV", x + w + h * 3 / 8, y, h, theme::TEXT);
+}
+inline void uiTopRight(Renderer &r, const std::string &hhmm, const std::string &date) {
+    const int W = r.width();
+    uiIconWifi(r, W - 301, 100, 80, theme::GREEN);
+    r.fillRect(W - 230, 46, 2, 69, 0xFF6A6A6A);
+    if (!hhmm.empty()) {
+        const int rx = W - 72;
+        uiHeavy(r, rx - r.textWidth(hhmm, 46), 44, hhmm, theme::TEXT, 46);
+        uiText(r, rx - r.textWidth(date, 22), 94, date, theme::SOFT, 22);
+    }
+}
+inline void uiHeader(Renderer &r, const std::string &hhmm, const std::string &date) {
+    uiBackground(r);
+    uiLogo(r, 73, 46, 69);
+    uiTopRight(r, hhmm, date);
 }
 
 struct UI {
     App &app;
-    Tab tab = Tab::Channels;
+    Screen screen = Screen::Home;
+    Tab tab = Tab::Kick;
+    int homeRow = 1;          // 0 = banner, 1 = atalhos, 2 = lista M3U
+    int homeCol = 0;          // 0 Kick TV, 1 Filmes, 2 Series, 3 Canais
     int cursor[4] = {0, 0, 0, 0};
     int scroll[4] = {0, 0, 0, 0};
-    int level = 0;           // so Series: 0 series, 1 temporadas, 2 episodios
+    int level = 0;            // so Series: 0 series, 1 temporadas, 2 episodios
     std::string curSeries;
     int curSeason = 0;
-    std::string kickLast;    // ultimo @ pesquisado
+    std::string kickLast;     // ultimo @ pesquisado
+    std::string m3uUrl;       // lista M3U atual
+    std::string timeText, dateText;   // relogio (a plataforma atualiza)
+    int textKind = 0;         // 0 nada, 1 = @streamer, 2 = endereco M3U (o que o teclado esta pedindo)
     static const int kRows = 10;
 
     explicit UI(App &a) : app(a) {}
 
-    // Itens da aba Kick (a ordem muda se ja existe um "ultimo streamer")
-    enum { KA_TYPE = 0, KA_LAST = 1, KA_TEST_HTTPS = 2, KA_TEST_HTTP = 3, KA_AVDIAG = 4 };
+    static Tab tileTab(int col) { static const Tab m[4] = {Tab::Kick, Tab::Movies, Tab::Series, Tab::Channels}; return m[col & 3]; }
+    static int tabTile(Tab t) { for (int i = 0; i < 4; i++) if (tileTab(i) == t) return i; return 0; }
+
+    // Dados guardados da ultima vez
+    void loadSaved() {
+        kickLast = kickSlug(app.pf.loadSetting("kick"));
+        m3uUrl = app.pf.loadSetting("m3u");
+    }
+    bool hasSavedList() const { return !m3uUrl.empty(); }
+    void loadSavedList() { if (!m3uUrl.empty()) app.loadM3U(m3uUrl); }
+
+    // Itens da tela Kick TV
+    enum { KA_TYPE = 0, KA_LAST = 1 };
     std::vector<int> kickActions() const {
         std::vector<int> a;
         a.push_back(KA_TYPE);
         if (!kickLast.empty()) a.push_back(KA_LAST);
-        a.push_back(KA_TEST_HTTPS);
-        a.push_back(KA_TEST_HTTP);
-        a.push_back(KA_AVDIAG);
         return a;
     }
-    std::string kickLabel(int a) const {
-        switch (a) {
-        case KA_TYPE: return "Digitar @streamer";
-        case KA_LAST: return "Assistir @" + kickLast;
-        case KA_AVDIAG: return "Diagnóstico do AvPlayer";
-        case KA_TEST_HTTPS: return "Teste do player (HTTPS)";
-        default: return "Teste do player (HTTP)";
-        }
-    }
+    std::string kickLabel(int a) const { return a == KA_LAST ? "Assistir @" + kickLast : "Digitar @streamer"; }
     std::string kickSub(int a) const {
-        switch (a) {
-        case KA_TYPE: return "Abre o teclado na tela e procura o canal ao vivo";
-        case KA_LAST: return "Abrir de novo o último canal pesquisado";
-        case KA_AVDIAG: return "Roda vários testes e mostra o resultado na tela";
-        case KA_TEST_HTTPS: return "Vídeo HLS público para validar o player";
-        default: return "Vídeo HLS público (sem criptografia)";
-        }
+        return a == KA_LAST ? "Abrir de novo o último canal pesquisado" : "Abre o teclado na tela e procura o canal ao vivo";
     }
-    static std::string kickIcon(int a) {
-        switch (a) { case KA_TYPE: return "@"; case KA_LAST: return ">"; case KA_AVDIAG: return "D"; default: return "T"; }
-    }
+    static std::string kickIcon(int a) { return a == KA_LAST ? ">" : "@"; }
 
     std::vector<std::string> labels() const {
         std::vector<std::string> v;
@@ -143,23 +407,47 @@ struct UI {
         return v;
     }
 
-    void onText(const std::string &t) { // chamado pelo IME ao confirmar
-        kickLast = kickSlug(t);
-        if (kickLast.empty() && !t.empty()) { app.say("@ invalido"); return; }
-        if (!kickLast.empty()) app.watchKick(kickLast);
+    // texto confirmado no teclado
+    void onText(const std::string &raw) {
+        int kind = textKind; textKind = 0;
+        if (kind == 2) { setM3U(raw); return; }
+        kickLast = kickSlug(raw);
+        if (kickLast.empty() && !raw.empty()) { app.say("@ invalido"); return; }
+        if (!kickLast.empty()) { app.pf.saveSetting("kick", kickLast); app.watchKick(kickLast); }
+    }
+    // texto que o teclado mostra ao abrir
+    std::string textInitial() const { return textKind == 2 ? m3uUrl : kickLast; }
+
+    void setM3U(std::string url) {
+        size_t a = url.find_first_not_of(" \t\r\n"), b = url.find_last_not_of(" \t\r\n");
+        url = a == std::string::npos ? "" : url.substr(a, b - a + 1);
+        if (url.empty()) {                       // campo vazio = remover a lista
+            m3uUrl.clear(); app.list = Playlist(); app.pf.saveSetting("m3u", "");
+            cursor[1] = cursor[2] = cursor[3] = scroll[1] = scroll[2] = scroll[3] = 0; level = 0;
+            app.say("Lista M3U removida");
+            return;
+        }
+        if (url.compare(0, 7, "http://") != 0 && url.compare(0, 8, "https://") != 0) url = "http://" + url;
+        if (app.loadM3U(url)) {
+            m3uUrl = url; app.pf.saveSetting("m3u", url);
+            cursor[1] = cursor[2] = cursor[3] = scroll[1] = scroll[2] = scroll[3] = 0; level = 0;
+        }
     }
 
     void handle(Input in) {
+        if (screen == Screen::Home) { handleHome(in); return; }
         int t = (int)tab, n = (int)labels().size();
         switch (in) {
-        case Input::PrevTab: setTab((t + 3) % 4); return;
-        case Input::NextTab: setTab((t + 1) % 4); return;
+        case Input::PrevTab: openTab(tileTab((tabTile(tab) + 3) % 4)); return;
+        case Input::NextTab: openTab(tileTab((tabTile(tab) + 1) % 4)); return;
         case Input::Up: cursor[t] = std::max(0, cursor[t] - 1); break;
         case Input::Down: cursor[t] = std::min(std::max(0, n - 1), cursor[t] + 1); break;
         case Input::PageUp: cursor[t] = std::max(0, cursor[t] - kRows); break;
         case Input::PageDown: cursor[t] = std::min(std::max(0, n - 1), cursor[t] + kRows); break;
+        case Input::Left: case Input::Right: return;
         case Input::Back:
             if (tab == Tab::Series && level > 0) { level--; cursor[t] = 0; scroll[t] = 0; }
+            else screen = Screen::Home;
             return;
         case Input::Confirm: confirm(n); return;
         }
@@ -167,118 +455,226 @@ struct UI {
         if (cursor[t] >= scroll[t] + kRows) scroll[t] = cursor[t] - kRows + 1;
     }
 
+    // ---------- Desenho ----------
     void render(Renderer &r) {
-        using namespace theme;
-        const int W = r.width(), H = r.height();
-        uiBackground(r);
+        uiHeader(r, timeText, dateText);
+        if (screen == Screen::Home) renderHome(r); else renderList(r);
+        renderFooter(r);
+    }
 
-        // ---- Cabecalho: logo + titulo + abas em "pilulas" ----
-        uiLogo(r, 48, 28, 64);
-        uiText(r, 132, 26, "Kick IPTV", TEXT, 38, true);
-        uiText(r, 134, 72, "Lives da Kick direto no seu PS4", MUTED, 20);
-        static const char *names[4] = {"Kick", "Canais", "Filmes", "Séries"};
-        const int pw = 160, ph = 50, pg = 6, total = 4 * pw + 3 * pg;
-        const int tx = W - 48 - total - 6;
-        r.roundRect(tx - 6, 34, total + 12, ph + 12, (ph + 12) / 2, CARD);
-        for (int i = 0; i < 4; i++) {
-            bool on = i == (int)tab;
-            int px = tx + i * (pw + pg);
-            if (on) { r.roundRect(px - 3, 37, pw + 6, ph + 6, 28, GREEN_GLOW); r.roundRect(px, 40, pw, ph, ph / 2, GREEN); }
-            uiCenter(r, px + pw / 2, 40 + ph / 2, names[i], on ? BLACK : MUTED, 24, on);
+private:
+    void openTab(Tab t) { tab = t; screen = t == Tab::Kick ? Screen::Kick : Screen::List; level = 0; }
+    void requestM3U() { textKind = 2; app.pf.requestText("Endereço da lista M3U"); }
+
+    void handleHome(Input in) {
+        switch (in) {
+        case Input::Up: homeRow = std::max(0, homeRow - 1); break;
+        case Input::Down: homeRow = std::min(2, homeRow + 1); break;
+        case Input::Left: if (homeRow == 1) homeCol = std::max(0, homeCol - 1); break;
+        case Input::Right: if (homeRow == 1) homeCol = std::min(3, homeCol + 1); break;
+        case Input::PrevTab: if (homeRow == 1) homeCol = std::max(0, homeCol - 1); break;
+        case Input::NextTab: if (homeRow == 1) homeCol = std::min(3, homeCol + 1); break;
+        case Input::Confirm:
+            if (homeRow == 0) openTab(Tab::Kick);
+            else if (homeRow == 1) openTab(tileTab(homeCol));
+            else requestM3U();
+            break;
+        default: break;
         }
+    }
 
-        // ---- Titulo da secao ----
+    std::string listSummary() const {
+        const Playlist &p = app.list;
+        if (p.channels.empty() && p.movies.empty() && p.seriesTree.empty()) return m3uUrl.empty() ? "Adicione sua lista de IPTV" : "Lista sem itens - X para trocar";
+        return std::to_string(p.channels.size()) + " canais  |  " + std::to_string(p.movies.size()) + " filmes  |  " + std::to_string(p.seriesTree.size()) + " séries";
+    }
+
+    void renderHome(Renderer &r) {
+        using namespace theme;
+        const int W = r.width();
+        const int mx = 37, fw = W - 2 * mx;
+        // ---- Banner ----
+        {
+            const int x = mx, y = 169, w = fw, h = 337, rad = 28;
+            bool on = homeRow == 0;
+            uiGlow(r, x, y, w, h, rad, GREEN, on ? 22 : 12, on ? 120 : 70);
+            uiFrame(r, x, y, w, h, rad, 3, GREEN, 0xFF020302);
+            UiClip clip{x + 3, y + 3, w - 6, h - 6, rad - 3};
+            // KICK desfocado ao fundo
+            {
+                const char *s = "KICK"; int bh = 232, bx = 1096, by = 205;
+                for (int i = 0; i < 4; i++) {
+                    static const int ox[4] = {-5, 5, -5, 5}, oy[4] = {-5, -5, 5, 5};
+                    uiWord(r, s, bx + ox[i], by + oy[i], bh, 0x1853FC18, 64);
+                }
+                uiWord(r, s, bx, by, bh, 0x3A53FC18, 64);
+            }
+            // faixas diagonais do canto
+            const float K0 = (float)(x + w + y + h);
+            const float T = (float)y, B = (float)(y + h);
+            uiBand(r, K0 - 600, K0 - 470, T, B, 0x2253FC18, &clip);
+            uiBand(r, K0 - 440, K0 - 408, T, B, 0xE053FC18, &clip);
+            uiBand(r, K0 - 372, K0 - 215, T, B, 0xE653FC18, &clip);
+            uiBand(r, K0 - 205, K0 - 170, T, B, 0x2253FC18, &clip);
+            uiBand(r, K0 - 160, K0 - 120, T, B, 0xF053FC18, &clip);
+            uiBand(r, K0 - 112, K0 + 20, T, B, 0x6653FC18, &clip);
+            // conteudo
+            uiKMark(r, 180, 234, 207, 211, GREEN);
+            r.fillRect(476, 234, 3, 211, GREEN_DK);
+            int gw = uiWord(r, "KICK", 535, 234, 74, GREEN);
+            uiWord(r, "TV", 535 + gw + 28, 234, 74, TEXT);
+            uiText(r, 535, 334, "Assista suas lives favoritas", TEXT, 31);
+            r.drawText(535, 372, "da Kick em ", TEXT, 31);
+            int aw = r.textWidth("da Kick em ", 31);
+            uiText(r, 535 + aw, 372, "tempo real", GREEN, 31, true);
+            r.drawText(535 + aw + r.textWidth("tempo real", 31), 372, "!", TEXT, 31);
+            // botao
+            const int bx = 535, by = 423, bw = 305, bh = 61;
+            if (on) { r.roundRect(bx, by, bw, bh, 14, GREEN); }
+            else uiFrame(r, bx, by, bw, bh, 14, 3, GREEN, 0xFF020302);
+            unsigned bc = on ? BLACK : GREEN;
+            UiPt tri[3] = {{(float)bx + 24, (float)by + 17}, {(float)bx + 24, (float)by + 44}, {(float)bx + 50, (float)by + 30.5f}};
+            uiPoly(r, tri, 3, bc);
+            uiText(r, bx + 71, by + 15, "Acessar Agora", bc, 31, true);
+        }
+        // ---- Atalhos ----
+        {
+            static const char *names[4] = {"KICK TV", "FILMES", "SÉRIES", "CANAIS"};
+            const int gap = 19, tw = (fw - 3 * gap) / 4, ty = 560, th = 251, rad = 24;
+            for (int i = 0; i < 4; i++) {
+                const int x = mx + i * (tw + gap);
+                bool sel = homeRow == 1 && homeCol == i;
+                unsigned fill = sel ? SEL : CARD;
+                if (sel) uiGlow(r, x, ty, tw, th, rad, GREEN, 18, 130);
+                uiFrame(r, x, ty, tw, th, rad, sel ? 4 : 2, sel ? GREEN : CARD_LINE, fill);
+                UiClip clip{x + 2, ty + 2, tw - 4, th - 4, rad - 2};
+                const float K0 = (float)(x + tw + ty + th), T = (float)ty, B = (float)(ty + th);
+                uiBand(r, K0 - 215, K0 - 185, T, B, sel ? 0x4053FC18 : 0x2653FC18, &clip);
+                uiBand(r, K0 - 160, K0 - 88, T, B, sel ? 0xDD53FC18 : 0xB053FC18, &clip);
+                uiBand(r, K0 - 74, K0 + 10, T, B, sel ? 0x6653FC18 : 0x4053FC18, &clip);
+                const int cx = x + tw / 2;
+                unsigned ic = TEXT;
+                if (i == 0) uiKMark(r, cx - 47, ty + 36, 94, 96, GREEN);
+                else if (i == 1) uiIconClapper(r, cx - 54, ty + 33, 108, ic, fill);
+                else if (i == 2) uiIconTvPlay(r, cx - 54, ty + 33, 108, ic, fill);
+                else uiIconTvRetro(r, cx - 54, ty + 33, 108, ic, fill);
+                int fs = i == 0 ? 52 : 50;
+                uiCenterHeavy(r, cx, ty + 187, names[i], TEXT, fs);
+                int lw = sel ? r.textWidth(names[i], fs) : 120;
+                if (sel) r.fillRect(cx - lw / 2, ty + 222, lw, 4, GREEN);
+                else { r.roundRect(cx - 60, ty + 222, 120, 4, 2, 0xFF1E7A0C); r.roundRect(cx - 30, ty + 222, 60, 4, 2, GREEN_DK); }
+            }
+        }
+        // ---- Lista M3U ----
+        {
+            const int x = mx, y = 865, w = fw, h = 140, rad = 26;
+            bool sel = homeRow == 2;
+            if (sel) uiGlow(r, x, y, w, h, rad, GREEN, 18, 130);
+            uiFrame(r, x, y, w, h, rad, sel ? 4 : 2, sel ? GREEN : CARD_LINE, sel ? SEL : CARD);
+            uiIconLink(r, x + 84, y + 70, 78, TEXT);
+            r.fillRect(x + 170, y + 40, 3, 62, GREEN_DK);
+            uiHeavy(r, x + 222, y + 28, "LISTA M3U", TEXT, 40);
+            uiText(r, x + 222, y + 80, uiFit(r, listSummary(), 26, w - 222 - 140), SOFT, 26);
+            const int pcx = x + w - 90, pcy = y + h / 2;
+            r.roundRect(pcx - 36, pcy - 36, 72, 72, 36, GREEN);
+            r.fillRect(pcx - 15, pcy - 3, 30, 6, BLACK); r.fillRect(pcx - 3, pcy - 15, 6, 30, BLACK);
+        }
+    }
+
+    void renderList(Renderer &r) {
+        using namespace theme;
+        const int W = r.width();
         auto v = labels();
         int t = (int)tab, n = (int)v.size();
+        bool kick = tab == Tab::Kick;
+        // titulo da secao
         std::string title;
         switch (tab) {
-        case Tab::Kick: title = "Assistir na Kick"; break;
-        case Tab::Channels: title = "Canais"; break;
-        case Tab::Movies: title = "Filmes"; break;
-        default:
-            title = level == 0 ? "Séries" : level == 1 ? curSeries : curSeries + "  /  Temporada " + std::to_string(curSeason);
+        case Tab::Kick: title = "KICK TV"; break;
+        case Tab::Channels: title = "CANAIS"; break;
+        case Tab::Movies: title = "FILMES"; break;
+        default: title = level == 0 ? "SÉRIES" : level == 1 ? curSeries : curSeries + "  /  Temporada " + std::to_string(curSeason);
         }
-        uiText(r, 52, 128, uiFit(r, title, 30, W - 400), TEXT, 30, true);
-        if (tab != Tab::Kick) {
+        uiKMark(r, 73, 146, 40, 41, GREEN);
+        uiHeavy(r, 130, 152, uiFit(r, title, 36, W - 560), TEXT, 36);
+        r.fillRect(73, 196, W - 146, 2, 0xFF1C1C1C);
+        if (!kick) {
             std::string c = std::to_string(n) + (n == 1 ? " item" : " itens");
-            uiText(r, W - 48 - r.textWidth(c, 20), 134, c, MUTED, 20);
+            uiText(r, W - 73 - r.textWidth(c, 22), 158, c, MUTED, 22);
         }
 
-        // ---- Lista de cartoes ----
-        const int x = 48, rw = W - 96 - 24, rh = 68, pitch = 78, y0 = 184;
+        const int x = 73, rw = W - 146 - 28, rh = kick ? 92 : 64, pitch = kick ? 108 : 74, y0 = 218;
         auto acts = kickActions();
         for (int row = 0; row < kRows; row++) {
             int idx = scroll[t] + row;
             if (idx >= n) break;
             int y = y0 + row * pitch;
             bool sel = idx == cursor[t];
-            if (sel) r.roundRect(x - 5, y - 5, rw + 10, rh + 10, 23, GREEN_GLOW);
-            r.roundRect(x, y, rw, rh, 18, sel ? SEL : CARD);
-            if (sel) r.roundRect(x, y + 16, 6, rh - 32, 3, GREEN);
-            // icone redondo com a inicial
+            if (sel) uiGlow(r, x, y, rw, rh, 18, GREEN, 10, 110);
+            uiFrame(r, x, y, rw, rh, 18, sel ? 3 : 2, sel ? GREEN : CARD_LINE, sel ? SEL : CARD);
             std::string ic = "#";
-            if (tab == Tab::Kick) ic = kickIcon(acts[idx]);
+            if (kick) ic = kickIcon(acts[idx]);
             else for (unsigned char ch : v[idx]) if (std::isalnum(ch)) { ic = std::string(1, (char)((ch >= 'a' && ch <= 'z') ? ch - 32 : ch)); break; }
-            r.roundRect(x + 22, y + 12, 44, 44, 22, sel ? GREEN : CHIP);
-            uiCenter(r, x + 44, y + 34, ic, sel ? BLACK : MUTED, 24, true);
+            int is = rh - 20;
+            r.roundRect(x + 14, y + 10, is, is, 14, sel ? GREEN : CHIP);
+            uiCenterHeavy(r, x + 14 + is / 2, y + rh / 2, ic, sel ? BLACK : MUTED, kick ? 34 : 28);
             unsigned tc = sel ? TEXT : SOFT;
-            int textMax = rw - 88 - 110;
-            if (tab == Tab::Kick) {
-                uiText(r, x + 88, y + 9, uiFit(r, v[idx], 26, textMax), tc, 26, true);
-                uiText(r, x + 88, y + 40, uiFit(r, kickSub(acts[idx]), 18, textMax), MUTED, 18);
+            int tx = x + 14 + is + 22, textMax = rw - (tx - x) - 110;
+            if (kick) {
+                uiHeavy(r, tx, y + 14, uiFit(r, v[idx], 30, textMax), tc, 30);
+                uiText(r, tx, y + 54, uiFit(r, kickSub(acts[idx]), 21, textMax), MUTED, 21);
             } else {
-                uiText(r, x + 88, y + (rh - 26) / 2, uiFit(r, v[idx], 26, textMax), tc, 26, sel);
+                uiText(r, tx, y + (rh - 28) / 2, uiFit(r, v[idx], 28, textMax), tc, 28, sel);
             }
-            if (sel) { r.roundRect(x + rw - 78, y + 16, 56, 36, 11, KEY); uiCenter(r, x + rw - 50, y + 34, "X", TEXT, 22, true); }
+            if (sel) { r.roundRect(x + rw - 84, y + rh / 2 - 19, 56, 38, 12, KEY); uiCenter(r, x + rw - 56, y + rh / 2, "X", TEXT, 22, true); }
         }
-        if (n == 0) uiCenter(r, W / 2, y0 + 120, "Nada por aqui ainda", MUTED, 28);
-
-        // ---- Barra de rolagem ----
+        if (n == 0) {
+            bool noList = app.list.channels.empty() && app.list.movies.empty() && app.list.seriesTree.empty();
+            uiCenterHeavy(r, W / 2, y0 + 150, noList ? "Nenhuma lista M3U adicionada" : "Nada por aqui ainda", MUTED, 32);
+            if (noList) uiCenter(r, W / 2, y0 + 200, "Volte ao início e use LISTA M3U para adicionar a sua", DIM, 24);
+        }
+        // barra de rolagem
         if (n > kRows) {
             int th = kRows * pitch - 10;
-            r.roundRect(W - 44, y0, 8, th, 4, CARD);
+            r.roundRect(W - 52, y0, 8, th, 4, CARD2);
             int kh = std::max(48, th * kRows / n);
             int ky = y0 + (th - kh) * scroll[t] / std::max(1, n - kRows);
-            r.roundRect(W - 44, ky, 8, kh, 4, MUTED);
+            r.roundRect(W - 52, ky, 8, kh, 4, GREEN_DK);
         }
-
-        // ---- Cartao de ajuda (aba Kick) ----
-        if (tab == Tab::Kick) {
-            int hy = y0 + n * pitch + 12;
-            r.roundRect(x, hy, rw, 156, 18, 0xFF111623);
-            uiText(r, x + 28, hy + 18, "Como usar", GREEN, 22, true);
-            uiText(r, x + 28, hy + 54, "1. Escolha \"Digitar @streamer\" e informe o nome do canal (ex.: @dekin021).", MUTED, 20);
-            uiText(r, x + 28, hy + 84, "2. O canal precisa estar ao vivo. Aperte O para voltar ao menu a qualquer momento.", MUTED, 20);
-            uiText(r, x + 28, hy + 114, "3. Se o vídeo não abrir, rode o Diagnóstico e tire um print da tela.", MUTED, 20);
+        // ajuda (tela Kick)
+        if (kick) {
+            int hy = y0 + n * pitch + 10;
+            uiFrame(r, x, hy, rw, 190, 18, 2, CARD_LINE, 0xFF0B0B0B);
+            uiText(r, x + 30, hy + 20, "Como usar", GREEN, 24, true);
+            uiText(r, x + 30, hy + 62, "1. Escolha \"Digitar @streamer\" e informe o nome do canal (ex.: @dekin021).", SOFT, 22);
+            uiText(r, x + 30, hy + 98, "2. O canal precisa estar ao vivo. Aperte O para voltar ao menu a qualquer momento.", SOFT, 22);
+            uiText(r, x + 30, hy + 134, "3. As lives da Kick abrem direto aqui no PS4, sem navegador.", SOFT, 22);
         }
-
-        // ---- Rodape: status + dicas de botoes ----
-        const int fy = H - 92, fh = 60;
-        r.roundRect(48, fy, W - 96, fh, 20, 0xFF111623);
-        int hintsX = uiHints(r, W - 48 - 24, fy + fh / 2, {{"L1/R1", "Abas"}, {"X", "Selecionar"}, {"O", "Voltar"}});
-        const std::string &st = app.lastStatus;
-        unsigned dot = AMBER;
-        if (st.find("Falha") != std::string::npos || st.find("offline") != std::string::npos || st.find("invalido") != std::string::npos) dot = RED;
-        else if (st.compare(0, 10, "Assistindo") == 0 || st == "Pronto") dot = GREEN;
-        r.roundRect(48 + 26, fy + fh / 2 - 6, 12, 12, 6, dot);
-        uiText(r, 48 + 52, fy + fh / 2 - 11, uiFit(r, st, 22, hintsX - (48 + 52) - 30), SOFT, 22);
     }
 
-private:
-    void setTab(int t) { tab = (Tab)t; level = 0; }
+    void renderFooter(Renderer &r) {
+        using namespace theme;
+        const int W = r.width(), cy = 1043;
+        std::vector<std::pair<std::string, std::string>> hints;
+        if (screen == Screen::Home) hints = {{"D-pad", "Navegar"}, {"X", "Selecionar"}, {"OPTIONS", "Sair"}};
+        else hints = {{"L1/R1", "Abas"}, {"X", "Selecionar"}, {"O", "Voltar"}};
+        int hx = uiHints(r, W - 73, cy, hints);
+        const std::string &st = app.lastStatus;
+        unsigned dot = AMBER;
+        if (st.find("Falha") != std::string::npos || st.find("offline") != std::string::npos || st.find("invalido") != std::string::npos || st.find("Aviso") != std::string::npos) dot = RED;
+        else if (st.compare(0, 10, "Assistindo") == 0 || st == "Pronto" || st.compare(0, 6, "Canais") == 0) dot = GREEN;
+        r.roundRect(73, cy - 6, 12, 12, 6, dot);
+        uiText(r, 98, cy - 11, uiFit(r, st, 22, hx - 98 - 30), SOFT, 22);
+    }
+
     void confirm(int n) {
         int t = (int)tab, c = cursor[t];
         const Playlist &p = app.list;
         if (tab == Tab::Kick) {
             auto acts = kickActions();
             if (c >= (int)acts.size()) return;
-            switch (acts[c]) {
-            case KA_LAST: app.watchKick(kickLast); break;
-            case KA_AVDIAG: app.pf.command("avdiag"); break;
-            case KA_TEST_HTTPS: app.say("Teste de player (https)"); app.pf.play(kTestHlsHttps(), "Teste HLS publico (https)"); break;
-            case KA_TEST_HTTP: app.say("Teste de player (http)"); app.pf.play(kTestHlsHttp(), "Teste HLS publico (http)"); break;
-            default: app.pf.requestText("@ do streamer"); break;
-            }
+            if (acts[c] == KA_LAST) app.watchKick(kickLast);
+            else { textKind = 1; app.pf.requestText("@ do streamer"); }
             return;
         }
         if (c >= n) return;
