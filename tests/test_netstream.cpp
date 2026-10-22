@@ -52,5 +52,30 @@ int main() {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
         assert(stopped);
     }
+    // 6) download retomavel: a conexao cai varias vezes, o resultado sai completo e na ordem
+    {
+        std::string data(3000000, 'a'); for (size_t i = 0; i < data.size(); i++) data[i] = (char)('a' + (i * 7 + i / 1000) % 26);
+        int calls = 0, retries = 0;
+        Attempt att = [&](uint64_t &pos, const std::function<bool(const char *, size_t)> &onData, int &st) -> int {
+            calls++; st = 206;
+            size_t dropAt = calls % 3 == 0 ? pos : std::min<size_t>(data.size(), pos + 400000 + calls * 1000);   // 1 a cada 3 conexoes cai sem entregar nada
+            while (pos < dropAt) { size_t n = std::min<size_t>(65536, dropAt - pos); if (!onData(data.data() + pos, n)) return -2; pos += n; }
+            return pos >= data.size() ? 1 : 0;
+        };
+        std::string got; int st = 0;
+        bool ok = resumable(att, [&](const char *d, size_t n) { got.append(d, n); return true; }, st, [&](int n) { if (n) retries++; }, 12, 1);
+        assert(ok && got == data && retries >= 3);
+        // so falha: desiste depois de maxFails sem progresso
+        calls = 0; int tries = 0;
+        Attempt bad = [&](uint64_t &, const std::function<bool(const char *, size_t)> &, int &s2) -> int { tries++; s2 = 0; return 0; };
+        assert(!resumable(bad, [](const char *, size_t) { return true; }, st, nullptr, 3, 1) && tries == 4);
+        // recusado (4xx logo de cara): nao insiste
+        tries = 0;
+        Attempt refused = [&](uint64_t &, const std::function<bool(const char *, size_t)> &, int &s2) -> int { tries++; s2 = 403; return -1; };
+        assert(!resumable(refused, [](const char *, size_t) { return true; }, st, nullptr, 3, 1) && tries == 1 && st == 403);
+        // cancelar durante a espera para retomar
+        tries = 0;
+        assert(!resumable(bad, [](const char *, size_t n) { return n != 0; }, st, nullptr, 3, 1) && tries == 1);
+    }
     std::cout << "OK\n";
 }
