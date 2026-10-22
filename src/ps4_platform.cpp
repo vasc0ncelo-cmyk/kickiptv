@@ -1,3 +1,4 @@
+// Durante o video: QUADRADO = alterna qualidade Fluido(30fps)/Maxima(60fps)
 // TESTE 5 - PLAYER com AvPlayer (video + audio) + teclado na tela + diagnostico.
 //   HLS (.m3u8): o app baixa playlist/segmentos e entrega ao AvPlayer por callbacks de arquivo (hls.hpp / streambuf.hpp).
 //   Aba Kick (abre por padrao):
@@ -131,6 +132,70 @@ struct NetClient {
         }
         sceHttpDeleteTemplate(tmpl);
         return ok;
+    }
+
+    // ---- Sessao com conexao reaproveitada (keep-alive): o alimentador HLS baixa playlist + segmentos do MESMO servidor
+    // varias vezes por segundo. Antes cada GET criava conexao nova (handshake TLS completo no CPU fraco do PS4).
+    struct Session { int tmpl = -1, conn = -1; std::string origin; };
+    static std::string originOf(const std::string &url) {
+        size_t se = url.find("://");
+        if (se == std::string::npos) return "";
+        size_t he = url.find('/', se + 3);
+        return he == std::string::npos ? url : url.substr(0, he);
+    }
+    void closeSession(Session &s) {
+        if (s.conn >= 0) sceHttpDeleteConnection(s.conn);
+        if (s.tmpl >= 0) sceHttpDeleteTemplate(s.tmpl);
+        s = Session();
+    }
+    bool openSession(Session &s, const std::string &url) {
+        closeSession(s);
+        if (!init()) return false;
+        const char *ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
+        s.tmpl = sceHttpCreateTemplate(httpCtx, ua, 1 /*HTTP/1.1*/, 1);
+        if (s.tmpl < 0) { s.tmpl = -1; return false; }
+        sceHttpsDisableOption(s.tmpl, 0x1F);
+        sceHttpSetAutoRedirect(s.tmpl, 1);
+        const unsigned T = 15 * 1000 * 1000;
+        sceHttpSetResolveTimeOut(s.tmpl, T);
+        sceHttpSetConnectTimeOut(s.tmpl, T);
+        sceHttpSetSendTimeOut(s.tmpl, T);
+        sceHttpSetRecvTimeOut(s.tmpl, T);
+        s.conn = sceHttpCreateConnectionWithURL(s.tmpl, url.c_str(), 1 /*keep-alive*/);
+        if (s.conn < 0) { s.conn = -1; closeSession(s); return false; }
+        s.origin = originOf(url);
+        return true;
+    }
+    // GET reaproveitando a conexao de 's' (so use de UMA thread por sessao). Se a conexao antiga caiu, refaz uma vez.
+    // Leitura interrompida no meio (erro de rede) conta como falha: antes devolvia o segmento cortado como se fosse bom.
+    bool getKA(Session &s, const std::string &url, std::string &body, int &status, size_t maxBytes = 1536 * 1024) {
+        for (int attempt = 0; attempt < 2; attempt++) {
+            status = 0; body.clear();
+            bool fresh = false;
+            if (s.conn < 0 || s.origin != originOf(url)) { if (!openSession(s, url)) return false; fresh = true; }
+            int req = sceHttpCreateRequestWithURL(s.conn, 0 /*GET*/, url.c_str(), 0);
+            bool ok = false, clean = false;
+            if (req >= 0) {
+                sceHttpAddRequestHeader(req, "Accept", "*/*", 0);
+                if (sceHttpSendRequest(req, NULL, 0) >= 0) {
+                    sceHttpGetStatusCode(req, &status);
+                    std::vector<char> buf(64 * 1024);
+                    ok = clean = true;
+                    for (;;) {
+                        int n = sceHttpReadData(req, buf.data(), buf.size());
+                        if (n < 0) { ok = clean = false; break; }
+                        if (n == 0) break;
+                        body.append(buf.data(), n);
+                        if (body.size() > maxBytes) { clean = false; break; }   // resposta nao lida ate o fim: nao reaproveita
+                    }
+                }
+                sceHttpDeleteRequest(req);
+            }
+            if (ok) { if (!clean) closeSession(s); return true; }
+            closeSession(s);
+            if (fresh) return false;                                            // ja era uma conexao nova: falha de verdade
+        }
+        return false;
     }
 };
 
@@ -514,14 +579,20 @@ struct AudioPump {
     std::atomic<unsigned> rate{0}, chans{0};
     std::atomic<unsigned> chunks{0};
     KAvHandle h = 0;
+    std::mutex hm;                       // protege 'h': a troca de pedaco muda o player SEM fechar a porta de audio
     int port = -1;
     static const int GRAIN = 1024;
 
     void start(KAvHandle handle) {
         stop();
-        h = handle; run = true; state = 1; chunks = 0; rate = chans = 0; openRc = 0;
+        { std::lock_guard<std::mutex> l(hm); h = handle; }
+        run = true; state = 1; chunks = 0; rate = chans = 0; openRc = 0;
         th = std::thread([this] { loop(); });
     }
+    // Troca o player que alimenta o audio. Antes cada troca de pedaco (a cada poucos segundos) fechava e reabria a porta
+    // do AudioOut: isso causa um "buraco" de audio e arrasta o video junto. Agora a porta continua aberta.
+    // Ao retornar, a thread de audio nao esta mais dentro de uma chamada ao player antigo (so entao ele pode ser fechado).
+    void retarget(KAvHandle handle) { std::lock_guard<std::mutex> l(hm); h = handle; }
     void stop() {
         run = false;
         if (th.joinable()) th.join();
@@ -532,12 +603,23 @@ struct AudioPump {
 
     void loop() {
         std::vector<int16_t> acc;
+        std::vector<uint8_t> pcm;
         float prevL = 0, prevR = 0, phase = 0;
         while (run) {
             KAvFrameInfo au; memset(&au, 0, sizeof au);
-            if (!sceAvPlayerGetAudioData(h, &au) || !au.pData) { sceKernelUsleep(3000); continue; }
-            unsigned ch = *(uint16_t *)(au.details + 0), sr = *(uint32_t *)(au.details + 4), sz = *(uint32_t *)(au.details + 8);
-            if (ch == 0 || ch > 8 || sr < 8000 || sr > 192000 || sz < 2u * ch) continue;
+            unsigned ch = 0, sr = 0, sz = 0;
+            bool got = false;
+            {   // a chamada ao player e a COPIA do quadro de audio ficam sob o mutex (o buffer e do player e some quando ele fecha)
+                std::lock_guard<std::mutex> l(hm);
+                if (h && sceAvPlayerGetAudioData(h, &au) && au.pData) {
+                    ch = *(uint16_t *)(au.details + 0); sr = *(uint32_t *)(au.details + 4); sz = *(uint32_t *)(au.details + 8);
+                    if (ch >= 1 && ch <= 8 && sr >= 8000 && sr <= 192000 && sz >= 2u * ch && sz <= (1u << 20)) {
+                        pcm.assign((const uint8_t *)au.pData, (const uint8_t *)au.pData + sz);
+                        got = true;
+                    }
+                }
+            }
+            if (!got) { sceKernelUsleep(3000); continue; }
             rate = sr; chans = ch;
             if (port < 0 && state != -1) {
                 int p = sceAudioOutOpen(0xFF /*usuario do sistema*/, ORBIS_AUDIO_OUT_PORT_TYPE_MAIN, 0, GRAIN, 48000, ORBIS_AUDIO_OUT_PARAM_FORMAT_S16_STEREO);
@@ -545,7 +627,7 @@ struct AudioPump {
                 if (p > 0) { port = p; state = 2; } else state = -1;      // se falhar, so descarta o audio (o relogio do player continua)
             }
             if (port <= 0) continue;
-            const int16_t *in = (const int16_t *)au.pData;
+            const int16_t *in = (const int16_t *)pcm.data();
             size_t frames = sz / (2 * ch);
             float step = (float)sr / 48000.0f;
             for (size_t i = 0; i < frames; i++) {
@@ -573,6 +655,9 @@ struct AudioPump {
     }
 };
 
+// Qualidade: 0 = "Fluido" (limita a 30 fps; o desenho do video e feito pela CPU e 60 fps pesa o dobro) | 1 = "Maxima" (ate 720p60)
+static std::atomic<int> g_quality{0};
+
 // ---------- Alimentador HLS -> AvPlayer ----------
 // O AvPlayer do PS4 nao abre https/HLS direto (AddSource=806A0002). Entao o app baixa o HLS (playlist + segmentos .ts)
 // com o cliente HTTP proprio e entrega os bytes ao player pelos callbacks de arquivo ("fileReplacement").
@@ -583,9 +668,14 @@ struct HlsFeeder {
     std::atomic<int> segs{0}, opens{0}, reads{0}, failed{0};
     FILE *outFile = nullptr;                    // modo "arquivo que cresce": segmentos vao para /data/live.ts
     std::atomic<unsigned long long> outBytes{0};
+    std::atomic<bool> discardBuf{false};        // modo "pedacos": ninguem le o StreamBuf, entao nao acumula (antes crescia ate 48 MB)
+    NetClient::Session sess;                    // conexao HTTP reaproveitada (so a thread do alimentador usa)
     std::mutex lm;
     std::string status;
     std::string url;
+    std::atomic<int> variantFps{0}, variantH{0};
+    std::atomic<double> dlMs{0}, dlMsMax{0}, lastSegDur{0};        // tempo de download do ultimo segmento (diagnostico)
+    static double nowSecF() { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec + ts.tv_nsec / 1e9; }
     std::mutex rm;                                                   // ultimos segmentos (para tocar em "pedacos")
     std::deque<std::pair<unsigned long long, std::string>> recent;
 
@@ -596,8 +686,8 @@ struct HlsFeeder {
     void start(const std::string &u) {
         join(); sb.reset();
         { std::lock_guard<std::mutex> l(rm); recent.clear(); }
-        url = u; segs = opens = reads = failed = 0; run = true; setStatus("iniciando");
-        th = std::thread([this] { loop(); });
+        url = u; segs = opens = reads = failed = 0; run = true; discardBuf = false; dlMs = dlMsMax = 0; setStatus("iniciando");
+        th = std::thread([this] { loop(); g_net.closeSession(sess); });
     }
     void abort() { run = false; sb.abort(); }                // libera leituras bloqueadas do player
     void join() { abort(); if (th.joinable()) th.join(); }
@@ -607,18 +697,20 @@ struct HlsFeeder {
     void loop() {
         std::string body; int st = 0;
         setStatus("baixando playlist mestre");
-        if (!g_net.get(url, body, st) || st < 200 || st >= 300) { fail("playlist mestre HTTP " + std::to_string(st) + (body.empty() ? " (sem resposta)" : "")); return; }
+        if (!g_net.getKA(sess, url, body, st) || st < 200 || st >= 300) { fail("playlist mestre HTTP " + std::to_string(st) + (body.empty() ? " (sem resposta)" : "")); return; }
         std::string mediaUrl = url;
         if (hlsIsMaster(body)) {
             auto v = hlsParseMaster(body);
-            int i = hlsPickVariant(v, 720);
+            int i = hlsPickVariant(v, 720, g_quality.load() == 0 ? 30 : 0);
             if (i < 0) { fail("playlist mestre sem variantes"); return; }
             mediaUrl = hlsResolve(url, v[i].uri);
-            setStatus("variante " + std::to_string(v[i].width) + "x" + std::to_string(v[i].height) + " bw=" + std::to_string(v[i].bandwidth));
+            setStatus("variante " + std::to_string(v[i].width) + "x" + std::to_string(v[i].height) + " " + std::to_string((int)(v[i].fps + 0.5)) +
+                      "fps bw=" + std::to_string(v[i].bandwidth));
+            variantFps = (int)(v[i].fps + 0.5); variantH = v[i].height;
         }
         unsigned long long next = 0; bool first = true; int errs = 0;
         while (run) {
-            if (!g_net.get(mediaUrl, body, st) || st < 200 || st >= 300) {
+            if (!g_net.getKA(sess, mediaUrl, body, st) || st < 200 || st >= 300) {
                 if (++errs > 6) { fail("playlist de midia HTTP " + std::to_string(st)); return; }
                 sleepMs(1000, run); continue;
             }
@@ -632,14 +724,17 @@ struct HlsFeeder {
                 if (!run) break;
                 if (sg.seq < next) continue;
                 std::string seg; int ss = 0;
-                if (!g_net.get(hlsResolve(mediaUrl, sg.uri), seg, ss, 12u << 20) || ss < 200 || ss >= 300 || seg.empty()) {
+                double d0 = nowSecF();
+                if (!g_net.getKA(sess, hlsResolve(mediaUrl, sg.uri), seg, ss, 12u << 20) || ss < 200 || ss >= 300 || seg.empty()) {
                     if (++errs > 6) { fail("segmento HTTP " + std::to_string(ss)); return; }
                     break;
                 }
                 if (outFile) {
                     fwrite(seg.data(), 1, seg.size(), outFile); fflush(outFile); outBytes += seg.size();
                     if (outBytes > 1200000000ULL) { fail("limite de gravacao (1,2 GB) atingido"); return; }
-                } else sb.append((const uint8_t *)seg.data(), seg.size());
+                } else if (!discardBuf.load()) sb.append((const uint8_t *)seg.data(), seg.size());
+                { double dm = (nowSecF() - d0) * 1000.0; dlMs = dm; if (dm > dlMsMax.load()) dlMsMax = dm; }
+                lastSegDur = sg.dur;
                 { std::lock_guard<std::mutex> l(rm); recent.push_back({sg.seq, seg}); while (recent.size() > 8) recent.pop_front(); }
                 next = sg.seq + 1; segs++; got = true;
                 setStatus("ao vivo: segmento " + std::to_string(sg.seq) + " (" + std::to_string(seg.size() / 1024) + " KB)");
@@ -680,7 +775,11 @@ struct Player {
     int chunkIdx = 0;
     unsigned long long lastSeq = 0;
     double inactiveSince = 0, lastFrameT = 0, hudUntil = 0;
-    std::string title;
+    std::string title, url;
+    // diagnostico de fluidez (HUD)
+    double lastDrawT = 0, worstGap = 0, worstShown = 0;      // maior intervalo entre quadros desenhados no ultimo segundo
+    double convMs = 0;                                       // tempo da ultima conversao TS->MP4
+    double openMs = 800, openT0 = 0;                         // tempo medido para abrir o 2o player (abertura adaptativa)
 
     // ---- pipeline do ao vivo por pedacos: preparo assincrono + segundo player (troca sem emenda) ----
     double curDur = 0;                       // duracao (s) do pedaco que toca agora (0 = desconhecida)
@@ -771,7 +870,8 @@ struct Player {
                 presentCb(); sceKernelUsleep(30000);
             }
         }
-        this->title = title; hudUntil = nowSec() + 8;
+        this->title = title; this->url = url; hudUntil = nowSec() + 8;
+        lastDrawT = 0; worstGap = worstShown = 0; convMs = 0; openMs = 800;
         log.push_back("Reproduzindo: " + title);
         {   // host e tamanho da URL
             size_t a = url.find("://"); a = a == std::string::npos ? 0 : a + 3;
@@ -826,6 +926,7 @@ struct Player {
             } else log.push_back("ERRO conversao TS->MP4: " + err);
         }
         if (cancelled) { failed = true; stop(); return false; }
+        if (chunkMode) { g_feed.discardBuf = true; g_feed.sb.reset(); }     // os segmentos so seguem para 'recent' (nao enche mais o StreamBuf)
         // Plano B: escada de tentativas com o TS cru (varias extensoes) e depois leitura propria (callbacks)
         static const char *exts[] = {"mp4", "m2ts", "mpg", "ts", "mkv"};
         if (!chunkMode)
@@ -842,6 +943,7 @@ struct Player {
             }
             remove(path.c_str());
         }
+        if (chunkMode) { g_feed.discardBuf = true; g_feed.sb.reset(); }
         if (!chunkMode) {
             static const char *names[] = {"live.mp4", "live.ts", "live.m2ts"};
             for (const char *nm : names) {
@@ -877,7 +979,9 @@ struct Player {
         prepBusy = true;
         prepTh = std::thread([this, data, last, idx, rm, ext]() {
             std::string out, err; tsmux::Info ti; bool ok = true;
+            double c0 = nowSec();
             if (rm) ok = tsmux::convert(data, out, err, &ti); else out = data;
+            convMs = (nowSec() - c0) * 1000.0;
             std::string path = chunkPath(ext, idx);
             if (ok && writeFile(path, out)) { nextPath = path; nextLast = last; nextDur = rm ? ti.seconds : 0; nextIdx = idx; nextReady = true; }
             prepBusy = false;
@@ -886,7 +990,7 @@ struct Player {
     // abre o proximo pedaco num SEGUNDO player, em segundo plano, um pouco antes do atual acabar
     void openNextAsync() {
         if (openTh.joinable()) openTh.join();
-        bState = 1;
+        bState = 1; openT0 = nowSec();
         std::string path = nextPath;
         openTh = std::thread([this, path] { KAvHandle nh = 0; bool ok = openSource(path, false, 0, 0, false, &nh); bHandle = nh; bState = ok ? 2 : 3; });
     }
@@ -900,17 +1004,16 @@ struct Player {
         std::string oldPath = chunkPath(chunkExt, chunkIdx);
         gapStartT = lastFrameT > 0 ? lastFrameT : t;
         if (h2) {
-            audio.stop();
             KAvHandle old = h; h = h2; h2 = 0;
-            audio.start(h);
-            closeLater(old, oldPath);
+            audio.retarget(h);                       // porta de audio continua aberta (sem buraco); so muda de onde vem o PCM
+            closeLater(old, oldPath);                // so fecha o antigo DEPOIS do retarget (a thread de audio ja saiu dele)
             switchesOk++;
         } else {
-            audio.stop();
+            audio.retarget(0);
             avStopClose(h); h = 0;
             remove(oldPath.c_str());
             if (!openSource(nextPath, false, 0, 0, false)) { failed = true; log.push_back("ERRO ao reabrir pedaco: " + hx8(addRc)); nextReady = false; return false; }
-            audio.start(h);
+            audio.retarget(h);
             restarts++;
         }
         chunkIdx = nextIdx; curDur = nextDur; nextReady = false;
@@ -924,10 +1027,14 @@ struct Player {
         // 1) comeca a preparar o proximo pedaco assim que houver 2 segmentos novos
         if (!prepBusy.load() && !nextReady.load() && !h2 && fresh >= 2) startPrep();
         // 2) segundo player
-        if (bState.load() == 2) { h2 = bHandle; bState = 0; }
+        if (bState.load() == 2) {
+            h2 = bHandle; bState = 0;
+            double m = (nowSec() - openT0) * 1000.0;                  // quanto levou para abrir: ajusta quando abrir o proximo
+            if (m > 50 && m < 4000) openMs = openMs * 0.5 + m * 0.5;
+        }
         else if (bState.load() == 3) { bState = 0; gapless = false; log.push_back("segundo player nao abriu: troca com emenda"); }
         double el = chunkT0 > 0 ? t - chunkT0 : 0;
-        if (gapless && nextReady.load() && !h2 && bState.load() == 0 && chunkT0 > 0 && curDur > 0 && el >= curDur - 0.8) openNextAsync();
+        if (gapless && nextReady.load() && !h2 && bState.load() == 0 && chunkT0 > 0 && curDur > 0 && el >= curDur - (openMs / 1000.0 + 0.25)) openNextAsync();
         // 3) troca
         bool ended = inactive && t - inactiveSince > 0.03;
         bool overdue = curDur > 0 && chunkT0 > 0 && el > curDur + 0.6;
@@ -992,11 +1099,13 @@ struct Player {
         }
         double t = nowSec();
         if (drew) {
+            if (lastDrawT > 0 && (t - lastDrawT) * 1000.0 > worstGap) worstGap = (t - lastDrawT) * 1000.0;
+            lastDrawT = t;
             lastFrameT = t; inactiveSince = 0;
             if (chunkT0 == 0) { chunkT0 = t; if (gapStartT > 0) { lastGapMs = (t - gapStartT) * 1000.0; gapStartT = 0; } }
         }
         if (chunkMode && h && !failed) managePipeline(t);
-        if (t - lastFps >= 1.0) { fps = fpsFrames / (t - lastFps); fpsFrames = 0; lastFps = t; }
+        if (t - lastFps >= 1.0) { fps = fpsFrames / (t - lastFps); fpsFrames = 0; lastFps = t; worstShown = worstGap; worstGap = 0; }
         return drew;
     }
     bool hudActive() const { return nowSec() <= hudUntil || (useFeed && g_feed.failed); }
@@ -1005,8 +1114,8 @@ struct Player {
         using namespace theme;
         if (nowSec() > hudUntil && !(useFeed && g_feed.failed)) return;
         if (nowSec() <= hudUntil) {
-            char b[96];
-            snprintf(b, sizeof b, "%ux%u  |  %.0f fps  |  desenho %.0f ms", vw, vh, fps, blitMs);
+            char b[256];
+            snprintf(b, sizeof b, "%ux%u  |  %.0f fps  |  desenho %.0f ms  |  %s", vw, vh, fps, blitMs, g_quality.load() == 0 ? "Fluido" : "Maxima");
             std::string stats = b;
             int tw = r.textWidth(title, 24), sw = r.textWidth(stats, 18);
             int pw = 24 + 92 + 16 + tw + 24 + sw + 28;
@@ -1015,10 +1124,12 @@ struct Player {
             uiCenter(r, 44 + 46, 58, "AO VIVO", TEXT, 16, true);
             uiText(r, 44 + 92 + 16, 58 - 12, title, TEXT, 24, true);
             uiText(r, 44 + 92 + 16 + tw + 24, 58 - 9, stats, MUTED, 18);
-            int hw = r.textWidth("O  Sair     TRIÂNGULO  Ajustar imagem", 18) + 48;
-            r.roundRect(r.W - 32 - hw, r.H - 76, hw, 44, 22, 0xB8000000);
-            uiCenter(r, r.W - 32 - hw / 2, r.H - 54, "O  Sair     TRIÂNGULO  Ajustar imagem", SOFT, 18);
-            snprintf(b, sizeof b, "stride %d  |  audio %d %uHz  |  trocas: %d sem emenda, %d com emenda  |  ultima %.0f ms%s", strideMode, audio.state.load(), audio.rate.load(), switchesOk, restarts, lastGapMs, gapless ? "" : "  (sem-emenda OFF)");
+            const char *hint = "O  Sair     QUADRADO  Qualidade     TRIÂNGULO  Ajustar imagem";
+            int hw = r.textWidth(hint, 18) + 48;
+            r.roundRect(r.W - 32 - hw, r.H - 130, hw, 44, 22, 0xB8000000);   // acima da linha de diagnostico (que ficou mais longa)
+            uiCenter(r, r.W - 32 - hw / 2, r.H - 108, hint, SOFT, 18);
+            snprintf(b, sizeof b, "pico %.0f ms  |  baixa %.0f/%.0f ms (seg %.1fs)  |  conv %.0f ms  |  abre %.0f ms  |  trocas: %d ok, %d com emenda, ultima %.0f ms%s",
+                     worstShown, g_feed.dlMs.load(), g_feed.dlMsMax.load(), g_feed.lastSegDur.load(), convMs, openMs, switchesOk, restarts, lastGapMs, gapless ? "" : "  (sem-emenda OFF)");
             r.roundRect(32, r.H - 76, r.textWidth(b, 16) + 40, 40, 20, 0x90000000);
             uiText(r, 52, r.H - 76 + 12, b, DIM, 16);
         }
@@ -1300,15 +1411,15 @@ int main() {
     const int W = 1920, H = 1080;
     int vh = sceVideoOutOpen(ORBIS_VIDEO_USER_MAIN, 0, 0, NULL);
     if (vh < 0) return 1;
-    const size_t bufSize = 0x800000, total = bufSize * 2;
+    const size_t bufSize = 0x800000, total = bufSize * 3;      // 3 telas em anel: nunca desenha na tela que esta aparecendo/aguardando o flip
     off_t phys = 0;
     void *mem = NULL;
     if (sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), total, 0x200000, 3, &phys) < 0) return 2;
     if (sceKernelMapDirectMemory(&mem, total, 0x33, 0, phys, 0x200000) < 0) return 3;
-    void *bufs[2] = {mem, (char *)mem + bufSize};
+    void *bufs[3] = {mem, (char *)mem + bufSize, (char *)mem + bufSize * 2};
     OrbisVideoOutBufferAttribute attr;
     sceVideoOutSetBufferAttribute(&attr, 0x80000000, ORBIS_VIDEO_OUT_TILING_MODE_LINEAR, ORBIS_VIDEO_OUT_ASPECT_RATIO_16_9, W, H, W);
-    if (sceVideoOutRegisterBuffers(vh, 0, bufs, 2, &attr) < 0) return 4;
+    if (sceVideoOutRegisterBuffers(vh, 0, bufs, 3, &attr) < 0) return 4;
     BootScreen boot;
     boot.init(bufs[0], W, H);                                       // so escrita: igual ao codigo original
     sceVideoOutSubmitFlip(vh, 0, ORBIS_VIDEO_OUT_FLIP_VSYNC, 0);
@@ -1354,7 +1465,7 @@ int main() {
     boot.line(shadow == shadowFallback.data() ? "[3] rascunho de tela: heap" : "[3] rascunho de tela: memoria direta");
     auto flip = [&]() {
         memcpy(bufs[back], shadow, (size_t)W * H * 4);          // copia sequencial (rapida)
-        sceVideoOutSubmitFlip(vh, back, ORBIS_VIDEO_OUT_FLIP_VSYNC, 0); back ^= 1;
+        sceVideoOutSubmitFlip(vh, back, ORBIS_VIDEO_OUT_FLIP_VSYNC, 0); back = (back + 1) % 3;
     };
     auto presentMenu = [&]() { FbRenderer r(shadow, W, H); ui.render(r); flip(); };
     auto presentDiag = [&](bool running) { FbRenderer r(shadow, W, H); renderDiag(r, diag, running); flip(); };
@@ -1420,6 +1531,11 @@ int main() {
             if (pressed & B_CIRCLE) { player.stop(); mode = Mode::Menu; dirty = true; sceKernelUsleep(16000); continue; }
             if (pressed) player.hudUntil = nowSec() + 5;      // qualquer botao mostra o HUD por 5s
             if (pressed & B_TRIANGLE) player.strideMode = (player.strideMode + 1) % 4;
+            if ((pressed & B_SQUARE) && !player.url.empty()) {     // QUADRADO: alterna Fluido (30 fps) <-> Maxima (60 fps) e reabre o canal
+                g_quality = g_quality.load() == 0 ? 1 : 0;
+                pf.pendingPlayUrl = player.url; pf.pendingPlayTitle = player.title;
+                player.stop(); mode = Mode::Menu; dirty = true; sceKernelUsleep(16000); continue;
+            }
             if (player.h) {
                 // Sem HUD o video e desenhado DIRETO no quadro de video (so escrita, sem a copia de 8 MB).
                 // Com HUD (precisa ler pixels para a transparencia) passa pelo rascunho, como antes.
@@ -1428,7 +1544,7 @@ int main() {
                 if (player.poll(r)) {
                     gotFrame = true;
                     if (hud) { player.overlay(r); flip(); }
-                    else { sceVideoOutSubmitFlip(vh, back, ORBIS_VIDEO_OUT_FLIP_VSYNC, 0); back ^= 1; }
+                    else { sceVideoOutSubmitFlip(vh, back, ORBIS_VIDEO_OUT_FLIP_VSYNC, 0); back = (back + 1) % 3; }
                 }
                 else if (!gotFrame && nowSec() - lastWaitDraw > 0.12) { lastWaitDraw = nowSec(); presentWait(); }
             } else if (nowSec() - lastWaitDraw > 0.12) { lastWaitDraw = nowSec(); presentWait(); }
