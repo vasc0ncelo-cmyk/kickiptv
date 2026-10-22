@@ -67,7 +67,7 @@ inline uint64_t probeSize(const Fetch &f, std::string &err, const std::function<
 
 class Reader {
 public:
-    static const uint64_t kBlock = 2u << 20;           // blocos de 2 MB: menos requisicoes (cada uma custa ~1 ida e volta no painel IPTV)
+    static const uint64_t kBlock = 1u << 20;           // blocos de 1 MB: usa menos memoria (o PS4 estava fechando o app por falta de RAM)
 
     // Probe: tamanho do arquivo em UMA requisicao (Content-Range: bytes 0-0/TOTAL). Retorna 0 se nao deu (ai cai na sondagem lenta).
     using Probe = std::function<uint64_t()>;
@@ -84,7 +84,11 @@ public:
         join();
         stop_ = false; state_ = 0; inflight_.clear();
         for (size_t i = 0; i < workers_.size(); i++)
-            ths_.emplace_back([this, i] { run(i); if (workers_[i].onExit) workers_[i].onExit(); });
+            ths_.emplace_back([this, i] {
+                // excecao solta numa thread = std::terminate = o app fecha sozinho. Aqui vira um erro normal na tela.
+                try { run(i); } catch (...) { setFail("sem memoria ou erro interno ao baixar o arquivo"); }
+                try { if (workers_[i].onExit) workers_[i].onExit(); } catch (...) {}
+            });
     }
     void abort() { { std::lock_guard<std::mutex> l(m_); stop_ = true; } cv_.notify_all(); }   // acorda quem esta lendo
     void join() { abort(); for (auto &t : ths_) if (t.joinable()) t.join(); ths_.clear(); }
