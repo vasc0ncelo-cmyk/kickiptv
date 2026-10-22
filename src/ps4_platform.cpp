@@ -153,6 +153,15 @@ struct Ps4Platform : Platform {
 };
 
 // ---------- Renderer (igual ao Teste 2) ----------
+// Matematica sem libm (o app original nao importava nenhuma funcao de matematica do libc)
+static inline int ifloor(float f) { int i = (int)f; return ((float)i > f) ? i - 1 : i; }
+static inline float fsqrt(float v) {
+    if (v <= 0.f) return 0.f;
+    float g = v > 1.f ? v * 0.5f + 0.5f : 1.f;
+    for (int i = 0; i < 8; i++) g = 0.5f * (g + v / g);
+    return g;
+}
+
 static inline uint32_t blendPx(uint32_t d, uint32_t s, int a) {   // a: 0..255
     if (a <= 0) return d;
     if (a >= 255) return 0xFF000000u | (s & 0xFFFFFFu);
@@ -199,7 +208,7 @@ struct FbRenderer : Renderer {
                     for (int i = px0; i < px1; i++) {
                         if (i < 0 || i >= W) continue;
                         float dx = (i + 0.5f) - cx;
-                        float cov = (float)rad - sqrtf(dx * dx + dy * dy) + 0.5f;
+                        float cov = (float)rad - fsqrt(dx * dx + dy * dy) + 0.5f;
                         if (cov <= 0.f) continue;
                         if (cov > 1.f) cov = 1.f;
                         row[i] = blendPx(row[i], argb, (int)(a * cov));
@@ -257,12 +266,12 @@ struct FbRenderer : Renderer {
                 for (int dy = 0; dy < gh; dy++) {
                     int py = y + dy;
                     if (py < 0 || py >= H) continue;
-                    float v = (dy + 0.5f) / s - 0.5f; int v0 = (int)floorf(v); float fv = v - v0;
+                    float v = (dy + 0.5f) / s - 0.5f; int v0 = ifloor(v); float fv = v - v0;
                     uint32_t *row = fb + (size_t)py * W;
                     for (int dx = 0; dx < gw; dx++) {
                         int px = cx + dx;
                         if (px < 0 || px >= W) continue;
-                        float u = (dx + 0.5f) / s - 0.5f; int u0 = (int)floorf(u); float fu = u - u0;
+                        float u = (dx + 0.5f) / s - 0.5f; int u0 = ifloor(u); float fu = u - u0;
                         float cv = (bit(u0, v0) * (1 - fu) + bit(u0 + 1, v0) * fu) * (1 - fv) +
                                    (bit(u0, v0 + 1) * (1 - fu) + bit(u0 + 1, v0 + 1) * fu) * fv;
                         if (cv <= 0.03f) continue;
@@ -367,24 +376,14 @@ struct BootScreen {
 
 // ---------- Registro de passos em /data/kickiptv.log ----------
 // Se o app cair, na proxima abertura o menu mostra em qual passo ele parou.
-static std::string g_prevStage;
+static std::string g_prevStage;           // (leitura do log anterior removida: usava fread, que o app original nao importava)
 static void traceInit() {
-    FILE *f = fopen("/data/kickiptv.log", "rb");
-    if (f) {
-        std::string all; char b[256]; size_t n;
-        while ((n = fread(b, 1, sizeof b, f)) > 0) all.append(b, n);
-        fclose(f);
-        while (!all.empty() && (all.back() == '\n' || all.back() == '\r')) all.pop_back();
-        size_t p = all.rfind('\n');
-        std::string last = p == std::string::npos ? all : all.substr(p + 1);
-        if (!last.empty() && last != "fim") g_prevStage = last;
-    }
-    f = fopen("/data/kickiptv.log", "wb");
-    if (f) { fputs("inicio\n", f); fclose(f); }
+    FILE *f = fopen("/data/kickiptv.log", "wb");
+    if (f) { fwrite("inicio\n", 1, 7, f); fclose(f); }
 }
 static void trace(const char *stage) {
     FILE *f = fopen("/data/kickiptv.log", "ab");
-    if (f) { fputs(stage, f); fputc('\n', f); fclose(f); }
+    if (f) { fwrite(stage, 1, strlen(stage), f); fwrite("\n", 1, 1, f); fclose(f); }
 }
 
 static void fillDemo(App &app) {
@@ -961,10 +960,12 @@ struct Player {
         } else {
             double tt = nowSec();
             for (int i = 0; i < 12; i++) {
-                float ang = i * 0.5235988f;
-                float ph = fmodf((float)tt * 1.3f - i / 12.0f + 4.0f, 1.0f);
+                static const float kc[12] = {1.f, .8660254f, .5f, 0.f, -.5f, -.8660254f, -1.f, -.8660254f, -.5f, 0.f, .5f, .8660254f};
+                static const float ks[12] = {0.f, .5f, .8660254f, 1.f, .8660254f, .5f, 0.f, -.5f, -.8660254f, -1.f, -.8660254f, -.5f};
+                float xx = (float)tt * 1.3f - i / 12.0f + 4.0f;
+                float ph = xx - (float)(int)xx;
                 int al = 40 + (int)(215 * (1.0f - ph));
-                int px = scx + (int)(30 * cosf(ang)), py = scy + (int)(30 * sinf(ang));
+                int px = scx + (int)(30 * kc[i]), py = scy + (int)(30 * ks[i]);
                 r.roundRect(px - 6, py - 6, 12, 12, 6, ((unsigned)al << 24) | 0x0053FC18);
             }
         }
