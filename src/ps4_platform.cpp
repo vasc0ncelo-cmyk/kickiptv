@@ -27,6 +27,7 @@
 #include "hls.hpp"
 #include "streambuf.hpp"
 #include "tsmux.hpp"
+#include "blit.hpp"
 #include <orbis/libkernel.h>
 #include <orbis/VideoOut.h>
 #include <orbis/UserService.h>
@@ -438,12 +439,15 @@ typedef int (*KAvLogCb)(void *ud, const char *fmt, va_list ap);
 int sceAvPlayerSetLogCallback(KAvLogCb cb, void *ud);
 }
 
+// Quantas desmontagens (fechar player/threads) estao rodando em segundo plano. O botao O nao espera por elas.
+static std::atomic<int> g_tearing{0};
+
 // Stop+Close em outra thread com limite de tempo: se o player travar, abandona o handle e segue em frente
 static bool avStopClose(KAvHandle h, int timeoutMs = 5000) {
     if (!h) return true;
     std::atomic<bool> *done = new std::atomic<bool>(false);
     std::thread t([h, done] { sceAvPlayerStop(h); sceAvPlayerClose(h); done->store(true); });
-    for (int i = 0; i < timeoutMs / 50 && !done->load(); i++) sceKernelUsleep(50000);
+    for (int i = 0; i < timeoutMs / 5 && !done->load(); i++) sceKernelUsleep(5000);
     if (done->load()) { t.join(); delete done; return true; }
     t.detach();                               // vaza de proposito: a thread ainda usa 'done'
     return false;
@@ -494,39 +498,10 @@ static void avFreeTex(void *, void *p) {
     g_tex.erase(it);
 }
 
-// ---------- NV12 -> BGRA (vizinho mais proximo, com escala) ----------
-static int g_yTab[256], g_rv[256], g_gu[256], g_gv[256], g_bu[256];
-static bool g_tabInit = false;
-static void initTabs() {
-    if (g_tabInit) return;
-    for (int i = 0; i < 256; i++) {
-        int y = ((i - 16) * 298) >> 8; g_yTab[i] = y < 0 ? 0 : y;
-        int c = i - 128;
-        g_rv[i] = (409 * c) >> 8;   // BT.709 aproximado
-        g_gu[i] = (100 * c) >> 8;
-        g_gv[i] = (208 * c) >> 8;
-        g_bu[i] = (516 * c) >> 8;
-    }
-    g_tabInit = true;
-}
-static inline int clamp255(int v) { return v < 0 ? 0 : (v > 255 ? 255 : v); }
+// ---------- NV12 -> BGRA: ver blit.hpp (rapido, em varias threads) ----------
 static void blitNV12(const uint8_t *src, int sw, int sh, int pitch, int yRows, uint32_t *dst, int dw, int dh) {
-    initTabs();
-    static std::vector<int> xmap; static int xmapW = 0, xmapS = 0;
-    if (xmapW != dw || xmapS != sw) { xmap.resize(dw); for (int x = 0; x < dw; x++) xmap[x] = (int)((long long)x * sw / dw); xmapW = dw; xmapS = sw; }
-    const uint8_t *Y = src, *UV = src + (size_t)pitch * yRows;
-    for (int y = 0; y < dh; y++) {
-        int sy = (int)((long long)y * sh / dh);
-        const uint8_t *yr = Y + (size_t)sy * pitch, *uvr = UV + (size_t)(sy >> 1) * pitch;
-        uint32_t *o = dst + (size_t)y * dw;
-        for (int x = 0; x < dw; x++) {
-            int sx = xmap[x];
-            int yy = g_yTab[yr[sx]];
-            int u = uvr[sx & ~1], v = uvr[(sx & ~1) + 1];
-            int r = clamp255(yy + g_rv[v]), g = clamp255(yy - g_gu[u] - g_gv[v]), b = clamp255(yy + g_bu[u]);
-            o[x] = 0xFF000000u | (r << 16) | (g << 8) | b;
-        }
-    }
+    blit::pool().start(4);                     // 3 trabalhadores + a thread principal (so cria na primeira vez)
+    blit::nv12(src, sw, sh, pitch, yRows, dst, dw, dh);
 }
 
 // ---------- Audio: thread propria (sceAudioOutOutput bloqueia ate o buffer tocar) ----------
@@ -707,6 +682,21 @@ struct Player {
     double inactiveSince = 0, lastFrameT = 0, hudUntil = 0;
     std::string title;
 
+    // ---- pipeline do ao vivo por pedacos: preparo assincrono + segundo player (troca sem emenda) ----
+    double curDur = 0;                       // duracao (s) do pedaco que toca agora (0 = desconhecida)
+    double chunkT0 = 0;                      // instante do primeiro quadro do pedaco atual
+    KAvHandle h2 = 0;                        // proximo pedaco ja aberto num segundo player
+    bool gapless = true;                     // desliga sozinho se o segundo player falhar
+    std::atomic<bool> prepBusy{false}, nextReady{false};
+    std::string nextPath; unsigned long long nextLast = 0; double nextDur = 0; int nextIdx = 0;
+    std::thread prepTh, openTh;
+    std::atomic<int> bState{0};              // segundo player: 0 nada | 1 abrindo | 2 pronto | 3 falhou
+    KAvHandle bHandle = 0;
+    int restarts = 0, switchesOk = 0;
+    double lastGapMs = 0, gapStartT = 0, switchedAt = 0, blitMs = 0;
+    std::function<bool()> cancelCb;          // main liga: true = o usuario cancelou (O) ou pediu para sair
+    bool cancelled = false;
+
     static std::string chunkPath(const std::string &ext, int idx) { return "/data/live" + std::to_string(idx) + "." + ext; }
     static std::string hx8(int v) { char b[16]; snprintf(b, sizeof b, "%08X", (unsigned)v); return b; }
 
@@ -728,7 +718,7 @@ struct Player {
     }
 
     // Abre uma fonte. waitMs>0: so aceita se chegar um quadro de video nesse tempo. Guarda o handle em 'h'.
-    bool openSource(const std::string &path, bool cb, int dbg, int waitMs, bool note) {
+    bool openSource(const std::string &path, bool cb, int dbg, int waitMs, bool note, KAvHandle *target = nullptr) {
         KAvInitData id; memset(&id, 0, sizeof id);
         id.allocate = avAlloc; id.deallocate = avFree; id.allocateTexture = avAllocTex; id.deallocateTexture = avFreeTex;
         id.debugLevel = dbg; id.basePriority = 700; id.numOutputVideoFrameBuffers = 3; id.autoStart = true; id.defaultLanguage = "eng";
@@ -741,7 +731,7 @@ struct Player {
         if (!hh) { if (note) log.push_back("   Init falhou"); return false; }
         int rc = sceAvPlayerAddSource(hh, path.c_str());
         addRc = rc;
-        sceKernelUsleep(300000);
+        if (note || waitMs > 0) sceKernelUsleep(300000);
         if (note) {
             log.push_back("   AddSource(" + path + ") = " + hx8(rc) + "  open=" + std::to_string(g_feed.opens.load()) + " leituras=" + std::to_string(g_feed.reads.load()));
             std::lock_guard<std::mutex> l(g_avlogM);
@@ -761,16 +751,26 @@ struct Player {
                 KAvFrameInfo au; memset(&au, 0, sizeof au);
                 sceAvPlayerGetAudioData(hh, &au);
                 sceKernelUsleep(8000);
+                if (cancelCb && cancelCb()) { cancelled = true; break; }
             }
             if (note) log.push_back(got ? "      -> chegou video!" : "      -> aceitou, mas nenhum quadro em " + std::to_string(waitMs / 1000) + "s");
             if (!got) { avStopClose(hh); return false; }
         }
-        h = hh;
+        (target ? *target : h) = hh;
         return true;
     }
 
     bool start(const std::string &url, const std::string &title) {
         log.clear(); frames = 0; vw = vh = 0; fps = 0; fpsFrames = 0; failed = false; addRc = 0; chunkMode = false; chunkIdx = 0; inactiveSince = 0;
+        cancelled = false; restarts = switchesOk = 0; lastGapMs = 0; gapStartT = switchedAt = 0; curDur = 0; chunkT0 = 0; blitMs = 0;
+        h2 = 0; bHandle = 0; bState = 0; nextReady = false; prepBusy = false; gapless = true;
+        if (g_tearing.load() > 0) {
+            log.push_back("Encerrando a exibicao anterior...");
+            while (g_tearing.load() > 0) {
+                if (cancelCb && cancelCb()) { cancelled = true; failed = true; return false; }
+                presentCb(); sceKernelUsleep(30000);
+            }
+        }
         this->title = title; hudUntil = nowSec() + 8;
         log.push_back("Reproduzindo: " + title);
         {   // host e tamanho da URL
@@ -791,7 +791,12 @@ struct Player {
         }
         g_feed.join(); g_feed.opens = g_feed.reads = g_feed.segs = 0; g_feedSize = 1ULL << 40;
         g_feed.start(url);                                      // sem outFile: segmentos vao para o buffer (callbacks) e para 'recent' (arquivos)
-        for (int i = 0; i < 100 && g_feed.segs.load() < 3 && !g_feed.failed.load(); i++) sceKernelUsleep(200000);
+        for (int i = 0; i < 400 && g_feed.segs.load() < 3 && !g_feed.failed.load(); i++) {
+            sceKernelUsleep(50000);
+            if (cancelCb && cancelCb()) { cancelled = true; break; }
+            if (i % 2 == 0) presentCb();                    // a animacao de "Conectando..." continua rodando
+        }
+        if (cancelled) { failed = true; stop(); return false; }
         log.push_back("HLS: segmentos baixados=" + std::to_string(g_feed.segs.load()) + "  " + g_feed.getStatus());
         if (g_feed.segs.load() == 0) { failed = true; log.push_back("ERRO: nenhum segmento baixado"); g_feed.join(); return false; }
 
@@ -815,15 +820,17 @@ struct Player {
                 log.push_back("Tentando MP4 convertido " + path + " ...");
                 presentCb();
                 if (writeFile(path, mp4) && openSource(path, false, 3, 7000, true)) {
-                    chunkMode = true; remux = true; chunkExt = "mp4"; chunkIdx = 0; lastSeq = last;
+                    chunkMode = true; remux = true; chunkExt = "mp4"; chunkIdx = 0; lastSeq = last; curDur = ti.seconds;
                     log.push_back("OK: tocando MP4 convertido");
                 } else remove(path.c_str());
             } else log.push_back("ERRO conversao TS->MP4: " + err);
         }
+        if (cancelled) { failed = true; stop(); return false; }
         // Plano B: escada de tentativas com o TS cru (varias extensoes) e depois leitura propria (callbacks)
         static const char *exts[] = {"mp4", "m2ts", "mpg", "ts", "mkv"};
         if (!chunkMode)
         for (const char *ext : exts) {
+            if (cancelled) break;
             std::string path = chunkPath(ext, 0);
             log.push_back("Tentando arquivo " + path + " ...");
             presentCb();
@@ -838,12 +845,14 @@ struct Player {
         if (!chunkMode) {
             static const char *names[] = {"live.mp4", "live.ts", "live.m2ts"};
             for (const char *nm : names) {
+                if (cancelled) break;
                 log.push_back(std::string("Tentando leitura propria, nome ") + nm + " ...");
                 presentCb();
                 g_feedSize = 1ULL << 40;
                 if (openSource(nm, true, 3, 6000, true)) { log.push_back("OK: tocando por leitura propria"); break; }
             }
         }
+        if (cancelled) { failed = true; stop(); return false; }
         if (!h) {
             failed = true;
             log.push_back("ERRO: nenhuma forma funcionou. Tire print desta tela.");
@@ -856,37 +865,107 @@ struct Player {
     }
     std::function<void()> presentCb = [] {};   // main liga isto para redesenhar a tela de espera durante as tentativas
 
-    // fim do arquivo atual: grava os segmentos novos em outro arquivo e abre de novo
-    bool restartChunk() {
+    // ---- preparo assincrono do proximo pedaco: junta, converte e grava enquanto o atual ainda toca ----
+    void startPrep() {
+        if (prepBusy.load() || nextReady.load()) return;
         std::string data; unsigned long long last = lastSeq;
-        if (gatherChunk(false, data, last) == 0) return false;
-        if (remux) {                                          // converte os segmentos novos em MP4
-            std::string mp4, err;
-            if (!tsmux::convert(data, mp4, err)) { lastSeq = last; return false; }   // segmento ruim: pula
-            data.swap(mp4);
+        if (gatherChunk(false, data, last) == 0) return;
+        lastSeq = last;                                      // esses segmentos ja tem dono (o pedaco em preparo)
+        int idx = (chunkIdx + 1) % 4;
+        bool rm = remux; std::string ext = chunkExt;
+        if (prepTh.joinable()) prepTh.join();
+        prepBusy = true;
+        prepTh = std::thread([this, data, last, idx, rm, ext]() {
+            std::string out, err; tsmux::Info ti; bool ok = true;
+            if (rm) ok = tsmux::convert(data, out, err, &ti); else out = data;
+            std::string path = chunkPath(ext, idx);
+            if (ok && writeFile(path, out)) { nextPath = path; nextLast = last; nextDur = rm ? ti.seconds : 0; nextIdx = idx; nextReady = true; }
+            prepBusy = false;
+        });
+    }
+    // abre o proximo pedaco num SEGUNDO player, em segundo plano, um pouco antes do atual acabar
+    void openNextAsync() {
+        if (openTh.joinable()) openTh.join();
+        bState = 1;
+        std::string path = nextPath;
+        openTh = std::thread([this, path] { KAvHandle nh = 0; bool ok = openSource(path, false, 0, 0, false, &nh); bHandle = nh; bState = ok ? 2 : 3; });
+    }
+    static void closeLater(KAvHandle old, const std::string &oldPath) {
+        g_tearing++;
+        std::thread([old, oldPath] { avStopClose(old); remove(oldPath.c_str()); g_tearing--; }).detach();
+    }
+    // troca para o proximo pedaco (ja pronto em disco). Com segundo player aberto nao ha emenda.
+    bool switchChunk(double t) {
+        if (!nextReady.load()) return false;
+        std::string oldPath = chunkPath(chunkExt, chunkIdx);
+        gapStartT = lastFrameT > 0 ? lastFrameT : t;
+        if (h2) {
+            audio.stop();
+            KAvHandle old = h; h = h2; h2 = 0;
+            audio.start(h);
+            closeLater(old, oldPath);
+            switchesOk++;
+        } else {
+            audio.stop();
+            avStopClose(h); h = 0;
+            remove(oldPath.c_str());
+            if (!openSource(nextPath, false, 0, 0, false)) { failed = true; log.push_back("ERRO ao reabrir pedaco: " + hx8(addRc)); nextReady = false; return false; }
+            audio.start(h);
+            restarts++;
         }
-        audio.stop();
-        std::string old = chunkPath(chunkExt, chunkIdx);
-        avStopClose(h); h = 0;
-        remove(old.c_str());
-        chunkIdx = (chunkIdx + 1) % 4;
-        std::string path = chunkPath(chunkExt, chunkIdx);
-        if (!writeFile(path, data)) return false;
-        lastSeq = last;
-        if (!openSource(path, false, 0, 0, false)) { failed = true; log.push_back("ERRO ao reabrir pedaco: " + hx8(addRc)); return false; }
-        audio.start(h);
-        inactiveSince = 0; lastFrameT = nowSec();
+        chunkIdx = nextIdx; curDur = nextDur; nextReady = false;
+        chunkT0 = 0; inactiveSince = 0; lastFrameT = t; switchedAt = t;
         return true;
     }
+    void managePipeline(double t) {
+        bool inactive = !sceAvPlayerIsActive(h);
+        if (inactive && inactiveSince == 0) inactiveSince = t;
+        int fresh = 0; { std::lock_guard<std::mutex> l(g_feed.rm); for (auto &sg : g_feed.recent) if (sg.first > lastSeq) fresh++; }
+        // 1) comeca a preparar o proximo pedaco assim que houver 2 segmentos novos
+        if (!prepBusy.load() && !nextReady.load() && !h2 && fresh >= 2) startPrep();
+        // 2) segundo player
+        if (bState.load() == 2) { h2 = bHandle; bState = 0; }
+        else if (bState.load() == 3) { bState = 0; gapless = false; log.push_back("segundo player nao abriu: troca com emenda"); }
+        double el = chunkT0 > 0 ? t - chunkT0 : 0;
+        if (gapless && nextReady.load() && !h2 && bState.load() == 0 && chunkT0 > 0 && curDur > 0 && el >= curDur - 0.8) openNextAsync();
+        // 3) troca
+        bool ended = inactive && t - inactiveSince > 0.03;
+        bool overdue = curDur > 0 && chunkT0 > 0 && el > curDur + 0.6;
+        bool stalled = t - lastFrameT > 3.0;
+        if (nextReady.load()) {
+            if (h2 && (ended || overdue || stalled)) switchChunk(t);
+            else if (!h2 && bState.load() == 0 && (ended || stalled)) switchChunk(t);
+        } else if ((ended || stalled) && !prepBusy.load() && fresh >= 1) startPrep();
+        // segundo player que nao entregou video depois da troca: desliga o modo sem emenda
+        if (switchedAt > 0 && chunkT0 == 0 && t - switchedAt > 2.5 && gapless) { gapless = false; log.push_back("sem quadros apos a troca: modo sem emenda desligado"); }
+    }
+    // Desmonta TUDO em segundo plano: o botao O volta ao menu na hora (antes travava ate a rede responder).
     void stop() {
-        g_feed.abort();                     // libera leituras bloqueadas do player (senao o Close poderia travar)
-        audio.stop();                       // a thread de audio usa o handle: para antes de fechar
-        avStopClose(h);
-        g_feed.join();
-        for (int i = 0; i < 4; i++) { static const char *e[] = {"mp4","m2ts","mpg","ts","mkv"}; for (const char *x : e) remove(chunkPath(x, i).c_str()); }
-        if (g_feed.outFile) { fclose(g_feed.outFile); g_feed.outFile = nullptr; }
-        remove("/data/live.ts");
-        h = 0; active = false; chunkMode = false;
+        KAvHandle hh = h, hh2 = h2;
+        h = 0; h2 = 0; active = false; chunkMode = false;
+        g_feed.abort();                                      // acorda leituras bloqueadas
+        g_tearing++;
+        std::thread([this, hh, hh2] {
+            audio.stop();
+            if (openTh.joinable()) openTh.join();
+            KAvHandle hb = bState.load() == 2 ? bHandle : 0;
+            bState = 0;
+            avStopClose(hh);
+            if (hh2) avStopClose(hh2);
+            if (hb) avStopClose(hb);
+            if (prepTh.joinable()) prepTh.join();
+            g_feed.join();
+            for (int i = 0; i < 4; i++) { static const char *e[] = {"mp4","m2ts","mpg","ts","mkv"}; for (const char *x : e) remove(chunkPath(x, i).c_str()); }
+            if (g_feed.outFile) { fclose(g_feed.outFile); g_feed.outFile = nullptr; }
+            remove("/data/live.ts");
+            nextReady = false; prepBusy = false;
+            g_tearing--;
+        }).detach();
+    }
+    // espera as desmontagens terminarem (usado ao fechar o app)
+    static void waitTeardown(double maxSec) {
+        double t0 = nowSec();
+        while (g_tearing.load() > 0 && nowSec() - t0 < maxSec) sceKernelUsleep(20000);
     }
     // chama a cada iteracao; retorna true se desenhou um quadro novo
     bool poll(FbRenderer &r) {
@@ -903,31 +982,31 @@ struct Player {
                 case 2: pitch = (w + 63) & ~63; yRows = a16h; break;
                 case 3: pitch = (w + 255) & ~255; yRows = a16h; break;
                 }
+                double b0 = nowSec();
                 blitNV12(fi.pData, w, hh, pitch, yRows, r.fb, r.W, r.H);
+                double bm = (nowSec() - b0) * 1000.0;
+                blitMs = blitMs == 0 ? bm : blitMs * 0.9 + bm * 0.1;
                 frames++; fpsFrames++;
                 drew = true;
             }
         }
         double t = nowSec();
-        if (drew) { lastFrameT = t; inactiveSince = 0; }
-        if (chunkMode && h && !failed) {      // ao vivo por pedacos: reabre quando o arquivo acaba
-            bool inactive = !sceAvPlayerIsActive(h);
-            if (inactive && inactiveSince == 0) inactiveSince = t;
-            bool ended = inactive && t - inactiveSince > 0.25;
-            bool stalled = t - lastFrameT > 3.0;
-            int fresh = 0; { std::lock_guard<std::mutex> l(g_feed.rm); for (auto &sg : g_feed.recent) if (sg.first > lastSeq) fresh++; }
-            if ((ended && (fresh >= 2 || t - inactiveSince > 2.0)) || (stalled && fresh >= 1)) restartChunk();
+        if (drew) {
+            lastFrameT = t; inactiveSince = 0;
+            if (chunkT0 == 0) { chunkT0 = t; if (gapStartT > 0) { lastGapMs = (t - gapStartT) * 1000.0; gapStartT = 0; } }
         }
+        if (chunkMode && h && !failed) managePipeline(t);
         if (t - lastFps >= 1.0) { fps = fpsFrames / (t - lastFps); fpsFrames = 0; lastFps = t; }
         return drew;
     }
+    bool hudActive() const { return nowSec() <= hudUntil || (useFeed && g_feed.failed); }
     // HUD moderno sobre o video (aparece nos primeiros segundos e quando qualquer botao e apertado)
     void overlay(FbRenderer &r) {
         using namespace theme;
         if (nowSec() > hudUntil && !(useFeed && g_feed.failed)) return;
         if (nowSec() <= hudUntil) {
             char b[96];
-            snprintf(b, sizeof b, "%ux%u  |  %.0f fps", vw, vh, fps);
+            snprintf(b, sizeof b, "%ux%u  |  %.0f fps  |  desenho %.0f ms", vw, vh, fps, blitMs);
             std::string stats = b;
             int tw = r.textWidth(title, 24), sw = r.textWidth(stats, 18);
             int pw = 24 + 92 + 16 + tw + 24 + sw + 28;
@@ -939,7 +1018,7 @@ struct Player {
             int hw = r.textWidth("O  Sair     TRIÂNGULO  Ajustar imagem", 18) + 48;
             r.roundRect(r.W - 32 - hw, r.H - 76, hw, 44, 22, 0xB8000000);
             uiCenter(r, r.W - 32 - hw / 2, r.H - 54, "O  Sair     TRIÂNGULO  Ajustar imagem", SOFT, 18);
-            snprintf(b, sizeof b, "stride %d  |  audio %d %uHz", strideMode, audio.state.load(), audio.rate.load());
+            snprintf(b, sizeof b, "stride %d  |  audio %d %uHz  |  trocas: %d sem emenda, %d com emenda  |  ultima %.0f ms%s", strideMode, audio.state.load(), audio.rate.load(), switchesOk, restarts, lastGapMs, gapless ? "" : "  (sem-emenda OFF)");
             r.roundRect(32, r.H - 76, r.textWidth(b, 16) + 40, 40, 20, 0x90000000);
             uiText(r, 52, r.H - 76 + 12, b, DIM, 16);
         }
@@ -1189,6 +1268,25 @@ static const uint32_t B_OPTIONS = 0x0008, B_UP = 0x0010, B_DOWN = 0x0040, B_LEFT
 
 enum class Mode { Menu, Diag, Play, Kbd };
 
+// Leitura do controle sem perder toques rapidos: o scePadRead guarda os estados recentes, entao um aperto curto
+// feito enquanto o app estava ocupado (carregando, trocando de pedaco) ainda e visto depois.
+struct PadIn {
+    int h = -1;
+    uint32_t held = 0, pending = 0;
+    void poll() {
+        if (h < 0) return;
+        OrbisPadData buf[16]; uint32_t seen = 0;
+        int n = scePadRead(h, buf, 16);
+        for (int i = 0; i < n; i++) seen |= buf[i].buttons;
+        OrbisPadData d; uint32_t cur = held;
+        if (scePadReadState(h, &d) == 0) cur = d.buttons;
+        seen |= cur;
+        pending |= seen & ~held;
+        held = cur;
+    }
+    uint32_t take() { uint32_t e = pending; pending = 0; return e; }
+};
+
 int main() {
     sceUserServiceInitialize(NULL);
     int userId = 0;
@@ -1196,6 +1294,8 @@ int main() {
     scePadInit();
     sceAudioOutInit();
     int pad = scePadOpen(userId, 0, 0, NULL);
+    PadIn pin; pin.h = pad;
+    bool wantQuit = false;
 
     const int W = 1920, H = 1080;
     int vh = sceVideoOutOpen(ORBIS_VIDEO_USER_MAIN, 0, 0, NULL);
@@ -1291,12 +1391,10 @@ int main() {
     trace("intro-ok");
 
     for (;;) {
-        OrbisPadData d;
-        uint32_t now = 0;
-        if (pad >= 0 && scePadReadState(pad, &d) == 0) now = d.buttons;
-        if (now & B_OPTIONS) break;
-        uint32_t pressed = now & ~prev;
-        prev = now;
+        pin.poll();
+        uint32_t now = pin.held, pressed = pin.take();
+        if (wantQuit || ((now | pressed) & B_OPTIONS)) break;
+        (void)prev;
 
         if (mode == Mode::Kbd) {
             bool changed = false, done = false;
@@ -1323,8 +1421,15 @@ int main() {
             if (pressed) player.hudUntil = nowSec() + 5;      // qualquer botao mostra o HUD por 5s
             if (pressed & B_TRIANGLE) player.strideMode = (player.strideMode + 1) % 4;
             if (player.h) {
-                FbRenderer r(shadow, W, H);
-                if (player.poll(r)) { gotFrame = true; player.overlay(r); flip(); }
+                // Sem HUD o video e desenhado DIRETO no quadro de video (so escrita, sem a copia de 8 MB).
+                // Com HUD (precisa ler pixels para a transparencia) passa pelo rascunho, como antes.
+                bool hud = player.hudActive();
+                FbRenderer r(hud ? shadow : (uint32_t *)bufs[back], W, H);
+                if (player.poll(r)) {
+                    gotFrame = true;
+                    if (hud) { player.overlay(r); flip(); }
+                    else { sceVideoOutSubmitFlip(vh, back, ORBIS_VIDEO_OUT_FLIP_VSYNC, 0); back ^= 1; }
+                }
                 else if (!gotFrame && nowSec() - lastWaitDraw > 0.12) { lastWaitDraw = nowSec(); presentWait(); }
             } else if (nowSec() - lastWaitDraw > 0.12) { lastWaitDraw = nowSec(); presentWait(); }
             sceKernelUsleep(4000);
@@ -1386,8 +1491,15 @@ int main() {
             mode = Mode::Play; gotFrame = false; lastWaitDraw = 0;
             presentWait();                       // mostra "Player" antes de bloquear
             player.presentCb = presentWait;
+            player.cancelCb = [&]() -> bool {        // O cancela o carregamento na hora; OPTIONS fecha o app
+                pin.poll();
+                if (pin.pending & B_CIRCLE) { pin.pending &= ~B_CIRCLE; return true; }
+                if ((pin.held | pin.pending) & B_OPTIONS) { wantQuit = true; return true; }
+                return false;
+            };
             trace("player-start");
             player.start(url, title);
+            if (player.cancelled) { player.cancelled = false; mode = Mode::Menu; dirty = true; trace("player-cancelado"); continue; }
             trace(player.failed ? "player-falhou" : "player-aberto");
             presentWait();
             continue;
@@ -1395,6 +1507,13 @@ int main() {
         if (dirty) { presentMenu(); dirty = false; static bool once = false; if (!once) { once = true; trace("menu-ok"); } }
         sceKernelUsleep(16000);
     }
+    // ---- encerramento limpo: nenhuma thread pode estar viva ao sair (std::thread ativa no fim = "terminate" = erro no PS4) ----
+    trace("saindo");
+    if (player.h || player.h2 || mode == Mode::Play) player.stop();
+    Player::waitTeardown(10.0);
+    if (g_tearing.load() > 0) { trace("fim-forcado"); _Exit(0); }   // algo travou (rede): sai sem rodar destrutores
+    g_feed.join();
+    blit::pool().shutdown();
     trace("fim");
     return 0;
 }
