@@ -546,6 +546,17 @@ static void avFree(void *, void *p) { alignedFree(p); }
 // memoria "de textura" (os quadros de video): memoria direta mapeada, como nos samples da Sony
 struct TexMem { off_t phys; size_t size; };
 static std::map<void *, TexMem> g_tex;
+static std::mutex g_texM;                      // o AvPlayer chama alocar/liberar de threads proprias
+// Quantos bytes existem de 'p' ate o fim do bloco de textura que o contem (0 = nao e um bloco nosso). Evita ler alem do mapeado.
+static size_t texAvail(const void *p) {
+    std::lock_guard<std::mutex> l(g_texM);
+    auto it = g_tex.upper_bound((void *)p);
+    if (it == g_tex.begin()) return 0;
+    --it;
+    const char *base = (const char *)it->first, *q = (const char *)p;
+    if (q < base || q >= base + it->second.size) return 0;
+    return (size_t)(base + it->second.size - q);
+}
 static void *avAllocTex(void *, uint32_t align, uint32_t size) {
     g_texN++;
     size_t al = align < 0x10000 ? 0x10000 : align;
@@ -553,14 +564,36 @@ static void *avAllocTex(void *, uint32_t align, uint32_t size) {
     off_t phys = 0; void *addr = NULL;
     if (sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), sz, al, 3, &phys) < 0) { g_texFail++; return NULL; }
     if (sceKernelMapDirectMemory(&addr, sz, 0x33, 0, phys, al) < 0) { g_texFail++; return NULL; }
-    g_tex[addr] = {phys, sz};
+    { std::lock_guard<std::mutex> l(g_texM); g_tex[addr] = {phys, sz}; }
     return addr;
 }
 static void avFreeTex(void *, void *p) {
-    auto it = g_tex.find(p);
-    if (it == g_tex.end()) return;
-    sceKernelReleaseDirectMemory(it->second.phys, it->second.size);
-    g_tex.erase(it);
+    TexMem tm;
+    {
+        std::lock_guard<std::mutex> l(g_texM);
+        auto it = g_tex.find(p);
+        if (it == g_tex.end()) return;
+        tm = it->second; g_tex.erase(it);
+    }
+    sceKernelReleaseDirectMemory(tm.phys, tm.size);
+}
+
+// ---------- Copia rapida de memoria "write-combined" (a memoria de textura do decoder e type 3 = WC/GARLIC) ----------
+// LER essa memoria byte a byte pela CPU e lentissimo (cada leitura e um acesso sem cache). Era ISSO que travava o video: o HUD
+// mostrava "desenho 201 ms" (4 fps) so para ler um quadro 864x480. Aqui lemos em blocos de 64 bytes com "movntdqa"
+// (leitura em fila para memoria WC, SSE4.1; o Jaguar do PS4 tem) para um buffer comum em RAM com cache, e o blit le de la.
+typedef long long KV2 __attribute__((vector_size(16)));
+static void copyFromWC(uint8_t *dst, const uint8_t *src, size_t n) {
+    size_t i = 0;
+    while (i < n && ((uintptr_t)(src + i) & 15)) { dst[i] = src[i]; i++; }
+    for (; i + 64 <= n; i += 64) {
+        KV2 a, b, c, d;
+        __asm__ volatile("movntdqa (%4), %0\n\tmovntdqa 16(%4), %1\n\tmovntdqa 32(%4), %2\n\tmovntdqa 48(%4), %3"
+                         : "=&x"(a), "=&x"(b), "=&x"(c), "=&x"(d) : "r"(src + i) : "memory");
+        __builtin_memcpy(dst + i, &a, 16); __builtin_memcpy(dst + i + 16, &b, 16);
+        __builtin_memcpy(dst + i + 32, &c, 16); __builtin_memcpy(dst + i + 48, &d, 16);
+    }
+    for (; i < n; i++) dst[i] = src[i];
 }
 
 // ---------- NV12 -> BGRA: ver blit.hpp (rapido, em varias threads) ----------
@@ -780,6 +813,13 @@ struct Player {
     double lastDrawT = 0, worstGap = 0, worstShown = 0;      // maior intervalo entre quadros desenhados no ultimo segundo
     double convMs = 0;                                       // tempo da ultima conversao TS->MP4
     double openMs = 800, openT0 = 0;                         // tempo medido para abrir o 2o player (abertura adaptativa)
+    uint8_t *stage = nullptr; size_t stageCap = 0;           // copia em RAM com cache do quadro (ver copyFromWC)
+    bool autoStride = true, strideLocked = false; int lockW = 0, lockH = 0;
+    double copyMs = 0;
+    uint8_t *stageBuf(size_t n) {
+        if (n > stageCap) { alignedFree(stage); stageCap = (n + 0xFFFF) & ~(size_t)0xFFFF; stage = (uint8_t *)alignedAlloc(64, stageCap); if (!stage) stageCap = 0; }
+        return stage;
+    }
 
     // ---- pipeline do ao vivo por pedacos: preparo assincrono + segundo player (troca sem emenda) ----
     double curDur = 0;                       // duracao (s) do pedaco que toca agora (0 = desconhecida)
@@ -871,7 +911,7 @@ struct Player {
             }
         }
         this->title = title; this->url = url; hudUntil = nowSec() + 8;
-        lastDrawT = 0; worstGap = worstShown = 0; convMs = 0; openMs = 800;
+        lastDrawT = 0; worstGap = worstShown = 0; convMs = 0; openMs = 800; copyMs = 0; autoStride = true; strideLocked = false; lockW = lockH = 0; strideMode = 1;
         log.push_back("Reproduzindo: " + title);
         {   // host e tamanho da URL
             size_t a = url.find("://"); a = a == std::string::npos ? 0 : a + 3;
@@ -1082,19 +1122,33 @@ struct Player {
             uint32_t w = *(uint32_t *)(fi.details + 0), hh = *(uint32_t *)(fi.details + 4);
             if (w > 0 && hh > 0 && w <= 4096 && hh <= 4096) {
                 vw = w; vh = hh;
-                int a16h = (hh + 15) & ~15;
-                int pitch = w, yRows = hh;
-                switch (strideMode) {
-                case 1: yRows = a16h; break;
-                case 2: pitch = (w + 63) & ~63; yRows = a16h; break;
-                case 3: pitch = (w + 255) & ~255; yRows = a16h; break;
-                }
+                if (w != (unsigned)lockW || hh != (unsigned)lockH) { lockW = (int)w; lockH = (int)hh; strideLocked = false; }
+                const uint8_t *src = fi.pData; size_t srcN = 0;
+                size_t avail = texAvail(fi.pData);
                 double b0 = nowSec();
-                blitNV12(fi.pData, w, hh, pitch, yRows, r.fb, r.W, r.H);
-                double bm = (nowSec() - b0) * 1000.0;
-                blitMs = blitMs == 0 ? bm : blitMs * 0.9 + bm * 0.1;
-                frames++; fpsFrames++;
-                drew = true;
+                if (avail >= (size_t)w * hh * 3 / 2) {
+                    // copia o quadro para RAM com cache. Enquanto o stride nao foi detectado, copia o maximo que cabe (todos os modos)
+                    size_t want = blit::strideBytes(strideLocked || !autoStride ? strideMode : 3, (int)w, (int)hh);
+                    if (!strideLocked && autoStride) { size_t m = blit::strideBytes(3, (int)w, (int)hh); if (m > want) want = m; }
+                    srcN = want < avail ? want : avail; srcN &= ~(size_t)15;
+                    uint8_t *st = stageBuf(srcN);
+                    if (st) { copyFromWC(st, fi.pData, srcN); src = st; } else srcN = 0;
+                }
+                copyMs = copyMs == 0 ? (nowSec() - b0) * 1000.0 : copyMs * 0.9 + (nowSec() - b0) * 100.0;
+                if (srcN && autoStride && !strideLocked) {
+                    int m = blit::detectStride(src, srcN, (int)w, (int)hh);
+                    if (m > 0) { strideMode = m; strideLocked = true; }
+                }
+                int pitch, yRows; blit::strideCandidate(strideMode, (int)w, (int)hh, pitch, yRows);
+                bool fits = srcN ? blit::strideBytes(strideMode, (int)w, (int)hh) <= srcN : true;   // sem copia: leitura direta (lenta, como antes)
+                if (fits) {
+                    b0 = nowSec();
+                    blitNV12(src, w, hh, pitch, yRows, r.fb, r.W, r.H);
+                    double bm = (nowSec() - b0) * 1000.0;
+                    blitMs = blitMs == 0 ? bm : blitMs * 0.9 + bm * 0.1;
+                    frames++; fpsFrames++;
+                    drew = true;
+                }                                                                               // modo manual que nao cabe no que foi copiado: pula o quadro
             }
         }
         double t = nowSec();
@@ -1115,7 +1169,7 @@ struct Player {
         if (nowSec() > hudUntil && !(useFeed && g_feed.failed)) return;
         if (nowSec() <= hudUntil) {
             char b[256];
-            snprintf(b, sizeof b, "%ux%u  |  %.0f fps  |  desenho %.0f ms  |  %s", vw, vh, fps, blitMs, g_quality.load() == 0 ? "Fluido" : "Maxima");
+            snprintf(b, sizeof b, "%ux%u  |  %.0f fps  |  desenho %.0f+%.0f ms  |  %s", vw, vh, fps, copyMs, blitMs, g_quality.load() == 0 ? "Fluido" : "Maxima");
             std::string stats = b;
             int tw = r.textWidth(title, 24), sw = r.textWidth(stats, 18);
             int pw = 24 + 92 + 16 + tw + 24 + sw + 28;
@@ -1530,7 +1584,7 @@ int main() {
         if (mode == Mode::Play) {
             if (pressed & B_CIRCLE) { player.stop(); mode = Mode::Menu; dirty = true; sceKernelUsleep(16000); continue; }
             if (pressed) player.hudUntil = nowSec() + 5;      // qualquer botao mostra o HUD por 5s
-            if (pressed & B_TRIANGLE) player.strideMode = (player.strideMode + 1) % 4;
+            if (pressed & B_TRIANGLE) { player.autoStride = false; player.strideMode = (player.strideMode + 1) % 4; }   // manual desliga a deteccao
             if ((pressed & B_SQUARE) && !player.url.empty()) {     // QUADRADO: alterna Fluido (30 fps) <-> Maxima (60 fps) e reabre o canal
                 g_quality = g_quality.load() == 0 ? 1 : 0;
                 pf.pendingPlayUrl = player.url; pf.pendingPlayTitle = player.title;
