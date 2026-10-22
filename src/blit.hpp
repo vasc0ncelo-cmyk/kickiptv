@@ -124,4 +124,56 @@ inline void nv12(const uint8_t *src, int sw, int sh, int pitch, int yRows, uint3
     p.run(j);
 }
 
+
+// ---------- Stride (pitch) do quadro NV12 ----------
+// O AvPlayer pode alinhar a largura (ex.: 864 -> 896 ou 1024) e a altura do plano Y (1080 -> 1088). Se o app assumir o
+// valor errado, a imagem sai verde/torta. Antes isso era ajustado a mao com TRIANGULO; agora e detectado sozinho.
+inline void strideCandidate(int mode, int w, int h, int &pitch, int &yRows) {
+    int a16h = (h + 15) & ~15;
+    pitch = w; yRows = h;
+    switch (mode) {
+    case 1: yRows = a16h; break;
+    case 2: pitch = (w + 63) & ~63; yRows = a16h; break;
+    case 3: pitch = (w + 255) & ~255; yRows = a16h; break;
+    }
+}
+inline size_t strideBytes(int mode, int w, int h) {                       // bytes do quadro NV12 nesse modo
+    int pitch, yRows; strideCandidate(mode, w, h, pitch, yRows);
+    return (size_t)pitch * yRows + (size_t)pitch * ((h + 1) / 2);
+}
+// Mede o quanto linhas vizinhas se parecem (imagem de verdade e "suave" na vertical; com stride errado cada linha
+// aparece deslocada e a diferenca explode). Retorna < 0 se o modo nao cabe em 'avail' bytes.
+inline double strideScore(const uint8_t *buf, size_t avail, int w, int h, int mode) {
+    int pitch, yRows; strideCandidate(mode, w, h, pitch, yRows);
+    if (strideBytes(mode, w, h) > avail || w < 16 || h < 16) return -1;
+    const uint8_t *Y = buf, *UV = buf + (size_t)pitch * yRows;
+    const int K = 24;
+    double sy = 0, suv = 0; long cy = 0, cuv = 0;
+    for (int k = 0; k < K; k++) {
+        int r = (int)((long long)(h - 2) * k / (K - 1));
+        for (int x = 0; x < w; x += 3) { int d = (int)Y[(size_t)r * pitch + x] - (int)Y[(size_t)(r + 1) * pitch + x]; sy += d < 0 ? -d : d; cy++; }
+        int hc = h / 2, rc = (int)((long long)(hc - 2) * k / (K - 1));
+        for (int x = 0; x < w; x += 2) { int d = (int)UV[(size_t)rc * pitch + x] - (int)UV[(size_t)(rc + 1) * pitch + x]; suv += d < 0 ? -d : d; cuv++; }
+    }
+    return sy / (cy ? cy : 1) + 2.0 * suv / (cuv ? cuv : 1);
+}
+// Retorna o modo (1..3) cujo stride e claramente o certo, ou -1 se a imagem nao permite decidir (ex.: quadro todo preto).
+// Mede-se so o PITCH (largura da linha em bytes): a altura do plano Y assume alinhamento de 16 (como todo decoder H.264 faz;
+// para altura multipla de 16, como 480 e 720, e identico). Modo 1 = pitch igual a largura, 2 = alinhado a 64, 3 = alinhado a 256.
+inline int detectStride(const uint8_t *buf, size_t avail, int w, int h) {
+    double sc[4] = {-1, -1, -1, -1}; int best = -1;
+    for (int m = 1; m <= 3; m++) { sc[m] = strideScore(buf, avail, w, h, m); if (sc[m] >= 0 && (best < 0 || sc[m] < sc[best] - 1e-9)) best = m; }
+    if (best < 0) return -1;
+    int pb, rb; strideCandidate(best, w, h, pb, rb);
+    double second = 1e18; bool any = false;
+    for (int m = 1; m <= 3; m++) {
+        if (m == best || sc[m] < 0) continue;
+        int pm, rm; strideCandidate(m, w, h, pm, rm);
+        if (pm == pb) continue;                                          // mesmo pitch (ex.: 1280 nos 3 modos): empate nao conta
+        any = true; if (sc[m] < second) second = sc[m];
+    }
+    if (!any) return best;
+    return second >= sc[best] * 1.25 + 0.5 ? best : -1;
+}
+
 }  // namespace blit
