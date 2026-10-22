@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <algorithm>
 #include <map>
+#include <string.h>
 #include <string>
 #include <vector>
 
@@ -108,6 +109,10 @@ struct Demux {
     std::vector<uint8_t> sps, pps;
     std::vector<VSample> vs; std::vector<ASample> as;
     bool waitKey = true;
+    // Descontinuidade: se a live reinicia (streamer reconectou), os timestamps saltam e/ou o SPS muda no meio do trecho.
+    // Antes isso gerava um MP4 em que UM quadro durava horas (a imagem congelava para sempre). Agora o trecho e cortado ali:
+    // o que veio depois da emenda fica para o proximo pedaco (que comeca limpo, com o SPS novo).
+    bool cut = false, haveDts = false, haveAPts = false; int64_t lastDts = 0, lastAPts = 0;
     int aProfile = 2, aFreq = 4, aChan = 2;
     bool aInfo = false;
     std::string err;
@@ -130,6 +135,8 @@ struct Demux {
     void videoAu(const std::vector<uint8_t> &pes) {
         int64_t pts, dts; size_t off;
         if (!pesHeader(pes, pts, dts, off) || pts < 0) return;
+        if (cut) return;
+        if (haveDts) { int64_t dd = dts - lastDts; if (dd > 3 * 90000 || dd < -3 * 90000) { cut = true; return; } }   // salto de mais de 3 s = emenda
         const uint8_t *d = pes.data(); size_t n = pes.size();
         // separa os NALs (Annex B)
         std::vector<std::pair<size_t, size_t>> nals;
@@ -142,10 +149,15 @@ struct Demux {
         }
         if (start != (size_t)-1 && start < n) { size_t e = n; while (e > start && d[e - 1] == 0) e--; nals.push_back({start, e - start}); }
         VSample s; s.dts = dts; s.pts = pts; s.key = false;
-        bool slice = false;
+        bool slice = false, spsChanged = false;
         for (auto &nl : nals) {
             if (nl.second == 0) continue;
             int type = d[nl.first] & 0x1F;
+            if (type == 7 && !sps.empty() && (nl.second != sps.size() || memcmp(d + nl.first, sps.data(), sps.size()) != 0)) {
+                if (vs.empty()) { sps.assign(d + nl.first, d + nl.first + nl.second); pps.clear(); }   // ainda nao comecamos: adota o SPS novo
+                else spsChanged = true;
+                continue;
+            }
             if (type == 7 && sps.empty()) sps.assign(d + nl.first, d + nl.first + nl.second);
             else if (type == 8 && pps.empty()) pps.assign(d + nl.first, d + nl.first + nl.second);
             else if (type == 1 || type == 5) {
@@ -155,14 +167,19 @@ struct Demux {
                 s.data.insert(s.data.end(), d + nl.first, d + nl.first + nl.second);
             }
         }
+        if (spsChanged) { cut = true; return; }                  // outra resolucao/configuracao: o MP4 so tem um SPS, corta aqui
         if (!slice) return;
         if (waitKey) { if (!s.key || sps.empty() || pps.empty()) return; waitKey = false; }   // comeca no primeiro quadro-chave
+        lastDts = dts; haveDts = true;
         vs.push_back(std::move(s));
     }
 
     void audioAu(const std::vector<uint8_t> &pes) {
         int64_t pts, dts; size_t off;
         if (!pesHeader(pes, pts, dts, off) || pts < 0) return;
+        if (cut) return;                                                      // depois da emenda do video, o audio tambem e do trecho novo
+        if (haveAPts) { int64_t dd = pts - lastAPts; if (dd > 3 * 90000 || dd < -3 * 90000) { cut = true; return; } }
+        lastAPts = pts; haveAPts = true;
         const uint8_t *d = pes.data(); size_t n = pes.size(), i = off; int k = 0;
         while (i + 7 <= n) {
             if (!(d[i] == 0xFF && (d[i + 1] & 0xF0) == 0xF0)) { i++; continue; }
@@ -236,7 +253,8 @@ inline bool convert(const std::string &ts, std::string &mp4, std::string &err, I
     size_t nv = dm.vs.size();
     // audio: descarta quadros anteriores ao primeiro quadro de video exibido
     std::vector<ASample> au;
-    for (auto &a : dm.as) if (a.pts >= pts0) au.push_back(a);
+    int64_t vLastPts = pts0; for (auto &v : dm.vs) if (v.pts > vLastPts) vLastPts = v.pts;
+    for (auto &a : dm.as) if (a.pts >= pts0 && (!dm.cut || a.pts <= vLastPts + 45000)) au.push_back(a);
     bool hasAudio = dm.aPid >= 0 && dm.aInfo && !au.empty();
     if (dm.aPid >= 0 && dm.aInfo && dm.aProfile > 4) hasAudio = false;      // perfis AAC exoticos (HE etc.) ficam sem audio
     int sr = dm.kFreq[dm.aFreq];
