@@ -1113,28 +1113,70 @@ struct Player {
     }
 };
 
-static const uint32_t B_OPTIONS = 0x0008, B_UP = 0x0010, B_DOWN = 0x0040, B_LEFT = 0x0080, B_RIGHT = 0x0020, B_L2 = 0x0100, B_R2 = 0x0200,
+static const uint32_t B_L3 = 0x0002, B_R3 = 0x0004,
+                      B_OPTIONS = 0x0008, B_UP = 0x0010, B_DOWN = 0x0040, B_LEFT = 0x0080, B_RIGHT = 0x0020, B_L2 = 0x0100, B_R2 = 0x0200,
                       B_L1 = 0x0400, B_R1 = 0x0800, B_TRIANGLE = 0x1000, B_SQUARE = 0x8000, B_CIRCLE = 0x2000, B_CROSS = 0x4000;
 
 enum class Mode { Menu, Play, Kbd };
 
 // Leitura do controle sem perder toques rapidos: o scePadRead guarda os estados recentes, entao um aperto curto
 // feito enquanto o app estava ocupado (carregando, trocando de pedaco) ainda e visto depois.
+// Extras: o analogico esquerdo (L3) vira "setas" (UP/DOWN/LEFT/RIGHT) e as setas/analogico repetem sozinhos
+// enquanto seguradas, contando em TEMPO REAL (antes contava "voltas do loop", que ficavam lentas quando o desenho demorava).
 struct PadIn {
     int h = -1;
     uint32_t held = 0, pending = 0;
+    uint32_t stickDir = 0;                         // direcao atual do analogico esquerdo (um dos B_UP/DOWN/LEFT/RIGHT, ou 0)
+    double nextRep[4] = {0, 0, 0, 0};              // proximo instante de repeticao de cada seta
+    double repStart[4] = {0, 0, 0, 0};
+    static constexpr double kRepDelay = 0.34;      // segurando: espera 340 ms ate comecar a repetir...
+    static constexpr double kRepSlow = 0.085;      // ...depois 1 passo a cada 85 ms...
+    static constexpr double kRepFast = 0.045;      // ...e, apos 1,2 s, 1 passo a cada 45 ms (rolar listas grandes)
+
+    static const uint32_t *dirs() { static const uint32_t d[4] = {B_UP, B_DOWN, B_LEFT, B_RIGHT}; return d; }
+
+    // analogico esquerdo -> uma direcao so (a mais inclinada), com histerese: liga ao passar de 62 e so desliga abaixo de 34
+    uint32_t stickToDir(const OrbisPadData &d) {
+        int dx = (int)d.leftStick.x - 128, dy = (int)d.leftStick.y - 128;
+        int ax = dx < 0 ? -dx : dx, ay = dy < 0 ? -dy : dy;
+        int th = stickDir ? 34 : 62;
+        if (ax < th && ay < th) return 0;
+        if (ax >= ay) return dx < 0 ? B_LEFT : B_RIGHT;
+        return dy < 0 ? B_UP : B_DOWN;
+    }
+    uint32_t merged(const OrbisPadData &d) {       // botoes reais + setas virtuais do analogico
+        stickDir = stickToDir(d);
+        return d.buttons | stickDir;
+    }
     void poll() {
         if (h < 0) return;
         OrbisPadData buf[16]; uint32_t seen = 0;
         int n = scePadRead(h, buf, 16);
-        for (int i = 0; i < n; i++) seen |= buf[i].buttons;
+        for (int i = 0; i < n; i++) seen |= merged(buf[i]);     // cada estado guardado, em ordem (flick rapido do analogico nao se perde)
         OrbisPadData d; uint32_t cur = held;
-        if (scePadReadState(h, &d) == 0) cur = d.buttons;
+        if (scePadReadState(h, &d) == 0) cur = merged(d);
         seen |= cur;
-        pending |= seen & ~held;
+        uint32_t fresh = seen & ~held;
+        pending |= fresh;
         held = cur;
+        double t = nowSec();
+        for (int i = 0; i < 4; i++) {
+            if (fresh & dirs()[i]) { repStart[i] = t; nextRep[i] = t + kRepDelay; }
+            if (!(held & dirs()[i])) nextRep[i] = 0;
+        }
     }
     uint32_t take() { uint32_t e = pending; pending = 0; return e; }
+    // setas seguradas que ja devem repetir (so para menus e teclado)
+    uint32_t repeats() {
+        uint32_t out = 0; double t = nowSec();
+        for (int i = 0; i < 4; i++) {
+            if (nextRep[i] > 0 && (held & dirs()[i]) && t >= nextRep[i]) {
+                out |= dirs()[i];
+                nextRep[i] = t + ((t - repStart[i]) > 1.2 ? kRepFast : kRepSlow);   // a partir de "agora": nunca dispara em rajada
+            }
+        }
+        return out;
+    }
 };
 
 int main() {
@@ -1183,7 +1225,7 @@ int main() {
     bool gotFrame = false;
     double lastWaitDraw = 0;
     uint32_t prev = 0;
-    int heldFrames = 0, back = 1;
+    int back = 1;
     bool dirty = true;
     // Reconexao automatica: no maximo 5 tentativas em 2 minutos (depois desiste e avisa, para nao ficar em loop se a live acabou)
     double rtT[5] = {0, 0, 0, 0, 0}; int rtI = 0; bool autoMode = false;
@@ -1267,14 +1309,20 @@ int main() {
 
         if (mode == Mode::Kbd) {
             bool changed = false, done = false;
-            if (pressed & B_UP)       { kbd.move(0, -1); changed = true; }
-            if (pressed & B_DOWN)     { kbd.move(0, 1);  changed = true; }
-            if (pressed & B_LEFT)     { kbd.move(-1, 0); changed = true; }
-            if (pressed & B_RIGHT)    { kbd.move(1, 0);  changed = true; }
-            if (pressed & B_SQUARE)   { kbd.backspace(); changed = true; }
+            uint32_t nav = pressed | pin.repeats();                 // setas/analogico: repetem sozinhos enquanto seguradas
+            if (nav & B_UP)           { kbd.move(0, -1); changed = true; }
+            if (nav & B_DOWN)         { kbd.move(0, 1);  changed = true; }
+            if (nav & B_LEFT)         { kbd.move(-1, 0); changed = true; }
+            if (nav & B_RIGHT)        { kbd.move(1, 0);  changed = true; }
+            {   // apagar: QUADRADO ou R3; segurando apaga em sequencia
+                static double bsNext = 0;
+                double tn = nowSec();
+                if (pressed & (B_SQUARE | B_R3)) { kbd.backspace(); changed = true; bsNext = tn + 0.4; }
+                else if ((now & (B_SQUARE | B_R3)) && tn >= bsNext) { kbd.backspace(); changed = true; bsNext = tn + 0.05; }
+            }
             if (pressed & B_TRIANGLE) { kbd.insert("https://"); changed = true; }
             if (pressed & B_L2)       { kbd.clear(); changed = true; }
-            if (pressed & B_CROSS)    { done = kbd.press(); changed = true; }
+            if (pressed & (B_CROSS | B_L3)) { done = kbd.press(); changed = true; }   // X ou clique no L3 digita a tecla
             if (pressed & B_R1)       done = true;
             if (pressed & B_CIRCLE)   { ui.textKind = 0; mode = Mode::Menu; dirty = true; continue; }
             if (done) {
@@ -1285,8 +1333,12 @@ int main() {
             }
             int blinkNow = ((int)(nowSec() * 2)) % 2;
             static int lastBlink = -1;
-            if (changed || dirty || blinkNow != lastBlink) { lastBlink = blinkNow; presentKbd(); dirty = false; }
-            sceKernelUsleep(16000);
+            if (changed || dirty) { lastBlink = blinkNow; presentKbd(); dirty = false; }       // desenho completo so quando algo mudou
+            else if (blinkNow != lastBlink) {                                                // cursor piscando: so o retangulo dele
+                lastBlink = blinkNow;
+                FbRenderer r(shadow, W, H); kbd.drawCaret(r, blinkNow == 0); flip();
+            }
+            sceKernelUsleep(4000);
             continue;
         }
 
@@ -1337,10 +1389,7 @@ int main() {
         }
 
         // ---- Menu ----
-        if (now & (B_UP | B_DOWN)) {
-            heldFrames++;
-            if (heldFrames > 20 && heldFrames % 4 == 0) pressed |= now & (B_UP | B_DOWN);
-        } else heldFrames = 0;
+        pressed |= pin.repeats();                  // setas/analogico seguradas repetem (por tempo, nao por volta do loop)
         if (pressed & B_UP)     { ui.handle(Input::Up);       dirty = true; }
         if (pressed & B_DOWN)   { ui.handle(Input::Down);     dirty = true; }
         if (pressed & B_LEFT)   { ui.handle(Input::Left);     dirty = true; }
@@ -1398,7 +1447,7 @@ int main() {
             continue;
         }
         if (dirty) { presentMenu(); dirty = false; static bool once = false; if (!once) { once = true; trace("menu-ok"); } }
-        sceKernelUsleep(16000);
+        sceKernelUsleep(4000);                     // 4 ms: o controle e lido ~200x por segundo (antes 16 ms)
     }
     // ---- encerramento limpo: nenhuma thread pode estar viva ao sair (std::thread ativa no fim = "terminate" = erro no PS4) ----
     trace("saindo");
