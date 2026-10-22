@@ -70,6 +70,11 @@ int sceHttpSetRecvTimeOut(int id, unsigned usec);
 int sceHttpSetResolveTimeOut(int id, unsigned usec);
 }
 
+// Heap da libc sem limite: sem isso o malloc acaba (lista M3U grande + cache do filme + buffers do AvPlayer) e o app fecha.
+extern "C" {
+unsigned int sceLibcHeapExtendedAlloc = 1;
+size_t sceLibcHeapSize = 0xFFFFFFFFFFFFFFFFULL;   // SCE_LIBC_HEAP_SIZE_EXTENDED_ALLOC_NO_LIMIT
+}
 static void trace(const char *stage);   // (definida mais abaixo)
 // Marcadores finos do download da lista M3U: se o app fechar, a proxima abertura mostra o ULTIMO passo que foi gravado.
 static bool g_traceHttp = false;                 // so durante o download da lista M3U
@@ -572,7 +577,11 @@ static void *alignedAlloc(size_t align, size_t size) {
     return (void *)a;
 }
 static void alignedFree(void *p) { if (p) free(((void **)p)[-1]); }
-static void *avAlloc(void *, uint32_t align, uint32_t size) { g_allocN++; void *p = alignedAlloc(align, size); if (!p) g_allocFail++; return p; }
+static void *avAlloc(void *, uint32_t align, uint32_t size) {
+    g_allocN++; void *p = alignedAlloc(align, size);
+    if (!p) { if (g_allocFail++ == 0) trace("av-malloc-FALHOU"); }
+    return p;
+}
 static void avFree(void *, void *p) { alignedFree(p); }
 
 // memoria "de textura" (os quadros de video): memoria direta mapeada, como nos samples da Sony
@@ -597,7 +606,7 @@ static void *avAllocTex(void *, uint32_t align, uint32_t size) {
     size_t al = align < 0x10000 ? 0x10000 : align;
     size_t sz = (size + 0xFFFF) & ~(size_t)0xFFFF;
     off_t phys = 0; void *addr = NULL;
-    if (sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), sz, al, g_texType.load(), &phys) < 0) { g_texFail++; return NULL; }
+    if (sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), sz, al, g_texType.load(), &phys) < 0) { if (g_texFail++ == 0) trace("av-textura-FALHOU"); return NULL; }
     if (sceKernelMapDirectMemory(&addr, sz, 0x33, 0, phys, al) < 0) { g_texFail++; return NULL; }
     { std::lock_guard<std::mutex> l(g_texM); g_tex[addr] = {phys, sz}; }
     return addr;
@@ -1041,7 +1050,11 @@ struct Player {
         log.push_back("modulo AvPlayerStreaming: " + hx8(sceSysmoduleLoadModuleInternal(0x80000050)));
         bool isHls = url.find(".m3u8") != std::string::npos;
         useFeed = false;
-        if (!isHls && urlIsVideoFile(url)) { isVod = true; return startFile(url); }   // filme/serie: o app le o arquivo por HTTP Range e entrega ao player
+        if (!isHls && urlIsVideoFile(url)) {
+            isVod = true;
+            try { return startFile(url); }
+            catch (...) { failed = true; log.push_back("ERRO: sem memoria ao abrir o arquivo"); trace("vod-excecao"); releaseHfAsync(); return false; }
+        }   // filme/serie: o app le o arquivo por HTTP Range e entrega ao player
 
         // Ao vivo: HLS (.m3u8) vai direto. Canal "cru" (.ts / sem extensao): primeiro tenta o HLS equivalente do painel Xtream
         // (mais estavel), e se o painel nao tiver, le o MPEG-TS continuo e corta em pedacos.
@@ -1143,7 +1156,7 @@ struct Player {
     // Filme/serie: arquivo remoto lido por blocos (httpfile.hpp). Depois da leitura propria, tenta o jeito antigo (o player abrir a URL sozinho).
     bool startFile(const std::string &url) {
         std::string ext = urlExtension(url);
-        log.push_back("Arquivo ." + ext + ": leitura propria por HTTP (3 conexoes, blocos de 2 MB)");
+        log.push_back("Arquivo ." + ext + ": leitura propria por HTTP (3 conexoes, blocos de 1 MB)");
         presentCb();
         // 3 conexoes em paralelo (cada uma com a sua sessao): um unico download por vez nao acompanha filme de bitrate alto e a imagem travava.
         const int kConns = 3;
@@ -1156,7 +1169,7 @@ struct Player {
                 return st;
             };
         };
-        auto rd = std::make_shared<httpfile::Reader>(mkFetch(sessions[0]), 24, 10);   // 24 blocos x 2 MB de cache, ate 10 blocos adiante
+        auto rd = std::make_shared<httpfile::Reader>(mkFetch(sessions[0]), 20, 8);   // 20 blocos x 1 MB de cache, ate 8 blocos adiante
         for (int i = 1; i < kConns; i++) { auto ss = sessions[i]; rd->addWorker(mkFetch(ss), [ss] { g_net.closeSession(*ss); }); }
         rd->setOnExit([s0 = sessions[0]] { g_net.closeSession(*s0); });
         rd->setProbe([s0 = sessions[0], url]() -> uint64_t {      // tamanho do arquivo em UMA requisicao (antes eram ~25 requisicoes: 1 minuto na tela de espera)
@@ -1164,6 +1177,7 @@ struct Player {
             if (!g_net.getRange(*s0, url, 0, 0, b, st, &total) || st != 206) return 0;
             return total;
         });
+        trace("vod-baixando-tamanho");
         setHf(rd); rd->start();
         double w0 = nowSec();
         while (rd->state() == 0 && nowSec() - w0 < 60) {
@@ -1178,9 +1192,11 @@ struct Player {
         } else {
             log.push_back("   tamanho do arquivo: " + std::to_string(rd->size() >> 20) + " MB");
             presentCb();
+            trace("vod-abrindo-player");
             std::string name = "video." + ext;
             if (openSource(name, 2, 3, 25000, true)) {
                 audio.start(h); active = true; t0 = lastFps = lastFrameT = nowSec();
+                trace("vod-tocando");
                 log.push_back("OK: tocando o arquivo");
                 return true;
             }
