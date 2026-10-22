@@ -6,7 +6,7 @@
 #include <string>
 #include <vector>
 
-struct HlsVariant { std::string uri; int bandwidth = 0, width = 0, height = 0; };
+struct HlsVariant { std::string uri; int bandwidth = 0, width = 0, height = 0; double fps = 0; };
 struct HlsSegment { std::string uri; double dur = 0; unsigned long long seq = 0; };
 struct HlsMedia {
     std::vector<HlsSegment> segs;
@@ -64,6 +64,7 @@ inline std::vector<HlsVariant> hlsParseMaster(const std::string &text) {
             std::string r = hlsAttr(line, "RESOLUTION");
             size_t x = r.find('x');
             if (x != std::string::npos) { cur.width = atoi(r.c_str()); cur.height = atoi(r.c_str() + x + 1); }
+            cur.fps = atof(hlsAttr(line, "FRAME-RATE").c_str());   // 0 = nao informado
             pending = true;
         } else if (line[0] != '#' && pending) { cur.uri = line; v.push_back(cur); pending = false; }
     }
@@ -71,17 +72,26 @@ inline std::vector<HlsVariant> hlsParseMaster(const std::string &text) {
 }
 
 // Escolhe a melhor variante com altura <= maxHeight (ignora so-audio). Retorna -1 se vazio.
-inline int hlsPickVariant(const std::vector<HlsVariant> &v, int maxHeight) {
-    int best = -1, lowest = -1;
+// maxFps > 0: prefere variantes com no maximo esse FPS (ex.: 30). O PS4 desenha o video por software (CPU),
+// entao 60 fps custa o dobro de 30 fps. Se nenhuma variante cumprir o limite, ele e ignorado.
+inline int hlsPickVariant(const std::vector<HlsVariant> &v, int maxHeight, int maxFps = 0) {
     bool anyRes = false;
     for (auto &x : v) if (x.height > 0) anyRes = true;
-    for (int i = 0; i < (int)v.size(); i++) {
-        if (anyRes && v[i].height == 0) continue;                 // so audio
-        if (lowest < 0 || v[i].bandwidth < v[lowest].bandwidth) lowest = i;
-        bool ok = anyRes ? v[i].height <= maxHeight : v[i].bandwidth <= 4500000;
-        if (ok && (best < 0 || v[i].bandwidth > v[best].bandwidth)) best = i;
+    for (int pass = 0; pass < 2; pass++) {
+        bool useFps = pass == 0 && maxFps > 0;                    // 1a passada: com limite de fps; 2a: sem limite
+        if (pass == 1 && maxFps <= 0) break;                      // sem limite, a 1a passada ja foi a completa
+        int best = -1, lowest = -1;
+        for (int i = 0; i < (int)v.size(); i++) {
+            if (anyRes && v[i].height == 0) continue;             // so audio
+            if (useFps && v[i].fps > maxFps + 0.5) continue;
+            if (lowest < 0 || v[i].bandwidth < v[lowest].bandwidth) lowest = i;
+            bool ok = anyRes ? v[i].height <= maxHeight : v[i].bandwidth <= 4500000;
+            if (ok && (best < 0 || v[i].bandwidth > v[best].bandwidth)) best = i;
+        }
+        if (best >= 0) return best;
+        if (!useFps && lowest >= 0) return lowest;                // nada cabe: a mais leve
     }
-    return best >= 0 ? best : lowest;
+    return -1;
 }
 
 inline HlsMedia hlsParseMedia(const std::string &text) {
