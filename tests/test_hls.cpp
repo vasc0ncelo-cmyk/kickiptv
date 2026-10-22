@@ -26,6 +26,28 @@ int main() {
     assert(v[hlsPickVariant(v, 1080)].uri == "1080p60/playlist.m3u8");
     assert(v[hlsPickVariant(v, 100)].uri == "160p/playlist.m3u8");   // nada cabe: usa a mais leve (sem audio)
 
+    // limite de fps: 60 fps pesa o dobro no PS4 (desenho por CPU); com limite 30 escolhe a variante de 30 fps
+    std::string m2 =
+        "#EXTM3U\n"
+        "#EXT-X-STREAM-INF:BANDWIDTH=8000000,RESOLUTION=1920x1080,FRAME-RATE=60.000\n1080p60/p.m3u8\n"
+        "#EXT-X-STREAM-INF:BANDWIDTH=3500000,RESOLUTION=1280x720,FRAME-RATE=60.000\n720p60/p.m3u8\n"
+        "#EXT-X-STREAM-INF:BANDWIDTH=1500000,RESOLUTION=852x480,FRAME-RATE=30.000\n480p30/p.m3u8\n"
+        "#EXT-X-STREAM-INF:BANDWIDTH=300000,RESOLUTION=284x160,FRAME-RATE=30.000\n160p/p.m3u8\n";
+    auto v2 = hlsParseMaster(m2);
+    assert(v2[1].fps == 60.0 && v2[2].fps == 30.0);
+    assert(v2[hlsPickVariant(v2, 720)].uri == "720p60/p.m3u8");                // sem limite: igual a antes
+    assert(v2[hlsPickVariant(v2, 720, 30)].uri == "480p30/p.m3u8");            // limite 30 fps
+    std::string m3 =   // canal que transmite em 30 fps: 720p30 continua sendo escolhido
+        "#EXTM3U\n"
+        "#EXT-X-STREAM-INF:BANDWIDTH=3000000,RESOLUTION=1280x720,FRAME-RATE=30.000\n720p30/p.m3u8\n"
+        "#EXT-X-STREAM-INF:BANDWIDTH=1500000,RESOLUTION=852x480,FRAME-RATE=30.000\n480p30/p.m3u8\n";
+    auto v3 = hlsParseMaster(m3);
+    assert(v3[hlsPickVariant(v3, 720, 30)].uri == "720p30/p.m3u8");
+    std::string m4 =   // so 60 fps disponivel: o limite e ignorado em vez de falhar
+        "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=3500000,RESOLUTION=1280x720,FRAME-RATE=60.000\n720p60/p.m3u8\n";
+    auto v4 = hlsParseMaster(m4);
+    assert(v4[hlsPickVariant(v4, 720, 30)].uri == "720p60/p.m3u8");
+
     // playlist de midia
     std::string media = "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:100\n#EXTINF:2.000,\nseg100.ts\n#EXTINF:2.0,\nseg101.ts\n";
     assert(!hlsIsMaster(media));
