@@ -17,10 +17,6 @@ inline std::string kickSlug(std::string in) {
 // API NAO OFICIAL da Kick (pode mudar ou bloquear via Cloudflare).
 inline std::string kickApiUrl(const std::string &slug) { return "https://kick.com/api/v2/channels/" + slug; }
 
-// URLs publicas de teste (para validar o AvPlayer separado da Kick).
-inline const char *kTestHlsHttps() { return "https://devstreaming-cdn.apple.com/videos/streaming/examples/img_bipbop_adv_example_ts/master.m3u8"; }
-inline const char *kTestHlsHttp() { return "http://devimages.apple.com/iphone/samples/bipbop/bipbopall.m3u8"; }
-
 // Extrai o valor string de uma chave JSON (suficiente para "playback_url").
 // Trata \/ e \uXXXX (ex.: \u0026 = &).
 inline std::string jsonString(const std::string &json, const std::string &key) {
