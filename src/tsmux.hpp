@@ -262,7 +262,12 @@ inline bool convert(const std::string &ts, std::string &mp4, std::string &err, I
         chunks.push_back({0, i, j - i, (double)(dm.vs[i].dts - dts0) / TS, 0}); i = j; } }
     if (hasAudio) { size_t i = 0; while (i < au.size()) { size_t c = std::min<size_t>(21, au.size() - i);
         chunks.push_back({1, i, c, (double)(aStart + (int64_t)i * 1024 * TS / sr) / TS, 0}); i += c; } }
-    std::stable_sort(chunks.begin(), chunks.end(), [](const Chunk &a, const Chunk &b) { return a.start < b.start; });
+    // ordenacao estavel por insercao (poucos blocos; evita std::stable_sort, que usa new(nothrow))
+    for (size_t i = 1; i < chunks.size(); i++) {
+        Chunk cur = chunks[i]; size_t j = i;
+        while (j > 0 && chunks[j - 1].start > cur.start) { chunks[j] = chunks[j - 1]; j--; }
+        chunks[j] = cur;
+    }
 
     // ---- tabelas ----
     auto stszOf = [&](int track) { std::string s; p32(s, 0);
