@@ -2,6 +2,8 @@
 // Logica do app independente de plataforma (testavel no PC).
 #include "kick.hpp"
 #include "m3u.hpp"
+#include <functional>
+#include <cstdio>
 #include <string>
 
 enum class Tab { Kick = 0, Channels = 1, Movies = 2, Series = 3 };
@@ -10,6 +12,14 @@ enum class Tab { Kick = 0, Channels = 1, Movies = 2, Series = 3 };
 struct Platform {
     virtual ~Platform() {}
     virtual bool httpGet(const std::string &url, std::string &body) = 0;
+    // Download grande (lista M3U): entrega em pedacos para 'sink' (false = cancelar) em vez de montar tudo na memoria.
+    // true = baixou tudo. A versao padrao usa httpGet (testes / plataformas simples).
+    virtual bool httpStream(const std::string &url, const std::function<bool(const char *, size_t)> &sink) {
+        std::string body;
+        if (!httpGet(url, body)) return false;
+        return sink(body.data(), body.size());
+    }
+    virtual bool wasCancelled() { return false; }   // o ultimo httpStream foi cancelado pelo usuario?
     virtual void play(const std::string &url, const std::string &title) = 0;
     virtual void requestText(const std::string &prompt) = 0; // abre o teclado (IME); depois chame UI::onText
     virtual std::string loadSetting(const std::string &) { return ""; }              // dados guardados (ex.: "m3u", "kick")
@@ -24,13 +34,38 @@ struct App {
 
     void say(const std::string &m) { lastStatus = m; }
 
+    static std::string fmtMB(size_t bytes) {
+        char b[32]; snprintf(b, sizeof b, "%.1f MB", bytes / 1048576.0); return b;
+    }
+
     bool loadM3U(const std::string &url) {
-        std::string body;
-        if (!pf.httpGet(url, body)) { say("Falha ao baixar a lista M3U"); return false; }
-        list = buildPlaylist(body);
-        say("Canais: " + std::to_string(list.channels.size()) + " | Filmes: " + std::to_string(list.movies.size()) +
-            " | Series: " + std::to_string(list.seriesTree.size()));
+        PlaylistBuilder b;
+        size_t bytes = 0;
+        say("Baixando lista M3U...  (O cancela)");
+        bool ok = pf.httpStream(url, [&](const char *d, size_t n) {
+            b.feed(d, n); bytes += n;
+            say("Baixando lista M3U... " + fmtMB(bytes) + "  |  " + std::to_string(b.count()) + " itens  (O cancela)");
+            return true;
+        });
+        b.finish();
+        size_t total = b.count();
+        if (!ok) {
+            if (pf.wasCancelled()) { say("Download da lista cancelado"); return false; }
+            if (total == 0) { say("Falha ao baixar a lista M3U"); return false; }
+            // a conexao caiu no meio: aproveita o que ja chegou
+            list = b.take();
+            say("Aviso: lista incompleta (conexao caiu) - " + summary());
+            return true;
+        }
+        if (total == 0) { say("Falha: o link nao devolveu uma lista M3U valida"); return false; }
+        list = b.take();
+        say(summary());
         return true;
+    }
+
+    std::string summary() const {
+        return "Canais: " + std::to_string(list.channels.size()) + " | Filmes: " + std::to_string(list.movies.size()) +
+               " | Series: " + std::to_string(list.seriesTree.size());
     }
 
     void watchKick(const std::string &input) {
