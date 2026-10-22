@@ -1,7 +1,9 @@
 #pragma once
 #include <cstddef>
+#include <cstdint>
 #include <map>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 enum class Kind { Channel, Movie, Series };
@@ -12,8 +14,17 @@ struct Entry {
     int season = 0, episode = 0;    // so para series
 };
 
+// Categoria (group-title da lista). Filmes/canais: indices em Playlist::movies / channels. Series: nomes (chave de seriesTree).
+struct Category {
+    std::string name;
+    std::vector<uint32_t> items;     // so canais e filmes
+    std::vector<std::string> series; // so series (ordenadas)
+    size_t size() const { return items.empty() ? series.size() : items.size(); }
+};
+
 struct Playlist {
     std::vector<Entry> channels, movies;
+    std::vector<Category> channelCats, movieCats, seriesCats;   // na ordem em que aparecem na lista
     size_t seriesEpisodes = 0;   // total de episodios (os episodios em si ficam em seriesTree)
     bool truncated = false;      // a lista tinha mais itens que o limite de memoria (os ultimos ficaram de fora)
     // serie -> temporada -> episodios
@@ -37,7 +48,12 @@ private:
     bool skipRest_ = false, first_ = true;
     Playlist p_;
     size_t count_ = 0;
+    std::unordered_map<std::string, int> chanIdx_, movieIdx_, seriesIdx_;   // nome limpo da categoria -> posicao
+    static int catFor(std::vector<Category> &cats, std::unordered_map<std::string, int> &idx, const std::string &group);
 };
+
+// Nome de categoria para mostrar: tira o prefixo do tipo ("FILMES | Acao" -> "Acao"); vazio vira "Sem categoria".
+std::string cleanCategory(const std::string &group);
 
 // Versoes "tudo de uma vez" (testes e compatibilidade).
 std::vector<Entry> parseM3U(const std::string &text);
