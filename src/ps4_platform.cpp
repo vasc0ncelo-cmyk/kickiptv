@@ -156,11 +156,11 @@ struct NetClient {
         if (s.tmpl < 0) { s.tmpl = -1; return false; }
         sceHttpsDisableOption(s.tmpl, 0x1F);
         sceHttpSetAutoRedirect(s.tmpl, 1);
-        const unsigned T = 15 * 1000 * 1000;
+        const unsigned T = 15 * 1000 * 1000, TR = 8 * 1000 * 1000;   // conexao 15 s; envio/recepcao 8 s (conexao morta no meio de um segmento nao trava mais 15 s)
         sceHttpSetResolveTimeOut(s.tmpl, T);
         sceHttpSetConnectTimeOut(s.tmpl, T);
-        sceHttpSetSendTimeOut(s.tmpl, T);
-        sceHttpSetRecvTimeOut(s.tmpl, T);
+        sceHttpSetSendTimeOut(s.tmpl, TR);
+        sceHttpSetRecvTimeOut(s.tmpl, TR);
         s.conn = sceHttpCreateConnectionWithURL(s.tmpl, url.c_str(), 1 /*keep-alive*/);
         if (s.conn < 0) { s.conn = -1; closeSession(s); return false; }
         s.origin = originOf(url);
@@ -695,6 +695,10 @@ struct AudioPump {
 static std::atomic<int> g_quality{1};
 static const char *kQualityName[3] = {"Fluido 30fps", "Maxima 720p60", "Ultra 1080p60"};
 
+// Reconexao automatica: se a live congelar ou a rede/pipeline quebrar, o app reabre a transmissao sozinho (ver Player::wantReconnect).
+static std::string g_reconnectNote;          // motivo da ultima reconexao (mostrado na tela "Conectando...")
+static int g_autoRestarts = 0;               // quantas reconexoes automaticas ja houve (HUD)
+
 // ---------- Alimentador HLS -> AvPlayer ----------
 // O AvPlayer do PS4 nao abre https/HLS direto (AddSource=806A0002). Entao o app baixa o HLS (playlist + segmentos .ts)
 // com o cliente HTTP proprio e entrega os bytes ao player pelos callbacks de arquivo ("fileReplacement").
@@ -703,6 +707,9 @@ struct HlsFeeder {
     std::thread th;
     std::atomic<bool> run{false};
     std::atomic<int> segs{0}, opens{0}, reads{0}, failed{0};
+    std::atomic<bool> streamEnded{false};       // a playlist trouxe EXT-X-ENDLIST (a live acabou)
+    unsigned long long localId = 0;             // numero PROPRIO de cada segmento baixado (so cresce). O numero da playlist pode voltar atras
+                                                // (streamer reconectou); antes o player ignorava para sempre os segmentos novos e a imagem congelava.
     FILE *outFile = nullptr;                    // modo "arquivo que cresce": segmentos vao para /data/live.ts
     std::atomic<unsigned long long> outBytes{0};
     std::atomic<bool> discardBuf{false};        // modo "pedacos": ninguem le o StreamBuf, entao nao acumula (antes crescia ate 48 MB)
@@ -723,7 +730,7 @@ struct HlsFeeder {
     void start(const std::string &u) {
         join(); sb.reset();
         { std::lock_guard<std::mutex> l(rm); recent.clear(); }
-        url = u; segs = opens = reads = failed = 0; run = true; discardBuf = false; dlMs = dlMsMax = 0; setStatus("iniciando");
+        url = u; segs = opens = reads = failed = 0; localId = 0; streamEnded = false; run = true; discardBuf = false; dlMs = dlMsMax = 0; setStatus("iniciando");
         th = std::thread([this] { loop(); g_net.closeSession(sess); });
     }
     void abort() { run = false; sb.abort(); }                // libera leituras bloqueadas do player
@@ -756,6 +763,10 @@ struct HlsFeeder {
             if (md.hasMap) { fail("fMP4 (EXT-X-MAP) ainda nao suportado"); return; }
             if (md.segs.empty()) { sleepMs(1000, run); continue; }
             if (first) { size_t k = md.segs.size() > 3 ? md.segs.size() - 3 : 0; next = md.segs[k].seq; first = false; }
+            else if (md.segs.back().seq + 1 < next) {            // a numeracao da playlist voltou atras (live reiniciou): ressincroniza nos 3 mais novos
+                size_t k = md.segs.size() > 3 ? md.segs.size() - 3 : 0; next = md.segs[k].seq;
+                setStatus("playlist reiniciou: ressincronizando");
+            }
             bool got = false;
             for (auto &sg : md.segs) {
                 if (!run) break;
@@ -772,11 +783,11 @@ struct HlsFeeder {
                 } else if (!discardBuf.load()) sb.append((const uint8_t *)seg.data(), seg.size());
                 { double dm = (nowSecF() - d0) * 1000.0; dlMs = dm; if (dm > dlMsMax.load()) dlMsMax = dm; }
                 lastSegDur = sg.dur;
-                { std::lock_guard<std::mutex> l(rm); recent.push_back({sg.seq, seg}); while (recent.size() > 8) recent.pop_front(); }
+                { std::lock_guard<std::mutex> l(rm); recent.push_back({++localId, seg}); while (recent.size() > 8) recent.pop_front(); }
                 next = sg.seq + 1; segs++; got = true;
                 setStatus("ao vivo: segmento " + std::to_string(sg.seq) + " (" + std::to_string(seg.size() / 1024) + " KB)");
             }
-            if (md.endList && !got) { setStatus("fim da transmissao"); return; }
+            if (md.endList && !got) { setStatus("fim da transmissao"); streamEnded = true; return; }
             if (!got) { int ms = (int)(md.target * 500); sleepMs(ms < 300 ? 300 : (ms > 1500 ? 1500 : ms), run); }
         }
     }
@@ -819,6 +830,7 @@ struct Player {
     double openMs = 800, openT0 = 0;                         // tempo medido para abrir o 2o player (abertura adaptativa)
     uint8_t *stage = nullptr; size_t stageCap = 0;           // copia em RAM com cache do quadro (ver copyFromWC)
     bool autoStride = true, strideLocked = false; int lockW = 0, lockH = 0;
+    int strideUndecided = 0;                                 // quadros seguidos em que a deteccao de stride nao teve certeza (nao desenha lixo)
     double copyMs = 0;
     uint8_t *stageBuf(size_t n) {
         if (n > stageCap) { alignedFree(stage); stageCap = (n + 0xFFFF) & ~(size_t)0xFFFF; stage = (uint8_t *)alignedAlloc(64, stageCap); if (!stage) stageCap = 0; }
@@ -914,8 +926,9 @@ struct Player {
                 presentCb(); sceKernelUsleep(30000);
             }
         }
+        if (!g_reconnectNote.empty()) { log.push_back("Reconexao automatica #" + std::to_string(g_autoRestarts) + ": " + g_reconnectNote); g_reconnectNote.clear(); }
         this->title = title; this->url = url; hudUntil = nowSec() + 8;
-        lastDrawT = 0; worstGap = worstShown = 0; convMs = 0; openMs = 800; copyMs = 0; autoStride = true; strideLocked = false; lockW = lockH = 0; strideMode = 1;
+        lastDrawT = 0; worstGap = worstShown = 0; convMs = 0; openMs = 800; copyMs = 0; autoStride = true; strideLocked = false; lockW = lockH = 0; strideMode = 1; strideUndecided = 0;
         log.push_back("Reproduzindo: " + title);
         {   // host e tamanho da URL
             size_t a = url.find("://"); a = a == std::string::npos ? 0 : a + 3;
@@ -1132,7 +1145,7 @@ struct Player {
             uint32_t w = *(uint32_t *)(fi.details + 0), hh = *(uint32_t *)(fi.details + 4);
             if (w > 0 && hh > 0 && w <= 4096 && hh <= 4096) {
                 vw = w; vh = hh;
-                if (w != (unsigned)lockW || hh != (unsigned)lockH) { lockW = (int)w; lockH = (int)hh; strideLocked = false; }
+                if (w != (unsigned)lockW || hh != (unsigned)lockH) { lockW = (int)w; lockH = (int)hh; strideLocked = false; strideUndecided = 0; }
                 const uint8_t *src = fi.pData; size_t srcN = 0;
                 size_t avail = texAvail(fi.pData);
                 double b0 = nowSec();
@@ -1150,13 +1163,15 @@ struct Player {
                     if (st) { copyFromWC(st, fi.pData, srcN); src = st; } else srcN = 0;
                 }
                 copyMs = copyMs == 0 ? (nowSec() - b0) * 1000.0 : copyMs * 0.9 + (nowSec() - b0) * 100.0;
+                bool skipDraw = false;
                 if (srcN && autoStride && !strideLocked) {
                     int m = blit::detectStride(src, srcN, (int)w, (int)hh);
-                    if (m > 0) { strideMode = m; strideLocked = true; }
+                    if (m > 0) { strideMode = m; strideLocked = true; strideUndecided = 0; }
+                    else if (++strideUndecided < 90) skipDraw = true;          // ainda sem certeza (ex.: quadro preto): nao mostra imagem torta/verde; depois de ~3 s desenha mesmo assim
                 }
                 int pitch, yRows; blit::strideCandidate(strideMode, (int)w, (int)hh, pitch, yRows);
                 bool fits = srcN ? blit::strideBytes(strideMode, (int)w, (int)hh) <= srcN : true;   // sem copia: leitura direta (lenta, como antes)
-                if (fits) {
+                if (fits && !skipDraw) {
                     b0 = nowSec();
                     blitNV12(src, w, hh, pitch, yRows, r.fb, r.W, r.H);
                     double bm = (nowSec() - b0) * 1000.0;
@@ -1177,11 +1192,24 @@ struct Player {
         if (t - lastFps >= 1.0) { fps = fpsFrames / (t - lastFps); fpsFrames = 0; lastFps = t; worstShown = worstGap; worstGap = 0; }
         return drew;
     }
-    bool hudActive() const { return nowSec() <= hudUntil || (useFeed && g_feed.failed); }
+    // ---- vigia (anti-congelamento): true = a live parou de verdade e o app deve reabri-la sozinho ----
+    // So age no ao vivo por pedacos. 'why' recebe o motivo (aparece na tela "Conectando..." e no log).
+    bool wantReconnect(std::string &why) {
+        if (!useFeed || !chunkMode || !active) return false;
+        double t = nowSec();
+        double still = lastFrameT > 0 ? t - lastFrameT : 0;                          // ha quanto tempo nenhum quadro novo foi desenhado
+        if (failed) { why = "falha ao abrir o proximo pedaco (" + hx8(addRc) + ")"; return true; }
+        if (g_feed.streamEnded.load()) return false;                                  // a live acabou: nao adianta reconectar
+        if (g_feed.failed.load() && still > 2.0) { why = "rede: " + g_feed.getStatus(); return true; }   // espera o que ja foi baixado acabar de tocar
+        if (still > 10.0) { why = "imagem parada ha " + std::to_string((int)still) + " s"; return true; }
+        return false;
+    }
+    bool feedProblem() const { return useFeed && (g_feed.failed.load() || g_feed.streamEnded.load()); }
+    bool hudActive() const { return nowSec() <= hudUntil || feedProblem(); }
     // HUD moderno sobre o video (aparece nos primeiros segundos e quando qualquer botao e apertado)
     void overlay(FbRenderer &r) {
         using namespace theme;
-        if (nowSec() > hudUntil && !(useFeed && g_feed.failed)) return;
+        if (nowSec() > hudUntil && !feedProblem()) return;
         if (nowSec() <= hudUntil) {
             char b[256];
             snprintf(b, sizeof b, "%ux%u  |  %.0f fps  |  desenho %.0f+%.0f ms  |  %s  |  %s", vw, vh, fps, copyMs, blitMs, kQualityName[g_quality.load() % 3], g_texType.load() == 0 ? "mem Onion" : "mem Garlic");
@@ -1197,12 +1225,13 @@ struct Player {
             int hw = r.textWidth(hint, 18) + 48;
             r.roundRect(r.W - 32 - hw, r.H - 130, hw, 44, 22, 0xB8000000);   // acima da linha de diagnostico (que ficou mais longa)
             uiCenter(r, r.W - 32 - hw / 2, r.H - 108, hint, SOFT, 18);
-            snprintf(b, sizeof b, "pico %.0f ms  |  baixa %.0f/%.0f ms (seg %.1fs)  |  conv %.0f ms  |  abre %.0f ms  |  trocas: %d ok, %d com emenda, ultima %.0f ms%s",
-                     worstShown, g_feed.dlMs.load(), g_feed.dlMsMax.load(), g_feed.lastSegDur.load(), convMs, openMs, switchesOk, restarts, lastGapMs, gapless ? "" : "  (sem-emenda OFF)");
+            char rb[48] = ""; if (g_autoRestarts > 0) snprintf(rb, sizeof rb, "  |  reconexoes: %d", g_autoRestarts);
+            snprintf(b, sizeof b, "pico %.0f ms  |  baixa %.0f/%.0f ms (seg %.1fs)  |  conv %.0f ms  |  abre %.0f ms  |  trocas: %d ok, %d com emenda, ultima %.0f ms%s%s",
+                     worstShown, g_feed.dlMs.load(), g_feed.dlMsMax.load(), g_feed.lastSegDur.load(), convMs, openMs, switchesOk, restarts, lastGapMs, gapless ? "" : "  (sem-emenda OFF)", rb);
             r.roundRect(32, r.H - 76, r.textWidth(b, 16) + 40, 40, 20, 0x90000000);
             uiText(r, 52, r.H - 76 + 12, b, DIM, 16);
         }
-        if (useFeed && g_feed.failed) {
+        if (feedProblem()) {
             std::string m = uiFit(r, g_feed.getStatus(), 20, r.W - 160);
             r.roundRect(32, 100, r.textWidth(m, 20) + 48, 44, 22, 0xD0801520);
             uiText(r, 56, 100 + 12, m, TEXT, 20);
@@ -1517,6 +1546,14 @@ int main() {
     uint32_t prev = 0;
     int heldFrames = 0, back = 1;
     bool dirty = true;
+    // Reconexao automatica: no maximo 5 tentativas em 2 minutos (depois desiste e avisa, para nao ficar em loop se a live acabou)
+    double rtT[5] = {0, 0, 0, 0, 0}; int rtI = 0; bool autoMode = false;
+    auto allowAuto = [&]() -> bool {
+        double tn = nowSec(); int n = 0;
+        for (double x : rtT) if (x > 0 && tn - x < 120.0) n++;
+        if (n >= 5) { for (double &x : rtT) x = 0; return false; }
+        rtT[rtI++ % 5] = tn; return true;
+    };
 
     // A memoria de video e "write-combined": ESCREVER e rapido, mas LER e lentissimo. O desenho novo (transparencia,
     // texto suave) le pixels, entao desenhamos tudo numa tela de rascunho na RAM normal e so copiamos para o video.
@@ -1610,6 +1647,22 @@ int main() {
                 pf.pendingPlayUrl = player.url; pf.pendingPlayTitle = player.title;
                 player.stop(); mode = Mode::Menu; dirty = true; sceKernelUsleep(16000); continue;
             }
+            {   // anti-congelamento: se a live parou, reabre sozinho (no maximo 5 vezes em 2 minutos; depois desiste e avisa)
+                std::string why;
+                if (player.wantReconnect(why)) {
+                    if (!allowAuto()) {
+                        autoMode = false;
+                        app.say("Conexao instavel: a live nao voltou depois de varias tentativas (" + why + ")");
+                        trace("auto-reconexao-desistiu");
+                        player.stop(); mode = Mode::Menu; dirty = true; continue;
+                    }
+                    g_autoRestarts++; autoMode = true;
+                    g_reconnectNote = why;
+                    trace("auto-reconexao");
+                    pf.pendingPlayUrl = player.url; pf.pendingPlayTitle = player.title;
+                    player.stop(); mode = Mode::Menu; dirty = true; continue;
+                }
+            }
             if (player.h) {
                 // Sem HUD o video e desenhado DIRETO no quadro de video (so escrita, sem a copia de 8 MB).
                 // Com HUD (precisa ler pixels para a transparencia) passa pelo rascunho, como antes.
@@ -1692,6 +1745,17 @@ int main() {
             if (player.cancelled) { player.cancelled = false; mode = Mode::Menu; dirty = true; trace("player-cancelado"); continue; }
             trace(player.failed ? "player-falhou" : "player-aberto");
             presentWait();
+            if (!player.failed) autoMode = false;
+            else if (autoMode && allowAuto()) {                   // a reconexao automatica falhou (rede fora?): espera 3 s e tenta de novo
+                g_autoRestarts++;
+                g_reconnectNote = "nova tentativa (a anterior falhou)";
+                bool abort = false;
+                for (int i = 0; i < 25 && !abort; i++) { presentWait(); sceKernelUsleep(120000); if (player.cancelCb && player.cancelCb()) abort = true; }
+                player.stop();
+                if (abort) { autoMode = false; g_reconnectNote.clear(); mode = Mode::Menu; dirty = true; continue; }
+                pf.pendingPlayUrl = url; pf.pendingPlayTitle = title;
+                mode = Mode::Menu; dirty = true;
+            } else autoMode = false;
             continue;
         }
         if (dirty) { presentMenu(); dirty = false; static bool once = false; if (!once) { once = true; trace("menu-ok"); } }
