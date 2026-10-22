@@ -26,6 +26,7 @@
 #include "streambuf.hpp"
 #include "tsmux.hpp"
 #include "blit.hpp"
+#include "padin.hpp"
 #include <orbis/libkernel.h>
 #include <orbis/VideoOut.h>
 #include <orbis/UserService.h>
@@ -1113,71 +1114,26 @@ struct Player {
     }
 };
 
-static const uint32_t B_L3 = 0x0002, B_R3 = 0x0004,
-                      B_OPTIONS = 0x0008, B_UP = 0x0010, B_DOWN = 0x0040, B_LEFT = 0x0080, B_RIGHT = 0x0020, B_L2 = 0x0100, B_R2 = 0x0200,
-                      B_L1 = 0x0400, B_R1 = 0x0800, B_TRIANGLE = 0x1000, B_SQUARE = 0x8000, B_CIRCLE = 0x2000, B_CROSS = 0x4000;
-
 enum class Mode { Menu, Play, Kbd };
 
-// Leitura do controle sem perder toques rapidos: o scePadRead guarda os estados recentes, entao um aperto curto
-// feito enquanto o app estava ocupado (carregando, trocando de pedaco) ainda e visto depois.
-// Extras: o analogico esquerdo (L3) vira "setas" (UP/DOWN/LEFT/RIGHT) e as setas/analogico repetem sozinhos
-// enquanto seguradas, contando em TEMPO REAL (antes contava "voltas do loop", que ficavam lentas quando o desenho demorava).
-struct PadIn {
-    int h = -1;
-    uint32_t held = 0, pending = 0;
-    uint32_t stickDir = 0;                         // direcao atual do analogico esquerdo (um dos B_UP/DOWN/LEFT/RIGHT, ou 0)
-    double nextRep[4] = {0, 0, 0, 0};              // proximo instante de repeticao de cada seta
-    double repStart[4] = {0, 0, 0, 0};
-    static constexpr double kRepDelay = 0.34;      // segurando: espera 340 ms ate comecar a repetir...
-    static constexpr double kRepSlow = 0.085;      // ...depois 1 passo a cada 85 ms...
-    static constexpr double kRepFast = 0.045;      // ...e, apos 1,2 s, 1 passo a cada 45 ms (rolar listas grandes)
-
-    static const uint32_t *dirs() { static const uint32_t d[4] = {B_UP, B_DOWN, B_LEFT, B_RIGHT}; return d; }
-
-    // analogico esquerdo -> uma direcao so (a mais inclinada), com histerese: liga ao passar de 62 e so desliga abaixo de 34
-    uint32_t stickToDir(const OrbisPadData &d) {
-        int dx = (int)d.leftStick.x - 128, dy = (int)d.leftStick.y - 128;
-        int ax = dx < 0 ? -dx : dx, ay = dy < 0 ? -dy : dy;
-        int th = stickDir ? 34 : 62;
-        if (ax < th && ay < th) return 0;
-        if (ax >= ay) return dx < 0 ? B_LEFT : B_RIGHT;
-        return dy < 0 ? B_UP : B_DOWN;
+// Leitura do controle (logica em padin.hpp, testada no PC): adaptador para o scePad do PS4.
+struct OrbisPadSrc {
+    static int read(int h, PadSample *out, int n) {
+        OrbisPadData buf[16]; if (n > 16) n = 16;
+        int k = scePadRead(h, buf, n);
+        if (k < 0) k = 0;
+        for (int i = 0; i < k; i++) { out[i].buttons = buf[i].buttons; out[i].lx = buf[i].leftStick.x; out[i].ly = buf[i].leftStick.y; }
+        return k;
     }
-    uint32_t merged(const OrbisPadData &d) {       // botoes reais + setas virtuais do analogico
-        stickDir = stickToDir(d);
-        return d.buttons | stickDir;
+    static bool state(int h, PadSample &s) {
+        OrbisPadData d;
+        if (scePadReadState(h, &d) != 0) return false;
+        s.buttons = d.buttons; s.lx = d.leftStick.x; s.ly = d.leftStick.y;
+        return true;
     }
-    void poll() {
-        if (h < 0) return;
-        OrbisPadData buf[16]; uint32_t seen = 0;
-        int n = scePadRead(h, buf, 16);
-        for (int i = 0; i < n; i++) seen |= merged(buf[i]);     // cada estado guardado, em ordem (flick rapido do analogico nao se perde)
-        OrbisPadData d; uint32_t cur = held;
-        if (scePadReadState(h, &d) == 0) cur = merged(d);
-        seen |= cur;
-        uint32_t fresh = seen & ~held;
-        pending |= fresh;
-        held = cur;
-        double t = nowSec();
-        for (int i = 0; i < 4; i++) {
-            if (fresh & dirs()[i]) { repStart[i] = t; nextRep[i] = t + kRepDelay; }
-            if (!(held & dirs()[i])) nextRep[i] = 0;
-        }
-    }
-    uint32_t take() { uint32_t e = pending; pending = 0; return e; }
-    // setas seguradas que ja devem repetir (so para menus e teclado)
-    uint32_t repeats() {
-        uint32_t out = 0; double t = nowSec();
-        for (int i = 0; i < 4; i++) {
-            if (nextRep[i] > 0 && (held & dirs()[i]) && t >= nextRep[i]) {
-                out |= dirs()[i];
-                nextRep[i] = t + ((t - repStart[i]) > 1.2 ? kRepFast : kRepSlow);   // a partir de "agora": nunca dispara em rajada
-            }
-        }
-        return out;
-    }
+    static double now() { return nowSec(); }
 };
+using PadIn = PadInT<OrbisPadSrc>;
 
 int main() {
     sceUserServiceInitialize(NULL);
@@ -1309,11 +1265,17 @@ int main() {
 
         if (mode == Mode::Kbd) {
             bool changed = false, done = false;
-            uint32_t nav = pressed | pin.repeats();                 // setas/analogico: repetem sozinhos enquanto seguradas
-            if (nav & B_UP)           { kbd.move(0, -1); changed = true; }
-            if (nav & B_DOWN)         { kbd.move(0, 1);  changed = true; }
-            if (nav & B_LEFT)         { kbd.move(-1, 0); changed = true; }
-            if (nav & B_RIGHT)        { kbd.move(1, 0);  changed = true; }
+            {   // setas/analogico: 1 passo ao apertar + repeticao rapida enquanto seguradas (por tempo, nao por quadro)
+                int st[4]; pin.steps(st);
+                int nU = ((pressed & B_UP) ? 1 : 0) + st[0], nD = ((pressed & B_DOWN) ? 1 : 0) + st[1];
+                int nL = ((pressed & B_LEFT) ? 1 : 0) + st[2], nR = ((pressed & B_RIGHT) ? 1 : 0) + st[3];
+                for (int i = 0; i < nU; i++) kbd.move(0, -1);
+                for (int i = 0; i < nD; i++) kbd.move(0, 1);
+                for (int i = 0; i < nL; i++) kbd.move(-1, 0);
+                for (int i = 0; i < nR; i++) kbd.move(1, 0);
+                if (nU + nD + nL + nR > 0) changed = true;
+            }
+            if (pressed & B_L1)       { kbd.toggleShift(); changed = true; }      // L1: maiusculas (1 letra -> travado -> desligado)
             {   // apagar: QUADRADO ou R3; segurando apaga em sequencia
                 static double bsNext = 0;
                 double tn = nowSec();
@@ -1389,11 +1351,17 @@ int main() {
         }
 
         // ---- Menu ----
-        pressed |= pin.repeats();                  // setas/analogico seguradas repetem (por tempo, nao por volta do loop)
-        if (pressed & B_UP)     { ui.handle(Input::Up);       dirty = true; }
-        if (pressed & B_DOWN)   { ui.handle(Input::Down);     dirty = true; }
-        if (pressed & B_LEFT)   { ui.handle(Input::Left);     dirty = true; }
-        if (pressed & B_RIGHT)  { ui.handle(Input::Right);    dirty = true; }
+        {   // setas/analogico: repetem sozinhos enquanto seguradas; segurando mais tempo, listas longas andam mais itens por passo
+            int st[4]; pin.steps(st);
+            int nU = ((pressed & B_UP) ? 1 : 0) + st[0] * (st[0] ? pin.accel(0) : 1);
+            int nD = ((pressed & B_DOWN) ? 1 : 0) + st[1] * (st[1] ? pin.accel(1) : 1);
+            int nL = ((pressed & B_LEFT) ? 1 : 0) + st[2], nR = ((pressed & B_RIGHT) ? 1 : 0) + st[3];
+            for (int i = 0; i < nU; i++) ui.handle(Input::Up);
+            for (int i = 0; i < nD; i++) ui.handle(Input::Down);
+            for (int i = 0; i < nL; i++) ui.handle(Input::Left);
+            for (int i = 0; i < nR; i++) ui.handle(Input::Right);
+            if (nU + nD + nL + nR > 0) dirty = true;
+        }
         if (pressed & B_L1)     { ui.handle(Input::PrevTab);  dirty = true; }
         if (pressed & B_R1)     { ui.handle(Input::NextTab);  dirty = true; }
         if (pressed & B_L2)     { ui.handle(Input::PageUp);   dirty = true; }
