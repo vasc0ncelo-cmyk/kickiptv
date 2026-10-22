@@ -1,5 +1,6 @@
 #pragma once
-// Teclado na tela (D-pad move, X digita, QUADRADO apaga, TRIANGULO insere "https://", L2 limpa, R1 confirma, O cancela).
+// Teclado na tela (D-pad ou analogico esquerdo (L3) move, X ou clique no L3 digita, QUADRADO ou R3 apaga,
+// TRIANGULO insere "https://", L2 limpa, R1 confirma, O cancela).
 // Serve para o @ do streamer e para o endereco da lista M3U.
 #include "ui.hpp"
 #include <string>
@@ -40,23 +41,40 @@ struct Keyboard {
         else if ((int)text.size() < maxLen) text += k;
         return false;
     }
+    // Onde fica o campo de texto e o cursor (usado por render e por drawCaret).
+    struct Field { int fx, fy, fw, fh, px, caretX; std::string shown; };
+    Field field(const Renderer &r) const {
+        Field f;
+        f.fx = 73; f.fy = 232; f.fw = r.width() - 146; f.fh = 84;
+        f.px = f.fx + 30;
+        if (!isUrl) f.px += 34;
+        int maxChars = (f.fw - (f.px - f.fx) - 60) / (36 / 2);
+        f.shown = text;                                          // mostra o final se for longo
+        if ((int)f.shown.size() > maxChars) f.shown = "..." + f.shown.substr(f.shown.size() - (maxChars - 3));
+        f.caretX = f.px + r.textWidth(f.shown, 36) + 3;
+        return f;
+    }
+    // So o cursor piscando: apaga ou desenha um retangulo pequeno (nao precisa redesenhar o teclado inteiro).
+    void drawCaret(Renderer &r, bool blink) const {
+        using namespace theme;
+        Field f = field(r);
+        r.fillRect(f.caretX, f.fy + 14, 6, 56, 0xFF050805);       // apaga (cor do fundo do campo)
+        if (blink) r.roundRect(f.caretX, f.fy + 18, 4, 48, 2, GREEN);
+    }
     void render(Renderer &r, bool blink, const std::string &hhmm, const std::string &date) const {
         using namespace theme;
         uiHeader(r, hhmm, date);
         uiKMark(r, 73, 150, 40, 41, GREEN);
         uiHeavy(r, 130, 148, title, TEXT, 36);
         uiText(r, 132, 192, subtitle, MUTED, 22);
-        // campo de texto (mostra o final se for longo)
-        const int fx = 73, fy = 232, fw = r.width() - 146, fh = 84;
-        uiGlow(r, fx, fy, fw, fh, 22, GREEN, 8, 90);
+        // campo de texto
+        Field f = field(r);
+        const int fx = f.fx, fy = f.fy, fw = f.fw, fh = f.fh;
+        uiGlow(r, fx, fy, fw, fh, 22, GREEN, 8, 90, false);
         uiFrame(r, fx, fy, fw, fh, 22, 3, GREEN, 0xFF050805);
-        int px = fx + 30;
-        if (!isUrl) { uiHeavy(r, px, fy + 22, "@", GREEN, 40); px += 34; }
-        int maxChars = (fw - (px - fx) - 60) / (36 / 2);
-        std::string shown = text;
-        if ((int)shown.size() > maxChars) shown = "..." + shown.substr(shown.size() - (maxChars - 3));
-        uiText(r, px, fy + 22, shown, TEXT, 36, true);
-        if (blink) r.roundRect(px + r.textWidth(shown, 36) + 3, fy + 18, 4, 48, 2, GREEN);
+        if (!isUrl) uiHeavy(r, fx + 30, fy + 22, "@", GREEN, 40);
+        uiText(r, f.px, fy + 22, f.shown, TEXT, 36, true);
+        if (blink) r.roundRect(f.caretX, fy + 18, 4, 48, 2, GREEN);
         // teclas
         const int kx = 73, ky = 350, ks = 80, kp = 92;
         for (int y = 0; y < ROWS; y++)
@@ -65,7 +83,7 @@ struct Keyboard {
                 int px2 = kx + x * kp, py = ky + y * kp;
                 std::string k = keyAt(x, y);
                 bool special = k == "<" || k == "OK" || k == "Aa";
-                if (on) uiGlow(r, px2, py, ks, ks, 16, GREEN, 8, 130);
+                if (on) uiGlow(r, px2, py, ks, ks, 16, GREEN, 8, 130, false);
                 unsigned bg = on ? GREEN : (k == "OK" ? 0xFF14310B : (special ? CARD_LINE : CARD2));
                 r.roundRect(px2, py, ks, ks, 16, bg);
                 std::string lab = k == "<" ? "Apagar" : k;
@@ -76,7 +94,7 @@ struct Keyboard {
         const int cx0 = kx + COLS * kp + 24, cw = r.width() - 73 - cx0;
         uiFrame(r, cx0, ky, cw, 5 * kp - 12, 22, 2, CARD_LINE, 0xFF0B0B0B);
         uiText(r, cx0 + 30, ky + 22, "Controles", GREEN, 26, true);
-        static const char *ks2[6] = {"D-pad", "X", "QUADRADO", "TRIÂNGULO", "L2", "R1"};
+        static const char *ks2[6] = {"D-pad / L3", "X / clique L3", "QUADRADO / R3", "TRIÂNGULO", "L2", "R1"};
         static const char *ls[6] = {"mover", "digitar", "apagar", "https://", "limpar tudo", "confirmar"};
         for (int i = 0; i < 6; i++) {
             int ry = ky + 90 + i * 62;
