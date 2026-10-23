@@ -10,6 +10,7 @@ enum class Kind { Channel, Movie, Series };
 
 struct Entry {
     std::string name, url, group;   // (group so existe durante o parse; a Playlist final nao guarda, para poupar memoria)
+    std::string logo;               // tvg-logo / logo (capa do filme/canal, se a lista trouxer)
     Kind kind = Kind::Channel;
     int season = 0, episode = 0;    // so para series
 };
