@@ -31,6 +31,7 @@
 #include "tschunk.hpp"
 #include "urlutil.hpp"
 #include "imgcache.hpp"
+#include "sfx.hpp"
 #include "tsmux.hpp"
 #include "blit.hpp"
 #include "padin.hpp"
@@ -1241,73 +1242,17 @@ struct Player {
         active = true; t0 = lastFps = lastFrameT = nowSec();
         return true;
     }
-    // Filme/serie:
-    //  1) STREAMING (HTTP Range + callbacks) — comeca rapido, serve filmes grandes sem encher o disco
-    //  2) se falhar: DOWNLOAD LOCAL completo e toca arquivo (estavel, como pedacos de live)
+    // Filme/serie: SO arquivo local (streaming HTTP fechava o app com CE-34878-0).
+    // Sem limite de tamanho. Progresso na tela. O cancela.
     bool startFile(const std::string &url) {
-        std::string name = vodPlayerName(url);
-        std::string ext = urlExtension(url);
-        log.push_back(std::string("VOD") + (ext.empty() ? " (painel)" : " ." + ext) + " — tentando streaming");
-        presentCb();
-
-        // ---- 1) streaming (sem baixar o arquivo inteiro) ----
-        {
-            auto ss = std::make_shared<NetClient::Session>();
-            ss->recvSec = 30;
-            auto mkFetch = [url](std::shared_ptr<NetClient::Session> sess) -> httpfile::Fetch {
-                return [sess, url](uint64_t from, uint64_t to, std::string &body) -> int {
-                    int st = 0;
-                    if (!g_net.getRange(*sess, url, from, to, body, st)) return 0;
-                    return st;
-                };
-            };
-            auto rd = std::make_shared<httpfile::Reader>(mkFetch(ss), 16, 8);  // 16 MB cache
-            rd->setOnExit([ss] { g_net.closeSession(*ss); });
-            rd->setProbe([ss, url]() -> uint64_t {
-                std::string b; int st = 0; uint64_t total = 0;
-                if (!g_net.getRange(*ss, url, 0, 0, b, st, &total) || st != 206) return 0;
-                return total;
-            });
-            setHf(rd); rd->start();
-            double w0 = nowSec();
-            while (rd->state() == 0 && nowSec() - w0 < 40) {
-                sceKernelUsleep(50000);
-                if (cancelCb && cancelCb()) { cancelled = true; break; }
-                presentCb();
-            }
-            if (cancelled) { releaseHfAsync(); failed = true; return false; }
-            if (rd->state() == 1) {
-                log.push_back("   stream " + std::to_string(rd->size() >> 20) + " MB — buffer...");
-                presentCb();
-                uint8_t tip[128];
-                rd->read(tip, 0, 128, 20000);
-                double b0 = nowSec();
-                while (rd->cachedBlocks() < 3 && nowSec() - b0 < 25) {
-                    sceKernelUsleep(50000);
-                    if (cancelCb && cancelCb()) { cancelled = true; break; }
-                    presentCb();
-                }
-                if (!cancelled && rd->cachedBlocks() >= 1) {
-                    // waitMs=0: nao bloqueia no GetVideoData (evita CE-34878-0 em varios paineis)
-                    if (openSource(name, 2, 0, 0, true)) {
-                        audio.start(h); active = true; t0 = lastFps = lastFrameT = nowSec();
-                        isVod = true;
-                        log.push_back("OK: streaming VOD (arquivo grande suportado)");
-                        return true;
-                    }
-                    log.push_back("   streaming falhou — baixando para disco...");
-                }
-            } else {
-                log.push_back("   stream indisponivel — baixando para disco...");
-            }
-            releaseHfAsync();
-            if (cancelled) { failed = true; return false; }
-        }
-
-        // ---- 2) download local completo (sem limite de tamanho) ----
         const char *path = "/data/kickiptv_vod.mp4";
-        remove(path);
+        std::string ext = urlExtension(url);
+        log.push_back(std::string("VOD") + (ext.empty() ? " (painel)" : " ." + ext) +
+                      ": download local (estavel)");
         presentCb();
+        remove(path);
+        releaseHfAsync();   // garante que nao ha callbacks HTTP ativos
+
         NetClient::Session ss; ss.recvSec = 30;
         std::string tip; int st = 0; uint64_t total = 0;
         if (!g_net.getRange(ss, url, 0, 0, tip, st, &total) || st != 206 || total < 1024) {
@@ -1316,8 +1261,9 @@ struct Player {
             failed = true;
             return false;
         }
-        log.push_back("   download " + std::to_string(total >> 20) + " MB (sem limite). O cancela.");
+        log.push_back("   " + std::to_string(total >> 20) + " MB — baixando (sem limite). O cancela.");
         presentCb();
+
         FILE *fp = fopen(path, "wb");
         if (!fp) {
             log.push_back("ERRO: nao criou /data/kickiptv_vod.mp4");
@@ -1325,7 +1271,7 @@ struct Player {
             failed = true;
             return false;
         }
-        const uint64_t kChunk = 1u << 20;
+        const uint64_t kChunk = 2u << 20;  // 2 MB por pedaco (mais rapido)
         uint64_t pos = 0;
         int fails = 0;
         double lastUi = nowSec();
@@ -1335,20 +1281,20 @@ struct Player {
             if (to >= total) to = total - 1;
             std::string body;
             if (!g_net.getRange(ss, url, pos, to, body, st) || (st != 206 && !(st == 200 && pos == 0))) {
-                if (++fails > 10) break;
+                if (++fails > 12) break;
                 g_net.closeSession(ss);
-                sceKernelUsleep(250000);
+                sceKernelUsleep(300000);
                 continue;
             }
             fails = 0;
             if (fwrite(body.data(), 1, body.size(), fp) != body.size()) { fails = 99; break; }
             pos += body.size();
-            if (nowSec() - lastUi > 0.25) {
+            if (nowSec() - lastUi > 0.3) {
                 lastUi = nowSec();
                 int pct = total ? (int)((pos * 100) / total) : 0;
                 log.push_back("   " + std::to_string(pct) + "% (" +
                               std::to_string(pos >> 20) + "/" + std::to_string(total >> 20) + " MB)");
-                if (log.size() > 35) log.erase(log.begin() + 4, log.begin() + 12);
+                if (log.size() > 30) log.erase(log.begin() + 3, log.begin() + 10);
                 presentCb();
             }
         }
@@ -1366,21 +1312,21 @@ struct Player {
             if (ck) { fread(hdr, 1, 12, ck); fclose(ck); }
             bool okMp4 = (hdr[4] == 'f' && hdr[5] == 't' && hdr[6] == 'y' && hdr[7] == 'p');
             if (!okMp4) {
-                log.push_back("ERRO: nao e MP4 (ftyp)");
+                log.push_back("ERRO: arquivo nao e MP4 (ftyp)");
                 remove(path); failed = true; return false;
             }
         }
-        log.push_back("   download ok — abrindo local");
+        log.push_back("   download ok — abrindo arquivo local");
         presentCb();
-        if (openSource(path, 0, 0, 15000, true)) {
+        if (openSource(path, 0, 0, 20000, true)) {
             audio.start(h); active = true; t0 = lastFps = lastFrameT = nowSec();
             isVod = true;
-            log.push_back("OK: tocando arquivo local");
+            log.push_back("OK: tocando");
             return true;
         }
         remove(path);
         failed = true;
-        log.push_back("ERRO: player nao abriu o arquivo");
+        log.push_back("ERRO: player nao abriu o arquivo local");
         return false;
     }
 
@@ -1740,6 +1686,7 @@ int main() {
     sceUserServiceGetInitialUser(&userId);
     scePadInit();
     sceAudioOutInit();
+    sfx::init();
     int pad = scePadOpen(userId, 0, 0, NULL);
     PadIn pin; pin.h = pad;
     bool wantQuit = false;
@@ -2041,23 +1988,31 @@ int main() {
             int nU = ((pressed & B_UP) ? 1 : 0) + st[0] * (st[0] ? pin.accel(0) : 1);
             int nD = ((pressed & B_DOWN) ? 1 : 0) + st[1] * (st[1] ? pin.accel(1) : 1);
             int nL = ((pressed & B_LEFT) ? 1 : 0) + st[2], nR = ((pressed & B_RIGHT) ? 1 : 0) + st[3];
+            if (nU + nD + nL + nR > 0) sfx::play(sfx::Kind::Move);
             for (int i = 0; i < nU; i++) ui.handle(Input::Up);
             for (int i = 0; i < nD; i++) ui.handle(Input::Down);
             for (int i = 0; i < nL; i++) ui.handle(Input::Left);
             for (int i = 0; i < nR; i++) ui.handle(Input::Right);
             if (nU + nD + nL + nR > 0) dirty = true;
         }
-        if (pressed & B_L1)     { ui.handle(Input::PrevTab);  dirty = true; }
-        if (pressed & B_R1)     { ui.handle(Input::NextTab);  dirty = true; }
-        if (pressed & B_L2)     { ui.handle(Input::PageUp);   dirty = true; }
-        if (pressed & B_R2)     { ui.handle(Input::PageDown); dirty = true; }
-        if (pressed & B_CROSS)  { ui.handle(Input::Confirm);  dirty = true; }
-        if (pressed & B_CIRCLE) { ui.handle(Input::Back);     dirty = true; }
+        if (pressed & B_L1)     { sfx::play(sfx::Kind::Move); ui.handle(Input::PrevTab);  dirty = true; }
+        if (pressed & B_R1)     { sfx::play(sfx::Kind::Move); ui.handle(Input::NextTab);  dirty = true; }
+        if (pressed & B_L2)     { sfx::play(sfx::Kind::Move); ui.handle(Input::PageUp);   dirty = true; }
+        if (pressed & B_R2)     { sfx::play(sfx::Kind::Move); ui.handle(Input::PageDown); dirty = true; }
+        if (pressed & B_CROSS)  { sfx::play(sfx::Kind::Confirm); ui.handle(Input::Confirm);  dirty = true; }
+        if (pressed & B_CIRCLE) { sfx::play(sfx::Kind::Back); ui.handle(Input::Back);     dirty = true; }
         if ((pressed & B_TRIANGLE) && mode == Mode::Menu && ui.screen == Screen::List) {
             ui.requestSearch();
             dirty = true;
         }
         if (updateClock()) dirty = true;
+        // animacao continua no menu (pulso do foco)
+        sfx::setMuted(mode == Mode::Play || mode == Mode::Waiting);
+        if (mode == Mode::Menu) {
+            ui.animPhase = (float)(nowSec() * 0.7);
+            ui.animTick++;
+            if ((ui.animTick % 2) == 0) dirty = true;   // ~30 fps de efeito
+        }
 
         if (pf.kbdRequested) {                    // X em "Digitar @streamer": abre o teclado na tela
             pf.kbdRequested = false;
@@ -2124,6 +2079,7 @@ int main() {
     // ---- encerramento limpo: nenhuma thread pode estar viva ao sair (std::thread ativa no fim = "terminate" = erro no PS4) ----
     trace("saindo");
     g_covers.shutdown();
+    sfx::shutdown();
     if (player.h || player.h2 || mode == Mode::Play) player.stop();
     Player::waitTeardown(10.0);
     if (g_tearing.load() > 0) { trace("fim-forcado"); _Exit(0); }   // algo travou (rede): sai sem rodar destrutores
