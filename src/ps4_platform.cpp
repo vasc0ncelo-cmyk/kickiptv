@@ -2007,7 +2007,7 @@ int main() {
         }
         if (updateClock()) dirty = true;
         // animacao continua no menu (pulso do foco)
-        sfx::setMuted(mode == Mode::Play || mode == Mode::Waiting);
+        sfx::setMuted(mode == Mode::Play);
         if (mode == Mode::Menu) {
             ui.animPhase = (float)(nowSec() * 0.7);
             ui.animTick++;
