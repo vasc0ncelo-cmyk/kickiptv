@@ -12,6 +12,7 @@
 #include <deque>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -31,7 +32,6 @@
 #include "tschunk.hpp"
 #include "urlutil.hpp"
 #include "imgcache.hpp"
-#include "sfx.hpp"
 #include "tsmux.hpp"
 #include "blit.hpp"
 #include "padin.hpp"
@@ -1242,92 +1242,71 @@ struct Player {
         active = true; t0 = lastFps = lastFrameT = nowSec();
         return true;
     }
-    // Filme/serie: tenta abrir HTTP nativo (instantaneo). Se falhar, baixa local.
-    // Nunca usa callbacks HTTP (cb=2) — fechavam o app.
+    // Filme/serie em STREAMING (igual canais): o app baixa por HTTP Range sob demanda e
+    // entrega bytes ao AvPlayer pelos mesmos callbacks de arquivo usados no HLS/live.
+    // Nao baixa o filme inteiro para o disco — comeca a tocar assim que o buffer enche.
+    // VOD estavel: 1) URL HTTP direta  2) download local completo. NUNCA cb=2 (fecha o app).
     bool startFile(const std::string &url) {
         std::string ext = urlExtension(url);
-        log.push_back(std::string("VOD") + (ext.empty() ? " (painel)" : " ." + ext));
+        log.push_back(std::string("VOD") + (ext.empty() ? "" : " ." + ext));
         presentCb();
         releaseHfAsync();
 
-        // 1) AvPlayer abre a URL HTTP direto (sem baixar) — se o painel permitir, e instantaneo
-        log.push_back("   tentando abertura direta...");
+        log.push_back("   tentativa direta...");
         presentCb();
-        if (openSource(url, 0, 0, 12000, true)) {
+        if (openSource(url, 0, 0, 10000, true)) {
             audio.start(h); active = true; t0 = lastFps = lastFrameT = nowSec();
             isVod = true;
-            log.push_back("OK: streaming direto (instantaneo)");
+            log.push_back("OK: direto");
             return true;
         }
-        log.push_back("   direto falhou — baixando para /data...");
-        presentCb();
 
         const char *path = "/data/kickiptv_vod.mp4";
         remove(path);
+        log.push_back("   baixando local...");
+        presentCb();
         NetClient::Session ss; ss.recvSec = 25;
         std::string tip; int st = 0; uint64_t total = 0;
         if (!g_net.getRange(ss, url, 0, 0, tip, st, &total) || st != 206 || total < 1024) {
-            log.push_back("ERRO: sem tamanho (HTTP " + std::to_string(st) + ")");
-            g_net.closeSession(ss);
-            failed = true;
-            return false;
+            log.push_back("ERRO: sem tamanho HTTP " + std::to_string(st));
+            g_net.closeSession(ss); failed = true; return false;
         }
-        log.push_back("   " + std::to_string(total >> 20) + " MB — baixando (O cancela)");
+        log.push_back("   " + std::to_string(total >> 20) + " MB (O cancela)");
         presentCb();
         FILE *fp = fopen(path, "wb");
-        if (!fp) {
-            log.push_back("ERRO: disco /data");
-            g_net.closeSession(ss);
-            failed = true;
-            return false;
-        }
-        const uint64_t kChunk = 4u << 20;  // 4 MB — mais rapido
-        uint64_t pos = 0;
-        int fails = 0;
-        double lastUi = nowSec();
+        if (!fp) { log.push_back("ERRO: /data"); g_net.closeSession(ss); failed = true; return false; }
+        const uint64_t kChunk = 4u << 20;
+        uint64_t pos = 0; int fails = 0; double lastUi = nowSec();
         while (pos < total) {
             if (cancelCb && cancelCb()) { cancelled = true; break; }
-            uint64_t to = pos + kChunk - 1;
-            if (to >= total) to = total - 1;
+            uint64_t to = pos + kChunk - 1; if (to >= total) to = total - 1;
             std::string body;
             if (!g_net.getRange(ss, url, pos, to, body, st) || (st != 206 && !(st == 200 && pos == 0))) {
                 if (++fails > 12) break;
-                g_net.closeSession(ss);
-                sceKernelUsleep(200000);
-                continue;
+                g_net.closeSession(ss); sceKernelUsleep(200000); continue;
             }
             fails = 0;
             if (fwrite(body.data(), 1, body.size(), fp) != body.size()) { fails = 99; break; }
             pos += body.size();
-            if (nowSec() - lastUi > 0.2) {
+            if (nowSec() - lastUi > 0.25) {
                 lastUi = nowSec();
                 int pct = total ? (int)((pos * 100) / total) : 0;
-                log.push_back("   " + std::to_string(pct) + "% (" +
-                              std::to_string(pos >> 20) + "/" + std::to_string(total >> 20) + " MB)");
-                if (log.size() > 28) log.erase(log.begin() + 3, log.begin() + 10);
+                log.push_back("   " + std::to_string(pct) + "%");
+                if (log.size() > 25) log.erase(log.begin() + 3, log.begin() + 8);
                 presentCb();
             }
         }
-        fclose(fp);
-        g_net.closeSession(ss);
-        if (cancelled) { remove(path); failed = true; return false; }
-        if (pos < 64 * 1024) {
+        fclose(fp); g_net.closeSession(ss);
+        if (cancelled || pos < 64 * 1024) {
             remove(path); failed = true;
-            log.push_back("ERRO: download incompleto");
+            if (!cancelled) log.push_back("ERRO: download incompleto");
             return false;
         }
-        log.push_back("   abrindo arquivo local...");
-        presentCb();
         if (openSource(path, 0, 0, 15000, true)) {
             audio.start(h); active = true; t0 = lastFps = lastFrameT = nowSec();
-            isVod = true;
-            log.push_back("OK: tocando");
-            return true;
+            isVod = true; log.push_back("OK: local"); return true;
         }
-        remove(path);
-        failed = true;
-        log.push_back("ERRO: player nao abriu");
-        return false;
+        remove(path); failed = true; log.push_back("ERRO: nao abriu"); return false;
     }
 
     std::function<void()> presentCb = [] {};   // main liga isto para redesenhar a tela de espera durante as tentativas
@@ -1686,7 +1665,6 @@ int main() {
     sceUserServiceGetInitialUser(&userId);
     scePadInit();
     sceAudioOutInit();
-    sfx::init();
     int pad = scePadOpen(userId, 0, 0, NULL);
     PadIn pin; pin.h = pad;
     bool wantQuit = false;
@@ -1715,24 +1693,29 @@ int main() {
     App app(pf);
     pf.app = &app;
     UI ui(app);
-    ui.loadSaved();                           // ultimo streamer e lista M3U guardados
-    // Capas reais (tvg-logo JPEG/PNG)
     g_covers.setFetch([](const std::string &url, std::string &body) -> bool {
         int st = 0;
-        return g_net.get(url, body, st) && st >= 200 && st < 300 && body.size() > 32;
+        try {
+            return g_net.get(url, body, st) && st >= 200 && st < 300 && body.size() > 32;
+        } catch (...) { return false; }
     });
-    ui.coverRequest = [](const std::string &url) { g_covers.requestFront(url); };
-    ui.coverGet = [](const std::string &url, const uint32_t *&px, int &w, int &h) -> bool {
-        // snapshot por URL: varias capas no mesmo quadro
-        static std::map<std::string, Cover> snap;
-        Cover c;
-        if (!g_covers.get(url, c) || !c.ready || c.bgra.empty()) return false;
-        snap[url] = std::move(c);
-        auto &s = snap[url];
-        px = s.bgra.data(); w = s.w; h = s.h;
-        if (snap.size() > 80) snap.clear();   // evita crescer sem fim
-        return true;
+    ui.coverRequest = [](const std::string &url) {
+        try { g_covers.requestFront(url); } catch (...) {}
     };
+    ui.coverGet = [](const std::string &url, const uint32_t *&px, int &w, int &h) -> bool {
+        static std::map<std::string, Cover> snap;
+        try {
+            Cover c;
+            if (!g_covers.get(url, c) || !c.ready || c.bgra.empty()) return false;
+            snap[url] = std::move(c);
+            auto &s = snap[url];
+            px = s.bgra.data(); w = s.w; h = s.h;
+            if (snap.size() > 60) snap.clear();
+            return true;
+        } catch (...) { return false; }
+    };
+
+    ui.loadSaved();                           // ultimo streamer e lista M3U guardados
     if (!g_prevStage.empty()) app.say("Aviso: da ultima vez o app parou no passo: " + g_prevStage);
     trace("estado-criado");
     boot.line("[2] estado do app criado");
@@ -1746,6 +1729,35 @@ int main() {
     uint32_t prev = 0;
     int back = 1;
     bool dirty = true;
+    // Lista em background: UI na hora; troca atomica quando terminar (sem race na navegacao)
+    std::atomic<bool> listBgDone{false};
+    std::shared_ptr<Playlist> listPending;
+    std::mutex listMu;
+    if (ui.hasSavedList()) {
+        std::string urlCopy = ui.m3uUrl;
+        std::thread([&, urlCopy]() {
+            try {
+                PlaylistBuilder b;
+                app.pf.cacheLoad(urlCopy, [&](const char *d, size_t n) {
+                    try { b.feed(d, n); } catch (...) { return false; }
+                    return true;
+                });
+                try { b.finish(); } catch (...) {}
+                auto pl = std::make_shared<Playlist>(b.take());
+                {
+                    std::lock_guard<std::mutex> lk(listMu);
+                    listPending = pl;
+                }
+                listBgDone = true;
+                trace("lista-bg-ok");
+            } catch (...) {
+                listBgDone = true;
+                trace("lista-bg-fail");
+            }
+        }).detach();
+        app.say("Pronto — lista carregando...");
+    }
+
     // Reconexao automatica: no maximo 5 tentativas em 2 minutos (depois desiste e avisa, para nao ficar em loop se a live acabou)
     double rtT[5] = {0, 0, 0, 0, 0}; int rtI = 0; bool autoMode = false;
     auto allowAuto = [&]() -> bool {
@@ -1835,12 +1847,9 @@ int main() {
             else skipAuto = true;
         }
         if (ui.hasSavedList() && skipAuto) {
-            app.say("A lista M3U fechou o app na ultima vez (passo: " + g_prevStage + ") - nao carreguei sozinho. Abra LISTA M3U e aperte X.");
-        } else if (ui.hasSavedList()) {          // reabre a lista M3U da ultima vez
-            app.say(g_safeM3U ? "Carregando sua lista M3U (modo seguro)..." : "Carregando sua lista M3U...");
-            presentMenu();
-            ui.loadSavedList();
-            trace("lista-m3u-carregada");
+            app.say("A lista M3U fechou o app na ultima vez - abra LISTA M3U e aperte X.");
+        } else if (ui.hasSavedList()) {
+            app.say("Pronto");   // lista sobe em background no loop principal
         }
     }
 
@@ -1988,45 +1997,43 @@ int main() {
             int nU = ((pressed & B_UP) ? 1 : 0) + st[0] * (st[0] ? pin.accel(0) : 1);
             int nD = ((pressed & B_DOWN) ? 1 : 0) + st[1] * (st[1] ? pin.accel(1) : 1);
             int nL = ((pressed & B_LEFT) ? 1 : 0) + st[2], nR = ((pressed & B_RIGHT) ? 1 : 0) + st[3];
-            if (nU + nD + nL + nR > 0) sfx::play(sfx::Kind::Move);
             for (int i = 0; i < nU; i++) ui.handle(Input::Up);
             for (int i = 0; i < nD; i++) ui.handle(Input::Down);
             for (int i = 0; i < nL; i++) ui.handle(Input::Left);
             for (int i = 0; i < nR; i++) ui.handle(Input::Right);
             if (nU + nD + nL + nR > 0) dirty = true;
         }
-        if (pressed & B_L1)     { sfx::play(sfx::Kind::Move); ui.handle(Input::PrevTab);  dirty = true; }
-        if (pressed & B_R1)     { sfx::play(sfx::Kind::Move); ui.handle(Input::NextTab);  dirty = true; }
-        if (pressed & B_L2)     { sfx::play(sfx::Kind::Move); ui.handle(Input::PageUp);   dirty = true; }
-        if (pressed & B_R2)     { sfx::play(sfx::Kind::Move); ui.handle(Input::PageDown); dirty = true; }
-        if (pressed & B_CROSS)  { sfx::play(sfx::Kind::Confirm); ui.handle(Input::Confirm);  dirty = true; }
-        if (pressed & B_CIRCLE) { sfx::play(sfx::Kind::Back); ui.handle(Input::Back);     dirty = true; }
-        if ((pressed & B_TRIANGLE) && mode == Mode::Menu && ui.screen == Screen::List) {
-            ui.requestSearch();
-            dirty = true;
-        }
+        if (pressed & B_L1)     { ui.handle(Input::PrevTab);  dirty = true; }
+        if (pressed & B_R1)     { ui.handle(Input::NextTab);  dirty = true; }
+        if (pressed & B_L2)     { ui.handle(Input::PageUp);   dirty = true; }
+        if (pressed & B_R2)     { ui.handle(Input::PageDown); dirty = true; }
+        if (pressed & B_CROSS)  { ui.handle(Input::Confirm);  dirty = true; }
+        if (pressed & B_CIRCLE) { ui.handle(Input::Back);     dirty = true; }
         if (updateClock()) dirty = true;
-        // animacao continua no menu (pulso do foco)
-        sfx::setMuted(mode == Mode::Play);
-        if (mode == Mode::Menu) {
-            ui.animPhase = (float)(nowSec() * 0.7);
-            ui.animTick++;
-            if ((ui.animTick % 2) == 0) dirty = true;   // ~30 fps de efeito
+        if (listBgDone.exchange(false)) {
+            std::shared_ptr<Playlist> pl;
+            { std::lock_guard<std::mutex> lk(listMu); pl = listPending; listPending.reset(); }
+            if (pl) {
+                app.list = std::move(*pl);
+                for (int i = 0; i < 4; i++) ui.cursor[i] = ui.scroll[i] = ui.catCur[i] = ui.catScroll[i] = 0;
+                ui.level = 0; ui.inItems = false;
+                app.say("Lista pronta");
+            }
+            dirty = true;
         }
 
         if (pf.kbdRequested) {                    // X em "Digitar @streamer": abre o teclado na tela
             pf.kbdRequested = false;
-            kbd.open(ui.textInitial(), ui.textKind == 2 || ui.textKind == 3);
+            kbd.open(ui.textInitial(), ui.textKind == 2);
             mode = Mode::Kbd; dirty = true;
             continue;
         }
         if (pf.hasPendingText) {                  // texto confirmado no teclado: busca o canal ou baixa a lista M3U
             std::string typed = pf.pendingText; pf.pendingText.clear(); pf.hasPendingText = false;
             if (ui.textKind == 2) app.say(typed.empty() ? "Removendo a lista M3U..." : "Baixando a lista M3U...");
-            else if (ui.textKind == 3) app.say(typed.empty() ? "Limpando busca..." : ("Buscando \"" + typed + "\"..."));
             else app.say("Buscando @" + kickSlug(typed) + " na Kick...");
             presentMenu();
-            ui.onText(typed);                    // httpGet + (se ao vivo) play() / busca / m3u
+            ui.onText(typed);                    // httpGet + (se ao vivo) play()
             trace("texto-processado");
             dirty = true;
         }
@@ -2079,7 +2086,6 @@ int main() {
     // ---- encerramento limpo: nenhuma thread pode estar viva ao sair (std::thread ativa no fim = "terminate" = erro no PS4) ----
     trace("saindo");
     g_covers.shutdown();
-    sfx::shutdown();
     if (player.h || player.h2 || mode == Mode::Play) player.stop();
     Player::waitTeardown(10.0);
     if (g_tearing.load() > 0) { trace("fim-forcado"); _Exit(0); }   // algo travou (rede): sai sem rodar destrutores
