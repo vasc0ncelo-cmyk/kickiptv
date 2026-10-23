@@ -1,8 +1,7 @@
 #include "imgcache.hpp"
 #include <cstdio>
-#include <sys/stat.h>
 #include <cstring>
-#include <string>
+#include <sys/stat.h>
 
 #define STBI_NO_HDR
 #define STBI_NO_PIC
@@ -15,7 +14,7 @@
 
 bool imgDecodeToCover(const std::string &body, Cover &out, int tw, int th) {
     out = Cover{};
-    if (body.size() < 24) return false;
+    if (body.size() < 24 || body.size() > 2 * 1024 * 1024) return false;
     int w = 0, h = 0, comp = 0;
     unsigned char *px = stbi_load_from_memory(
         (const stbi_uc *)body.data(), (int)body.size(), &w, &h, &comp, 4);
@@ -30,8 +29,8 @@ bool imgDecodeToCover(const std::string &body, Cover &out, int tw, int th) {
         for (int x = 0; x < tw; x++) {
             int sx = x * w / tw;
             const unsigned char *p = px + ((size_t)sy * w + sx) * 4;
-            unsigned a = p[3], r = p[0], g = p[1], b = p[2];
-            out.bgra[(size_t)y * tw + x] = (a << 24) | (r << 16) | (g << 8) | b;
+            out.bgra[(size_t)y * tw + x] =
+                ((unsigned)p[3] << 24) | ((unsigned)p[0] << 16) | ((unsigned)p[1] << 8) | (unsigned)p[2];
         }
     }
     stbi_image_free(px);
@@ -40,7 +39,6 @@ bool imgDecodeToCover(const std::string &body, Cover &out, int tw, int th) {
 }
 
 std::string ImgCache::diskPath(const std::string &url) {
-    // hash simples do URL -> nome de arquivo
     uint32_t h = 2166136261u;
     for (unsigned char c : url) { h ^= c; h *= 16777619u; }
     char b[64];
@@ -49,15 +47,13 @@ std::string ImgCache::diskPath(const std::string &url) {
 }
 
 bool ImgCache::loadDisk(const std::string &url, Cover &out) {
-    std::string path = diskPath(url);
-    FILE *f = fopen(path.c_str(), "rb");
+    FILE *f = fopen(diskPath(url).c_str(), "rb");
     if (!f) return false;
     int w = 0, h = 0;
-    if (fread(&w, 4, 1, f) != 1 || fread(&h, 4, 1, f) != 1 || w <= 0 || h <= 0 || w > 512 || h > 512) {
-        fclose(f); return false;
-    }
+    if (fread(&w, 4, 1, f) != 1 || fread(&h, 4, 1, f) != 1 ||
+        w != kThumbW || h != kThumbH) { fclose(f); return false; }
     out.w = w; out.h = h;
-    out.bgra.resize((size_t)w * (size_t)h);
+    out.bgra.resize((size_t)w * h);
     size_t n = fread(out.bgra.data(), 4, out.bgra.size(), f);
     fclose(f);
     if (n != out.bgra.size()) return false;
@@ -67,11 +63,8 @@ bool ImgCache::loadDisk(const std::string &url, Cover &out) {
 
 void ImgCache::saveDisk(const std::string &url, const Cover &c) {
     if (!c.ready || c.bgra.empty()) return;
-    // garante pasta
-    // cria pasta se nao existir
     mkdir("/data/kickiptv_cov", 0777);
-    std::string path = diskPath(url);
-    FILE *f = fopen(path.c_str(), "wb");
+    FILE *f = fopen(diskPath(url).c_str(), "wb");
     if (!f) return;
     fwrite(&c.w, 4, 1, f);
     fwrite(&c.h, 4, 1, f);
@@ -81,7 +74,6 @@ void ImgCache::saveDisk(const std::string &url, const Cover &c) {
 
 void ImgCache::loadOne(const std::string &url) {
     Cover c;
-    // disco de novo (outra thread pode ter gravado)
     if (loadDisk(url, c)) {
         std::lock_guard<std::mutex> l(m_);
         map_[url] = std::move(c);
@@ -95,9 +87,9 @@ void ImgCache::loadOne(const std::string &url) {
     std::string body;
     bool ok = false;
     try {
-        ok = fetch_(url, body) && body.size() > 32 && body.size() < 3 * 1024 * 1024;
+        ok = fetch_(url, body) && body.size() > 32 && body.size() < 2 * 1024 * 1024;
+        if (ok) ok = imgDecodeToCover(body, c, kThumbW, kThumbH);
     } catch (...) { ok = false; }
-    if (ok) ok = imgDecodeToCover(body, c, kThumbW, kThumbH);
     if (ok) saveDisk(url, c);
     {
         std::lock_guard<std::mutex> l(m_);
