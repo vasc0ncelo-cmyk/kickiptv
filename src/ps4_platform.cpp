@@ -30,6 +30,7 @@
 #include "httpfile.hpp"
 #include "tschunk.hpp"
 #include "urlutil.hpp"
+#include "imgcache.hpp"
 #include "tsmux.hpp"
 #include "blit.hpp"
 #include "padin.hpp"
@@ -340,6 +341,7 @@ struct NetClient {
 };
 
 static NetClient g_net;
+static ImgCache g_covers;
 
 // ---------- Plataforma ----------
 struct Ps4Platform : Platform {
@@ -1239,91 +1241,149 @@ struct Player {
         active = true; t0 = lastFps = lastFrameT = nowSec();
         return true;
     }
-    // Filme/serie em STREAMING (igual canais): o app baixa por HTTP Range sob demanda e
-    // entrega bytes ao AvPlayer pelos mesmos callbacks de arquivo usados no HLS/live.
-    // Nao baixa o filme inteiro para o disco — comeca a tocar assim que o buffer enche.
+    // Filme/serie:
+    //  1) STREAMING (HTTP Range + callbacks) — comeca rapido, serve filmes grandes sem encher o disco
+    //  2) se falhar: DOWNLOAD LOCAL completo e toca arquivo (estavel, como pedacos de live)
     bool startFile(const std::string &url) {
         std::string name = vodPlayerName(url);
         std::string ext = urlExtension(url);
-        log.push_back(std::string("VOD") + (ext.empty() ? " (painel)" : " ." + ext) +
-                      ": streaming (igual canais) -> " + name);
+        log.push_back(std::string("VOD") + (ext.empty() ? " (painel)" : " ." + ext) + " — tentando streaming");
         presentCb();
 
-        // 1 conexao + cache moderado (estavel no PS4)
-        auto ss = std::make_shared<NetClient::Session>();
-        ss->recvSec = 30;
-        auto mkFetch = [url](std::shared_ptr<NetClient::Session> sess) -> httpfile::Fetch {
-            return [sess, url](uint64_t from, uint64_t to, std::string &body) -> int {
-                int st = 0;
-                if (!g_net.getRange(*sess, url, from, to, body, st)) return 0;
-                return st;
-            };
-        };
-        // 12 blocos x 1 MB = 12 MB de buffer a frente (parecido com margem de live)
-        auto rd = std::make_shared<httpfile::Reader>(mkFetch(ss), 12, 6);
-        rd->setOnExit([ss] { g_net.closeSession(*ss); });
-        rd->setProbe([ss, url]() -> uint64_t {
-            std::string b; int st = 0; uint64_t total = 0;
-            if (!g_net.getRange(*ss, url, 0, 0, b, st, &total) || st != 206) return 0;
-            return total;
-        });
-
-        setHf(rd);
-        rd->start();
-        log.push_back("   medindo tamanho / enchendo buffer...");
-        presentCb();
-
-        double w0 = nowSec();
-        while (rd->state() == 0 && nowSec() - w0 < 45) {
-            sceKernelUsleep(50000);
-            if (cancelCb && cancelCb()) { cancelled = true; break; }
-            presentCb();
-        }
-        if (cancelled) { failed = true; releaseHfAsync(); return false; }
-        if (rd->state() != 1) {
-            log.push_back("ERRO: " + (rd->state() == 2 ? rd->error() : std::string("servidor demorou demais")));
-            releaseHfAsync();
-            failed = true;
-            return false;
-        }
-
-        uint64_t fsize = rd->size();
-        log.push_back("   tamanho: " + std::to_string(fsize >> 20) + " MB (streaming, sem baixar tudo)");
-        presentCb();
-
-        // Pre-buffer: espera pelo menos 2 blocos (~2 MB) antes de abrir o player
+        // ---- 1) streaming (sem baixar o arquivo inteiro) ----
         {
-            uint8_t tip[64];
-            rd->read(tip, 0, 64, 20000);
-            double b0 = nowSec();
-            while (rd->cachedBlocks() < 2 && nowSec() - b0 < 30) {
+            auto ss = std::make_shared<NetClient::Session>();
+            ss->recvSec = 30;
+            auto mkFetch = [url](std::shared_ptr<NetClient::Session> sess) -> httpfile::Fetch {
+                return [sess, url](uint64_t from, uint64_t to, std::string &body) -> int {
+                    int st = 0;
+                    if (!g_net.getRange(*sess, url, from, to, body, st)) return 0;
+                    return st;
+                };
+            };
+            auto rd = std::make_shared<httpfile::Reader>(mkFetch(ss), 16, 8);  // 16 MB cache
+            rd->setOnExit([ss] { g_net.closeSession(*ss); });
+            rd->setProbe([ss, url]() -> uint64_t {
+                std::string b; int st = 0; uint64_t total = 0;
+                if (!g_net.getRange(*ss, url, 0, 0, b, st, &total) || st != 206) return 0;
+                return total;
+            });
+            setHf(rd); rd->start();
+            double w0 = nowSec();
+            while (rd->state() == 0 && nowSec() - w0 < 40) {
                 sceKernelUsleep(50000);
                 if (cancelCb && cancelCb()) { cancelled = true; break; }
                 presentCb();
             }
-        }
-        if (cancelled) { failed = true; releaseHfAsync(); return false; }
-        if (rd->cachedBlocks() < 1) {
-            log.push_back("ERRO: nao preencheu o buffer inicial");
+            if (cancelled) { releaseHfAsync(); failed = true; return false; }
+            if (rd->state() == 1) {
+                log.push_back("   stream " + std::to_string(rd->size() >> 20) + " MB — buffer...");
+                presentCb();
+                uint8_t tip[128];
+                rd->read(tip, 0, 128, 20000);
+                double b0 = nowSec();
+                while (rd->cachedBlocks() < 3 && nowSec() - b0 < 25) {
+                    sceKernelUsleep(50000);
+                    if (cancelCb && cancelCb()) { cancelled = true; break; }
+                    presentCb();
+                }
+                if (!cancelled && rd->cachedBlocks() >= 1) {
+                    // waitMs=0: nao bloqueia no GetVideoData (evita CE-34878-0 em varios paineis)
+                    if (openSource(name, 2, 0, 0, true)) {
+                        audio.start(h); active = true; t0 = lastFps = lastFrameT = nowSec();
+                        isVod = true;
+                        log.push_back("OK: streaming VOD (arquivo grande suportado)");
+                        return true;
+                    }
+                    log.push_back("   streaming falhou — baixando para disco...");
+                }
+            } else {
+                log.push_back("   stream indisponivel — baixando para disco...");
+            }
             releaseHfAsync();
+            if (cancelled) { failed = true; return false; }
+        }
+
+        // ---- 2) download local completo (sem limite de tamanho) ----
+        const char *path = "/data/kickiptv_vod.mp4";
+        remove(path);
+        presentCb();
+        NetClient::Session ss; ss.recvSec = 30;
+        std::string tip; int st = 0; uint64_t total = 0;
+        if (!g_net.getRange(ss, url, 0, 0, tip, st, &total) || st != 206 || total < 1024) {
+            log.push_back("ERRO: painel nao informou tamanho (HTTP " + std::to_string(st) + ")");
+            g_net.closeSession(ss);
             failed = true;
             return false;
         }
-
-        log.push_back("   buffer ok — abrindo player (streaming)");
+        log.push_back("   download " + std::to_string(total >> 20) + " MB (sem limite). O cancela.");
         presentCb();
-        // cb=2: callbacks HTTP (mesmo modelo do feed HLS dos canais)
-        if (openSource(name, 2, 0, 20000, true)) {
+        FILE *fp = fopen(path, "wb");
+        if (!fp) {
+            log.push_back("ERRO: nao criou /data/kickiptv_vod.mp4");
+            g_net.closeSession(ss);
+            failed = true;
+            return false;
+        }
+        const uint64_t kChunk = 1u << 20;
+        uint64_t pos = 0;
+        int fails = 0;
+        double lastUi = nowSec();
+        while (pos < total) {
+            if (cancelCb && cancelCb()) { cancelled = true; break; }
+            uint64_t to = pos + kChunk - 1;
+            if (to >= total) to = total - 1;
+            std::string body;
+            if (!g_net.getRange(ss, url, pos, to, body, st) || (st != 206 && !(st == 200 && pos == 0))) {
+                if (++fails > 10) break;
+                g_net.closeSession(ss);
+                sceKernelUsleep(250000);
+                continue;
+            }
+            fails = 0;
+            if (fwrite(body.data(), 1, body.size(), fp) != body.size()) { fails = 99; break; }
+            pos += body.size();
+            if (nowSec() - lastUi > 0.25) {
+                lastUi = nowSec();
+                int pct = total ? (int)((pos * 100) / total) : 0;
+                log.push_back("   " + std::to_string(pct) + "% (" +
+                              std::to_string(pos >> 20) + "/" + std::to_string(total >> 20) + " MB)");
+                if (log.size() > 35) log.erase(log.begin() + 4, log.begin() + 12);
+                presentCb();
+            }
+        }
+        fclose(fp);
+        g_net.closeSession(ss);
+        if (cancelled) { remove(path); failed = true; return false; }
+        if (pos < 64 * 1024) {
+            remove(path); failed = true;
+            log.push_back("ERRO: download incompleto");
+            return false;
+        }
+        {
+            FILE *ck = fopen(path, "rb");
+            char hdr[12] = {};
+            if (ck) { fread(hdr, 1, 12, ck); fclose(ck); }
+            bool okMp4 = (hdr[4] == 'f' && hdr[5] == 't' && hdr[6] == 'y' && hdr[7] == 'p');
+            if (!okMp4) {
+                log.push_back("ERRO: nao e MP4 (ftyp)");
+                remove(path); failed = true; return false;
+            }
+        }
+        log.push_back("   download ok — abrindo local");
+        presentCb();
+        if (openSource(path, 0, 0, 15000, true)) {
             audio.start(h); active = true; t0 = lastFps = lastFrameT = nowSec();
             isVod = true;
-            log.push_back("OK: streaming VOD");
+            log.push_back("OK: tocando arquivo local");
             return true;
         }
-        releaseHfAsync();
+        remove(path);
         failed = true;
-        log.push_back("ERRO: player nao abriu o stream VOD");
+        log.push_back("ERRO: player nao abriu o arquivo");
         return false;
     }
+
     std::function<void()> presentCb = [] {};   // main liga isto para redesenhar a tela de espera durante as tentativas
 
     // ---- preparo assincrono do proximo pedaco: junta, converte e grava enquanto o atual ainda toca ----
@@ -1709,6 +1769,23 @@ int main() {
     pf.app = &app;
     UI ui(app);
     ui.loadSaved();                           // ultimo streamer e lista M3U guardados
+    // Capas reais (tvg-logo JPEG/PNG)
+    g_covers.setFetch([](const std::string &url, std::string &body) -> bool {
+        int st = 0;
+        return g_net.get(url, body, st) && st >= 200 && st < 300 && body.size() > 32;
+    });
+    ui.coverRequest = [](const std::string &url) { g_covers.request(url); };
+    ui.coverGet = [](const std::string &url, const uint32_t *&px, int &w, int &h) -> bool {
+        // snapshot por URL: varias capas no mesmo quadro
+        static std::map<std::string, Cover> snap;
+        Cover c;
+        if (!g_covers.get(url, c) || !c.ready || c.bgra.empty()) return false;
+        snap[url] = std::move(c);
+        auto &s = snap[url];
+        px = s.bgra.data(); w = s.w; h = s.h;
+        if (snap.size() > 80) snap.clear();   // evita crescer sem fim
+        return true;
+    };
     if (!g_prevStage.empty()) app.say("Aviso: da ultima vez o app parou no passo: " + g_prevStage);
     trace("estado-criado");
     boot.line("[2] estado do app criado");
@@ -1976,20 +2053,25 @@ int main() {
         if (pressed & B_R2)     { ui.handle(Input::PageDown); dirty = true; }
         if (pressed & B_CROSS)  { ui.handle(Input::Confirm);  dirty = true; }
         if (pressed & B_CIRCLE) { ui.handle(Input::Back);     dirty = true; }
+        if ((pressed & B_TRIANGLE) && mode == Mode::Menu && ui.screen == Screen::List) {
+            ui.requestSearch();
+            dirty = true;
+        }
         if (updateClock()) dirty = true;
 
         if (pf.kbdRequested) {                    // X em "Digitar @streamer": abre o teclado na tela
             pf.kbdRequested = false;
-            kbd.open(ui.textInitial(), ui.textKind == 2);
+            kbd.open(ui.textInitial(), ui.textKind == 2 || ui.textKind == 3);
             mode = Mode::Kbd; dirty = true;
             continue;
         }
         if (pf.hasPendingText) {                  // texto confirmado no teclado: busca o canal ou baixa a lista M3U
             std::string typed = pf.pendingText; pf.pendingText.clear(); pf.hasPendingText = false;
             if (ui.textKind == 2) app.say(typed.empty() ? "Removendo a lista M3U..." : "Baixando a lista M3U...");
+            else if (ui.textKind == 3) app.say(typed.empty() ? "Limpando busca..." : ("Buscando \"" + typed + "\"..."));
             else app.say("Buscando @" + kickSlug(typed) + " na Kick...");
             presentMenu();
-            ui.onText(typed);                    // httpGet + (se ao vivo) play()
+            ui.onText(typed);                    // httpGet + (se ao vivo) play() / busca / m3u
             trace("texto-processado");
             dirty = true;
         }
@@ -2041,6 +2123,7 @@ int main() {
     }
     // ---- encerramento limpo: nenhuma thread pode estar viva ao sair (std::thread ativa no fim = "terminate" = erro no PS4) ----
     trace("saindo");
+    g_covers.shutdown();
     if (player.h || player.h2 || mode == Mode::Play) player.stop();
     Player::waitTeardown(10.0);
     if (g_tearing.load() > 0) { trace("fim-forcado"); _Exit(0); }   // algo travou (rede): sai sem rodar destrutores
