@@ -46,6 +46,24 @@ constexpr unsigned TEXT = 0xFFFFFFFF, SOFT = 0xFFD6D6D6, MUTED = 0xFF9A9A9A, DIM
 constexpr unsigned RED = 0xFFFF4D5A, AMBER = 0xFFFFB020;
 }
 
+// Pulso 0.5..1.0 a partir de phase (0..1)
+inline float uiPulse(float phase) {
+    float s = phase * 6.2831853f;
+    // approx sin without libm heavy: triangle-ish smooth
+    float x = phase - (int)phase;
+    if (x < 0) x += 1.f;
+    float tri = x < 0.5f ? x * 2.f : (1.f - x) * 2.f;
+    return 0.55f + 0.45f * tri;
+}
+inline unsigned uiFade(unsigned argb, float a01) {
+    if (a01 >= 0.99f) return argb;
+    if (a01 <= 0.01f) return argb & 0x00FFFFFFu;
+    unsigned a = (argb >> 24) & 255;
+    a = (unsigned)(a * a01);
+    if (a > 255) a = 255;
+    return (a << 24) | (argb & 0x00FFFFFFu);
+}
+
 // ---------- Matematica simples (sem libm) ----------
 inline float uiSqrt(float v) {
     if (v <= 0.f) return 0.f;
@@ -201,6 +219,31 @@ inline void uiFrame(Renderer &r, int x, int y, int w, int h, int rad, int bw, un
 
 // ---------- Marca Kick (estilo pixel) ----------
 // "K" em blocos, caixa w x h
+// Brilho animado na selecao (pulsa com animPhase)
+inline void uiSelGlow(Renderer &r, int x, int y, int w, int h, int rad, float phase) {
+    float p = uiPulse(phase);
+    int peak = (int)(90 + 80 * p);
+    int spread = 10 + (int)(6 * p);
+    uiGlow(r, x - 2, y - 2, w + 4, h + 4, rad + 2, theme::GREEN, spread, peak, false);
+}
+// Barra de progresso animada (shimmer)
+inline void uiProgressBar(Renderer &r, int x, int y, int w, int h, float frac, float phase) {
+    if (w <= 0 || h <= 0) return;
+    if (frac < 0) frac = 0; if (frac > 1) frac = 1;
+    r.roundRect(x, y, w, h, h / 2, 0xFF1A1A1A);
+    int fw = (int)(w * frac);
+    if (fw > 0) {
+        r.roundRect(x, y, fw, h, h / 2, theme::GREEN);
+        // shimmer
+        int sh = (int)((w + 40) * (phase - (int)phase));
+        int sx = x + sh - 20;
+        if (sx < x) sx = x;
+        if (sx + 30 > x + fw) sx = x + fw - 30;
+        if (fw > 40 && sx >= x)
+            r.roundRect(sx, y + 1, 24, h - 2, (h - 2) / 2, 0x88FFFFFF);
+    }
+}
+
 inline void uiKMark(Renderer &r, int x, int y, int w, int h, unsigned c) {
     struct R { float x0, x1, y0, y1; };
     static const R rs[8] = {{0, .370f, 0, 1}, {.370f, .491f, .245f, .764f}, {.491f, .620f, .136f, .882f}, {.620f, 1, 0, .318f},
@@ -378,6 +421,8 @@ struct UI {
     std::string kickLast;     // ultimo @ pesquisado
     std::string m3uUrl;       // lista M3U atual
     std::string searchQ;      // filtro de busca (filmes/series/canais)
+    float animPhase = 0.f;    // 0..1 ciclo de animacao (plataforma atualiza)
+    int animTick = 0;         // contador de frames para efeitos
     std::string timeText, dateText;   // relogio (a plataforma atualiza)
     int textKind = 0;         // 0 nada, 1 = @streamer, 2 = endereco M3U, 3 = busca na lista
     static const int kRows = 10;
@@ -602,8 +647,50 @@ private:
         if (tab == Tab::Series && level > 0) { level--; cursor[t] = 0; scroll[t] = 0; }
         else inItems = false;
     }
+    // Grade de filmes: 5 colunas (igual layout de capas)
+    static const int kGridCols = 5;
+    static const int kGridVisibleRows = 2;
+
+    bool useMovieGrid() const { return tab == Tab::Movies; }
+
     void handleItems(Input in) {
         int t = (int)tab, n = itemCount();
+        if (n <= 0) return;
+        if (useMovieGrid()) {
+            int cols = kGridCols;
+            int before = cursor[t];
+            switch (in) {
+            case Input::Left:
+                if (cursor[t] % cols == 0) { goBack(); return; }
+                cursor[t] = std::max(0, cursor[t] - 1);
+                break;
+            case Input::Right:
+                cursor[t] = std::min(n - 1, cursor[t] + 1);
+                break;
+            case Input::Up:
+                cursor[t] = std::max(0, cursor[t] - cols);
+                break;
+            case Input::Down:
+                cursor[t] = std::min(n - 1, cursor[t] + cols);
+                break;
+            case Input::PageUp:
+                cursor[t] = std::max(0, cursor[t] - cols * kGridVisibleRows);
+                break;
+            case Input::PageDown:
+                cursor[t] = std::min(n - 1, cursor[t] + cols * kGridVisibleRows);
+                break;
+            case Input::Back: goBack(); return;
+            case Input::Confirm: confirm(n); return;
+            default: return;
+            }
+            // scroll em linhas de grade
+            int row = cursor[t] / cols;
+            int firstRow = scroll[t] / cols;
+            if (row < firstRow) scroll[t] = row * cols;
+            if (row >= firstRow + kGridVisibleRows) scroll[t] = (row - kGridVisibleRows + 1) * cols;
+            (void)before;
+            return;
+        }
         switch (in) {
         case Input::Up: cursor[t] = std::max(0, cursor[t] - 1); break;
         case Input::Down: cursor[t] = std::min(std::max(0, n - 1), cursor[t] + 1); break;
@@ -650,7 +737,7 @@ private:
         {
             const int x = mx, y = 169, w = fw, h = 337, rad = 28;
             bool on = homeRow == 0;
-            uiGlow(r, x, y, w, h, rad, GREEN, on ? 22 : 12, on ? 120 : 70, false);
+            uiGlow(r, x, y, w, h, rad, GREEN, on ? (18 + (int)(8*uiPulse(animPhase))) : 12, on ? (100 + (int)(40*uiPulse(animPhase))) : 70, false);
             uiFrame(r, x, y, w, h, rad, 3, GREEN, 0xFF020302);
             UiClip clip{x + 3, y + 3, w - 6, h - 6, rad - 3};
             // KICK desfocado ao fundo
@@ -774,7 +861,7 @@ private:
             if (idx >= nc) break;
             int y = y0 + row * pitch;
             bool cur = idx == catCur[t], sel = cur && !inItems;
-            if (sel) uiGlow(r, cx, y, cw, rh, 18, GREEN, 10, 110, false);
+            if (sel) uiSelGlow(r, cx, y, cw, rh, 18, animPhase);
             uiFrame(r, cx, y, cw, rh, 18, sel ? 3 : 2, sel ? GREEN : CARD_LINE, sel ? SEL : CARD);
             if (cur && !sel) r.roundRect(cx + 10, y + 14, 5, rh - 28, 2, GREEN);        // categoria aberta (foco nos itens)
             std::string cnt = std::to_string(catSize(idx));
@@ -791,99 +878,115 @@ private:
         }
         // ---- itens ----
         const int x = cx + cw + 36, rw = W - 73 - 28 - x;
-        for (int row = 0; row < kRows; row++) {
-            int idx = scroll[t] + row;
-            if (idx >= n) break;
-            int y = y0 + row * pitch;
-            bool sel = inItems && idx == cursor[t];
-            if (sel) uiGlow(r, x, y, rw, rh, 18, GREEN, 10, 110, false);
-            uiFrame(r, x, y, rw, rh, 18, sel ? 3 : 2, sel ? GREEN : CARD_LINE, sel ? SEL : CARD);
-            const std::string label = itemLabel(idx);
-            std::string ic = "#";
-            for (unsigned char ch : label) if (std::isalnum(ch)) { ic = std::string(1, (char)((ch >= 'a' && ch <= 'z') ? ch - 32 : ch)); break; }
-            // Capa real (tvg-logo) se disponivel; senao poster com letra
-            int isW = (tab == Tab::Movies) ? 48 : (rh - 20);
-            int isH = rh - 12;
-            int px = x + 10, py = y + 6;
-            unsigned posterBg = sel ? GREEN : (tab == Tab::Movies ? 0xFF1A2838 : CHIP);
-            r.roundRect(px, py, isW, isH, 10, posterBg);
-            bool drewCover = false;
-            std::string logoUrl = itemLogo(idx);
-            if (!logoUrl.empty() && coverRequest) coverRequest(logoUrl);
-            if (!logoUrl.empty() && coverGet) {
-                const uint32_t *pxc = nullptr; int cw = 0, ch = 0;
-                if (coverGet(logoUrl, pxc, cw, ch) && pxc && cw > 0 && ch > 0) {
-                    r.blitImage(px + 2, py + 2, isW - 4, isH - 4, pxc, cw, ch);
-                    drewCover = true;
+
+        if (useMovieGrid() && n > 0) {
+            // GRADE DE CAPAS (estilo Netflix/IPTV moderno) — 5 colunas x 2 linhas
+            const int cols = kGridCols;
+            const int gapX = 16, gapY = 18;
+            const int cardW = (rw - gapX * (cols - 1) - 8) / cols;
+            const int posterH = (int)(cardW * 1.45f);
+            const int titleH = 44;
+            const int cardH = posterH + titleH;
+            int first = scroll[t];
+            if (first % cols) first -= first % cols;
+            int maxShow = cols * kGridVisibleRows;
+            for (int i = 0; i < maxShow; i++) {
+                int idx = first + i;
+                if (idx >= n) break;
+                int col = i % cols, row = i / cols;
+                int bx = x + col * (cardW + gapX);
+                int by = y0 + row * (cardH + gapY);
+                bool sel = inItems && idx == cursor[t];
+                if (sel) uiSelGlow(r, bx - 4, by - 4, cardW + 8, cardH + 8, 16, animPhase);
+                // card fundo
+                r.roundRect(bx, by, cardW, posterH, 14, 0xFF0E0E12);
+                if (sel) {
+                    // borda verde
+                    r.roundRect(bx, by, cardW, 3, 2, GREEN);
+                    r.roundRect(bx, by + posterH - 3, cardW, 3, 2, GREEN);
+                    r.roundRect(bx, by, 3, posterH, 2, GREEN);
+                    r.roundRect(bx + cardW - 3, by, 3, posterH, 2, GREEN);
                 }
+                const std::string label = itemLabel(idx);
+                std::string ic = "#";
+                for (unsigned char ch : label) if (std::isalnum(ch)) {
+                    ic = std::string(1, (char)((ch >= 'a' && ch <= 'z') ? ch - 32 : ch)); break;
+                }
+                // capa
+                bool drew = false;
+                std::string logoUrl = itemLogo(idx);
+                if (!logoUrl.empty() && coverRequest) coverRequest(logoUrl);
+                if (!logoUrl.empty() && coverGet) {
+                    const uint32_t *pxc = nullptr; int cw = 0, ch = 0;
+                    if (coverGet(logoUrl, pxc, cw, ch) && pxc && cw > 0 && ch > 0) {
+                        r.blitImage(bx + 2, by + 2, cardW - 4, posterH - 4, pxc, cw, ch);
+                        drew = true;
+                    }
+                }
+                if (!drew) {
+                    r.roundRect(bx + 2, by + 2, cardW - 4, posterH - 4, 12, sel ? 0xFF1A3020 : 0xFF1A2838);
+                    uiCenterHeavy(r, bx + cardW / 2, by + posterH / 2 - 10, ic, sel ? GREEN : MUTED, 48);
+                }
+                // botao play no canto
+                {
+                    int ps = 28;
+                    int px = bx + cardW - ps - 10, py = by + posterH - ps - 10;
+                    r.roundRect(px, py, ps, ps, ps / 2, GREEN);
+                    // triangulo play simples
+                    uiCenterHeavy(r, px + ps / 2 + 1, py + ps / 2, ">", BLACK, 18);
+                }
+                // titulo sob a capa
+                uiText(r, bx + 4, by + posterH + 6, uiFit(r, label, 18, cardW - 8), sel ? TEXT : SOFT, 18, sel);
             }
-            if (!drewCover)
-                uiCenterHeavy(r, px + isW / 2, py + isH / 2, ic, sel ? BLACK : TEXT, tab == Tab::Movies ? 22 : 28);
-            int tx = px + isW + 16, textMax = rw - (tx - x) - 110;
-            uiText(r, tx, y + (rh - 28) / 2, uiFit(r, label, 28, textMax), sel ? TEXT : SOFT, 28, sel);
-            if (sel) { r.roundRect(x + rw - 84, y + rh / 2 - 19, 56, 38, 12, KEY); uiCenter(r, x + rw - 56, y + rh / 2, "X", TEXT, 22, true); }
-        }
-        if (n > kRows) {
-            int th = kRows * pitch - 10;
-            r.roundRect(W - 52, y0, 8, th, 4, CARD2);
-            int kh = std::max(48, th * kRows / n);
-            r.roundRect(W - 52, y0 + (th - kh) * scroll[t] / std::max(1, n - kRows), 8, kh, 4, GREEN_DK);
-        }
-        if (nc == 0) {
-            bool noList = app.list.empty();
-            uiCenterHeavy(r, W / 2, y0 + 150, noList ? "Nenhuma lista M3U adicionada" : "Nada por aqui ainda", MUTED, 32);
-            if (noList) uiCenter(r, W / 2, y0 + 200, "Volte ao início e use LISTA M3U para adicionar a sua", DIM, 24);
-        }
-    }
-
-    void renderList(Renderer &r) {
-        using namespace theme;
-        if (browsable(tab)) { renderBrowse(r); return; }
-        const int W = r.width();
-        int t = (int)tab, n = itemCount();
-        bool kick = tab == Tab::Kick;
-        // titulo da secao
-        std::string title;
-        switch (tab) {
-        case Tab::Kick: title = "KICK TV"; break;
-        case Tab::Channels: title = "CANAIS"; break;
-        case Tab::Movies: title = "FILMES"; break;
-        default: title = level == 0 ? "SÉRIES" : level == 1 ? curSeries : curSeries + "  /  Temporada " + std::to_string(curSeason);
-        }
-        uiKMark(r, 73, 146, 40, 41, GREEN);
-        uiHeavy(r, 130, 152, uiFit(r, title, 36, W - 560), TEXT, 36);
-        r.fillRect(73, 196, W - 146, 2, 0xFF1C1C1C);
-        if (!kick) {
-            std::string c = std::to_string(n) + (n == 1 ? " item" : " itens");
-            uiText(r, W - 73 - r.textWidth(c, 22), 158, c, MUTED, 22);
-        }
-
-        const int x = 73, rw = W - 146 - 28, rh = kick ? 92 : 64, pitch = kick ? 108 : 74, y0 = 218;
-        auto acts = kickActions();
-        for (int row = 0; row < kRows; row++) {
-            int idx = scroll[t] + row;
-            if (idx >= n) break;
-            int y = y0 + row * pitch;
-            bool sel = idx == cursor[t];
-            if (sel) uiGlow(r, x, y, rw, rh, 18, GREEN, 10, 110, false);
-            uiFrame(r, x, y, rw, rh, 18, sel ? 3 : 2, sel ? GREEN : CARD_LINE, sel ? SEL : CARD);
-            const std::string label = itemLabel(idx);
-            std::string ic = "#";
-            if (kick) ic = kickIcon(acts[idx]);
-            else for (unsigned char ch : label) if (std::isalnum(ch)) { ic = std::string(1, (char)((ch >= 'a' && ch <= 'z') ? ch - 32 : ch)); break; }
-            int is = rh - 20;
-            r.roundRect(x + 14, y + 10, is, is, 14, sel ? GREEN : CHIP);
-            uiCenterHeavy(r, x + 14 + is / 2, y + rh / 2, ic, sel ? BLACK : MUTED, kick ? 34 : 28);
-            unsigned tc = sel ? TEXT : SOFT;
-            int tx = x + 14 + is + 22, textMax = rw - (tx - x) - 110;
-            if (kick) {
-                uiHeavy(r, tx, y + 14, uiFit(r, label, 30, textMax), tc, 30);
-                uiText(r, tx, y + 54, uiFit(r, kickSub(acts[idx]), 21, textMax), MUTED, 21);
-            } else {
-                uiText(r, tx, y + (rh - 28) / 2, uiFit(r, label, 28, textMax), tc, 28, sel);
+            // scrollbar vertical da grade
+            int totalRows = (n + cols - 1) / cols;
+            if (totalRows > kGridVisibleRows) {
+                int th = kGridVisibleRows * (cardH + gapY) - gapY;
+                r.roundRect(W - 52, y0, 8, th, 4, CARD2);
+                int kh = std::max(40, th * kGridVisibleRows / totalRows);
+                int firstRow = first / cols;
+                r.roundRect(W - 52, y0 + (th - kh) * firstRow / std::max(1, totalRows - kGridVisibleRows), 8, kh, 4, GREEN);
             }
-            if (sel) { r.roundRect(x + rw - 84, y + rh / 2 - 19, 56, 38, 12, KEY); uiCenter(r, x + rw - 56, y + rh / 2, "X", TEXT, 22, true); }
+        } else {
+            // lista vertical (canais / series)
+            for (int row = 0; row < kRows; row++) {
+                int idx = scroll[t] + row;
+                if (idx >= n) break;
+                int y = y0 + row * pitch;
+                bool sel = inItems && idx == cursor[t];
+                if (sel) uiSelGlow(r, x, y, rw, rh, 18, animPhase);
+                uiFrame(r, x, y, rw, rh, 18, sel ? 3 : 2, sel ? GREEN : CARD_LINE, sel ? SEL : CARD);
+                const std::string label = itemLabel(idx);
+                std::string ic = "#";
+                for (unsigned char ch : label) if (std::isalnum(ch)) {
+                    ic = std::string(1, (char)((ch >= 'a' && ch <= 'z') ? ch - 32 : ch)); break;
+                }
+                int isW = rh - 20, isH = rh - 16;
+                int px = x + 10, py = y + 6;
+                r.roundRect(px, py, isW, isH, 10, sel ? GREEN : CHIP);
+                bool drewCover = false;
+                std::string logoUrl = itemLogo(idx);
+                if (!logoUrl.empty() && coverRequest) coverRequest(logoUrl);
+                if (!logoUrl.empty() && coverGet) {
+                    const uint32_t *pxc = nullptr; int cw = 0, ch = 0;
+                    if (coverGet(logoUrl, pxc, cw, ch) && pxc && cw > 0 && ch > 0) {
+                        r.blitImage(px + 2, py + 2, isW - 4, isH - 4, pxc, cw, ch);
+                        drewCover = true;
+                    }
+                }
+                if (!drewCover)
+                    uiCenterHeavy(r, px + isW / 2, py + isH / 2, ic, sel ? BLACK : TEXT, 28);
+                int tx = px + isW + 16, textMax = rw - (tx - x) - 110;
+                uiText(r, tx, y + (rh - 28) / 2, uiFit(r, label, 28, textMax), sel ? TEXT : SOFT, 28, sel);
+            }
+            if (n > kRows) {
+                int th = kRows * pitch - 10;
+                r.roundRect(W - 52, y0, 8, th, 4, CARD2);
+                int kh = std::max(48, th * kRows / n);
+                r.roundRect(W - 52, y0 + (th - kh) * scroll[t] / std::max(1, n - kRows), 8, kh, 4, GREEN_DK);
+            }
         }
+
         if (n == 0) {
             bool noList = app.list.channels.empty() && app.list.movies.empty() && app.list.seriesTree.empty();
             uiCenterHeavy(r, W / 2, y0 + 150, noList ? "Nenhuma lista M3U adicionada" : "Nada por aqui ainda", MUTED, 32);
