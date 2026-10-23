@@ -176,6 +176,7 @@ void PlaylistBuilder::line(std::string &raw) {
         if (l.compare(0, 7, "#EXTINF") == 0) extinf_ = l;
         return;                                             // #EXTM3U, #EXTVLCOPT, #EXTGRP etc.
     }
+    if (l.find("://") == std::string::npos) { extinf_.clear(); return; }   // nao e um link (pagina de erro/HTML, lixo): nao vira item
     Entry e;
     e.url = l;
     if (!extinf_.empty()) {
