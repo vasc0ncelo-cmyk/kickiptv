@@ -21,9 +21,9 @@ using CoverFetch = std::function<bool(const std::string &url, std::string &body)
 
 class ImgCache {
 public:
-    static const int kThumbW = 80;
-    static const int kThumbH = 120;
-    static const size_t kMaxEntries = 120;   // ~80*120*4*120 ≈ 4.5 MB
+    static const int kThumbW = 160;
+    static const int kThumbH = 240;
+    static const size_t kMaxEntries = 80;   // ~80*120*4*120 ≈ 4.5 MB
 
     void setFetch(CoverFetch f) { fetch_ = std::move(f); }
 
