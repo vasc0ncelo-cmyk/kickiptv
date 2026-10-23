@@ -32,6 +32,7 @@
 #include "tschunk.hpp"
 #include "urlutil.hpp"
 #include "imgcache.hpp"
+#include "listload.hpp"
 #include "tsmux.hpp"
 #include "blit.hpp"
 #include "padin.hpp"
@@ -482,6 +483,45 @@ struct Ps4Platform : Platform {
         }
         sceKernelClose(fd);
         trace(ok ? "m3u-cache-ok" : "m3u-cache-falhou");
+        return ok;
+    }
+    // ---- Versoes SEGURAS PARA THREAD (carregamento em segundo plano): nao desenham, nao leem o controle e nao mexem em
+    // membros compartilhados da plataforma. 'slot' vem pronto da thread principal (cacheInfo).
+    static bool cacheReadSlot(int slot, const std::function<bool(const char *, size_t)> &sink, const std::atomic<bool> &stop) {
+        if (slot < 0) return false;
+        int fd = sceKernelOpen(cachePath(slot).c_str(), 0, 0);
+        if (fd < 0) return false;
+        std::vector<char> buf(256 * 1024);
+        bool ok = true;
+        for (;;) {
+            if (stop.load()) { ok = false; break; }
+            long n = (long)sceKernelRead(fd, buf.data(), buf.size());
+            if (n < 0) { ok = false; break; }
+            if (n == 0) break;
+            if (!sink(buf.data(), (size_t)n)) { ok = false; break; }
+        }
+        sceKernelClose(fd);
+        return ok;
+    }
+    // Baixa a lista (retomando se a conexao cair) e grava a copia local num arquivo PROPRIO desta chamada.
+    bool netDownloadBg(const std::string &url, int curSlot, const std::function<bool(const char *, size_t)> &sink, const std::atomic<bool> &stop) {
+        int slot = curSlot == 0 ? 1 : 0;                                 // grava no arquivo que nao esta em uso
+        FILE *f = fopen(cachePath(slot).c_str(), "wb");
+        bool bad = f == nullptr;
+        netstream::Push push = [&](const char *d, size_t n) -> bool {
+            if (stop.load()) return false;
+            if (n == 0) return true;
+            if (f && !bad && fwrite(d, 1, n, f) != n) bad = true;       // disco cheio etc.
+            return sink(d, n);
+        };
+        int st = 0;
+        bool ok = fetchM3U(url, push, st);
+        bool closed = true;
+        if (f) closed = fclose(f) == 0;
+        if (ok && closed && !bad && !stop.load()) {
+            saveSetting("listcache", std::string(slot ? "1" : "0") + "|" + url);
+            if (curSlot >= 0 && curSlot != slot) remove(cachePath(curSlot).c_str());
+        } else remove(cachePath(slot).c_str());                          // descarta; a copia antiga (se houver) continua valendo
         return ok;
     }
     void cacheBegin() override {
@@ -1729,34 +1769,20 @@ int main() {
     uint32_t prev = 0;
     int back = 1;
     bool dirty = true;
-    // Lista em background: UI na hora; troca atomica quando terminar (sem race na navegacao)
-    std::atomic<bool> listBgDone{false};
-    std::shared_ptr<Playlist> listPending;
-    std::mutex listMu;
-    if (ui.hasSavedList()) {
-        std::string urlCopy = ui.m3uUrl;
-        std::thread([&, urlCopy]() {
-            try {
-                PlaylistBuilder b;
-                app.pf.cacheLoad(urlCopy, [&](const char *d, size_t n) {
-                    try { b.feed(d, n); } catch (...) { return false; }
-                    return true;
-                });
-                try { b.finish(); } catch (...) {}
-                auto pl = std::make_shared<Playlist>(b.take());
-                {
-                    std::lock_guard<std::mutex> lk(listMu);
-                    listPending = pl;
-                }
-                listBgDone = true;
-                trace("lista-bg-ok");
-            } catch (...) {
-                listBgDone = true;
-                trace("lista-bg-fail");
-            }
-        }).detach();
-        app.say("Pronto — lista carregando...");
-    }
+    // Lista em segundo plano: o app abre e responde na hora. A thread so le/baixa (nunca desenha nem le o controle);
+    // quando termina, o loop principal troca a lista de uma vez. Ordem: copia salva -> se nao houver, baixa da rede.
+    ListLoader loader;
+    double loaderSay = 0; size_t loaderSayItems = (size_t)-1;
+    auto startLoader = [&](const std::string &url) {
+        g_net.init();                                                 // a rede e inicializada na thread principal
+        int slot = -1; std::string cu; pf.cacheInfo(slot, cu);
+        int cslot = (slot >= 0 && cu == url) ? slot : -1;              // so vale a copia DESTA url
+        loader.start(url,
+            [cslot](const std::string &, const ListLoader::Sink &sink, const std::atomic<bool> &stop) { return Ps4Platform::cacheReadSlot(cslot, sink, stop); },
+            [&pf, slot](const std::string &u, const ListLoader::Sink &sink, const std::atomic<bool> &stop) { return pf.netDownloadBg(u, slot, sink, stop); });
+        loaderSay = 0; loaderSayItems = (size_t)-1;
+        trace("lista-bg-inicio");
+    };
 
     // Reconexao automatica: no maximo 5 tentativas em 2 minutos (depois desiste e avisa, para nao ficar em loop se a live acabou)
     double rtT[5] = {0, 0, 0, 0, 0}; int rtI = 0; bool autoMode = false;
@@ -1849,7 +1875,8 @@ int main() {
         if (ui.hasSavedList() && skipAuto) {
             app.say("A lista M3U fechou o app na ultima vez - abra LISTA M3U e aperte X.");
         } else if (ui.hasSavedList()) {
-            app.say("Pronto");   // lista sobe em background no loop principal
+            startLoader(ui.m3uUrl);                       // lista sobe em segundo plano; o app ja responde
+            app.say("Carregando sua lista M3U...");
         }
     }
 
@@ -2010,16 +2037,32 @@ int main() {
         if (pressed & B_CROSS)  { ui.handle(Input::Confirm);  dirty = true; }
         if (pressed & B_CIRCLE) { ui.handle(Input::Back);     dirty = true; }
         if (updateClock()) dirty = true;
-        if (listBgDone.exchange(false)) {
-            std::shared_ptr<Playlist> pl;
-            { std::lock_guard<std::mutex> lk(listMu); pl = listPending; listPending.reset(); }
-            if (pl) {
-                app.list = std::move(*pl);
-                for (int i = 0; i < 4; i++) ui.cursor[i] = ui.scroll[i] = ui.catCur[i] = ui.catScroll[i] = 0;
-                ui.level = 0; ui.inItems = false;
-                app.say("Lista pronta");
+        if (loader.running()) {                   // andamento: atualiza o texto so quando muda (e no maximo ~3x por segundo)
+            double tn = nowSec();
+            size_t it = loader.items();
+            if (tn - loaderSay >= 0.35 && it != loaderSayItems) {
+                loaderSay = tn; loaderSayItems = it;
+                app.say(std::string(loader.fromNet() ? "Baixando a lista M3U... " : "Carregando a lista salva... ") + App::fmtMB(loader.bytes()) + "  |  " + std::to_string(it) + " itens");
+                dirty = true;
             }
-            dirty = true;
+        }
+        {
+            std::shared_ptr<Playlist> pl; ListLoader::State lst = ListLoader::Idle;
+            if (loader.take(pl, lst)) {
+                if (pl) {
+                    app.list = std::move(*pl);
+                    for (int i = 0; i < 4; i++) ui.cursor[i] = ui.scroll[i] = ui.catCur[i] = ui.catScroll[i] = 0;
+                    ui.level = 0; ui.inItems = false;
+                    std::string src = loader.fromNet() ? "  |  baixada e salva" : "  |  lista salva";
+                    if (lst == ListLoader::Partial) app.say("Aviso: lista incompleta (" + std::string(loader.outOfMemory() ? "acabou a memoria" : "a conexao caiu") + ") - " + app.summary());
+                    else app.say(app.summary() + src);
+                    trace("lista-bg-ok");
+                } else if (lst == ListLoader::Failed) {
+                    app.say("Falha ao carregar a lista - abra LISTA M3U e aperte X");
+                    trace("lista-bg-falhou");
+                }
+                dirty = true;
+            }
         }
 
         if (pf.kbdRequested) {                    // X em "Digitar @streamer": abre o teclado na tela
@@ -2030,6 +2073,10 @@ int main() {
         }
         if (pf.hasPendingText) {                  // texto confirmado no teclado: busca o canal ou baixa a lista M3U
             std::string typed = pf.pendingText; pf.pendingText.clear(); pf.hasPendingText = false;
+            if (ui.textKind == 2 && loader.stillAlive() && !loader.cancel(4.0)) {
+                app.say("A lista anterior ainda esta terminando - tente de novo em instantes");
+                ui.textKind = 0; dirty = true; continue;
+            }
             if (ui.textKind == 2) app.say(typed.empty() ? "Removendo a lista M3U..." : "Baixando a lista M3U...");
             else app.say("Buscando @" + kickSlug(typed) + " na Kick...");
             presentMenu();
@@ -2085,6 +2132,7 @@ int main() {
     }
     // ---- encerramento limpo: nenhuma thread pode estar viva ao sair (std::thread ativa no fim = "terminate" = erro no PS4) ----
     trace("saindo");
+    if (!loader.cancel(2.0)) { trace("fim-forcado"); _Exit(0); }      // thread de lista presa na rede: sai sem rodar destrutores
     g_covers.shutdown();
     if (player.h || player.h2 || mode == Mode::Play) player.stop();
     Player::waitTeardown(10.0);
