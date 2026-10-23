@@ -1,0 +1,104 @@
+#pragma once
+// Cache de capas (tvg-logo): baixa JPEG/PNG, decodifica com stb_image, guarda BGRA pequeno.
+#include <atomic>
+#include <cstdint>
+#include <functional>
+#include <map>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+struct Cover {
+    int w = 0, h = 0;
+    std::vector<uint32_t> bgra;   // w*h, ARGB packed as 0xAARRGGBB for o renderer PS4
+    bool ready = false;
+    bool failed = false;
+};
+
+// fetch(url, body) -> true se baixou
+using CoverFetch = std::function<bool(const std::string &url, std::string &body)>;
+
+class ImgCache {
+public:
+    static const int kThumbW = 80;
+    static const int kThumbH = 120;
+    static const size_t kMaxEntries = 120;   // ~80*120*4*120 ≈ 4.5 MB
+
+    void setFetch(CoverFetch f) { fetch_ = std::move(f); }
+
+    // Pede a capa (baixa em background se ainda nao tiver).
+    void request(const std::string &url) {
+        if (url.empty() || url.compare(0, 4, "http") != 0) return;
+        {
+            std::lock_guard<std::mutex> l(m_);
+            auto it = map_.find(url);
+            if (it != map_.end()) return;
+            if (map_.size() >= kMaxEntries) {
+                // remove a primeira que nao e ready recente
+                for (auto it2 = map_.begin(); it2 != map_.end(); ++it2) {
+                    if (it2->second.failed || it2->second.ready) { map_.erase(it2); break; }
+                }
+                if (map_.size() >= kMaxEntries) return;
+            }
+            map_[url] = Cover{};
+            pending_.push_back(url);
+        }
+        kickWorker();
+    }
+
+    // Copia a capa se pronta (thread-safe).
+    bool get(const std::string &url, Cover &out) {
+        std::lock_guard<std::mutex> l(m_);
+        auto it = map_.find(url);
+        if (it == map_.end() || !it->second.ready) return false;
+        out = it->second;
+        return true;
+    }
+
+    bool hasReady(const std::string &url) {
+        std::lock_guard<std::mutex> l(m_);
+        auto it = map_.find(url);
+        return it != map_.end() && it->second.ready;
+    }
+
+    void shutdown() {
+        stop_ = true;
+        if (th_.joinable()) th_.join();
+    }
+
+    ~ImgCache() { shutdown(); }
+
+private:
+    CoverFetch fetch_;
+    std::mutex m_;
+    std::map<std::string, Cover> map_;
+    std::vector<std::string> pending_;
+    std::thread th_;
+    std::atomic<bool> stop_{false};
+    std::atomic<bool> running_{false};
+
+    void kickWorker() {
+        bool expected = false;
+        if (!running_.compare_exchange_strong(expected, true)) return;
+        if (th_.joinable()) th_.join();
+        th_ = std::thread([this] {
+            while (!stop_) {
+                std::string url;
+                {
+                    std::lock_guard<std::mutex> l(m_);
+                    if (pending_.empty()) { running_ = false; return; }
+                    url = pending_.front();
+                    pending_.erase(pending_.begin());
+                }
+                loadOne(url);
+            }
+            running_ = false;
+        });
+    }
+
+    void loadOne(const std::string &url);
+};
+
+// Implementacao em imgcache.cpp (precisa de stb_image)
+bool imgDecodeToCover(const std::string &body, Cover &out, int tw, int th);
