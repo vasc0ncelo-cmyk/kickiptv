@@ -29,6 +29,7 @@
 #include "streambuf.hpp"
 #include "netstream.hpp"
 #include "httpfile.hpp"
+#include "progfile.hpp"
 #include "tschunk.hpp"
 #include "urlutil.hpp"
 #include "imgcache.hpp"
@@ -1022,6 +1023,19 @@ static void releaseHfAsync() {                                                  
     std::thread([r]() mutable { r->join(); r.reset(); g_tearing--; }).detach();
 }
 
+// ---------- Filme/serie: download progressivo (progfile.hpp) ----------
+static std::mutex g_pfM;
+static std::shared_ptr<progfile::Downloader> g_pf;
+static std::shared_ptr<progfile::Downloader> getPf() { std::lock_guard<std::mutex> l(g_pfM); return g_pf; }
+static void setPf(std::shared_ptr<progfile::Downloader> r) { std::lock_guard<std::mutex> l(g_pfM); g_pf = std::move(r); }
+static std::shared_ptr<progfile::Downloader> takePf() { std::lock_guard<std::mutex> l(g_pfM); auto r = std::move(g_pf); g_pf.reset(); return r; }
+static void abortPf() { auto r = getPf(); if (r) r->abort(); }
+static void releasePfAsync() {                                                  // para em segundo plano (a rede pode demorar a responder)
+    auto r = takePf(); if (!r) return;
+    r->abort(); g_tearing++;
+    std::thread([r]() mutable { r->join(); r.reset(); remove("/data/kickiptv_vod.mp4"); g_tearing--; }).detach();
+}
+
 static double nowSec() { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec + ts.tv_nsec / 1e9; }
 
 struct Player {
@@ -1182,7 +1196,7 @@ struct Player {
         if (!isHls && urlIsVod(url)) {
             isVod = true;
             try { return startFile(url); }
-            catch (...) { failed = true; log.push_back("ERRO: sem memoria ao abrir o arquivo"); trace("vod-excecao"); releaseHfAsync(); return false; }
+            catch (...) { failed = true; log.push_back("ERRO: sem memoria ao abrir o arquivo"); trace("vod-excecao"); releaseHfAsync(); releasePfAsync(); return false; }
         }
 
         // Ao vivo: HLS (.m3u8) vai direto. Canal "cru" (.ts / sem extensao): primeiro tenta o HLS equivalente do painel Xtream
@@ -1288,65 +1302,77 @@ struct Player {
     // VOD estavel: 1) URL HTTP direta  2) download local completo. NUNCA cb=2 (fecha o app).
     bool startFile(const std::string &url) {
         std::string ext = urlExtension(url);
-        log.push_back(std::string("VOD") + (ext.empty() ? "" : " ." + ext));
+        log.push_back(std::string("Filme/serie") + (ext.empty() ? "" : " ." + ext));
         presentCb();
         releaseHfAsync();
-
-        log.push_back("   tentativa direta...");
-        presentCb();
-        if (openSource(url, 0, 0, 10000, true)) {
-            audio.start(h); active = true; t0 = lastFps = lastFrameT = nowSec();
-            isVod = true;
-            log.push_back("OK: direto");
-            return true;
+        releasePfAsync();
+        while (g_tearing.load() > 0) {                       // o arquivo da exibicao anterior ainda esta sendo apagado
+            if (cancelCb && cancelCb()) { cancelled = true; failed = true; return false; }
+            presentCb(); sceKernelUsleep(30000);
         }
 
-        const char *path = "/data/kickiptv_vod.mp4";
-        remove(path);
-        log.push_back("   baixando local...");
+        // 1) tamanho do arquivo (uma requisicao com Range). Sem tentar o AvPlayer direto na URL: o painel recusa e isso so atrasava ~10 s.
+        log.push_back("   conectando ao servidor...");
         presentCb();
-        NetClient::Session ss; ss.recvSec = 25;
+        NetClient::Session probe; probe.recvSec = 20;
         std::string tip; int st = 0; uint64_t total = 0;
-        if (!g_net.getRange(ss, url, 0, 0, tip, st, &total) || st != 206 || total < 1024) {
-            log.push_back("ERRO: sem tamanho HTTP " + std::to_string(st));
-            g_net.closeSession(ss); failed = true; return false;
+        bool okProbe = false;
+        for (int a = 0; a < 3 && !okProbe; a++) {
+            if (cancelCb && cancelCb()) { cancelled = true; g_net.closeSession(probe); return false; }
+            okProbe = g_net.getRange(probe, url, 0, 0, tip, st, &total) && st == 206 && total >= 1024;
+            if (!okProbe && st == 206 && total == 0) break;
+            if (!okProbe && st >= 400 && st < 500) break;
         }
-        log.push_back("   " + std::to_string(total >> 20) + " MB (O cancela)");
-        presentCb();
-        FILE *fp = fopen(path, "wb");
-        if (!fp) { log.push_back("ERRO: /data"); g_net.closeSession(ss); failed = true; return false; }
-        const uint64_t kChunk = 4u << 20;
-        uint64_t pos = 0; int fails = 0; double lastUi = nowSec();
-        while (pos < total) {
-            if (cancelCb && cancelCb()) { cancelled = true; break; }
-            uint64_t to = pos + kChunk - 1; if (to >= total) to = total - 1;
-            std::string body;
-            if (!g_net.getRange(ss, url, pos, to, body, st) || (st != 206 && !(st == 200 && pos == 0))) {
-                if (++fails > 12) break;
-                g_net.closeSession(ss); sceKernelUsleep(200000); continue;
-            }
-            fails = 0;
-            if (fwrite(body.data(), 1, body.size(), fp) != body.size()) { fails = 99; break; }
-            pos += body.size();
-            if (nowSec() - lastUi > 0.25) {
-                lastUi = nowSec();
-                int pct = total ? (int)((pos * 100) / total) : 0;
-                log.push_back("   " + std::to_string(pct) + "%");
-                if (log.size() > 25) log.erase(log.begin() + 3, log.begin() + 8);
-                presentCb();
-            }
-        }
-        fclose(fp); g_net.closeSession(ss);
-        if (cancelled || pos < 64 * 1024) {
-            remove(path); failed = true;
-            if (!cancelled) log.push_back("ERRO: download incompleto");
+        g_net.closeSession(probe);
+        if (!okProbe) {
+            failed = true;
+            if (st == 200) log.push_back("ERRO: o servidor nao aceita Range (nao da para tocar enquanto baixa)");
+            else log.push_back("ERRO: sem resposta do servidor (HTTP " + std::to_string(st) + ")");
             return false;
         }
-        if (openSource(path, 0, 0, 15000, true)) {
-            audio.start(h); active = true; t0 = lastFps = lastFrameT = nowSec();
-            isVod = true; log.push_back("OK: local"); return true;
+        char tb[96]; snprintf(tb, sizeof tb, "   arquivo de %.0f MB", total / 1048576.0);
+        log.back() = tb;
+
+        // 2) baixa o comeco + indice em segundo plano; o resto continua baixando enquanto toca
+        const char *path = "/data/kickiptv_vod.mp4";
+        remove(path);
+        std::string u = url;
+        auto sess = std::make_shared<NetClient::Session>(); sess->recvSec = 25;
+        auto dl = std::make_shared<progfile::Downloader>([u, sess](uint64_t from, uint64_t to, std::string &body) -> int {
+            int status = 0;
+            if (!g_net.getRange(*sess, u, from, to, body, status)) return 0;
+            return status;
+        }, path, total);
+        setPf(dl);
+        dl->start();
+        log.push_back("   preparando o inicio do filme...");
+        presentCb();
+        double tw = nowSec(), lastUi = 0;
+        while (dl->state() == 0) {
+            if (cancelCb && cancelCb()) { cancelled = true; break; }
+            if (nowSec() - tw > 90) { dl->abort(); failed = true; log.push_back("ERRO: o servidor esta lento demais (90 s)"); break; }
+            if (nowSec() - lastUi > 0.2) {
+                lastUi = nowSec();
+                char b[96]; snprintf(b, sizeof b, "   preparando o inicio do filme... %.1f MB  (O cancela)", dl->have() / 1048576.0);
+                log.back() = b;
+                presentCb();
+            }
+            sceKernelUsleep(20000);
         }
-        remove(path); failed = true; log.push_back("ERRO: nao abriu"); return false;
+        if (cancelled || failed) { releasePfAsync(); failed = true; return false; }
+        if (dl->state() == 2) { log.push_back("ERRO: " + dl->error()); failed = true; releasePfAsync(); return false; }
+        log.back() = "   inicio pronto: abrindo o player";
+        presentCb();
+
+        // 3) toca o arquivo local (o resto ja esta baixando)
+        if (openSource(path, 0, 0, 20000, true)) {
+            audio.start(h); active = true; t0 = lastFps = lastFrameT = nowSec();
+            isVod = true; log.push_back("OK: tocando enquanto baixa"); return true;
+        }
+        failed = true;
+        if (!cancelled) log.push_back("ERRO: o player nao abriu o arquivo (formato nao suportado?)");
+        releasePfAsync();
+        return false;
     }
 
     std::function<void()> presentCb = [] {};   // main liga isto para redesenhar a tela de espera durante as tentativas
@@ -1436,6 +1462,7 @@ struct Player {
         h = 0; h2 = 0; active = false; chunkMode = false;
         g_feed.abort();                                      // acorda leituras bloqueadas
         abortHf();
+        abortPf();
         g_tearing++;
         std::thread([this, hh, hh2] {
             audio.stop();
@@ -1448,6 +1475,7 @@ struct Player {
             if (prepTh.joinable()) prepTh.join();
             g_feed.join();
             { auto r = takeHf(); if (r) r->join(); }             // o player ja fechou: ninguem mais le o arquivo HTTP
+            { auto r = takePf(); if (r) { r->join(); r.reset(); } }   // idem para o download progressivo
             for (int i = 0; i < 4; i++) { static const char *e[] = {"mp4","m2ts","mpg","ts","mkv"}; for (const char *x : e) remove(chunkPath(x, i).c_str()); }
             if (g_feed.outFile) { fclose(g_feed.outFile); g_feed.outFile = nullptr; }
             remove("/data/live.ts");
@@ -1533,7 +1561,8 @@ struct Player {
         return false;
     }
     bool feedProblem() const { return useFeed && (g_feed.failed.load() || g_feed.streamEnded.load()); }
-    bool hudActive() const { return nowSec() <= hudUntil || feedProblem() || paused; }
+    static bool vodDlFailed() { auto d = getPf(); return d && d->state() == 2; }
+    bool hudActive() const { return nowSec() <= hudUntil || feedProblem() || paused || vodDlFailed(); }
 
     // Pausa em software: nao chama sceAvPlayerPause (NID instavel no homebrew → CE-34878-0).
     // O loop principal para de buscar quadros e o audio fica mudo enquanto paused==true.
@@ -1557,14 +1586,22 @@ struct Player {
     // HUD moderno sobre o video (aparece nos primeiros segundos e quando qualquer botao e apertado)
     void overlay(FbRenderer &r) {
         using namespace theme;
-        if (nowSec() > hudUntil && !feedProblem() && !paused) return;
+        if (nowSec() > hudUntil && !feedProblem() && !paused && !vodDlFailed()) return;
+        if (vodDlFailed()) {
+            std::string m = uiFit(r, "Download interrompido: " + getPf()->error() + "  (o que ja baixou continua tocando)", 20, r.W - 160);
+            r.roundRect(32, 100, r.textWidth(m, 20) + 48, 44, 22, 0xD0801520);
+            uiText(r, 56, 100 + 12, m, TEXT, 20);
+        }
         if (nowSec() <= hudUntil || paused) {
             char b[256];
             if (isVod) {
                 int sec = (int)(lastPtsMs / 1000); if (sec < 0) sec = 0;
                 int mm = sec / 60, ss = sec % 60;
-                snprintf(b, sizeof b, "%ux%u  |  %d:%02d  |  %s%s",
-                         vw, vh, mm, ss,
+                auto pfd = getPf();
+                char dlb[40] = "";
+                if (pfd && pfd->total() && pfd->state() != 3) snprintf(dlb, sizeof dlb, "  |  baixado %d%%", (int)(pfd->have() * 100 / pfd->total()));
+                snprintf(b, sizeof b, "%ux%u  |  %d:%02d%s  |  %s%s",
+                         vw, vh, mm, ss, dlb,
                          g_texType.load() == 0 ? "Onion" : "Garlic", paused ? "  |  PAUSADO" : "");
             } else {
                 snprintf(b, sizeof b, "%ux%u  |  %.0f fps  |  %s  |  %s%s",
@@ -2139,6 +2176,7 @@ int main() {
     if (g_tearing.load() > 0) { trace("fim-forcado"); _Exit(0); }   // algo travou (rede): sai sem rodar destrutores
     g_feed.join();
     { auto r = takeHf(); if (r) r->join(); }
+    { auto r = takePf(); if (r) { r->join(); r.reset(); } remove("/data/kickiptv_vod.mp4"); }
     blit::pool().shutdown();
     trace("fim");
     return 0;
