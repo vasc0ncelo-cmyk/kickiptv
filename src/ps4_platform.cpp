@@ -952,10 +952,17 @@ static std::shared_ptr<httpfile::Reader> g_hf;
 static std::shared_ptr<httpfile::Reader> getHf() { std::lock_guard<std::mutex> l(g_hfM); return g_hf; }
 static void setHf(std::shared_ptr<httpfile::Reader> r) { std::lock_guard<std::mutex> l(g_hfM); g_hf = std::move(r); }
 static std::shared_ptr<httpfile::Reader> takeHf() { std::lock_guard<std::mutex> l(g_hfM); auto r = std::move(g_hf); g_hf.reset(); return r; }
-static int hfOpen(void *, const char *) { return 0; }
+static int hfOpen(void *, const char *) { trace("vod-cb-open"); return 0; }
 static int hfClose(void *) { return 0; }
-static int hfRead(void *, uint8_t *dst, uint64_t pos, uint32_t len) { auto r = getHf(); return r ? r->read(dst, pos, len) : 0; }
-static uint64_t hfSize(void *) { auto r = getHf(); return r ? r->size() : 0; }
+static int hfRead(void *, uint8_t *dst, uint64_t pos, uint32_t len) {
+    static std::atomic<int> nr{0};
+    int k = nr.fetch_add(1);
+    if (k < 8) { char b[96]; snprintf(b, sizeof b, "vod-leitura-%d pos=%llu len=%u", k, (unsigned long long)pos, (unsigned)len); trace(b); }
+    auto r = getHf(); int got = r ? r->read(dst, pos, len) : 0;
+    if (got <= 0 && k < 40) { char b[96]; snprintf(b, sizeof b, "vod-leitura-falhou pos=%llu len=%u", (unsigned long long)pos, (unsigned)len); trace(b); }
+    return got;
+}
+static uint64_t hfSize(void *) { auto r = getHf(); uint64_t z = r ? r->size() : 0; static std::atomic<int> ns{0}; if (ns++ < 3) { char b[64]; snprintf(b, sizeof b, "vod-cb-size=%llu", (unsigned long long)z); trace(b); } return z; }
 static void abortHf() { auto r = getHf(); if (r) r->abort(); }                  // acorda leituras bloqueadas
 static void releaseHfAsync() {                                                  // para e apaga em segundo plano (a rede pode demorar a responder)
     auto r = takeHf(); if (!r) return;
@@ -1051,9 +1058,12 @@ struct Player {
         if (dbg) sceAvPlayerSetLogCallback(avLogCb, NULL);
         g_allocN = g_allocFail = g_texN = g_texFail = 0;
         g_feed.opens = g_feed.reads = 0;
+        if (cb == 2) trace("vod-av-init");
         KAvHandle hh = sceAvPlayerInit(&id);
         if (!hh) { if (note) log.push_back("   Init falhou"); return false; }
+        if (cb == 2) trace("vod-av-addsource");
         int rc = sceAvPlayerAddSource(hh, path.c_str());
+        if (cb == 2) trace(rc < 0 ? "vod-av-addsource-erro" : "vod-av-addsource-ok");
         addRc = rc;
         if (note || waitMs > 0) sceKernelUsleep(300000);
         if (note) {
@@ -1068,6 +1078,7 @@ struct Player {
         }
         if (rc < 0) { avStopClose(hh); return false; }
         if (waitMs > 0) {
+            if (cb == 2) trace("vod-esperando-quadro");
             double t0 = nowSec(); bool got = false;
             while (nowSec() - t0 < waitMs / 1000.0 && !got) {
                 KAvFrameInfo fi; memset(&fi, 0, sizeof fi);
@@ -1077,6 +1088,7 @@ struct Player {
                 sceKernelUsleep(8000);
                 if (cancelCb && cancelCb()) { cancelled = true; break; }
             }
+            if (cb == 2) trace(got ? "vod-chegou-quadro" : "vod-sem-quadro");
             if (note) log.push_back(got ? "      -> chegou video!" : "      -> aceitou, mas nenhum quadro em " + std::to_string(waitMs / 1000) + "s");
             if (!got) { avStopClose(hh); return false; }
         }
@@ -1252,6 +1264,7 @@ struct Player {
             log.push_back("ERRO: " + (rd->state() == 2 ? rd->error() : std::string("o servidor demorou demais para responder")));
             releaseHfAsync();
         } else {
+            trace("vod-tamanho-ok");
             log.push_back("   tamanho do arquivo: " + std::to_string(rd->size() >> 20) + " MB");
             presentCb();
             trace("vod-abrindo-player");
@@ -1396,6 +1409,7 @@ struct Player {
                 if (w != (unsigned)lockW || hh != (unsigned)lockH) { lockW = (int)w; lockH = (int)hh; strideLocked = false; strideUndecided = 0; }
                 const uint8_t *src = fi.pData; size_t srcN = 0;
                 size_t avail = texAvail(fi.pData);
+                if (isVod && frames == 0) { char b[128]; snprintf(b, sizeof b, "vod-1o-quadro %ux%u avail=%zu tex=%d", w, hh, avail, g_texType.load()); trace(b); }
                 double b0 = nowSec();
                 if (avail >= (size_t)w * hh * 3 / 2 && g_texType.load() == 0) {
                     // memoria Onion (com cache): le direto, sem copiar
