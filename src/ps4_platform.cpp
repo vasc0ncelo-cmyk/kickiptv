@@ -1239,124 +1239,89 @@ struct Player {
         active = true; t0 = lastFps = lastFrameT = nowSec();
         return true;
     }
-    // Filme/serie: BAIXA PARA ARQUIVO LOCAL e toca como os pedacos de live (openSource cb=0).
-    // O caminho antigo (callbacks HTTP + AvPlayer) fechava o app com CE-34878-0 em varios paineis.
-    // Mesmo metodo estavel usado nos canais ao vivo: arquivo em /data + sceAvPlayerAddSource(caminho).
+    // Filme/serie em STREAMING (igual canais): o app baixa por HTTP Range sob demanda e
+    // entrega bytes ao AvPlayer pelos mesmos callbacks de arquivo usados no HLS/live.
+    // Nao baixa o filme inteiro para o disco — comeca a tocar assim que o buffer enche.
     bool startFile(const std::string &url) {
-        const char *path = "/data/kickiptv_vod.mp4";
+        std::string name = vodPlayerName(url);
         std::string ext = urlExtension(url);
-        log.push_back(std::string("VOD") + (ext.empty() ? " (painel IPTV)" : " ." + ext) +
-                      ": baixando para disco e tocando local");
-        presentCb();
-        remove(path);
-
-        NetClient::Session ss; ss.recvSec = 30;
-        // 1) tamanho
-        std::string tip; int st = 0; uint64_t total = 0;
-        if (!g_net.getRange(ss, url, 0, 0, tip, st, &total) || st != 206 || total < 1024) {
-            log.push_back("ERRO: painel nao informou o tamanho (HTTP " + std::to_string(st) + "). Precisa de Range.");
-            g_net.closeSession(ss);
-            failed = true;
-            return false;
-        }
-        // Limite pratico no PS4 (espaco + tempo). Episodios muito grandes: avisa e recusa com seguranca.
-        const uint64_t kMax = 450ULL << 20;   // 450 MB
-        if (total > kMax) {
-            log.push_back("ERRO: arquivo muito grande (" + std::to_string(total >> 20) +
-                          " MB). Limite atual: 450 MB para estabilidade.");
-            g_net.closeSession(ss);
-            failed = true;
-            return false;
-        }
-        log.push_back("   tamanho: " + std::to_string(total >> 20) + " MB — baixando...");
+        log.push_back(std::string("VOD") + (ext.empty() ? " (painel)" : " ." + ext) +
+                      ": streaming (igual canais) -> " + name);
         presentCb();
 
-        FILE *fp = fopen(path, "wb");
-        if (!fp) {
-            log.push_back("ERRO: nao criou " + std::string(path));
-            g_net.closeSession(ss);
-            failed = true;
-            return false;
-        }
+        // 1 conexao + cache moderado (estavel no PS4)
+        auto ss = std::make_shared<NetClient::Session>();
+        ss->recvSec = 30;
+        auto mkFetch = [url](std::shared_ptr<NetClient::Session> sess) -> httpfile::Fetch {
+            return [sess, url](uint64_t from, uint64_t to, std::string &body) -> int {
+                int st = 0;
+                if (!g_net.getRange(*sess, url, from, to, body, st)) return 0;
+                return st;
+            };
+        };
+        // 12 blocos x 1 MB = 12 MB de buffer a frente (parecido com margem de live)
+        auto rd = std::make_shared<httpfile::Reader>(mkFetch(ss), 12, 6);
+        rd->setOnExit([ss] { g_net.closeSession(*ss); });
+        rd->setProbe([ss, url]() -> uint64_t {
+            std::string b; int st = 0; uint64_t total = 0;
+            if (!g_net.getRange(*ss, url, 0, 0, b, st, &total) || st != 206) return 0;
+            return total;
+        });
 
-        const uint64_t kChunk = 1u << 20;   // 1 MB por Range
-        uint64_t pos = 0;
-        int fails = 0;
-        double lastUi = nowSec();
-        while (pos < total) {
+        setHf(rd);
+        rd->start();
+        log.push_back("   medindo tamanho / enchendo buffer...");
+        presentCb();
+
+        double w0 = nowSec();
+        while (rd->state() == 0 && nowSec() - w0 < 45) {
+            sceKernelUsleep(50000);
             if (cancelCb && cancelCb()) { cancelled = true; break; }
-            uint64_t to = pos + kChunk - 1;
-            if (to >= total) to = total - 1;
-            std::string body;
-            if (!g_net.getRange(ss, url, pos, to, body, st) || (st != 206 && !(st == 200 && pos == 0))) {
-                if (++fails > 8) {
-                    log.push_back("ERRO: download falhou em " + std::to_string(pos >> 20) + " MB (HTTP " + std::to_string(st) + ")");
-                    break;
-                }
-                g_net.closeSession(ss);
-                sceKernelUsleep(200000);
-                continue;
-            }
-            fails = 0;
-            if (fwrite(body.data(), 1, body.size(), fp) != body.size()) {
-                log.push_back("ERRO: disco cheio ao gravar o video");
-                fails = 99;
-                break;
-            }
-            pos += body.size();
-            if (nowSec() - lastUi > 0.2) {
-                lastUi = nowSec();
-                int pct = total ? (int)((pos * 100) / total) : 0;
-                log.push_back("   baixando... " + std::to_string(pct) + "% (" +
-                              std::to_string(pos >> 20) + "/" + std::to_string(total >> 20) + " MB)");
-                // evita log infinito
-                if (log.size() > 40) log.erase(log.begin() + 5, log.begin() + 15);
+            presentCb();
+        }
+        if (cancelled) { failed = true; releaseHfAsync(); return false; }
+        if (rd->state() != 1) {
+            log.push_back("ERRO: " + (rd->state() == 2 ? rd->error() : std::string("servidor demorou demais")));
+            releaseHfAsync();
+            failed = true;
+            return false;
+        }
+
+        uint64_t fsize = rd->size();
+        log.push_back("   tamanho: " + std::to_string(fsize >> 20) + " MB (streaming, sem baixar tudo)");
+        presentCb();
+
+        // Pre-buffer: espera pelo menos 2 blocos (~2 MB) antes de abrir o player
+        {
+            uint8_t tip[64];
+            rd->read(tip, 0, 64, 20000);
+            double b0 = nowSec();
+            while (rd->cachedBlocks() < 2 && nowSec() - b0 < 30) {
+                sceKernelUsleep(50000);
+                if (cancelCb && cancelCb()) { cancelled = true; break; }
                 presentCb();
             }
         }
-        fclose(fp);
-        g_net.closeSession(ss);
-
-        if (cancelled) {
-            remove(path);
+        if (cancelled) { failed = true; releaseHfAsync(); return false; }
+        if (rd->cachedBlocks() < 1) {
+            log.push_back("ERRO: nao preencheu o buffer inicial");
+            releaseHfAsync();
             failed = true;
             return false;
         }
-        if (pos < total / 2 || pos < 64 * 1024) {
-            remove(path);
-            failed = true;
-            log.push_back("ERRO: download incompleto");
-            return false;
-        }
 
-        // Checagem minima de MP4 (ftyp). Se nao for, nao abre o decoder (evita CE-34878-0).
-        {
-            FILE *ck = fopen(path, "rb");
-            char hdr[12] = {};
-            if (ck) { fread(hdr, 1, 12, ck); fclose(ck); }
-            bool okMp4 = (hdr[4] == 'f' && hdr[5] == 't' && hdr[6] == 'y' && hdr[7] == 'p');
-            if (!okMp4) {
-                log.push_back("ERRO: o arquivo nao parece MP4 (ftyp). Formato nao suportado com seguranca.");
-                remove(path);
-                failed = true;
-                return false;
-            }
-        }
-
-        log.push_back("   download ok — abrindo player local");
+        log.push_back("   buffer ok — abrindo player (streaming)");
         presentCb();
-        trace("vod-local-open");
-        // cb=0: o AvPlayer abre o ARQUIVO LOCAL (mesmo caminho dos pedacos de live — estavel)
-        if (openSource(path, 0, 0, 15000, true)) {
+        // cb=2: callbacks HTTP (mesmo modelo do feed HLS dos canais)
+        if (openSource(name, 2, 0, 20000, true)) {
             audio.start(h); active = true; t0 = lastFps = lastFrameT = nowSec();
             isVod = true;
-            trace("vod-tocando");
-            log.push_back("OK: tocando arquivo local");
+            log.push_back("OK: streaming VOD");
             return true;
         }
-        remove(path);
+        releaseHfAsync();
         failed = true;
-        log.push_back("ERRO: o player nao abriu o arquivo local.");
+        log.push_back("ERRO: player nao abriu o stream VOD");
         return false;
     }
     std::function<void()> presentCb = [] {};   // main liga isto para redesenhar a tela de espera durante as tentativas
