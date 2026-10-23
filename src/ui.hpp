@@ -621,7 +621,7 @@ struct UI {
     // ---------- Desenho ----------
     void render(Renderer &r) {
         uiHeader(r, timeText, dateText);
-        if (screen == Screen::Home) renderHome(r); else renderList(r);
+        if (screen == Screen::Home) renderHome(r); else renderBrowse(r);
         renderFooter(r);
     }
 
@@ -1001,7 +1001,7 @@ private:
             r.roundRect(W - 52, ky, 8, kh, 4, GREEN_DK);
         }
         // ajuda (tela Kick)
-        if (kick) {
+        if (tab == Tab::Kick) {
             int hy = y0 + n * pitch + 10;
             uiFrame(r, x, hy, rw, 190, 18, 2, CARD_LINE, 0xFF0B0B0B);
             uiText(r, x + 30, hy + 20, "Como usar", GREEN, 24, true);
