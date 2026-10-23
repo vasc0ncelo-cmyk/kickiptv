@@ -1,6 +1,5 @@
 #pragma once
-// Cache de capas: memoria + disco (/data/kickiptv_cov/).
-// Multi-thread download para aparecer rapido ao rolar a lista.
+// Capas pequenas + 1 worker + cache em disco (rapido e estavel).
 #include <atomic>
 #include <cstdint>
 #include <functional>
@@ -21,10 +20,10 @@ using CoverFetch = std::function<bool(const std::string &url, std::string &body)
 
 class ImgCache {
 public:
-    static const int kThumbW = 96;
-    static const int kThumbH = 144;
-    static const size_t kMaxEntries = 200;
-    static const int kWorkers = 3;
+    // bem pequeno = download/decode rapido
+    static const int kThumbW = 48;
+    static const int kThumbH = 72;
+    static const size_t kMaxEntries = 150;
 
     void setFetch(CoverFetch f) { fetch_ = std::move(f); }
 
@@ -35,10 +34,7 @@ public:
             auto it = map_.find(url);
             if (it != map_.end()) return;
             Cover disk;
-            if (loadDisk(url, disk)) {
-                map_[url] = std::move(disk);
-                return;
-            }
+            if (loadDisk(url, disk)) { map_[url] = std::move(disk); return; }
             if (map_.size() >= kMaxEntries) {
                 for (auto it2 = map_.begin(); it2 != map_.end(); ++it2) {
                     if (it2->second.failed || it2->second.ready) { map_.erase(it2); break; }
@@ -48,9 +44,10 @@ public:
             map_[url] = Cover{};
             pending_.push_back(url);
         }
-        kickWorkers();
+        kickWorker();
     }
 
+    // prioridade do que esta na tela
     void requestFront(const std::string &url) {
         if (url.empty() || url.compare(0, 4, "http") != 0) return;
         {
@@ -62,12 +59,12 @@ public:
                 if (loadDisk(url, disk)) { map_[url] = std::move(disk); return; }
                 map_[url] = Cover{};
             }
-            for (size_t i = 0; i < pending_.size(); i++) {
+            for (size_t i = 0; i < pending_.size(); ++i) {
                 if (pending_[i] == url) { pending_.erase(pending_.begin() + (long)i); break; }
             }
             pending_.insert(pending_.begin(), url);
         }
-        kickWorkers();
+        kickWorker();
     }
 
     bool get(const std::string &url, Cover &out) {
@@ -78,17 +75,10 @@ public:
         return true;
     }
 
-    bool hasReady(const std::string &url) {
-        std::lock_guard<std::mutex> l(m_);
-        auto it = map_.find(url);
-        return it != map_.end() && it->second.ready;
-    }
-
     void shutdown() {
         stop_ = true;
-        for (auto &t : ths_) if (t.joinable()) t.join();
-        ths_.clear();
-        running_ = 0;
+        if (th_.joinable()) th_.join();
+        running_ = false;
     }
 
     ~ImgCache() { shutdown(); }
@@ -98,28 +88,27 @@ private:
     std::mutex m_;
     std::map<std::string, Cover> map_;
     std::vector<std::string> pending_;
-    std::vector<std::thread> ths_;
+    std::thread th_;
     std::atomic<bool> stop_{false};
-    std::atomic<int> running_{0};
+    std::atomic<bool> running_{false};
 
-    void kickWorkers() {
-        while (running_.load() < kWorkers && !stop_) {
-            int cur = running_.load();
-            if (!running_.compare_exchange_weak(cur, cur + 1)) continue;
-            ths_.emplace_back([this] {
-                while (!stop_) {
-                    std::string url;
-                    {
-                        std::lock_guard<std::mutex> l(m_);
-                        if (pending_.empty()) break;
-                        url = pending_.front();
-                        pending_.erase(pending_.begin());
-                    }
-                    loadOne(url);
+    void kickWorker() {
+        bool expected = false;
+        if (!running_.compare_exchange_strong(expected, true)) return;
+        if (th_.joinable()) th_.join();
+        th_ = std::thread([this] {
+            while (!stop_) {
+                std::string url;
+                {
+                    std::lock_guard<std::mutex> l(m_);
+                    if (pending_.empty()) { running_ = false; return; }
+                    url = pending_.front();
+                    pending_.erase(pending_.begin());
                 }
-                running_--;
-            });
-        }
+                loadOne(url);
+            }
+            running_ = false;
+        });
     }
 
     void loadOne(const std::string &url);
