@@ -956,14 +956,22 @@ static std::shared_ptr<httpfile::Reader> takeHf() { std::lock_guard<std::mutex> 
 static int hfOpen(void *, const char *) { trace("vod-cb-open"); return 0; }
 static int hfClose(void *) { return 0; }
 static int hfRead(void *, uint8_t *dst, uint64_t pos, uint32_t len) {
-    static std::atomic<int> nr{0};
-    int k = nr.fetch_add(1);
-    if (k < 8) { char b[96]; snprintf(b, sizeof b, "vod-leitura-%d pos=%llu len=%u", k, (unsigned long long)pos, (unsigned)len); trace(b); }
-    auto r = getHf(); int got = r ? r->read(dst, pos, len) : 0;
-    if (got <= 0 && k < 40) { char b[96]; snprintf(b, sizeof b, "vod-leitura-falhou pos=%llu len=%u", (unsigned long long)pos, (unsigned)len); trace(b); }
-    return got;
+    // Callback do AvPlayer (outra thread). Nunca devolver lixo: so bytes validos ou 0.
+    auto r = getHf();
+    if (!r || !dst || len == 0) return 0;
+    // algumas tentativas: o baixador pode estar um bloco atras
+    for (int a = 0; a < 4; a++) {
+        int got = r->read(dst, pos, len, 20000);
+        if (got > 0) return got;
+        if (r->state() == 2) return 0;   // falhou de verdade
+        sceKernelUsleep(50000);
+    }
+    return 0;
 }
-static uint64_t hfSize(void *) { auto r = getHf(); uint64_t z = r ? r->size() : 0; static std::atomic<int> ns{0}; if (ns++ < 3) { char b[64]; snprintf(b, sizeof b, "vod-cb-size=%llu", (unsigned long long)z); trace(b); } return z; }
+static uint64_t hfSize(void *) {
+    auto r = getHf();
+    return r ? r->size() : 0;
+}
 static void abortHf() { auto r = getHf(); if (r) r->abort(); }                  // acorda leituras bloqueadas
 static void releaseHfAsync() {                                                  // para e apaga em segundo plano (a rede pode demorar a responder)
     auto r = takeHf(); if (!r) return;
@@ -1305,14 +1313,10 @@ struct Player {
         releaseHfAsync();
         if (cancelled) { failed = true; return false; }
 
-        // Fallback: o player tenta abrir a URL HTTP sozinho (quase sempre falha nos paineis)
-        log.push_back("Tentando o player abrir a URL sozinho...");
-        presentCb();
-        if (openSource(url, 0, 0, 0, true)) {
-            audio.start(h); active = true; t0 = lastFps = lastFrameT = nowSec();
-            return true;
-        }
-        failed = true; log.push_back("ERRO: o player nao abriu esta URL. Formato pode nao ser suportado (use MP4).");
+        // Nao tenta mais o fallback "player abre a URL sozinho":
+        // nos paineis IPTV isso costuma falhar ou crashar o processo (CE-34878-0).
+        failed = true;
+        log.push_back("ERRO: o player nao abriu este arquivo. Prefira streams em MP4.");
         return false;
     }
     std::function<void()> presentCb = [] {};   // main liga isto para redesenhar a tela de espera durante as tentativas
@@ -1462,7 +1466,8 @@ struct Player {
                     else if (++strideUndecided < 90) skipDraw = true;          // ainda sem certeza (ex.: quadro preto): nao mostra imagem torta/verde; depois de ~3 s desenha mesmo assim
                 }
                 int pitch, yRows; blit::strideCandidate(strideMode, (int)w, (int)hh, pitch, yRows);
-                bool fits = srcN ? blit::strideBytes(strideMode, (int)w, (int)hh) <= srcN : true;   // sem copia: leitura direta (lenta, como antes)
+                // NUNCA desenhar com srcN==0: isso lia memoria invalida e fechava o app (CE-34878-0)
+                bool fits = srcN > 0 && blit::strideBytes(strideMode, (int)w, (int)hh) <= srcN;
                 if (fits && !skipDraw) {
                     b0 = nowSec();
                     blitNV12(src, w, hh, pitch, yRows, r.fb, r.W, r.H);
@@ -1470,7 +1475,7 @@ struct Player {
                     blitMs = blitMs == 0 ? bm : blitMs * 0.9 + bm * 0.1;
                     frames++; fpsFrames++;
                     drew = true;
-                }                                                                               // modo manual que nao cabe no que foi copiado: pula o quadro
+                }
             }
         }
         double t = nowSec();
@@ -2007,18 +2012,22 @@ int main() {
             player.quietWait = false;   // so vale para esta abertura (qualidade/reconexao/episodio)
             if (player.cancelled) { player.cancelled = false; mode = Mode::Menu; dirty = true; trace("player-cancelado"); continue; }
             trace(player.failed ? "player-falhou" : "player-aberto");
-            if (player.failed) presentWait();
-            if (!player.failed) autoMode = false;
-            else if (autoMode && allowAuto()) {                   // a reconexao automatica falhou (rede fora?): espera 3 s e tenta de novo
-                g_autoRestarts++;
-                g_reconnectNote = "nova tentativa (a anterior falhou)";
-                bool abort = false;
-                for (int i = 0; i < 25 && !abort; i++) { presentWait(); sceKernelUsleep(120000); if (player.cancelCb && player.cancelCb()) abort = true; }
+            if (player.failed) {
+                // mostra o erro e VOLTA ao menu (nao fica em Play com handle invalido)
+                for (int i = 0; i < 25; i++) {
+                    presentWait();
+                    sceKernelUsleep(100000);
+                    pin.poll();
+                    if (pin.take() & B_CIRCLE) break;
+                }
                 player.stop();
-                if (abort) { autoMode = false; g_reconnectNote.clear(); mode = Mode::Menu; dirty = true; continue; }
-                pf.pendingPlayUrl = url; pf.pendingPlayTitle = title;
-                mode = Mode::Menu; dirty = true;
-            } else autoMode = false;
+                autoMode = false;
+                mode = Mode::Menu;
+                dirty = true;
+                continue;
+            }
+            // sucesso: toca normalmente (reconexao automatica so vale para live)
+            autoMode = false;
             continue;
         }
         if (dirty) { presentMenu(); dirty = false; static bool once = false; if (!once) { once = true; trace("menu-ok"); } }
