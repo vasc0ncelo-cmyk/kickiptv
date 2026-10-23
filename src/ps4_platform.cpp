@@ -1126,11 +1126,13 @@ struct Player {
         log.push_back("modulo AvPlayerStreaming: " + hx8(sceSysmoduleLoadModuleInternal(0x80000050)));
         bool isHls = url.find(".m3u8") != std::string::npos;
         useFeed = false;
-        if (!isHls && urlIsVideoFile(url)) {
+        // Filmes/series: URL com extensao (.mp4...) OU caminho /movie/ /series/ do painel (muitas vezes SEM extensao).
+        // Se cair no pipeline de "ao vivo" (MPEG-TS), o PS4 fecha com CE-34878-0.
+        if (!isHls && urlIsVod(url)) {
             isVod = true;
             try { return startFile(url); }
             catch (...) { failed = true; log.push_back("ERRO: sem memoria ao abrir o arquivo"); trace("vod-excecao"); releaseHfAsync(); return false; }
-        }   // filme/serie: o app le o arquivo por HTTP Range e entrega ao player
+        }
 
         // Ao vivo: HLS (.m3u8) vai direto. Canal "cru" (.ts / sem extensao): primeiro tenta o HLS equivalente do painel Xtream
         // (mais estavel), e se o painel nao tiver, le o MPEG-TS continuo e corta em pedacos.
@@ -1232,12 +1234,14 @@ struct Player {
     // Filme/serie: arquivo remoto lido por blocos (httpfile.hpp). Depois da leitura propria, tenta o jeito antigo (o player abrir a URL sozinho).
     bool startFile(const std::string &url) {
         std::string ext = urlExtension(url);
-        log.push_back("Arquivo ." + ext + ": leitura propria por HTTP (3 conexoes, blocos de 1 MB)");
+        std::string name = vodPlayerName(url);
+        log.push_back(std::string("VOD") + (ext.empty() ? " (sem extensao, painel IPTV)" : " ." + ext) +
+                      ": leitura por HTTP Range -> " + name);
         presentCb();
-        // 3 conexoes em paralelo (cada uma com a sua sessao): um unico download por vez nao acompanha filme de bitrate alto e a imagem travava.
-        const int kConns = 3;
+        // 1 conexao + menos cache: no PS4 3x20 MB estourava memoria e fechava o app (CE-34878-0).
+        const int kConns = 1;
         std::vector<std::shared_ptr<NetClient::Session>> sessions;
-        for (int i = 0; i < kConns; i++) { auto ss = std::make_shared<NetClient::Session>(); ss->recvSec = 25; sessions.push_back(ss); }   // paineis IPTV demoram para o 1o byte
+        for (int i = 0; i < kConns; i++) { auto ss = std::make_shared<NetClient::Session>(); ss->recvSec = 25; sessions.push_back(ss); }
         auto mkFetch = [url](std::shared_ptr<NetClient::Session> ss) -> httpfile::Fetch {
             return [ss, url](uint64_t from, uint64_t to, std::string &body) -> int {
                 int st = 0;
@@ -1245,10 +1249,9 @@ struct Player {
                 return st;
             };
         };
-        auto rd = std::make_shared<httpfile::Reader>(mkFetch(sessions[0]), 20, 8);   // 20 blocos x 1 MB de cache, ate 8 blocos adiante
-        for (int i = 1; i < kConns; i++) { auto ss = sessions[i]; rd->addWorker(mkFetch(ss), [ss] { g_net.closeSession(*ss); }); }
+        auto rd = std::make_shared<httpfile::Reader>(mkFetch(sessions[0]), 8, 4);   // 8 blocos x 1 MB, 4 a frente
         rd->setOnExit([s0 = sessions[0]] { g_net.closeSession(*s0); });
-        rd->setProbe([s0 = sessions[0], url]() -> uint64_t {      // tamanho do arquivo em UMA requisicao (antes eram ~25 requisicoes: 1 minuto na tela de espera)
+        rd->setProbe([s0 = sessions[0], url]() -> uint64_t {
             std::string b; int st = 0; uint64_t total = 0;
             if (!g_net.getRange(*s0, url, 0, 0, b, st, &total) || st != 206) return 0;
             return total;
@@ -1256,7 +1259,7 @@ struct Player {
         trace("vod-baixando-tamanho");
         setHf(rd); rd->start();
         double w0 = nowSec();
-        while (rd->state() == 0 && nowSec() - w0 < 60) {
+        while (rd->state() == 0 && nowSec() - w0 < 45) {
             sceKernelUsleep(50000);
             if (cancelCb && cancelCb()) { cancelled = true; break; }
             presentCb();
@@ -1265,28 +1268,51 @@ struct Player {
         if (rd->state() != 1) {
             log.push_back("ERRO: " + (rd->state() == 2 ? rd->error() : std::string("o servidor demorou demais para responder")));
             releaseHfAsync();
-        } else {
-            trace("vod-tamanho-ok");
-            log.push_back("   tamanho do arquivo: " + std::to_string(rd->size() >> 20) + " MB");
-            presentCb();
-            trace("vod-abrindo-player");
-            std::string name = "video." + ext;
-            if (openSource(name, 2, 3, 25000, true)) {
-                audio.start(h); active = true; t0 = lastFps = lastFrameT = nowSec();
-                trace("vod-tocando");
-                log.push_back("OK: tocando o arquivo");
-                return true;
-            }
-            releaseHfAsync();
-            if (cancelled) { failed = true; return false; }
+            failed = true;
+            return false;
         }
+        // Pre-aquecimento: espera o 1o bloco (1 MB) antes de abrir o AvPlayer — evita leitura vazia no callback (crash).
+        trace("vod-tamanho-ok");
+        log.push_back("   tamanho do arquivo: " + std::to_string(rd->size() >> 20) + " MB");
+        presentCb();
+        {
+            // dispara a 1a leitura (marca want_)
+            uint8_t tip[64];
+            rd->read(tip, 0, 64, 15000);
+            double b0 = nowSec();
+            while (rd->cachedBlocks() < 1 && nowSec() - b0 < 20) {
+                sceKernelUsleep(50000);
+                if (cancelCb && cancelCb()) { cancelled = true; break; }
+                presentCb();
+            }
+        }
+        if (cancelled) { failed = true; releaseHfAsync(); return false; }
+        if (rd->cachedBlocks() < 1) {
+            log.push_back("ERRO: nao baixou o inicio do arquivo (rede/painel)");
+            releaseHfAsync();
+            failed = true;
+            return false;
+        }
+        trace("vod-abrindo-player");
+        presentCb();
+        // debugLevel 0 no VOD: menos log interno do AvPlayer (mais estavel)
+        if (openSource(name, 2, 0, 20000, true)) {
+            audio.start(h); active = true; t0 = lastFps = lastFrameT = nowSec();
+            trace("vod-tocando");
+            log.push_back("OK: tocando o arquivo");
+            return true;
+        }
+        releaseHfAsync();
+        if (cancelled) { failed = true; return false; }
+
+        // Fallback: o player tenta abrir a URL HTTP sozinho (quase sempre falha nos paineis)
         log.push_back("Tentando o player abrir a URL sozinho...");
         presentCb();
-        if (openSource(url, 0, 3, 0, true)) {
+        if (openSource(url, 0, 0, 0, true)) {
             audio.start(h); active = true; t0 = lastFps = lastFrameT = nowSec();
             return true;
         }
-        failed = true; log.push_back("ERRO: o player nao abriu esta URL.");
+        failed = true; log.push_back("ERRO: o player nao abriu esta URL. Formato pode nao ser suportado (use MP4).");
         return false;
     }
     std::function<void()> presentCb = [] {};   // main liga isto para redesenhar a tela de espera durante as tentativas
