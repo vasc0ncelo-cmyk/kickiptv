@@ -384,7 +384,7 @@ struct UI {
         m3uUrl = app.pf.loadSetting("m3u");
     }
     bool hasSavedList() const { return !m3uUrl.empty(); }
-    void loadSavedList() { if (!m3uUrl.empty()) app.loadM3U(m3uUrl); }
+    void loadSavedList() { if (!m3uUrl.empty()) app.loadM3U(m3uUrl, true); }   // true = usa a copia salva (nao baixa de novo)
 
     // Itens da tela Kick TV
     enum { KA_TYPE = 0, KA_LAST = 1 };
@@ -464,7 +464,7 @@ struct UI {
         size_t a = url.find_first_not_of(" \t\r\n"), b = url.find_last_not_of(" \t\r\n");
         url = a == std::string::npos ? "" : url.substr(a, b - a + 1);
         if (url.empty()) {                       // campo vazio = remover a lista
-            m3uUrl.clear(); app.list = Playlist(); app.pf.saveSetting("m3u", "");
+            m3uUrl.clear(); app.list = Playlist(); app.pf.saveSetting("m3u", ""); app.pf.cacheClear();
             resetBrowse();
             app.say("Lista M3U removida");
             return;
