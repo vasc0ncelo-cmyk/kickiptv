@@ -3,6 +3,7 @@
 #include "kick.hpp"
 #include "m3u.hpp"
 #include <functional>
+#include <new>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -28,6 +29,13 @@ struct Platform {
     virtual void requestText(const std::string &prompt) = 0; // abre o teclado (IME); depois chame UI::onText
     virtual std::string loadSetting(const std::string &) { return ""; }              // dados guardados (ex.: "m3u", "kick")
     virtual void saveSetting(const std::string &, const std::string &) {}
+    // Copia local da lista M3U (para nao baixar tudo a cada abertura do app).
+    // cacheLoad: entrega em pedacos a copia salva DESTA url; false = nao existe / url diferente / cancelado / erro.
+    virtual bool cacheLoad(const std::string & /*url*/, const std::function<bool(const char *, size_t)> & /*sink*/) { return false; }
+    virtual void cacheBegin() {}                                   // vai comecar um download: comece a gravar
+    virtual void cacheWrite(const char * /*d*/, size_t /*n*/) {}   // pedaco baixado, em ordem
+    virtual void cacheEnd(const std::string & /*url*/, bool /*complete*/) {}   // complete=true: a copia vira a lista salva (senao descarta e mantem a antiga)
+    virtual void cacheClear() {}                                   // apaga a copia salva
 };
 
 struct App {
@@ -42,17 +50,35 @@ struct App {
         char b[32]; snprintf(b, sizeof b, "%.1f MB", bytes / 1048576.0); return b;
     }
 
-    bool loadM3U(const std::string &url) {
+    // useCache=true (abrir o app): usa a copia salva no console, se houver (sem baixar nada).
+    // useCache=false (usuario confirmou o link): baixa de novo e atualiza a copia salva.
+    bool loadM3U(const std::string &url, bool useCache = false) {
+        if (useCache) {
+            int r = loadCached(url);
+            if (r == 1) return true;
+            if (r == -1) return false;          // cancelado
+        }
         PlaylistBuilder b;
         size_t bytes = 0;
+        bool oom = false;
         say("Baixando lista M3U...  (O cancela)");
+        pf.cacheBegin();
         bool ok = pf.httpStream(url, [&](const char *d, size_t n) {
-            b.feed(d, n); bytes += n;
+            pf.cacheWrite(d, n);                 // a copia local recebe tudo, mesmo que o parse fique sem memoria
+            try { b.feed(d, n); } catch (const std::bad_alloc &) { oom = true; return false; }
+            bytes += n;
             say("Baixando lista M3U... " + fmtMB(bytes) + "  |  " + std::to_string(b.count()) + " itens  (O cancela)");
             return true;
         });
-        b.finish();
+        try { b.finish(); } catch (...) {}
         size_t total = b.count();
+        pf.cacheEnd(url, ok && total > 0);       // so vira a lista salva se baixou tudo
+        if (oom) {
+            if (total == 0) { say("Memoria insuficiente para carregar a lista"); return false; }
+            list = b.take();
+            say("Aviso: acabou a memoria, so parte da lista foi carregada - " + summary());
+            return true;
+        }
         if (!ok) {
             if (pf.wasCancelled()) { say("Download da lista cancelado"); return false; }
             if (total == 0) { say("Falha ao baixar a lista M3U"); return false; }
@@ -63,8 +89,33 @@ struct App {
         }
         if (total == 0) { say("Falha: o link nao devolveu uma lista M3U valida"); return false; }
         list = b.take();
-        say(list.truncated ? "Aviso: lista muito grande, so os primeiros itens foram carregados - " + summary() : summary());
+        say(summary());
         return true;
+    }
+
+    // 1 = carregou da copia salva | 0 = nao tem copia valida (baixa) | -1 = o usuario cancelou
+    int loadCached(const std::string &url) {
+        PlaylistBuilder b;
+        size_t bytes = 0;
+        bool oom = false;
+        say("Carregando lista salva...  (O cancela)");
+        bool ok = pf.cacheLoad(url, [&](const char *d, size_t n) {
+            try { b.feed(d, n); } catch (const std::bad_alloc &) { oom = true; return false; }
+            bytes += n;
+            say("Carregando lista salva... " + fmtMB(bytes) + "  |  " + std::to_string(b.count()) + " itens  (O cancela)");
+            return true;
+        });
+        try { b.finish(); } catch (...) {}
+        if (oom && b.count() > 0) {
+            list = b.take();
+            say("Aviso: acabou a memoria, so parte da lista foi carregada - " + summary());
+            return 1;
+        }
+        if (!ok) { if (pf.wasCancelled()) { say("Carregamento cancelado"); return -1; } return 0; }
+        if (b.count() == 0) return 0;
+        list = b.take();
+        say(summary() + "  |  lista salva (confirme o link para atualizar)");
+        return 1;
     }
 
     std::string summary() const {
