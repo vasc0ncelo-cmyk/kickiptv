@@ -185,9 +185,9 @@ void PlaylistBuilder::line(std::string &raw) {
         if (c == std::string::npos) c = extinf_.rfind(',');
         e.name = c == std::string::npos ? "" : trim(extinf_.substr(c + 1));
         e.group = attr(extinf_, "group-title");
-        if (e.name.empty()) e.name = attr(extinf_, "tvg-name");
         e.logo = attr(extinf_, "tvg-logo");
         if (e.logo.empty()) e.logo = attr(extinf_, "logo");
+        if (e.name.empty()) e.name = attr(extinf_, "tvg-name");
     }
     if (e.name.empty()) e.name = e.url;
     e.kind = classify(e);
