@@ -3,7 +3,9 @@
 // Telas: Home (banner + 4 atalhos + lista M3U), Kick TV (digitar @streamer) e listas (Filmes / Series / Canais).
 #include "app.hpp"
 #include <algorithm>
+#include <functional>
 #include <cctype>
+#include <cstdint>
 #include <string>
 #include <utility>
 #include <vector>
@@ -31,6 +33,8 @@ struct Renderer {
     // Ganchos de desempenho (o PS4 implementa; quem nao implementar cai no desenho normal):
     virtual bool blitBackground() { return false; }        // true = o fundo ja foi copiado pronto
     virtual bool glow(int, int, int, int, int, unsigned, int, int, bool) { return false; }   // true = brilho desenhado
+    virtual void blitImage(int /*x*/, int /*y*/, int /*dw*/, int /*dh*/,
+                           const uint32_t * /*px*/, int /*sw*/, int /*sh*/) {}
 };
 
 // ---------- Tema (cores ARGB) ----------
@@ -356,6 +360,8 @@ inline void uiHeader(Renderer &r, const std::string &hhmm, const std::string &da
 
 struct UI {
     App &app;
+    std::function<void(const std::string &)> coverRequest;
+    std::function<bool(const std::string &, const uint32_t *&, int &, int &)> coverGet;
     Screen screen = Screen::Home;
     Tab tab = Tab::Kick;
     int homeRow = 1;          // 0 = banner, 1 = atalhos, 2 = lista M3U
