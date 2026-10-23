@@ -442,6 +442,68 @@ struct Ps4Platform : Platform {
         if (!v.empty()) fwrite(v.data(), 1, v.size(), f);
         fclose(f);
     }
+
+    // ---- copia local da lista M3U: abrir o app nao baixa tudo de novo ----
+    // Dois arquivos (a/b) se revezam: o download novo grava no que NAO esta valido; so quando termina inteiro a configuracao
+    // "listcache" ("<0|1>|<url>") passa a apontar para ele. Se a conexao cair no meio, a copia antiga continua valida.
+    static std::string cachePath(int slot) { return slot ? "/data/kickiptv_list_b.m3u" : "/data/kickiptv_list_a.m3u"; }
+    FILE *cacheF = nullptr;
+    int cacheSlot = 0;
+    bool cacheBad = false;
+    // le "listcache": slot valido (0/1) e a url a que ele pertence. slot = -1 se nao ha copia.
+    void cacheInfo(int &slot, std::string &url) {
+        slot = -1; url.clear();
+        std::string v = loadSetting("listcache");
+        size_t bar = v.find('|');
+        if (v.size() < 3 || bar != 1 || (v[0] != '0' && v[0] != '1')) return;
+        slot = v[0] - '0'; url = v.substr(2);
+    }
+    bool cacheLoad(const std::string &url, const std::function<bool(const char *, size_t)> &sink) override {
+        cancelled = false;
+        int slot; std::string cu; cacheInfo(slot, cu);
+        if (slot < 0 || cu != url) return false;                       // outra lista (ou nenhuma): baixa
+        int fd = sceKernelOpen(cachePath(slot).c_str(), 0, 0);
+        if (fd < 0) return false;
+        trace("m3u-cache-inicio");
+        std::vector<char> buf(256 * 1024);
+        bool ok = true, first = true;
+        double last = monoSec();
+        for (;;) {
+            long n = (long)sceKernelRead(fd, buf.data(), buf.size());
+            if (n < 0) { ok = false; break; }
+            if (n == 0) break;
+            if (first) { first = false; trace("m3u-cache-parse"); }
+            if (!sink(buf.data(), (size_t)n)) { ok = false; break; }
+            double t = monoSec();
+            if (t - last >= 0.15) { last = t; if (progressTick && progressTick()) { cancelled = true; ok = false; break; } }   // redesenha e deixa cancelar com O
+        }
+        sceKernelClose(fd);
+        trace(ok ? "m3u-cache-ok" : "m3u-cache-falhou");
+        return ok;
+    }
+    void cacheBegin() override {
+        if (cacheF) { fclose(cacheF); cacheF = nullptr; }
+        int cur; std::string cu; cacheInfo(cur, cu);
+        cacheSlot = cur == 0 ? 1 : 0;                                  // grava no arquivo que nao esta em uso
+        cacheF = fopen(cachePath(cacheSlot).c_str(), "wb");
+        cacheBad = cacheF == nullptr;
+    }
+    void cacheWrite(const char *d, size_t n) override {
+        if (cacheF && !cacheBad && fwrite(d, 1, n, cacheF) != n) cacheBad = true;   // disco cheio etc.
+    }
+    void cacheEnd(const std::string &url, bool complete) override {
+        if (!cacheF) return;
+        bool closed = fclose(cacheF) == 0; cacheF = nullptr;
+        if (complete && closed && !cacheBad) {
+            int old; std::string ou; cacheInfo(old, ou);
+            saveSetting("listcache", std::string(cacheSlot ? "1" : "0") + "|" + url);
+            if (old >= 0 && old != cacheSlot) remove(cachePath(old).c_str());
+        } else remove(cachePath(cacheSlot).c_str());                   // descarta; a copia antiga (se houver) continua valendo
+    }
+    void cacheClear() override {
+        saveSetting("listcache", "");
+        remove(cachePath(0).c_str()); remove(cachePath(1).c_str());
+    }
 };
 
 // (FbRenderer agora vive em fbrender.hpp)
@@ -1687,7 +1749,8 @@ int main() {
     //  caiu ate no modo seguro -> nao carrega a lista sozinho (o app abre normalmente e mostra o passo onde parou).
     {
         auto starts = [&](const char *p) { return g_prevStage.rfind(p, 0) == 0; };
-        bool crashM3u = starts("m3u-inicio") || starts("m3u-t-") || starts("m3u-sync") || starts("m3u-s-") || starts("m3u-parse");
+        bool crashM3u = starts("m3u-inicio") || starts("m3u-t-") || starts("m3u-sync") || starts("m3u-s-") || starts("m3u-parse") ||
+                        starts("m3u-cache-inicio") || starts("m3u-cache-parse");
         bool wasSafe = pf.loadSetting("safem3u") == "1";
         if (wasSafe) g_safeM3U = true;
         bool skipAuto = false;
