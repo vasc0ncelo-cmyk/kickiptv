@@ -30,6 +30,7 @@ jobs:
           g++ -std=c++17 -o w tests/test_urlutil.cpp && ./w
           g++ -std=c++17 -pthread -o f tests/test_httpfile.cpp && ./f
           g++ -std=c++17 -o s tests/test_tschunk.cpp && ./s
+          g++ -std=c++17 -pthread -o l tests/test_listload.cpp src/m3u.cpp && ./l
       - name: Toolchain OpenOrbis
         run: bash scripts/get_toolchain.sh
       - name: Icone e fundo do app (nao quebra o build se falhar)
