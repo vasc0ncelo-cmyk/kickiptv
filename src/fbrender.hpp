@@ -153,6 +153,32 @@ struct FbRenderer : Renderer {
         }
         return true;
     }
+    void blitImage(int x, int y, int dw, int dh, const uint32_t *px, int sw, int sh) override {
+        if (!px || sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) return;
+        for (int j = 0; j < dh; j++) {
+            int sy = j * sh / dh;
+            int dy = y + j;
+            if (dy < 0 || dy >= H) continue;
+            uint32_t *dst = fb + (size_t)dy * W;
+            const uint32_t *src = px + (size_t)sy * sw;
+            for (int i = 0; i < dw; i++) {
+                int sx = i * sw / dw;
+                int dx = x + i;
+                if (dx < 0 || dx >= W) continue;
+                uint32_t c = src[sx];
+                unsigned a = c >> 24;
+                if (a == 0) continue;
+                if (a >= 250) { dst[dx] = c | 0xFF000000u; continue; }
+                uint32_t d = dst[dx];
+                unsigned inv = 255 - a;
+                unsigned r = (((c >> 16) & 255) * a + ((d >> 16) & 255) * inv) / 255;
+                unsigned g = (((c >> 8) & 255) * a + ((d >> 8) & 255) * inv) / 255;
+                unsigned b = ((c & 255) * a + (d & 255) * inv) / 255;
+                dst[dx] = 0xFF000000u | (r << 16) | (g << 8) | b;
+            }
+        }
+    }
+
     void fillRect(int x, int y, int w, int h, unsigned argb) override {
         int x0 = x < 0 ? 0 : x, y0 = y < 0 ? 0 : y;
         int x1 = x + w > W ? W : x + w, y1 = y + h > H ? H : y + h;
