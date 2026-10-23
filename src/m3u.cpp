@@ -132,7 +132,7 @@ int PlaylistBuilder::catFor(std::vector<Category> &cats, std::unordered_map<std:
 
 // Limites de seguranca: uma linha gigante (lixo/arquivo que nao e M3U) nao pode estourar a memoria.
 static const size_t kMaxLine = 8192;
-static const size_t kMaxEntries = 300000;   // listas de painel chegam a 200 mil+ itens (60 MB); sem os campos extras cada item ocupa menos que antes
+// (sem limite de itens: a lista carrega inteira. Se a memoria acabar, App::loadM3U trata o bad_alloc e aproveita o que ja foi lido.)
 
 PlaylistBuilder::PlaylistBuilder() {}
 
@@ -176,7 +176,6 @@ void PlaylistBuilder::line(std::string &raw) {
         if (l.compare(0, 7, "#EXTINF") == 0) extinf_ = l;
         return;                                             // #EXTM3U, #EXTVLCOPT, #EXTGRP etc.
     }
-    if (count_ >= kMaxEntries) { extinf_.clear(); p_.truncated = true; return; }
     Entry e;
     e.url = l;
     if (!extinf_.empty()) {
