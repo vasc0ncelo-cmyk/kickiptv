@@ -82,7 +82,7 @@ private:
             if (env < 0) env = 0;
             float s = fastSin(2.f * 3.14159265f * f * t) * vol * env;
             // leve harmônico
-            s += 0.25f * fastSin(2.f * 3.14159265f * f * 2.f * t) * vol * env;
+            s += 0.08f * fastSin(2.f * 3.14159265f * f * 2.f * t) * vol * env;
             int16_t v = (int16_t)(s * 20000.f);
             buf[(size_t)i * 2] = v;
             buf[(size_t)i * 2 + 1] = v;
@@ -95,12 +95,13 @@ private:
 
     void playKind(Kind k) {
         switch (k) {
-        case Kind::Move:    tone(880.f,  28.f, 0.22f); break;
-        case Kind::Confirm: tone(660.f,  40.f, 0.28f, 990.f); break;
-        case Kind::Back:    tone(520.f,  35.f, 0.22f, 360.f); break;
-        case Kind::Open:    tone(440.f,  50.f, 0.25f, 880.f); break;
-        case Kind::Error:   tone(200.f,  90.f, 0.30f, 140.f); break;
-        case Kind::Success: tone(523.f,  40.f, 0.26f); tone(659.f, 45.f, 0.26f); break;
+        // sons mais suaves e curtos
+        case Kind::Move:    tone(620.f,  18.f, 0.12f); break;
+        case Kind::Confirm: tone(520.f,  30.f, 0.16f, 720.f); break;
+        case Kind::Back:    tone(480.f,  25.f, 0.12f, 380.f); break;
+        case Kind::Open:    tone(400.f,  35.f, 0.14f, 600.f); break;
+        case Kind::Error:   tone(280.f,  50.f, 0.14f, 220.f); break;
+        case Kind::Success: tone(540.f,  28.f, 0.14f); break;
         default: break;
         }
     }
