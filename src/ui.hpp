@@ -525,7 +525,7 @@ struct UI {
         const Entry &e = seasons.find(curSeason)->second[i];
         return e.episode ? "Ep " + std::to_string(e.episode) + " - " + e.name : e.name;
     }
-    // Capa (logo URL) do item, se a lista M3U trouxe tvg-logo.
+    // Capa (logo URL) do item — filmes, canais e series (1o episodio).
     std::string itemLogo(int i) const {
         const Playlist &p = app.list;
         if (i < 0 || i >= itemCount()) return "";
@@ -535,6 +535,19 @@ struct UI {
         if (!c) return "";
         if (tab == Tab::Movies) return p.movies[c->items[i]].logo;
         if (tab == Tab::Channels) return p.channels[c->items[i]].logo;
+        if (tab == Tab::Series && level == 0 && i < (int)c->series.size()) {
+            auto it = p.seriesTree.find(c->series[i]);
+            if (it == p.seriesTree.end() || it->second.empty()) return "";
+            const auto &eps = it->second.begin()->second;
+            return eps.empty() ? "" : eps[0].logo;
+        }
+        if (tab == Tab::Series && level == 2) {
+            auto it = p.seriesTree.find(curSeries);
+            if (it == p.seriesTree.end()) return "";
+            auto st = it->second.find(curSeason);
+            if (st == it->second.end() || i >= (int)st->second.size()) return "";
+            return st->second[i].logo;
+        }
         return "";
     }
     std::vector<std::string> labels() const {         // so para testes/compatibilidade (copia tudo)
@@ -609,7 +622,18 @@ struct UI {
         case Input::Down: catCur[t] = std::min(std::max(0, n - 1), catCur[t] + 1); break;
         case Input::PageUp: catCur[t] = std::max(0, catCur[t] - kRows); break;
         case Input::PageDown: catCur[t] = std::min(std::max(0, n - 1), catCur[t] + kRows); break;
-        case Input::Right: case Input::Confirm: if (itemCount() > 0) inItems = true; return;
+        case Input::Right: case Input::Confirm:
+            if (itemCount() > 0) {
+                inItems = true;
+                // pre-carrega capas visiveis (mais rapido)
+                int n = itemCount();
+                int maxP = useMovieGrid() ? kGridCols * kGridVisibleRows : kRows;
+                for (int i = 0; i < maxP && i < n; i++) {
+                    std::string u = itemLogo(i);
+                    if (!u.empty() && coverRequest) coverRequest(u);
+                }
+            }
+            return;
         case Input::Back: screen = Screen::Home; return;
         default: return;
         }
@@ -651,7 +675,7 @@ private:
     static const int kGridCols = 5;
     static const int kGridVisibleRows = 2;
 
-    bool useMovieGrid() const { return tab == Tab::Movies; }
+    bool useMovieGrid() const { return tab == Tab::Movies || (tab == Tab::Series && level == 0); }
 
     void handleItems(Input in) {
         int t = (int)tab, n = itemCount();
@@ -897,7 +921,12 @@ private:
                 int bx = x + col * (cardW + gapX);
                 int by = y0 + row * (cardH + gapY);
                 bool sel = inItems && idx == cursor[t];
-                if (sel) uiSelGlow(r, bx - 4, by - 4, cardW + 8, cardH + 8, 16, animPhase);
+                if (sel) {
+                    uiSelGlow(r, bx - 6, by - 6, cardW + 12, cardH + 12, 16, animPhase);
+                    // moldura extra
+                    r.roundRect(bx - 3, by - 3, cardW + 6, 4, 2, theme::GREEN);
+                    r.roundRect(bx - 3, by + posterH - 1, cardW + 6, 4, 2, theme::GREEN);
+                }
                 // card fundo
                 r.roundRect(bx, by, cardW, posterH, 14, 0xFF0E0E12);
                 if (sel) {
@@ -915,7 +944,7 @@ private:
                 // capa
                 bool drew = false;
                 std::string logoUrl = itemLogo(idx);
-                if (!logoUrl.empty() && coverRequest) coverRequest(logoUrl);
+                if (!logoUrl.empty() && coverRequest) coverRequest(logoUrl);  // prioridade visual
                 if (!logoUrl.empty() && coverGet) {
                     const uint32_t *pxc = nullptr; int cw = 0, ch = 0;
                     if (coverGet(logoUrl, pxc, cw, ch) && pxc && cw > 0 && ch > 0) {
@@ -966,7 +995,7 @@ private:
                 r.roundRect(px, py, isW, isH, 10, sel ? GREEN : CHIP);
                 bool drewCover = false;
                 std::string logoUrl = itemLogo(idx);
-                if (!logoUrl.empty() && coverRequest) coverRequest(logoUrl);
+                if (!logoUrl.empty() && coverRequest) coverRequest(logoUrl);  // prioridade visual
                 if (!logoUrl.empty() && coverGet) {
                     const uint32_t *pxc = nullptr; int cw = 0, ch = 0;
                     if (coverGet(logoUrl, pxc, cw, ch) && pxc && cw > 0 && ch > 0) {
