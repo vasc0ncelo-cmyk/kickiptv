@@ -1242,36 +1242,46 @@ struct Player {
         active = true; t0 = lastFps = lastFrameT = nowSec();
         return true;
     }
-    // Filme/serie: SO arquivo local (streaming HTTP fechava o app com CE-34878-0).
-    // Sem limite de tamanho. Progresso na tela. O cancela.
+    // Filme/serie: tenta abrir HTTP nativo (instantaneo). Se falhar, baixa local.
+    // Nunca usa callbacks HTTP (cb=2) — fechavam o app.
     bool startFile(const std::string &url) {
-        const char *path = "/data/kickiptv_vod.mp4";
         std::string ext = urlExtension(url);
-        log.push_back(std::string("VOD") + (ext.empty() ? " (painel)" : " ." + ext) +
-                      ": download local (estavel)");
+        log.push_back(std::string("VOD") + (ext.empty() ? " (painel)" : " ." + ext));
         presentCb();
-        remove(path);
-        releaseHfAsync();   // garante que nao ha callbacks HTTP ativos
+        releaseHfAsync();
 
-        NetClient::Session ss; ss.recvSec = 30;
+        // 1) AvPlayer abre a URL HTTP direto (sem baixar) — se o painel permitir, e instantaneo
+        log.push_back("   tentando abertura direta...");
+        presentCb();
+        if (openSource(url, 0, 0, 12000, true)) {
+            audio.start(h); active = true; t0 = lastFps = lastFrameT = nowSec();
+            isVod = true;
+            log.push_back("OK: streaming direto (instantaneo)");
+            return true;
+        }
+        log.push_back("   direto falhou — baixando para /data...");
+        presentCb();
+
+        const char *path = "/data/kickiptv_vod.mp4";
+        remove(path);
+        NetClient::Session ss; ss.recvSec = 25;
         std::string tip; int st = 0; uint64_t total = 0;
         if (!g_net.getRange(ss, url, 0, 0, tip, st, &total) || st != 206 || total < 1024) {
-            log.push_back("ERRO: painel nao informou tamanho (HTTP " + std::to_string(st) + ")");
+            log.push_back("ERRO: sem tamanho (HTTP " + std::to_string(st) + ")");
             g_net.closeSession(ss);
             failed = true;
             return false;
         }
-        log.push_back("   " + std::to_string(total >> 20) + " MB — baixando (sem limite). O cancela.");
+        log.push_back("   " + std::to_string(total >> 20) + " MB — baixando (O cancela)");
         presentCb();
-
         FILE *fp = fopen(path, "wb");
         if (!fp) {
-            log.push_back("ERRO: nao criou /data/kickiptv_vod.mp4");
+            log.push_back("ERRO: disco /data");
             g_net.closeSession(ss);
             failed = true;
             return false;
         }
-        const uint64_t kChunk = 2u << 20;  // 2 MB por pedaco (mais rapido)
+        const uint64_t kChunk = 4u << 20;  // 4 MB — mais rapido
         uint64_t pos = 0;
         int fails = 0;
         double lastUi = nowSec();
@@ -1283,18 +1293,18 @@ struct Player {
             if (!g_net.getRange(ss, url, pos, to, body, st) || (st != 206 && !(st == 200 && pos == 0))) {
                 if (++fails > 12) break;
                 g_net.closeSession(ss);
-                sceKernelUsleep(300000);
+                sceKernelUsleep(200000);
                 continue;
             }
             fails = 0;
             if (fwrite(body.data(), 1, body.size(), fp) != body.size()) { fails = 99; break; }
             pos += body.size();
-            if (nowSec() - lastUi > 0.3) {
+            if (nowSec() - lastUi > 0.2) {
                 lastUi = nowSec();
                 int pct = total ? (int)((pos * 100) / total) : 0;
                 log.push_back("   " + std::to_string(pct) + "% (" +
                               std::to_string(pos >> 20) + "/" + std::to_string(total >> 20) + " MB)");
-                if (log.size() > 30) log.erase(log.begin() + 3, log.begin() + 10);
+                if (log.size() > 28) log.erase(log.begin() + 3, log.begin() + 10);
                 presentCb();
             }
         }
@@ -1306,19 +1316,9 @@ struct Player {
             log.push_back("ERRO: download incompleto");
             return false;
         }
-        {
-            FILE *ck = fopen(path, "rb");
-            char hdr[12] = {};
-            if (ck) { fread(hdr, 1, 12, ck); fclose(ck); }
-            bool okMp4 = (hdr[4] == 'f' && hdr[5] == 't' && hdr[6] == 'y' && hdr[7] == 'p');
-            if (!okMp4) {
-                log.push_back("ERRO: arquivo nao e MP4 (ftyp)");
-                remove(path); failed = true; return false;
-            }
-        }
-        log.push_back("   download ok — abrindo arquivo local");
+        log.push_back("   abrindo arquivo local...");
         presentCb();
-        if (openSource(path, 0, 0, 20000, true)) {
+        if (openSource(path, 0, 0, 15000, true)) {
             audio.start(h); active = true; t0 = lastFps = lastFrameT = nowSec();
             isVod = true;
             log.push_back("OK: tocando");
@@ -1326,7 +1326,7 @@ struct Player {
         }
         remove(path);
         failed = true;
-        log.push_back("ERRO: player nao abriu o arquivo local");
+        log.push_back("ERRO: player nao abriu");
         return false;
     }
 
@@ -1721,7 +1721,7 @@ int main() {
         int st = 0;
         return g_net.get(url, body, st) && st >= 200 && st < 300 && body.size() > 32;
     });
-    ui.coverRequest = [](const std::string &url) { g_covers.request(url); };
+    ui.coverRequest = [](const std::string &url) { g_covers.requestFront(url); };
     ui.coverGet = [](const std::string &url, const uint32_t *&px, int &w, int &h) -> bool {
         // snapshot por URL: varias capas no mesmo quadro
         static std::map<std::string, Cover> snap;
