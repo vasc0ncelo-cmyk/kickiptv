@@ -28,6 +28,31 @@ inline bool urlIsVideoFile(const std::string &url) {
     return false;
 }
 
+// Painel Xtream Codes: filmes/series quase sempre em /movie/... ou /series/... (com ou SEM extensao).
+// Sem isso o app trata a URL como canal ao vivo (MPEG-TS) e o PS4 fecha com CE-34878-0.
+inline bool urlIsXtreamVod(const std::string &url) {
+    std::string lu = urlLower(url);
+    if (lu.find("/movie/") != std::string::npos) return true;
+    if (lu.find("/series/") != std::string::npos) return true;
+    if (lu.find("/vod/") != std::string::npos) return true;
+    return false;
+}
+
+// Qualquer VOD: arquivo de video por extensao OU caminho tipico de painel IPTV.
+inline bool urlIsVod(const std::string &url) {
+    if (urlIsVideoFile(url)) return true;
+    if (urlIsXtreamVod(url)) return true;
+    return false;
+}
+
+// Extensao segura para o AvPlayer (ele escolhe o demuxer pelo nome). Prefere mp4.
+inline std::string vodPlayerName(const std::string &url) {
+    std::string x = urlExtension(url);
+    if (x == "mp4" || x == "m4v" || x == "mov") return "video." + x;
+    // sem extensao ou formato que o AvPlayer do PS4 costuma rejeitar: finge mp4
+    return "video.mp4";
+}
+
 // Canal de painel Xtream: http://host[:porta]/[live/]usuario/senha/ID[.ts]  ->  http://host[:porta]/[live/]usuario/senha/ID.m3u8
 // (o HLS e bem mais confiavel que o fluxo TS cru). Devolve "" se a URL nao tem esse formato.
 inline std::string xtreamHlsUrl(const std::string &url) {
