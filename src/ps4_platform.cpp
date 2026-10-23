@@ -1239,84 +1239,124 @@ struct Player {
         active = true; t0 = lastFps = lastFrameT = nowSec();
         return true;
     }
-    // Filme/serie: arquivo remoto lido por blocos (httpfile.hpp). Depois da leitura propria, tenta o jeito antigo (o player abrir a URL sozinho).
+    // Filme/serie: BAIXA PARA ARQUIVO LOCAL e toca como os pedacos de live (openSource cb=0).
+    // O caminho antigo (callbacks HTTP + AvPlayer) fechava o app com CE-34878-0 em varios paineis.
+    // Mesmo metodo estavel usado nos canais ao vivo: arquivo em /data + sceAvPlayerAddSource(caminho).
     bool startFile(const std::string &url) {
+        const char *path = "/data/kickiptv_vod.mp4";
         std::string ext = urlExtension(url);
-        std::string name = vodPlayerName(url);
-        log.push_back(std::string("VOD") + (ext.empty() ? " (sem extensao, painel IPTV)" : " ." + ext) +
-                      ": leitura por HTTP Range -> " + name);
+        log.push_back(std::string("VOD") + (ext.empty() ? " (painel IPTV)" : " ." + ext) +
+                      ": baixando para disco e tocando local");
         presentCb();
-        // 1 conexao + menos cache: no PS4 3x20 MB estourava memoria e fechava o app (CE-34878-0).
-        const int kConns = 1;
-        std::vector<std::shared_ptr<NetClient::Session>> sessions;
-        for (int i = 0; i < kConns; i++) { auto ss = std::make_shared<NetClient::Session>(); ss->recvSec = 25; sessions.push_back(ss); }
-        auto mkFetch = [url](std::shared_ptr<NetClient::Session> ss) -> httpfile::Fetch {
-            return [ss, url](uint64_t from, uint64_t to, std::string &body) -> int {
-                int st = 0;
-                if (!g_net.getRange(*ss, url, from, to, body, st)) return 0;
-                return st;
-            };
-        };
-        auto rd = std::make_shared<httpfile::Reader>(mkFetch(sessions[0]), 8, 4);   // 8 blocos x 1 MB, 4 a frente
-        rd->setOnExit([s0 = sessions[0]] { g_net.closeSession(*s0); });
-        rd->setProbe([s0 = sessions[0], url]() -> uint64_t {
-            std::string b; int st = 0; uint64_t total = 0;
-            if (!g_net.getRange(*s0, url, 0, 0, b, st, &total) || st != 206) return 0;
-            return total;
-        });
-        trace("vod-baixando-tamanho");
-        setHf(rd); rd->start();
-        double w0 = nowSec();
-        while (rd->state() == 0 && nowSec() - w0 < 45) {
-            sceKernelUsleep(50000);
-            if (cancelCb && cancelCb()) { cancelled = true; break; }
-            presentCb();
-        }
-        if (cancelled) { failed = true; releaseHfAsync(); return false; }
-        if (rd->state() != 1) {
-            log.push_back("ERRO: " + (rd->state() == 2 ? rd->error() : std::string("o servidor demorou demais para responder")));
-            releaseHfAsync();
+        remove(path);
+
+        NetClient::Session ss; ss.recvSec = 30;
+        // 1) tamanho
+        std::string tip; int st = 0; uint64_t total = 0;
+        if (!g_net.getRange(ss, url, 0, 0, tip, st, &total) || st != 206 || total < 1024) {
+            log.push_back("ERRO: painel nao informou o tamanho (HTTP " + std::to_string(st) + "). Precisa de Range.");
+            g_net.closeSession(ss);
             failed = true;
             return false;
         }
-        // Pre-aquecimento: espera o 1o bloco (1 MB) antes de abrir o AvPlayer — evita leitura vazia no callback (crash).
-        trace("vod-tamanho-ok");
-        log.push_back("   tamanho do arquivo: " + std::to_string(rd->size() >> 20) + " MB");
+        // Limite pratico no PS4 (espaco + tempo). Episodios muito grandes: avisa e recusa com seguranca.
+        const uint64_t kMax = 450ULL << 20;   // 450 MB
+        if (total > kMax) {
+            log.push_back("ERRO: arquivo muito grande (" + std::to_string(total >> 20) +
+                          " MB). Limite atual: 450 MB para estabilidade.");
+            g_net.closeSession(ss);
+            failed = true;
+            return false;
+        }
+        log.push_back("   tamanho: " + std::to_string(total >> 20) + " MB — baixando...");
         presentCb();
-        {
-            // dispara a 1a leitura (marca want_)
-            uint8_t tip[64];
-            rd->read(tip, 0, 64, 15000);
-            double b0 = nowSec();
-            while (rd->cachedBlocks() < 1 && nowSec() - b0 < 20) {
-                sceKernelUsleep(50000);
-                if (cancelCb && cancelCb()) { cancelled = true; break; }
+
+        FILE *fp = fopen(path, "wb");
+        if (!fp) {
+            log.push_back("ERRO: nao criou " + std::string(path));
+            g_net.closeSession(ss);
+            failed = true;
+            return false;
+        }
+
+        const uint64_t kChunk = 1u << 20;   // 1 MB por Range
+        uint64_t pos = 0;
+        int fails = 0;
+        double lastUi = nowSec();
+        while (pos < total) {
+            if (cancelCb && cancelCb()) { cancelled = true; break; }
+            uint64_t to = pos + kChunk - 1;
+            if (to >= total) to = total - 1;
+            std::string body;
+            if (!g_net.getRange(ss, url, pos, to, body, st) || (st != 206 && !(st == 200 && pos == 0))) {
+                if (++fails > 8) {
+                    log.push_back("ERRO: download falhou em " + std::to_string(pos >> 20) + " MB (HTTP " + std::to_string(st) + ")");
+                    break;
+                }
+                g_net.closeSession(ss);
+                sceKernelUsleep(200000);
+                continue;
+            }
+            fails = 0;
+            if (fwrite(body.data(), 1, body.size(), fp) != body.size()) {
+                log.push_back("ERRO: disco cheio ao gravar o video");
+                fails = 99;
+                break;
+            }
+            pos += body.size();
+            if (nowSec() - lastUi > 0.2) {
+                lastUi = nowSec();
+                int pct = total ? (int)((pos * 100) / total) : 0;
+                log.push_back("   baixando... " + std::to_string(pct) + "% (" +
+                              std::to_string(pos >> 20) + "/" + std::to_string(total >> 20) + " MB)");
+                // evita log infinito
+                if (log.size() > 40) log.erase(log.begin() + 5, log.begin() + 15);
                 presentCb();
             }
         }
-        if (cancelled) { failed = true; releaseHfAsync(); return false; }
-        if (rd->cachedBlocks() < 1) {
-            log.push_back("ERRO: nao baixou o inicio do arquivo (rede/painel)");
-            releaseHfAsync();
+        fclose(fp);
+        g_net.closeSession(ss);
+
+        if (cancelled) {
+            remove(path);
             failed = true;
             return false;
         }
-        trace("vod-abrindo-player");
+        if (pos < total / 2 || pos < 64 * 1024) {
+            remove(path);
+            failed = true;
+            log.push_back("ERRO: download incompleto");
+            return false;
+        }
+
+        // Checagem minima de MP4 (ftyp). Se nao for, nao abre o decoder (evita CE-34878-0).
+        {
+            FILE *ck = fopen(path, "rb");
+            char hdr[12] = {};
+            if (ck) { fread(hdr, 1, 12, ck); fclose(ck); }
+            bool okMp4 = (hdr[4] == 'f' && hdr[5] == 't' && hdr[6] == 'y' && hdr[7] == 'p');
+            if (!okMp4) {
+                log.push_back("ERRO: o arquivo nao parece MP4 (ftyp). Formato nao suportado com seguranca.");
+                remove(path);
+                failed = true;
+                return false;
+            }
+        }
+
+        log.push_back("   download ok — abrindo player local");
         presentCb();
-        // debugLevel 0 no VOD: menos log interno do AvPlayer (mais estavel)
-        if (openSource(name, 2, 0, 20000, true)) {
+        trace("vod-local-open");
+        // cb=0: o AvPlayer abre o ARQUIVO LOCAL (mesmo caminho dos pedacos de live — estavel)
+        if (openSource(path, 0, 0, 15000, true)) {
             audio.start(h); active = true; t0 = lastFps = lastFrameT = nowSec();
+            isVod = true;
             trace("vod-tocando");
-            log.push_back("OK: tocando o arquivo");
+            log.push_back("OK: tocando arquivo local");
             return true;
         }
-        releaseHfAsync();
-        if (cancelled) { failed = true; return false; }
-
-        // Nao tenta mais o fallback "player abre a URL sozinho":
-        // nos paineis IPTV isso costuma falhar ou crashar o processo (CE-34878-0).
+        remove(path);
         failed = true;
-        log.push_back("ERRO: o player nao abriu este arquivo. Prefira streams em MP4.");
+        log.push_back("ERRO: o player nao abriu o arquivo local.");
         return false;
     }
     std::function<void()> presentCb = [] {};   // main liga isto para redesenhar a tela de espera durante as tentativas
@@ -1421,6 +1461,7 @@ struct Player {
             for (int i = 0; i < 4; i++) { static const char *e[] = {"mp4","m2ts","mpg","ts","mkv"}; for (const char *x : e) remove(chunkPath(x, i).c_str()); }
             if (g_feed.outFile) { fclose(g_feed.outFile); g_feed.outFile = nullptr; }
             remove("/data/live.ts");
+            remove("/data/kickiptv_vod.mp4");   // filme/serie baixado para disco
             nextReady = false; prepBusy = false;
             g_tearing--;
         }).detach();
