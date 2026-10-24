@@ -1893,6 +1893,9 @@ int main() {
     // quando termina, o loop principal troca a lista de uma vez. Ordem: copia salva -> se nao houver, baixa da rede.
     ListLoader loader;
     double loaderSay = 0; size_t loaderSayItems = (size_t)-1;
+    // Protecao "fecha sempre ao abrir": enquanto a lista carrega (e uns segundos depois de aparecer no menu) fica gravado "bgload=1".
+    // Se o app cair nesse intervalo, na proxima abertura a lista NAO e carregada sozinha (o app abre e explica), em vez de cair de novo.
+    double bgloadClearAt = 0;
     auto startLoader = [&](const std::string &url) {
         g_net.init();                                                 // a rede e inicializada na thread principal
         int slot = -1; std::string cu; pf.cacheInfo(slot, cu);
@@ -1901,6 +1904,7 @@ int main() {
             [cslot](const std::string &, const ListLoader::Sink &sink, const std::atomic<bool> &stop) { return Ps4Platform::cacheReadSlot(cslot, sink, stop); },
             [&pf, slot](const std::string &u, const ListLoader::Sink &sink, const std::atomic<bool> &stop) { return pf.netDownloadBg(u, slot, sink, stop); });
         loaderSay = 0; loaderSayItems = (size_t)-1;
+        pf.saveSetting("bgload", "1");
         trace("lista-bg-inicio");
     };
 
@@ -1988,6 +1992,7 @@ int main() {
         bool wasSafe = pf.loadSetting("safem3u") == "1";
         if (wasSafe) g_safeM3U = true;
         bool skipAuto = false;
+        if (pf.loadSetting("bgload") == "1") { skipAuto = true; trace("bgload-caiu"); }    // a ultima abertura caiu carregando a lista
         if (crashM3u) {
             if (!wasSafe) { g_safeM3U = true; pf.saveSetting("safem3u", "1"); trace("modo-seguro-ligado"); }
             else skipAuto = true;
@@ -2176,12 +2181,14 @@ int main() {
         {
             std::shared_ptr<Playlist> pl; ListLoader::State lst = ListLoader::Idle;
             if (loader.take(pl, lst)) {
+                bgloadClearAt = nowSec() + 4.0;           // o menu ja vai desenhar a lista nova (capas etc.): so depois disso e que "deu certo"
                 if (pl) {
                     app.list = std::move(*pl);
                     for (int i = 0; i < 4; i++) ui.cursor[i] = ui.scroll[i] = ui.catCur[i] = ui.catScroll[i] = 0;
                     ui.level = 0; ui.inItems = false;
                     std::string src = loader.fromNet() ? "  |  baixada e salva" : "  |  lista salva";
-                    if (lst == ListLoader::Partial) app.say("Aviso: lista incompleta (" + std::string(loader.outOfMemory() ? "acabou a memoria" : "a conexao caiu") + ") - " + app.summary());
+                    if (pl->truncated) app.say("Aviso: lista enorme - so os primeiros itens cabem na memoria do PS4 - " + app.summary());
+                    else if (lst == ListLoader::Partial) app.say("Aviso: lista incompleta (" + std::string(loader.outOfMemory() ? "acabou a memoria" : "a conexao caiu") + ") - " + app.summary());
                     else app.say(app.summary() + src);
                     trace("lista-bg-ok");
                 } else if (lst == ListLoader::Failed) {
@@ -2191,6 +2198,8 @@ int main() {
                 dirty = true;
             }
         }
+
+        if (bgloadClearAt > 0 && nowSec() >= bgloadClearAt) { pf.saveSetting("bgload", ""); bgloadClearAt = 0; trace("bgload-ok"); }
 
         if (pf.kbdRequested) {                    // X em "Digitar @streamer": abre o teclado na tela
             pf.kbdRequested = false;
@@ -2207,7 +2216,10 @@ int main() {
             if (ui.textKind == 2) app.say(typed.empty() ? "Removendo a lista M3U..." : "Baixando a lista M3U...");
             else app.say("Buscando @" + kickSlug(typed) + " na Kick...");
             presentMenu();
+            bool listLoad = ui.textKind == 2;
+            if (listLoad) pf.saveSetting("bgload", typed.empty() ? "" : "1");     // download manual da lista tambem e protegido
             ui.onText(typed);                    // httpGet + (se ao vivo) play()
+            if (listLoad && !typed.empty()) bgloadClearAt = nowSec() + 4.0;
             trace("texto-processado");
             dirty = true;
         }
@@ -2259,6 +2271,7 @@ int main() {
     }
     // ---- encerramento limpo: nenhuma thread pode estar viva ao sair (std::thread ativa no fim = "terminate" = erro no PS4) ----
     trace("saindo");
+    pf.saveSetting("bgload", "");               // saida normal: nao foi queda
     if (!loader.cancel(2.0)) { trace("fim-forcado"); _Exit(0); }      // thread de lista presa na rede: sai sem rodar destrutores
     g_covers.shutdown();
     if (player.h || player.h2 || mode == Mode::Play) player.stop();
