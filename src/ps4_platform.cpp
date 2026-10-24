@@ -74,11 +74,7 @@ int sceHttpSetRecvTimeOut(int id, unsigned usec);
 int sceHttpSetResolveTimeOut(int id, unsigned usec);
 }
 
-// Heap da libc sem limite: sem isso o malloc acaba (lista M3U grande + cache do filme + buffers do AvPlayer) e o app fecha.
-extern "C" {
-unsigned int sceLibcHeapExtendedAlloc = 1;
-size_t sceLibcHeapSize = 0xFFFFFFFFFFFFFFFFULL;   // SCE_LIBC_HEAP_SIZE_EXTENDED_ALLOC_NO_LIMIT
-}
+// (nao defina sceLibcHeapSize/sceLibcHeapExtendedAlloc aqui: no OpenOrbis isso derrubou o app antes de abrir. O limite de memoria da lista e o orcamento do PlaylistBuilder.)
 static void trace(const char *stage);   // (definida mais abaixo)
 // Marcadores finos do download da lista M3U: se o app fechar, a proxima abertura mostra o ULTIMO passo que foi gravado.
 static bool g_traceHttp = false;                 // so durante o download da lista M3U
