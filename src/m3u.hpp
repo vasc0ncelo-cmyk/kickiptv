@@ -45,7 +45,9 @@ public:
     bool full() const { return full_; }       // atingiu o orcamento de memoria: o resto da lista e ignorado (Playlist::truncated)
     // Orcamento de memoria da lista (estimado). Listas de IPTV chegam a 350 mil+ itens (~330 bytes cada = 115 MB+); no PS4 isso,
     // somado ao resto do app, faz o sistema fechar o app. Medido: 90 MB ~ 250 mil itens (a lista que ja carregou 200 mil sem problemas).
-    static const size_t kMaxBytes = 90u * 1024 * 1024;
+    // Orcamento de memoria da lista (bytes estimados). Padrao 90 MB (testes); o PS4 sobe isso no inicio (heap sem limite),
+    // porque lista cortada nao e aceitavel. Se a memoria acabar de verdade, App::loadM3U trata o bad_alloc e aproveita o que leu.
+    static size_t &maxBytes() { static size_t v = 90u * 1024 * 1024; return v; }
 
 private:
     void line(std::string &l);
