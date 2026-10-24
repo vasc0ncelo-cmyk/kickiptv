@@ -169,6 +169,20 @@ int main() {
         uc.inItems = true; uc.handle(Input::PageDown); uc.handle(Input::PageDown); { Rec r; uc.render(r); }
         assert(calls >= 2 && front[0] == "http://img/32.jpg");   // cursor 48 -> primeira linha visivel = 4 (poster 32)
     }
+    // --- lista enorme: o baixador de capas em segundo plano recebe so as primeiras (nao copia centenas de milhares de enderecos) ---
+    {
+        Fake fb; App ab(fb); UI ub(ab);
+        std::string m = "#EXTM3U\n";
+        for (int i = 0; i < 30000; i++) m += "#EXTINF:-1 tvg-logo=\"http://img/m" + std::to_string(i) + ".jpg\" group-title=\"FILMES | Todos\",Filme " + std::to_string(i) + "\nhttp://h/m/" + std::to_string(i) + ".mp4\n";
+        for (int i = 0; i < 30000; i++) m += "#EXTINF:-1 tvg-logo=\"http://img/c" + std::to_string(i) + ".jpg\" group-title=\"Abertos\",Canal " + std::to_string(i) + "\nhttp://h/live/" + std::to_string(i) + ".ts\n";
+        ab.list = buildPlaylist(m);
+        std::vector<std::string> bg; int bgCalls = 0;
+        ub.coverBackground = [&](std::vector<std::string> v) { bg = std::move(v); bgCalls++; };
+        ub.screen = Screen::List; ub.tab = Tab::Movies;
+        { Rec r; ub.render(r); }
+        assert(bgCalls == 1 && bg.size() <= 3 * 1200 && bg.size() >= 2400);
+        assert(bg[0] == "http://img/m0.jpg");                                          // as primeiras de cada aba vem primeiro
+    }
     // --- uiFit: corta com "..." sem estourar a largura e sem quebrar UTF-8 ---
     {
         Rec r; std::string longo(200, 'a');
