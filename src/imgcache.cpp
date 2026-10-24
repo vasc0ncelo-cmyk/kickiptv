@@ -5,6 +5,9 @@
 #include <cstring>
 #include <sys/stat.h>
 
+// PS4/OpenOrbis: nada de thread_local (TLS no eboot derruba o app na abertura) nem de stdio dentro do stb (so decodificamos da memoria).
+#define STBI_NO_THREAD_LOCALS
+#define STBI_NO_STDIO
 #define STBI_NO_HDR
 #define STBI_NO_PIC
 #define STBI_NO_PNM
