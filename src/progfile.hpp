@@ -183,6 +183,25 @@ inline std::string audioNote(const Info &in) {
 
 }  // namespace mp4
 
+// Matroska (.mkv): o cabecalho (Tracks) fica nos primeiros bytes e traz o codec como texto ("V_MPEGH/ISO/HEVC"...).
+namespace mkv {
+inline bool has(const std::string &h, const char *s) { return h.find(s) != std::string::npos; }
+// info: resumo dos codecs; warn: "" = parece compativel
+inline void scan(const std::string &head, std::string &info, std::string &warn) {
+    info.clear(); warn.clear();
+    if (head.size() < 4 || (uint8_t)head[0] != 0x1A || (uint8_t)head[1] != 0x45 || (uint8_t)head[2] != 0xDF || (uint8_t)head[3] != 0xA3) return;
+    std::string v, a;
+    if (has(head, "V_MPEGH/ISO/HEVC")) { v = "HEVC"; warn = "o video e HEVC/H.265, que o player do PS4 nao decodifica"; }
+    else if (has(head, "V_AV1")) { v = "AV1"; warn = "o video e AV1, que o player do PS4 nao decodifica"; }
+    else if (has(head, "V_VP9")) { v = "VP9"; warn = "o video e VP9, que o player do PS4 nao decodifica"; }
+    else if (has(head, "V_MPEG4/ISO/AVC")) v = "H.264";
+    if (has(head, "A_AAC")) a = "AAC"; else if (has(head, "A_AC3")) a = "AC3"; else if (has(head, "A_EAC3")) a = "EAC3";
+    else if (has(head, "A_DTS")) a = "DTS"; else if (has(head, "A_TRUEHD")) a = "TrueHD"; else if (has(head, "A_OPUS")) a = "Opus";
+    else if (has(head, "A_MPEG/L3")) a = "MP3";
+    if (!v.empty() || !a.empty()) info = "mkv  |  video " + (v.empty() ? std::string("?") : v) + "  |  audio " + (a.empty() ? std::string("?") : a);
+}
+}  // namespace mkv
+
 // ---------------------------------------------------------------------------------------------------------------------
 class Downloader {
 public:
@@ -311,6 +330,7 @@ private:
         std::string head0;
         if (!fetchRetry(0, std::min<uint64_t>(total_, kBlock) - 1, head0)) return;
         bool mp4f = head0.size() >= 12 && memcmp(head0.data() + 4, "ftyp", 4) == 0;
+        if (!mp4f) { std::string i, w; mkv::scan(head0, i, w); std::lock_guard<std::mutex> l(m_); if (!i.empty()) info_ = i; warn_ = w; }
         uint64_t mo = 0, ms = 0;
         if (mp4f && !findMoov(head0, mo, ms)) return;
         if (ms > kMaxIndex) { fail("indice do filme grande demais"); return; }
