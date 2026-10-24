@@ -89,7 +89,7 @@ struct App {
         }
         if (total == 0) { say("Falha: o link nao devolveu uma lista M3U valida"); return false; }
         list = b.take();
-        say(summary());
+        say(summary() + truncNote());
         return true;
     }
 
@@ -114,9 +114,12 @@ struct App {
         if (!ok) { if (pf.wasCancelled()) { say("Carregamento cancelado"); return -1; } return 0; }
         if (b.count() == 0) return 0;
         list = b.take();
-        say(summary() + "  |  lista salva (confirme o link para atualizar)");
+        say(summary() + "  |  lista salva" + truncNote());
         return 1;
     }
+
+    // aviso quando a lista passou do limite de memoria e so os primeiros itens foram carregados
+    std::string truncNote() const { return list.truncated ? "  |  lista enorme: so os primeiros itens cabem na memoria" : ""; }
 
     std::string summary() const {
         return "Canais: " + std::to_string(list.channels.size()) + " | Filmes: " + std::to_string(list.movies.size()) +
