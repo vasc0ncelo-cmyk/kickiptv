@@ -364,7 +364,8 @@ struct UI {
     std::function<bool(const std::string &, const uint32_t *&, int &, int &)> coverGet;
     // pede as capas: 1o argumento = o que esta na tela (em ordem), 2o = proximas paginas (pre-carregamento)
     std::function<void(const std::vector<std::string> &, const std::vector<std::string> &)> coverBatch;
-    std::string lastBatchKey;
+    std::function<void(std::vector<std::string>)> coverBackground;   // lista inteira de capas, para baixar em segundo plano
+    std::string lastBatchKey, lastBgKey;
     Screen screen = Screen::Home;
     Tab tab = Tab::Kick;
     int homeRow = 1;          // 0 = banner, 1 = atalhos, 2 = lista M3U
@@ -461,6 +462,26 @@ struct UI {
         for (int i = firstVisible + visibleCount; i < firstVisible + visibleCount * 3 && i < n; i++) back.push_back(itemLogo(i));   // 2 paginas adiante
         for (int i = std::max(0, firstVisible - per); i < firstVisible; i++) back.push_back(itemLogo(i));                           // e a anterior
         coverBatch(front, back);
+    }
+    // Todas as capas da lista, em ordem de importancia (as 3 abas intercaladas: primeira categoria de cada uma primeiro).
+    // O baixador de fundo guarda isso no disco; depois disso abrir qualquer aba mostra as capas na hora.
+    void backgroundCovers() {
+        if (!coverBackground) return;
+        const Playlist &p = app.list;
+        std::string key = std::to_string(p.channels.size()) + "|" + std::to_string(p.movies.size()) + "|" + std::to_string(p.seriesTree.size());
+        if (key == lastBgKey) return;
+        lastBgKey = key;
+        std::vector<std::string> mv, sr, ch;
+        for (const auto &c : p.movieCats) for (uint32_t i : c.items) mv.push_back(p.movies[i].logo);
+        for (const auto &c : p.seriesCats) for (const auto &n : c.series) sr.push_back(seriesLogo(n));
+        for (const auto &c : p.channelCats) for (uint32_t i : c.items) ch.push_back(p.channels[i].logo);
+        std::vector<std::string> all;
+        for (size_t i = 0; i < std::max(mv.size(), std::max(sr.size(), ch.size())); i++) {   // intercala as 3 listas
+            if (i < mv.size()) all.push_back(mv[i]);
+            if (i < sr.size()) all.push_back(sr[i]);
+            if (i < ch.size()) all.push_back(ch[i]);
+        }
+        coverBackground(std::move(all));
     }
     // Inicio: ja baixa as primeiras capas de cada aba (quando a lista carrega), para abrir tudo com as capas prontas
     void wantHomeCovers() {
@@ -580,6 +601,7 @@ struct UI {
 
     // ---------- Desenho ----------
     void render(Renderer &r) {
+        backgroundCovers();
         uiHeader(r, timeText, dateText);
         if (screen == Screen::Home) renderHome(r); else renderList(r);
         renderFooter(r);
