@@ -471,15 +471,19 @@ struct UI {
         std::string key = std::to_string(p.channels.size()) + "|" + std::to_string(p.movies.size()) + "|" + std::to_string(p.seriesTree.size());
         if (key == lastBgKey) return;
         lastBgKey = key;
+        // So as primeiras capas de cada aba (as outras sao baixadas quando aparecem na tela). Antes copiava o endereco de TODAS as
+        // capas (centenas de milhares de textos, varias copias) e isso estourava a memoria assim que a lista terminava de carregar.
+        const size_t kCap = 1200;
         std::vector<std::string> mv, sr, ch;
-        for (const auto &c : p.movieCats) for (uint32_t i : c.items) mv.push_back(p.movies[i].logo);
-        for (const auto &c : p.seriesCats) for (const auto &n : c.series) sr.push_back(seriesLogo(n));
-        for (const auto &c : p.channelCats) for (uint32_t i : c.items) ch.push_back(p.channels[i].logo);
+        for (const auto &c : p.movieCats) { for (uint32_t i : c.items) { if (mv.size() >= kCap) break; mv.push_back(p.movies[i].logo); } if (mv.size() >= kCap) break; }
+        for (const auto &c : p.seriesCats) { for (const auto &n : c.series) { if (sr.size() >= kCap) break; sr.push_back(seriesLogo(n)); } if (sr.size() >= kCap) break; }
+        for (const auto &c : p.channelCats) { for (uint32_t i : c.items) { if (ch.size() >= kCap) break; ch.push_back(p.channels[i].logo); } if (ch.size() >= kCap) break; }
         std::vector<std::string> all;
+        all.reserve(mv.size() + sr.size() + ch.size());
         for (size_t i = 0; i < std::max(mv.size(), std::max(sr.size(), ch.size())); i++) {   // intercala as 3 listas
-            if (i < mv.size()) all.push_back(mv[i]);
-            if (i < sr.size()) all.push_back(sr[i]);
-            if (i < ch.size()) all.push_back(ch[i]);
+            if (i < mv.size()) all.push_back(std::move(mv[i]));
+            if (i < sr.size()) all.push_back(std::move(sr[i]));
+            if (i < ch.size()) all.push_back(std::move(ch[i]));
         }
         coverBackground(std::move(all));
     }
