@@ -584,7 +584,7 @@ struct BootScreen {
 // ---------- Registro de passos em /data/kickiptv.log ----------
 // Se o app cair, na proxima abertura o menu mostra em qual passo ele parou.
 static std::string g_prevStage;           // (leitura do log anterior removida: usava fread, que o app original nao importava)
-static const bool kCoversOn = true;    // capas de filmes, series e canais (false = desliga para testar quedas)
+static const bool kCoversOn = false;   // capas DESLIGADAS (teste para o app abrir): nao baixa nem decodifica capas, sem threads de capa. true = liga.
 static std::string g_prevRaw = "(nenhum)";      // ultima linha do log da vez anterior, mesmo se foi saida normal
 static std::vector<std::string> g_prevTail;   // ultimas linhas do log da vez anterior (so quando o app nao saiu direito)
 static void traceInit() {
@@ -2042,8 +2042,10 @@ int main() {
         if (ui.hasSavedList() && skipAuto) {
             app.say("A lista M3U fechou o app na ultima vez - abra LISTA M3U e aperte X.");
         } else if (ui.hasSavedList()) {
-            startLoader(ui.m3uUrl);                       // lista sobe em segundo plano; o app ja responde
-            app.say("Carregando sua lista M3U...");
+            // SEM download em segundo plano (teste para o app abrir): a lista NAO carrega sozinha ao abrir.
+            // Para carregar: LISTA M3U > X (baixa na hora, com andamento na tela e O cancela).
+            (void)startLoader;
+            app.say("Lista M3U salva. Para carregar: abra LISTA M3U e aperte X.");
         }
     }
 
