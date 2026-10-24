@@ -1,0 +1,130 @@
+// Painel Xtream: categorias na conexao, itens so quando a categoria abre.
+#include "../src/ui.hpp"
+#include <cassert>
+#include <iostream>
+
+struct Rec : Renderer {
+    std::vector<std::string> texts;
+    int width() const override { return 1920; }
+    int height() const override { return 1080; }
+    void fillRect(int, int, int, int, unsigned) override {}
+    void drawText(int, int, const std::string &t, unsigned, int) override { texts.push_back(t); }
+    bool has(const std::string &s) { for (auto &t : texts) if (t == s) return true; return false; }
+};
+
+struct XtFake : Platform {
+    std::vector<std::string> calls; bool authOk = true, api = true; int bigItems = 0;
+    std::string played; std::map<std::string, std::string> store;
+    int count(const std::string &needle) const { int n = 0; for (auto &c : calls) if (c.find(needle) != std::string::npos) n++; return n; }
+    bool httpGet(const std::string &url, std::string &body) override {
+        calls.push_back(url);
+        if (url.find("player_api.php") == std::string::npos) { body = "#EXTM3U\n#EXTINF:-1 group-title=\"Abertos\",Globo\nhttp://h/live/1.ts\n"; return true; }
+        if (!api) { body = "<html>404</html>"; return true; }
+        if (url.find("action=") == std::string::npos) { body = authOk ? "{\"user_info\":{\"auth\":1,\"status\":\"Active\"},\"server_info\":{}}" : "{\"user_info\":{\"auth\":0}}"; return true; }
+        if (url.find("get_live_categories") != std::string::npos) { body = "[{\"category_id\":\"1\",\"category_name\":\"CANAIS | Abertos\"},{\"category_id\":\"2\",\"category_name\":\"Esportes\"}]"; return true; }
+        if (url.find("get_vod_categories") != std::string::npos) { body = "[{\"category_id\":\"10\",\"category_name\":\"FILMES | A\\u00e7\\u00e3o\"},{\"category_id\":\"11\",\"category_name\":\"Drama\"},{\"category_id\":\"12\",\"category_name\":\"Enorme\"}]"; return true; }
+        if (url.find("get_series_categories") != std::string::npos) { body = "[{\"category_id\":\"20\",\"category_name\":\"Drama\"}]"; return true; }
+        if (url.find("get_live_streams&category_id=2") != std::string::npos) { body = "[{\"name\":\"SporTV\",\"stream_id\":501,\"stream_icon\":\"http://i/s.png\"},{\"name\":\"ESPN\",\"stream_id\":\"502\"}]"; return true; }
+        if (url.find("get_vod_streams&category_id=10") != std::string::npos) { body = "[{\"name\":\"Duro de Matar\",\"stream_id\":7,\"container_extension\":\"mkv\",\"stream_icon\":\"http://i/dm.jpg\"},{\"name\":\"Sem ext\",\"stream_id\":8}]"; return true; }
+        if (url.find("get_vod_streams&category_id=11") != std::string::npos) { body = "[{\"name\":\"Titanic\",\"stream_id\":9,\"container_extension\":\"mp4\"}]"; return true; }
+        if (url.find("get_vod_streams&category_id=12") != std::string::npos) {
+            body = "[";
+            for (int i = 0; i < bigItems; i++) { if (i) body += ","; body += "{\"name\":\"Filme " + std::to_string(i) + "\",\"stream_id\":" + std::to_string(100000 + i) + ",\"container_extension\":\"mp4\"}"; }
+            body += "]"; return true;
+        }
+        if (url.find("get_series&category_id=20") != std::string::npos) { body = "[{\"name\":\"Zeta\",\"series_id\":98,\"cover\":\"http://i/z.jpg\"},{\"name\":\"4Ever\",\"series_id\":99,\"cover\":\"http://i/4.jpg\"},{\"name\":\"Vazia\",\"series_id\":97}]"; return true; }
+        if (url.find("get_series_info&series_id=99") != std::string::npos) {
+            body = "{\"info\":{\"cover\":\"http://i/4.jpg\"},\"episodes\":{\"2\":[{\"id\":\"302\",\"episode_num\":1,\"title\":\"X\",\"container_extension\":\"mp4\"}],"
+                   "\"1\":[{\"id\":\"202\",\"episode_num\":2,\"title\":\"B\",\"container_extension\":\"mp4\"},{\"id\":\"201\",\"episode_num\":1,\"title\":\"A\",\"container_extension\":\"mp4\",\"info\":{\"movie_image\":\"http://i/e1.jpg\"}}]}}";
+            return true;
+        }
+        if (url.find("get_series_info&series_id=97") != std::string::npos) { body = "{\"info\":{},\"episodes\":[]}"; return true; }
+        body = "[]"; return true;
+    }
+    void play(const std::string &url, const std::string &) override { played = url; }
+    void requestText(const std::string &) override {}
+    std::string loadSetting(const std::string &k) override { return store[k]; }
+    void saveSetting(const std::string &k, const std::string &v) override { store[k] = v; }
+};
+
+int main() {
+    const std::string url = "http://180381.sbs/get.php?username=Dirce0273&password=Sar5438&type=m3u_plus&output=ts";
+    // --- conexao: so categorias (nao baixa nenhuma lista M3U gigante nem nenhum item) ---
+    XtFake x; App a(x); UI ui(a);
+    assert(a.loadM3U(url) && a.xt.active && a.list.xtream && !a.list.empty());
+    assert(a.lastStatus == "Painel IPTV: 2 categorias de canais | 3 de filmes | 1 de series");
+    assert(x.calls.size() == 4 && x.calls[0] == "http://180381.sbs/player_api.php?username=Dirce0273&password=Sar5438");
+    assert(x.count("get.php") == 0 && x.count("_streams") == 0 && x.count("get_series&") == 0);
+    assert(a.list.movieCats[0].name == "A\xC3\xA7\xC3\xA3o" && a.list.channelCats[0].name == "Abertos" && a.list.movieCats[0].unloaded());
+    assert(a.list.channels.empty() && a.list.movies.empty());
+
+    // --- UI: abrir categoria de FILMES baixa so aquela ---
+    ui.screen = Screen::List; ui.tab = Tab::Movies;
+    { Rec r; ui.render(r); assert(r.has("Aperte X para abrir a categoria")); }
+    ui.handle(Input::Confirm);                                                       // categoria "Acao"
+    assert(ui.inItems && ui.itemCount() == 2 && ui.itemLabel(0) == "Duro de Matar" && x.count("get_vod_streams") == 1);
+    assert(a.list.movies[0].url == "http://180381.sbs/movie/Dirce0273/Sar5438/7.mkv" && a.list.movies[0].logo == "http://i/dm.jpg");
+    assert(a.list.movies[1].url == "http://180381.sbs/movie/Dirce0273/Sar5438/8.mp4");
+    ui.handle(Input::Confirm); assert(x.played == "http://180381.sbs/movie/Dirce0273/Sar5438/7.mkv");
+    ui.handle(Input::Back); assert(!ui.inItems);                                     // volta para as categorias
+    ui.handle(Input::Confirm); assert(x.count("get_vod_streams") == 1);             // reabrir: nao baixa de novo
+    ui.handle(Input::Back); ui.handle(Input::Down); ui.handle(Input::Confirm);       // categoria "Drama"
+    assert(ui.itemCount() == 1 && ui.itemLabel(0) == "Titanic" && x.count("get_vod_streams") == 2);
+    { Rec r; ui.render(r); assert(r.has("Titanic")); }
+
+    // --- CANAIS ---
+    ui.tab = Tab::Channels; ui.inItems = false; ui.catCur[1] = 1; ui.handle(Input::Confirm);
+    assert(ui.itemCount() == 2 && a.list.channels[0].url == "http://180381.sbs/live/Dirce0273/Sar5438/501.ts" && a.list.channels[1].url.find("/502.ts") != std::string::npos);
+    ui.handle(Input::Confirm); assert(x.played.find("/live/") != std::string::npos);
+
+    // --- SERIES: serie -> (baixa episodios so agora) -> temporadas -> episodios ordenados ---
+    ui.tab = Tab::Series; ui.inItems = false; ui.level = 0; ui.catCur[3] = 0;
+    ui.handle(Input::Confirm);                                                       // categoria "Drama"
+    assert(ui.itemCount() == 3 && ui.itemLabel(0) == "4Ever" && ui.itemLabel(2) == "Zeta" && x.count("get_series_info") == 0);   // ordenadas
+    assert(ui.itemLogo(0) == "http://i/4.jpg");                                      // capa vem da lista (antes de abrir a serie)
+    ui.handle(Input::Confirm);                                                       // abre "4Ever"
+    assert(x.count("get_series_info") == 1 && ui.level == 1 && ui.itemCount() == 2 && ui.itemLabel(0) == "Temporada 1" && ui.itemLabel(1) == "Temporada 2");
+    ui.handle(Input::Confirm); assert(ui.level == 2 && ui.itemCount() == 2 && ui.itemLabel(0) == "Ep 1 - A" && ui.itemLabel(1) == "Ep 2 - B");
+    assert(ui.itemLogo(0) == "http://i/e1.jpg" && ui.itemLogo(1) == "http://i/4.jpg");   // capa do episodio, senao a da serie
+    ui.handle(Input::Confirm); assert(x.played == "http://180381.sbs/series/Dirce0273/Sar5438/201.mp4");
+    ui.handle(Input::Back); ui.handle(Input::Back);                                  // volta para a lista de series
+    ui.handle(Input::Confirm); assert(x.count("get_series_info") == 1);              // mesma serie: nao baixa de novo
+    ui.handle(Input::Back);
+    ui.handle(Input::Right); ui.handle(Input::Confirm);                               // "Vazia" (a grade anda com as setas): sem episodios -> fica na lista, avisa
+    assert(ui.level == 0 && a.lastStatus.find("sem episodios") != std::string::npos);
+
+    // --- memoria: passou de ~100 mil itens carregados -> libera as categorias antigas ao abrir outra ---
+    { XtFake y; y.bigItems = 105000; App b(y); UI u(b); assert(b.loadM3U(url));
+      u.screen = Screen::List; u.tab = Tab::Movies; u.catCur[2] = 2; u.handle(Input::Confirm);          // "Enorme": 105 mil filmes
+      assert(u.itemCount() == 105000 && b.list.movies.size() == 105000);
+      u.handle(Input::Back); u.catCur[2] = 0; u.handle(Input::Confirm);                                  // abre outra categoria
+      assert(b.list.movies.size() == 2 && u.itemLabel(0) == "Duro de Matar" && b.list.movieCats[2].unloaded());   // a enorme foi descartada
+      u.handle(Input::Back); u.catCur[2] = 2; u.handle(Input::Confirm); assert(u.itemCount() == 105000);     // e volta a carregar ao reabrir
+    }
+
+    // --- painel recusa o login: avisa, nao baixa a lista gigante ---
+    { XtFake y; y.authOk = false; App b(y); assert(!b.loadM3U(url) && b.lastStatus.find("recusou") != std::string::npos && !b.list.xtream && y.count("get.php") == 0); }
+    // --- painel sem API / link M3U comum: usa a lista M3U ---
+    { XtFake y; y.api = false; App b(y); assert(b.loadM3U(url) && !b.xt.active && b.list.channels.size() == 1); }
+    { XtFake y; App b(y); assert(b.loadM3U("http://h/lista.m3u") && !b.xt.active && b.list.channels.size() == 1 && y.count("player_api") == 0); }
+    // --- remover a lista tambem limpa o modo Xtream ---
+    ui.setM3U(""); assert(!a.xt.active && a.list.empty());
+
+    // --- conexao em segundo plano (o app abre e responde na hora) ---
+    {
+        XtFake y; XtLoader ld;
+        ld.start(url, [&](const std::string &u, std::string &b) { std::this_thread::sleep_for(std::chrono::milliseconds(20)); return y.httpGet(u, b); });
+        XtLoader::Result r; int spins = 0;
+        while (!ld.take(r)) { assert(spins++ < 2000); std::this_thread::sleep_for(std::chrono::milliseconds(2)); }
+        assert(r.code == 1 && r.list && r.list->xtream && r.list->movieCats.size() == 3 && r.acct.user == "Dirce0273");
+        assert(!ld.take(r));                                                                             // so entrega uma vez
+        App b(y); b.useXtream(r.acct, std::move(*r.list)); assert(b.xt.active && b.ensureCategory(Tab::Movies, 1) && b.list.movies.size() == 1);
+        XtFake z; z.authOk = false; ld.start(url, [&](const std::string &u, std::string &b) { return z.httpGet(u, b); });
+        while (!ld.take(r)) std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        assert(r.code == 2 && !r.msg.empty());
+        ld.start("http://h/lista.m3u", [&](const std::string &u, std::string &b) { return y.httpGet(u, b); });
+        while (!ld.take(r)) std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        assert(r.code == 0);
+    }
+    std::cout << "OK\n";
+}
