@@ -362,6 +362,9 @@ struct UI {
     App &app;
     std::function<void(const std::string &)> coverRequest;
     std::function<bool(const std::string &, const uint32_t *&, int &, int &)> coverGet;
+    // pede as capas: 1o argumento = o que esta na tela (em ordem), 2o = proximas paginas (pre-carregamento)
+    std::function<void(const std::vector<std::string> &, const std::vector<std::string> &)> coverBatch;
+    std::string lastBatchKey;
     Screen screen = Screen::Home;
     Tab tab = Tab::Kick;
     int homeRow = 1;          // 0 = banner, 1 = atalhos, 2 = lista M3U
@@ -378,6 +381,8 @@ struct UI {
     std::string timeText, dateText;   // relogio (a plataforma atualiza)
     int textKind = 0;         // 0 nada, 1 = @streamer, 2 = endereco M3U (o que o teclado esta pedindo)
     static const int kRows = 10;
+    static const int ImgW = 148, ImgH = 222;       // tamanho do poster (igual ao da miniatura em imgcache.hpp)
+    static const int kCols = 8, kGridRows = 3;     // grade de posters (Filmes, Series, Canais)
 
     explicit UI(App &a) : app(a) {}
 
@@ -434,6 +439,43 @@ struct UI {
     // Quantidade de itens e nome de UM item, sem copiar a lista inteira.
     // (Antes, cada aperto de botao e cada quadro copiavam o nome de TODOS os canais: com listas de milhares de canais isso travava.)
     static bool browsable(Tab t) { return t != Tab::Kick; }
+    bool gridMode() const { return browsable(tab) && !(tab == Tab::Series && level > 0); }   // temporadas/episodios continuam em lista
+    std::string seriesLogo(const std::string &name) const {
+        auto it = app.list.seriesTree.find(name);
+        if (it == app.list.seriesTree.end() || it->second.empty()) return "";
+        const auto &eps = it->second.begin()->second;
+        return eps.empty() ? "" : eps[0].logo;
+    }
+    // pede as capas da tela atual (so quando algo mudou) e das proximas paginas, para ja estarem prontas
+    void wantCovers(int firstVisible, int visibleCount) {
+        if (!coverBatch) return;
+        const Playlist &p = app.list;
+        int n = itemCount();
+        std::string key = std::to_string((int)tab) + "|" + std::to_string(catCur[(int)tab]) + "|" + std::to_string(level) + "|" + curSeries + "|" +
+                          std::to_string(curSeason) + "|" + std::to_string(firstVisible) + "|" + std::to_string(p.channels.size() + p.movies.size() * 7 + p.seriesTree.size() * 13);
+        if (key == lastBatchKey) return;
+        lastBatchKey = key;
+        std::vector<std::string> front, back;
+        for (int i = firstVisible; i < firstVisible + visibleCount && i < n; i++) front.push_back(itemLogo(i));
+        int per = visibleCount;
+        for (int i = firstVisible + visibleCount; i < firstVisible + visibleCount * 3 && i < n; i++) back.push_back(itemLogo(i));   // 2 paginas adiante
+        for (int i = std::max(0, firstVisible - per); i < firstVisible; i++) back.push_back(itemLogo(i));                           // e a anterior
+        coverBatch(front, back);
+    }
+    // Inicio: ja baixa as primeiras capas de cada aba (quando a lista carrega), para abrir tudo com as capas prontas
+    void wantHomeCovers() {
+        if (!coverBatch) return;
+        const Playlist &p = app.list;
+        std::string key = "H|" + std::to_string(p.channels.size()) + "|" + std::to_string(p.movies.size()) + "|" + std::to_string(p.seriesTree.size());
+        if (key == lastBatchKey) return;
+        lastBatchKey = key;
+        std::vector<std::string> back;
+        const int per = kCols * kGridRows;
+        if (!p.movieCats.empty()) for (size_t i = 0; i < p.movieCats[0].items.size() && (int)i < per; i++) back.push_back(p.movies[p.movieCats[0].items[i]].logo);
+        if (!p.seriesCats.empty()) for (size_t i = 0; i < p.seriesCats[0].series.size() && (int)i < per; i++) back.push_back(seriesLogo(p.seriesCats[0].series[i]));
+        if (!p.channelCats.empty()) for (size_t i = 0; i < p.channelCats[0].items.size() && (int)i < per; i++) back.push_back(p.channels[p.channelCats[0].items[i]].logo);
+        coverBatch({}, back);
+    }
     const std::vector<Category> &cats(Tab t) const {
         const Playlist &p = app.list;
         return t == Tab::Channels ? p.channelCats : t == Tab::Movies ? p.movieCats : p.seriesCats;
@@ -517,7 +559,7 @@ struct UI {
         }
         if (!browsable(tab)) { handleItems(in); return; }
         if (inItems) {
-            if (in == Input::Left) { goBack(); return; }       // volta para as categorias (ou um nivel acima em Series)
+            if (in == Input::Left && !(gridMode() && cursor[t] % kCols != 0)) { goBack(); return; }   // 1a coluna: volta para as categorias (ou um nivel acima em Series)
             handleItems(in); return;
         }
         // ---- foco na barra de categorias ----
@@ -559,6 +601,25 @@ private:
     }
     void handleItems(Input in) {
         int t = (int)tab, n = itemCount();
+        if (gridMode()) {                                  // grade de posters: setas andam de 1 em 1 (esq/dir) e de linha em linha (cima/baixo)
+            int cur = cursor[t];
+            switch (in) {
+            case Input::Up: if (cur >= kCols) cur -= kCols; break;
+            case Input::Down: if (cur + kCols < n) cur += kCols; else if (cur / kCols < (n - 1) / kCols) cur = n - 1; break;
+            case Input::Left: if (cur % kCols > 0) cur--; break;
+            case Input::Right: if (cur + 1 < n && cur % kCols < kCols - 1) cur++; break;
+            case Input::PageUp: cur = std::max(0, cur - kCols * kGridRows); break;
+            case Input::PageDown: cur = std::min(std::max(0, n - 1), cur + kCols * kGridRows); break;
+            case Input::Back: goBack(); return;
+            case Input::Confirm: confirm(n); return;
+            default: return;
+            }
+            cursor[t] = cur;
+            int row = cur / kCols;
+            if (row < scroll[t]) scroll[t] = row;
+            if (row >= scroll[t] + kGridRows) scroll[t] = row - kGridRows + 1;
+            return;
+        }
         switch (in) {
         case Input::Up: cursor[t] = std::max(0, cursor[t] - 1); break;
         case Input::Down: cursor[t] = std::min(std::max(0, n - 1), cursor[t] + 1); break;
@@ -598,6 +659,7 @@ private:
     }
 
     void renderHome(Renderer &r) {
+        wantHomeCovers();
         using namespace theme;
         const int W = r.width();
         const int mx = 37, fw = W - 2 * mx;
@@ -739,6 +801,52 @@ private:
             int kh = std::max(40, th * kRows / nc);
             r.roundRect(cx + cw + 8, y0 + (th - kh) * catScroll[t] / std::max(1, nc - kRows), 6, kh, 3, GREEN_DK);
         }
+        // ---- itens em GRADE de posters (Filmes, Series, Canais) ----
+        if (gridMode()) {
+            const int gx0 = cx + cw + 36, gw = W - 73 - 28 - gx0;
+            const int pw = ImgW, ph = ImgH, gap = (gw - kCols * pw) / (kCols - 1), pitchY = ph + 40;
+            wantCovers(scroll[t] * kCols, kCols * kGridRows);
+            for (int row = 0; row < kGridRows; row++)
+                for (int col = 0; col < kCols; col++) {
+                    int idx = (scroll[t] + row) * kCols + col;
+                    if (idx >= n) break;
+                    int px = gx0 + col * (pw + gap), py = y0 + row * pitchY;
+                    bool sel = inItems && idx == cursor[t];
+                    const std::string label = itemLabel(idx);
+                    if (sel) uiGlow(r, px - 4, py - 4, pw + 8, ph + 8, 14, GREEN, 12, 120, false);
+                    if (sel) r.roundRect(px - 4, py - 4, pw + 8, ph + 8, 14, GREEN);      // moldura verde (fica atras do poster)
+                    r.roundRect(px, py, pw, ph, 10, CHIP);
+                    bool drew = false;
+                    std::string logoUrl = itemLogo(idx);
+                    if (!logoUrl.empty() && coverGet) {
+                        const uint32_t *pxc = nullptr; int cw2 = 0, ch2 = 0;
+                        if (coverGet(logoUrl, pxc, cw2, ch2) && pxc && cw2 > 0 && ch2 > 0) { r.blitImage(px, py, pw, ph, pxc, cw2, ch2); drew = true; }
+                    }
+                    if (!drew) {
+                        std::string ic = "#";
+                        for (unsigned char ch : label) if (std::isalnum(ch)) { ic = std::string(1, (char)((ch >= 'a' && ch <= 'z') ? ch - 32 : ch)); break; }
+                        uiCenterHeavy(r, px + pw / 2, py + ph / 2, ic, sel ? GREEN : MUTED, 56);
+                    }
+                    if (sel) {
+                        int bx = px + pw - 34, by = py + ph - 34;                       // botao play
+                        r.roundRect(bx - 22, by - 22, 44, 44, 22, GREEN);
+                        for (int j = 0; j < 22; j++) { int d = 2 * j + 1 - 22; if (d < 0) d = -d; int ww = 18 * (22 - d) / 22; if (ww > 0) r.fillRect(bx - 6, by - 11 + j, ww, 1, BLACK); }
+                    }
+                    uiText(r, px, py + ph + 10, uiFit(r, label, 20, pw + gap - 6), sel ? TEXT : SOFT, 20, sel);
+                }
+            if (n > kCols * kGridRows) {
+                int rows = (n + kCols - 1) / kCols, th = kGridRows * pitchY - 14;
+                r.roundRect(W - 52, y0, 8, th, 4, CARD2);
+                int kh = std::max(48, th * kGridRows / rows);
+                r.roundRect(W - 52, y0 + (th - kh) * scroll[t] / std::max(1, rows - kGridRows), 8, kh, 4, GREEN_DK);
+            }
+            if (n == 0) {
+                bool noList = app.list.channels.empty() && app.list.movies.empty() && app.list.seriesTree.empty();
+                uiCenterHeavy(r, W / 2 + 200, y0 + 150, noList ? "Nenhuma lista M3U adicionada" : "Nada por aqui ainda", MUTED, 32);
+            }
+            return;
+        }
+        wantCovers(scroll[t], kRows);
         // ---- itens ----
         const int x = cx + cw + 36, rw = W - 73 - 28 - x;
         for (int row = 0; row < kRows; row++) {
@@ -757,7 +865,6 @@ private:
             r.roundRect(px, py, isW, isH, 8, sel ? GREEN : CHIP);
             bool drew = false;
             std::string logoUrl = itemLogo(idx);
-            if (!logoUrl.empty() && coverRequest) coverRequest(logoUrl);
             if (!logoUrl.empty() && coverGet) {
                 const uint32_t *pxc = nullptr; int cw = 0, ch = 0;
                 if (coverGet(logoUrl, pxc, cw, ch) && pxc && cw > 0 && ch > 0) {
