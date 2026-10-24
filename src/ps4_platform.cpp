@@ -579,6 +579,7 @@ struct BootScreen {
 // ---------- Registro de passos em /data/kickiptv.log ----------
 // Se o app cair, na proxima abertura o menu mostra em qual passo ele parou.
 static std::string g_prevStage;           // (leitura do log anterior removida: usava fread, que o app original nao importava)
+static std::vector<std::string> g_prevTail;   // ultimas linhas do log da vez anterior (so quando o app nao saiu direito)
 static void traceInit() {
     // le o log da ultima vez (libkernel, como as configuracoes) para mostrar na tela em que passo o app parou
     int fd = sceKernelOpen("/data/kickiptv.log", 0, 0);
@@ -589,7 +590,12 @@ static void traceInit() {
         while (!all.empty() && (all.back() == '\n' || all.back() == '\r')) all.pop_back();
         size_t p = all.rfind('\n');
         std::string last = p == std::string::npos ? all : all.substr(p + 1);
-        if (!last.empty() && last != "fim" && last != "saindo" && last != "menu-ok" && last != "inicio") g_prevStage = last;
+        if (!last.empty() && last != "fim" && last != "saindo" && last != "menu-ok" && last != "inicio") {
+            g_prevStage = last;
+            std::vector<std::string> v; size_t st = 0;
+            while (st < all.size()) { size_t nl = all.find('\n', st); if (nl == std::string::npos) nl = all.size(); if (nl > st) v.push_back(all.substr(st, nl - st)); st = nl + 1; }
+            for (size_t i = v.size() > 8 ? v.size() - 8 : 0; i < v.size(); i++) g_prevTail.push_back(v[i]);
+        }
     }
     FILE *f = fopen("/data/kickiptv.log", "wb");
     if (f) { fwrite("inicio\n", 1, 7, f); fclose(f); }
@@ -1842,11 +1848,19 @@ int main() {
 
     traceInit();
     trace("video-ok");
-    if (!g_prevStage.empty()) boot.line("da ultima vez o app parou em: " + g_prevStage, 0xFFFFB020u);
+    if (!g_prevStage.empty()) {
+        boot.line("da ultima vez o app parou em: " + g_prevStage, 0xFFFFB020u);
+        boot.line("ultimos passos gravados:", 0xFFFFB020u);
+        for (auto &t : g_prevTail) boot.line("  " + t);
+        boot.line("(tire uma foto desta tela - continua em 12 segundos)", 0xFFFFB020u);
+        sceKernelUsleep(12 * 1000 * 1000);
+    }
     Ps4Platform pf;
+    trace("pf-ok");
     App app(pf);
     pf.app = &app;
     UI ui(app);
+    trace("ui-ok");
     g_covers.setFetch([](const std::string &url, std::string &body) -> bool {
         int st = 0;
         try {
@@ -1880,6 +1894,7 @@ int main() {
     Mode mode = Mode::Menu;
     Player player;
     Keyboard kbd;
+    trace("player-ok");
     bool gotFrame = false;
     double lastWaitDraw = 0;
     uint32_t prev = 0;
@@ -1950,6 +1965,7 @@ int main() {
         for (;;) {
             double e = nowSec() - ti;
             if (e > 1.8) break;
+            { static bool q1 = true; if (q1) { q1 = false; trace("intro-q1"); } }
             FbRenderer r(shadow, W, H);
             using namespace theme;
             uiBackground(r);
@@ -2001,11 +2017,13 @@ int main() {
         }
     }
 
+    trace("loop-inicio");
     for (;;) {
         pin.poll();
         uint32_t now = pin.held, pressed = pin.take();
         if (wantQuit || ((now | pressed) & B_OPTIONS)) break;
         (void)prev;
+        { static bool first = true; if (first) { first = false; trace("loop-q1"); } }
 
         g_covers.setPaused(mode == Mode::Play);      // durante o video o baixador de capas em segundo plano fica parado
 
