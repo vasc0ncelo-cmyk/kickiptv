@@ -117,8 +117,8 @@ int main() {
         u5.screen = Screen::List; u5.tab = Tab::Movies;
         assert(u5.catCount() == 3 && u5.catLabel(0) == "Comédia" && u5.catLabel(1) == "Ação" && u5.catLabel(2) == "Todos");
         assert(u5.catSize(0) == 2 && u5.itemCount() == 2 && u5.itemLabel(1) == "Superbad");
-        u5.handle(Input::Right); u5.handle(Input::Down); assert(u5.cursor[2] == 1);
-        u5.handle(Input::Left); u5.handle(Input::Down);                                   // categoria "Ação"
+        u5.handle(Input::Right); u5.handle(Input::Right); assert(u5.cursor[2] == 1);   // grade: direita anda 1 poster
+        u5.handle(Input::Left); u5.handle(Input::Left); u5.handle(Input::Down);       // 1a coluna: esquerda volta as categorias                                   // categoria "Ação"
         assert(u5.catCur[2] == 1 && u5.cursor[2] == 0 && u5.itemCount() == 1 && u5.itemLabel(0) == "Duro de Matar");
         u5.handle(Input::Confirm); f5.played.clear(); u5.handle(Input::Confirm); assert(f5.played == "http://h/movie/2.mp4");
         { Rec r; u5.render(r); assert(r.has("FILMES") && r.has("Ação") && r.has("Comédia") && r.has("Duro de Matar") && !r.has("Superbad")); }
@@ -137,10 +137,33 @@ int main() {
         { std::string m = "#EXTM3U\n"; for (int i = 0; i < 50000; i++) m += "#EXTINF:-1 group-title=\"Canais | Todos\",Canal " + std::to_string(i) + "\nhttp://h/live/" + std::to_string(i) + ".ts\n";
           a4.list = buildPlaylist(m); }
         u4.tab = Tab::Channels; u4.screen = Screen::List; u4.inItems = true;
-        u4.handle(Input::PageDown); assert(u4.cursor[1] == UI::kRows);
-        for (int i = 0; i < 5000; i++) u4.handle(Input::Down);
-        assert(u4.cursor[1] == UI::kRows + 5000 && u4.scroll[1] == u4.cursor[1] - UI::kRows + 1);
+        u4.handle(Input::PageDown); assert(u4.cursor[1] == UI::kCols * UI::kGridRows);
+        for (int i = 0; i < 5000; i++) u4.handle(Input::Down);                       // grade: cada Down pula uma linha de 8 posters
+        assert(u4.cursor[1] == UI::kCols * UI::kGridRows + 5000 * UI::kCols);
+        assert(u4.scroll[1] == u4.cursor[1] / UI::kCols - UI::kGridRows + 1);
         Rec r; u4.render(r); assert(r.has("Canal " + std::to_string(u4.cursor[1])));
+        // grade: Esquerda/Direita/Cima nas bordas nao saem da lista
+        u4.cursor[1] = 0; u4.scroll[1] = 0;
+        u4.handle(Input::Up); assert(u4.cursor[1] == 0);
+        u4.handle(Input::Right); assert(u4.cursor[1] == 1);
+        for (int i = 0; i < 20; i++) u4.handle(Input::Right);
+        assert(u4.cursor[1] == UI::kCols - 1);                                       // para no fim da linha
+    }
+    // --- capas: a tela pede as da pagina visivel primeiro e as proximas depois ---
+    {
+        Fake fc; App ac(fc); UI uc(ac);
+        std::string m = "#EXTM3U\n";
+        for (int i = 0; i < 100; i++) m += "#EXTINF:-1 tvg-logo=\"http://img/" + std::to_string(i) + ".jpg\" group-title=\"FILMES | Todos\",Filme " + std::to_string(i) + "\nhttp://h/m/" + std::to_string(i) + ".mp4\n";
+        ac.list = buildPlaylist(m);
+        std::vector<std::string> front, back; int calls = 0;
+        uc.coverBatch = [&](const std::vector<std::string> &f, const std::vector<std::string> &b) { front = f; back = b; calls++; };
+        uc.screen = Screen::List; uc.tab = Tab::Movies;
+        { Rec r; uc.render(r); }
+        assert(calls == 1 && (int)front.size() == UI::kCols * UI::kGridRows && front[0] == "http://img/0.jpg" && front[23] == "http://img/23.jpg");
+        assert((int)back.size() == UI::kCols * UI::kGridRows * 2 && back[0] == "http://img/24.jpg");   // 2 paginas adiante
+        { Rec r; uc.render(r); } assert(calls == 1);                                  // nada mudou: nao repete o pedido
+        uc.inItems = true; uc.handle(Input::PageDown); uc.handle(Input::PageDown); { Rec r; uc.render(r); }
+        assert(calls >= 2 && front[0] == "http://img/32.jpg");   // cursor 48 -> primeira linha visivel = 4 (poster 32)
     }
     // --- uiFit: corta com "..." sem estourar a largura e sem quebrar UTF-8 ---
     {
