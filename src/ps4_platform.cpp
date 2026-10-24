@@ -2054,8 +2054,8 @@ int main() {
         auto starts = [&](const char *p) { return g_prevStage.rfind(p, 0) == 0; };
         // Esta versao corrige a causa das quedas (heap). As marcas de queda gravadas pelas versoes anteriores ("bgload", modo seguro)
         // seriam herdadas e a lista nunca mais carregaria sozinha: limpa UMA vez. Se cair de novo, a protecao volta a funcionar normal.
-        if (pf.loadSetting("guardver") != "heap1") {
-            pf.saveSetting("guardver", "heap1"); pf.saveSetting("bgload", ""); pf.saveSetting("safem3u", "");
+        if (pf.loadSetting("guardver") != "heap2") {
+            pf.saveSetting("guardver", "heap2"); pf.saveSetting("bgload", ""); pf.saveSetting("safem3u", "");
             g_prevStage.clear(); trace("guardas-limpas");
         }
         bool crashM3u = starts("m3u-inicio") || starts("m3u-t-") || starts("m3u-sync") || starts("m3u-s-") || starts("m3u-parse") ||
@@ -2063,7 +2063,7 @@ int main() {
         bool wasSafe = pf.loadSetting("safem3u") == "1";
         if (wasSafe) g_safeM3U = true;
         bool skipAuto = false;
-        if (pf.loadSetting("bgload") == "1") { skipAuto = true; trace("bgload-caiu"); }    // a ultima abertura caiu carregando a lista
+        if (pf.loadSetting("bgload") == "1") { skipAuto = true; pf.saveSetting("bgload", ""); trace("bgload-caiu"); }   // pula so ESTA vez; a proxima abertura tenta de novo    // a ultima abertura caiu carregando a lista
         if (crashM3u) {
             if (!wasSafe) { g_safeM3U = true; pf.saveSetting("safem3u", "1"); trace("modo-seguro-ligado"); }
             else skipAuto = true;
