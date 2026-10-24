@@ -604,11 +604,17 @@ struct UI {
     }
 
     // ---------- Desenho ----------
+    std::function<void(const char *)> dbg;         // diagnostico: o PS4 grava cada etapa do 1o desenho (para achar onde cai)
     void render(Renderer &r) {
+        if (dbg) dbg("ui-render-ini");
         backgroundCovers();
+        if (dbg) dbg("ui-capas-ok");
         uiHeader(r, timeText, dateText);
+        if (dbg) dbg("ui-header-ok");
         if (screen == Screen::Home) renderHome(r); else renderList(r);
+        if (dbg) dbg("ui-corpo-ok");
         renderFooter(r);
+        if (dbg) dbg("ui-rodape-ok");
     }
 
 private:
