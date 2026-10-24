@@ -1909,10 +1909,7 @@ int main() {
             return g_net.getKA(ss, url, body, st, 768 * 1024) && st >= 200 && st < 300 && body.size() > 32;
         } catch (...) { return false; }
     });
-    ui.coverBackground = [](std::vector<std::string> urls) {  // poucas capas (as primeiras de cada aba), em segundo plano e com a tela/video na frente
-        if (!kCoversOn) return;
-        try { g_covers.setBackground(std::move(urls)); } catch (...) {}
-    };
+    ui.coverBackground = [](std::vector<std::string>) {};     // SEM baixador em segundo plano: so as capas que aparecem na tela e as proximas paginas
     ui.coverBatch = [](const std::vector<std::string> &front, const std::vector<std::string> &back) {
         if (!kCoversOn) return;
         try { g_covers.setWanted(front, back); } catch (...) {}
@@ -1951,6 +1948,7 @@ int main() {
     // Protecao "fecha sempre ao abrir": enquanto a lista carrega (e uns segundos depois de aparecer no menu) fica gravado "bgload=1".
     // Se o app cair nesse intervalo, na proxima abertura a lista NAO e carregada sozinha (o app abre e explica), em vez de cair de novo.
     double bgloadClearAt = 0;
+    bool autoLoadList = false; int autoLoadFrames = 0;
     auto startLoader = [&](const std::string &url) {
         trace("lista-net-init");
         g_net.init();                                                 // a rede e inicializada na thread principal
@@ -2075,8 +2073,9 @@ int main() {
         } else if (ui.hasSavedList()) {
             // Abre o app e carrega a lista SALVA em segundo plano (le o arquivo guardado no console: nao baixa nada).
             // So baixa da rede se nao houver copia salva desta lista. Se o app cair nisso, a proxima abertura nao repete (protecao acima).
-            app.say(g_safeM3U ? "Carregando a lista salva (modo seguro)..." : "Carregando a lista salva...");
-            startLoader(ui.m3uUrl);
+            (void)startLoader;                       // (a carga em thread no inicio fica desligada: o app tem que abrir sempre)
+            autoLoadList = true;                     // carrega a lista salva logo depois do 1o quadro do menu (veja no laco principal)
+            app.say("Lista M3U salva - carregando...");
         }
     }
 
@@ -2278,6 +2277,19 @@ int main() {
         }
 
         if (bgloadClearAt > 0 && nowSec() >= bgloadClearAt) { pf.saveSetting("bgload", ""); bgloadClearAt = 0; trace("bgload-ok"); }
+
+        // Lista salva: carrega do arquivo guardado no console (nao baixa), mas so depois de o menu ja ter aparecido uns quadros.
+        // Marca "bgload" antes: se o app cair aqui, a proxima abertura NAO repete (abre normal e avisa).
+        if (autoLoadList && mode == Mode::Menu && ++autoLoadFrames >= 20) {
+            autoLoadList = false;
+            presentMenu();
+            pf.saveSetting("bgload", "1");
+            trace("lista-auto-inicio");
+            ui.loadSavedList();                      // copia salva; so baixa se nao houver copia desta lista
+            bgloadClearAt = nowSec() + 4.0;
+            trace("lista-auto-fim");
+            dirty = true;
+        }
 
         if (pf.kbdRequested) {                    // X em "Digitar @streamer": abre o teclado na tela
             pf.kbdRequested = false;
