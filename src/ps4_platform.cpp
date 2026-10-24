@@ -1857,18 +1857,17 @@ int main() {
             return g_net.get(url, body, st) && st >= 200 && st < 300 && body.size() > 32;
         } catch (...) { return false; }
     });
-    ui.coverRequest = [](const std::string &url) {
-        try { g_covers.requestFront(url); } catch (...) {}
+    ui.coverBatch = [](const std::vector<std::string> &front, const std::vector<std::string> &back) {
+        try { g_covers.setWanted(front, back); } catch (...) {}
     };
     ui.coverGet = [](const std::string &url, const uint32_t *&px, int &w, int &h) -> bool {
-        static std::map<std::string, Cover> snap;
+        static std::map<std::string, std::shared_ptr<const Cover>> hold;     // mantem o poster vivo ate o desenho terminar (sem copiar pixels)
         try {
-            Cover c;
-            if (!g_covers.get(url, c) || !c.ready || c.bgra.empty()) return false;
-            snap[url] = std::move(c);
-            auto &s = snap[url];
-            px = s.bgra.data(); w = s.w; h = s.h;
-            if (snap.size() > 60) snap.clear();
+            auto c = g_covers.getPtr(url);
+            if (!c || !c->ready || c->bgra.empty()) return false;
+            if (hold.size() > 90) hold.clear();
+            hold[url] = c;
+            px = c->bgra.data(); w = c->w; h = c->h;
             return true;
         } catch (...) { return false; }
     };
@@ -2155,6 +2154,11 @@ int main() {
         if (pressed & B_CROSS)  { ui.handle(Input::Confirm);  dirty = true; }
         if (pressed & B_CIRCLE) { ui.handle(Input::Back);     dirty = true; }
         if (updateClock()) dirty = true;
+        {   // capa nova ficou pronta (baixada em segundo plano): redesenha sozinho, sem esperar um botao
+            static uint32_t covSeen = 0; static double covNext = 0;
+            uint32_t cv = g_covers.version();
+            if (cv != covSeen && nowSec() >= covNext) { covSeen = cv; covNext = nowSec() + 0.12; dirty = true; }
+        }
         if (loader.running()) {                   // andamento: atualiza o texto so quando muda (e no maximo ~3x por segundo)
             double tn = nowSec();
             size_t it = loader.items();
