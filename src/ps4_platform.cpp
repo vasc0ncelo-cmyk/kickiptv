@@ -1026,6 +1026,10 @@ static void releaseHfAsync() {                                                  
 // ---------- Filme/serie: download progressivo (progfile.hpp) ----------
 static std::mutex g_pfM;
 static std::shared_ptr<progfile::Downloader> g_pf;
+static void removeVodFiles() {                                                  // o arquivo local leva a extensao do container (mp4/mkv/avi/ts)
+    static const char *e[] = {"mp4", "mkv", "avi", "ts"};
+    for (const char *x : e) remove((std::string("/data/kickiptv_vod.") + x).c_str());
+}
 static std::shared_ptr<progfile::Downloader> getPf() { std::lock_guard<std::mutex> l(g_pfM); return g_pf; }
 static void setPf(std::shared_ptr<progfile::Downloader> r) { std::lock_guard<std::mutex> l(g_pfM); g_pf = std::move(r); }
 static std::shared_ptr<progfile::Downloader> takePf() { std::lock_guard<std::mutex> l(g_pfM); auto r = std::move(g_pf); g_pf.reset(); return r; }
@@ -1033,7 +1037,7 @@ static void abortPf() { auto r = getPf(); if (r) r->abort(); }
 static void releasePfAsync() {                                                  // para em segundo plano (a rede pode demorar a responder)
     auto r = takePf(); if (!r) return;
     r->abort(); g_tearing++;
-    std::thread([r]() mutable { r->join(); r.reset(); remove("/data/kickiptv_vod.mp4"); g_tearing--; }).detach();
+    std::thread([r]() mutable { r->join(); r.reset(); removeVodFiles(); g_tearing--; }).detach();
 }
 
 static double nowSec() { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec + ts.tv_nsec / 1e9; }
@@ -1213,7 +1217,7 @@ struct Player {
             g_feed.join(); g_feed.opens = g_feed.reads = g_feed.segs = 0; g_feedSize = 1ULL << 40;
             if (tries.size() > 1) log.push_back(std::string("Canal ao vivo: tentando ") + (tries[ti].second ? "fluxo MPEG-TS direto" : "HLS (.m3u8)"));
             g_feed.start(tries[ti].first, tries[ti].second);        // sem outFile: segmentos vao para o buffer (callbacks) e para 'recent' (arquivos)
-            for (int i = 0; i < 400 && g_feed.segs.load() < 3 && !g_feed.failed.load(); i++) {
+            for (int i = 0; i < 400 && g_feed.segs.load() < 2 && !g_feed.failed.load(); i++) {
                 sceKernelUsleep(50000);
                 if (cancelCb && cancelCb()) { cancelled = true; break; }
                 if (i % 2 == 0) presentCb();                    // a animacao de "Conectando..." continua rodando
@@ -1319,7 +1323,7 @@ struct Player {
         bool okProbe = false;
         for (int a = 0; a < 3 && !okProbe; a++) {
             if (cancelCb && cancelCb()) { cancelled = true; g_net.closeSession(probe); return false; }
-            okProbe = g_net.getRange(probe, url, 0, 0, tip, st, &total) && st == 206 && total >= 1024;
+            okProbe = g_net.getRange(probe, url, 0, 15, tip, st, &total) && st == 206 && total >= 1024;
             if (!okProbe && st == 206 && total == 0) break;
             if (!okProbe && st >= 400 && st < 500) break;
         }
@@ -1334,8 +1338,10 @@ struct Player {
         log.back() = tb;
 
         // 2) baixa o comeco + indice em segundo plano; o resto continua baixando enquanto toca
-        const char *path = "/data/kickiptv_vod.mp4";
-        remove(path);
+        const std::string vodExt = vodContainerExt(tip, url);        // mkv gravado como .mp4 nunca abria: o nome precisa casar com o container
+        const std::string pathS = "/data/kickiptv_vod." + vodExt;
+        const char *path = pathS.c_str();
+        removeVodFiles();
         std::string u = url;
         auto sess = std::make_shared<NetClient::Session>(); sess->recvSec = 25;
         auto dl = std::make_shared<progfile::Downloader>([u, sess](uint64_t from, uint64_t to, std::string &body) -> int {
@@ -1483,7 +1489,7 @@ struct Player {
             for (int i = 0; i < 4; i++) { static const char *e[] = {"mp4","m2ts","mpg","ts","mkv"}; for (const char *x : e) remove(chunkPath(x, i).c_str()); }
             if (g_feed.outFile) { fclose(g_feed.outFile); g_feed.outFile = nullptr; }
             remove("/data/live.ts");
-            remove("/data/kickiptv_vod.mp4");   // filme/serie baixado para disco
+            removeVodFiles();   // filme/serie baixado para disco
             nextReady = false; prepBusy = false;
             g_tearing--;
         }).detach();
@@ -2152,11 +2158,11 @@ int main() {
             trace(player.failed ? "player-falhou" : "player-aberto");
             if (player.failed) {
                 // mostra o erro e VOLTA ao menu (nao fica em Play com handle invalido)
-                for (int i = 0; i < 25; i++) {
+                for (int i = 0; i < 1200; i++) {          // fica ate apertar O (ate 2 min) para dar tempo de ler/fotografar o erro
                     presentWait();
                     sceKernelUsleep(100000);
                     pin.poll();
-                    if (pin.take() & B_CIRCLE) break;
+                    if (pin.take() & (B_CIRCLE | B_CROSS)) break;
                 }
                 player.stop();
                 autoMode = false;
@@ -2180,7 +2186,7 @@ int main() {
     if (g_tearing.load() > 0) { trace("fim-forcado"); _Exit(0); }   // algo travou (rede): sai sem rodar destrutores
     g_feed.join();
     { auto r = takeHf(); if (r) r->join(); }
-    { auto r = takePf(); if (r) { r->join(); r.reset(); } remove("/data/kickiptv_vod.mp4"); }
+    { auto r = takePf(); if (r) { r->join(); r.reset(); } removeVodFiles(); }
     blit::pool().shutdown();
     trace("fim");
     return 0;
