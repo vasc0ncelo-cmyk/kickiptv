@@ -195,7 +195,7 @@ void PlaylistBuilder::line(std::string &raw) {
     if (e.name.empty()) e.name = e.url;
     {   // orcamento de memoria: struct + 3 alocacoes de texto + indices
         size_t est = sizeof(Entry) + 3 * 32 + e.name.size() + e.url.size() + e.logo.size() + 16;
-        if (memBytes_ + est > kMaxBytes) { full_ = true; p_.truncated = true; extinf_.clear(); return; }
+        if (memBytes_ + est > maxBytes()) { full_ = true; p_.truncated = true; extinf_.clear(); return; }
         memBytes_ += est;
     }
     e.kind = classify(e);
