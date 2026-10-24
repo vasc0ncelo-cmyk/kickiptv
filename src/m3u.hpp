@@ -42,13 +42,18 @@ public:
     void finish();                 // processa a ultima linha e ordena os episodios
     Playlist take();               // entrega o resultado (use depois de finish)
     size_t count() const { return count_; }   // itens lidos ate agora
+    bool full() const { return full_; }       // atingiu o orcamento de memoria: o resto da lista e ignorado (Playlist::truncated)
+    // Orcamento de memoria da lista (estimado). Listas de IPTV chegam a 350 mil+ itens (~330 bytes cada = 115 MB+); no PS4 isso,
+    // somado ao resto do app, faz o sistema fechar o app. Medido: 90 MB ~ 250 mil itens (a lista que ja carregou 200 mil sem problemas).
+    static const size_t kMaxBytes = 90u * 1024 * 1024;
 
 private:
     void line(std::string &l);
     std::string cur_, extinf_;
     bool skipRest_ = false, first_ = true;
     Playlist p_;
-    size_t count_ = 0;
+    size_t count_ = 0, memBytes_ = 0;
+    bool full_ = false;
     std::unordered_map<std::string, int> chanIdx_, movieIdx_, seriesIdx_;   // nome limpo da categoria -> posicao
     static int catFor(std::vector<Category> &cats, std::unordered_map<std::string, int> &idx, const std::string &group);
 };
