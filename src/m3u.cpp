@@ -137,6 +137,7 @@ static const size_t kMaxLine = 8192;
 PlaylistBuilder::PlaylistBuilder() {}
 
 void PlaylistBuilder::feed(const char *d, size_t n) {
+    if (full_) return;                                     // orcamento de memoria cheio: ignora o resto (nem varre os bytes)
     size_t i = 0;
     while (i < n) {
         const char *nl = (const char *)memchr(d + i, '\n', n - i);
@@ -176,6 +177,7 @@ void PlaylistBuilder::line(std::string &raw) {
         if (l.compare(0, 7, "#EXTINF") == 0) extinf_ = l;
         return;                                             // #EXTM3U, #EXTVLCOPT, #EXTGRP etc.
     }
+    if (full_) { extinf_.clear(); return; }
     if (l.find("://") == std::string::npos) { extinf_.clear(); return; }   // nao e um link (pagina de erro/HTML, lixo): nao vira item
     Entry e;
     e.url = l;
@@ -191,6 +193,11 @@ void PlaylistBuilder::line(std::string &raw) {
         if (e.name.empty()) e.name = attr(extinf_, "tvg-name");
     }
     if (e.name.empty()) e.name = e.url;
+    {   // orcamento de memoria: struct + 3 alocacoes de texto + indices
+        size_t est = sizeof(Entry) + 3 * 32 + e.name.size() + e.url.size() + e.logo.size() + 16;
+        if (memBytes_ + est > kMaxBytes) { full_ = true; p_.truncated = true; extinf_.clear(); return; }
+        memBytes_ += est;
+    }
     e.kind = classify(e);
     extinf_.clear();
     count_++;
