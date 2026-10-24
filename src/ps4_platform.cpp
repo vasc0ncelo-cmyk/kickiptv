@@ -74,7 +74,12 @@ int sceHttpSetRecvTimeOut(int id, unsigned usec);
 int sceHttpSetResolveTimeOut(int id, unsigned usec);
 }
 
-// (nao defina sceLibcHeapSize/sceLibcHeapExtendedAlloc aqui: no OpenOrbis isso derrubou o app antes de abrir. O limite de memoria da lista e o orcamento do PlaylistBuilder.)
+// Heap da libc sem limite: sem isso o malloc acaba (lista M3U grande + capas + cache do filme + buffers do AvPlayer) e o app fecha
+// logo depois que o menu aparece (a lista e as capas comecam a encher a memoria). A versao que abria e tocava filmes tinha isto.
+extern "C" {
+unsigned int sceLibcHeapExtendedAlloc = 1;
+size_t sceLibcHeapSize = 0xFFFFFFFFFFFFFFFFULL;   // SCE_LIBC_HEAP_SIZE_EXTENDED_ALLOC_NO_LIMIT
+}
 static void trace(const char *stage);   // (definida mais abaixo)
 // Marcadores finos do download da lista M3U: se o app fechar, a proxima abertura mostra o ULTIMO passo que foi gravado.
 static bool g_traceHttp = false;                 // so durante o download da lista M3U
@@ -579,7 +584,7 @@ struct BootScreen {
 // ---------- Registro de passos em /data/kickiptv.log ----------
 // Se o app cair, na proxima abertura o menu mostra em qual passo ele parou.
 static std::string g_prevStage;           // (leitura do log anterior removida: usava fread, que o app original nao importava)
-static const bool kCoversOn = false;   // TESTE: false = nao baixa nem decodifica capas (para saber se elas derrubam o app). Volte para true depois.
+static const bool kCoversOn = true;    // capas de filmes, series e canais (false = desliga para testar quedas)
 static std::string g_prevRaw = "(nenhum)";      // ultima linha do log da vez anterior, mesmo se foi saida normal
 static std::vector<std::string> g_prevTail;   // ultimas linhas do log da vez anterior (so quando o app nao saiu direito)
 static void traceInit() {
@@ -2009,6 +2014,12 @@ int main() {
     //  caiu ate no modo seguro -> nao carrega a lista sozinho (o app abre normalmente e mostra o passo onde parou).
     {
         auto starts = [&](const char *p) { return g_prevStage.rfind(p, 0) == 0; };
+        // Esta versao corrige a causa das quedas (heap). As marcas de queda gravadas pelas versoes anteriores ("bgload", modo seguro)
+        // seriam herdadas e a lista nunca mais carregaria sozinha: limpa UMA vez. Se cair de novo, a protecao volta a funcionar normal.
+        if (pf.loadSetting("guardver") != "heap1") {
+            pf.saveSetting("guardver", "heap1"); pf.saveSetting("bgload", ""); pf.saveSetting("safem3u", "");
+            g_prevStage.clear(); trace("guardas-limpas");
+        }
         bool crashM3u = starts("m3u-inicio") || starts("m3u-t-") || starts("m3u-sync") || starts("m3u-s-") || starts("m3u-parse") ||
                         starts("m3u-cache-inicio") || starts("m3u-cache-parse");
         bool wasSafe = pf.loadSetting("safem3u") == "1";
