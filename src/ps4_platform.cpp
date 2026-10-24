@@ -1361,7 +1361,11 @@ struct Player {
         }
         if (cancelled || failed) { releasePfAsync(); failed = true; return false; }
         if (dl->state() == 2) { log.push_back("ERRO: " + dl->error()); failed = true; releasePfAsync(); return false; }
-        log.back() = "   inicio pronto: abrindo o player";
+        log.back() = std::string("   inicio pronto") + (dl->relocated() ? " (indice movido para o comeco)" : "");
+        if (!dl->info().empty()) log.push_back("   " + dl->info());
+        if (!dl->warn().empty()) log.push_back("   AVISO: " + dl->warn());
+        else if (!dl->audioWarn().empty()) log.push_back("   AVISO: " + dl->audioWarn());
+        log.push_back("   abrindo o player...");
         presentCb();
 
         // 3) toca o arquivo local (o resto ja esta baixando)
@@ -1370,7 +1374,7 @@ struct Player {
             isVod = true; log.push_back("OK: tocando enquanto baixa"); return true;
         }
         failed = true;
-        if (!cancelled) log.push_back("ERRO: o player nao abriu o arquivo (formato nao suportado?)");
+        if (!cancelled) log.push_back(dl->warn().empty() ? "ERRO: o player nao abriu o arquivo (mande um print desta tela)" : "ERRO: " + dl->warn());
         releasePfAsync();
         return false;
     }
