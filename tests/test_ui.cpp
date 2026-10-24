@@ -157,8 +157,12 @@ int main() {
         ac.list = buildPlaylist(m);
         std::vector<std::string> front, back; int calls = 0;
         uc.coverBatch = [&](const std::vector<std::string> &f, const std::vector<std::string> &b) { front = f; back = b; calls++; };
+        std::vector<std::string> bgAll; int bgCalls = 0;
+        uc.coverBackground = [&](std::vector<std::string> v) { bgAll = std::move(v); bgCalls++; };
         uc.screen = Screen::List; uc.tab = Tab::Movies;
         { Rec r; uc.render(r); }
+        assert(bgCalls == 1 && bgAll.size() == 100 && bgAll[0] == "http://img/0.jpg" && bgAll[99] == "http://img/99.jpg");   // lista inteira para o baixador de fundo
+        { Rec r; uc.render(r); } assert(bgCalls == 1);                                                                     // so manda de novo se a lista mudar
         assert(calls == 1 && (int)front.size() == UI::kCols * UI::kGridRows && front[0] == "http://img/0.jpg" && front[23] == "http://img/23.jpg");
         assert((int)back.size() == UI::kCols * UI::kGridRows * 2 && back[0] == "http://img/24.jpg");   // 2 paginas adiante
         { Rec r; uc.render(r); } assert(calls == 1);                                  // nada mudou: nao repete o pedido
