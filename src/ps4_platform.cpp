@@ -1857,6 +1857,9 @@ int main() {
             return g_net.get(url, body, st) && st >= 200 && st < 300 && body.size() > 32;
         } catch (...) { return false; }
     });
+    ui.coverBackground = [](std::vector<std::string> urls) {
+        try { g_covers.setBackground(std::move(urls)); } catch (...) {}
+    };
     ui.coverBatch = [](const std::vector<std::string> &front, const std::vector<std::string> &back) {
         try { g_covers.setWanted(front, back); } catch (...) {}
     };
@@ -2002,6 +2005,8 @@ int main() {
         uint32_t now = pin.held, pressed = pin.take();
         if (wantQuit || ((now | pressed) & B_OPTIONS)) break;
         (void)prev;
+
+        g_covers.setPaused(mode == Mode::Play);      // durante o video o baixador de capas em segundo plano fica parado
 
         if (mode == Mode::Kbd) {
             bool changed = false, done = false;
