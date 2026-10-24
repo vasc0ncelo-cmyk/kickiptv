@@ -82,6 +82,7 @@ private:
                         if (sh->stop) return false;
                         try { b.feed(d, n); } catch (const std::bad_alloc &) { sh->oom = true; return false; }
                         sh->bytes += n; sh->items = b.count();
+                        if (b.full() && !isNet) return false;       // copia salva: o resto nao cabe mesmo (o download segue ate o fim para a copia ficar inteira)
                         return true;
                     }, sh->stop);
                 } catch (const std::bad_alloc &) { sh->oom = true; }
@@ -89,7 +90,7 @@ private:
                 try { b.finish(); } catch (...) {}
                 if (sh->stop || b.count() == 0) return false;
                 res = std::make_shared<Playlist>(b.take());
-                fin = (ok && !sh->oom) ? Done : Partial;                         // Partial: a conexao caiu ou acabou a memoria
+                fin = ((ok && !sh->oom) || b.full()) ? Done : Partial;           // Partial: a conexao caiu ou acabou a memoria (b.full = so truncou de proposito)
                 return true;
             };
             if (!attempt(cache, false) && !sh->stop) { sh->oom = false; attempt(net, true); }
