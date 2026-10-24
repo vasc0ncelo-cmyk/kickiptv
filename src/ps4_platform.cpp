@@ -947,7 +947,7 @@ struct HlsFeeder {
             HlsMedia md = hlsParseMedia(body);
             if (md.hasMap) { fail("fMP4 (EXT-X-MAP) ainda nao suportado"); return; }
             if (md.segs.empty()) { sleepMs(1000, run); continue; }
-            if (first) { size_t k = md.segs.size() > 3 ? md.segs.size() - 3 : 0; next = md.segs[k].seq; first = false; }
+            if (first) { size_t k = md.segs.size() > 2 ? md.segs.size() - 2 : 0; next = md.segs[k].seq; first = false; }
             else if (md.segs.back().seq + 1 < next) {            // a numeracao da playlist voltou atras (live reiniciou): ressincroniza nos 3 mais novos
                 size_t k = md.segs.size() > 3 ? md.segs.size() - 3 : 0; next = md.segs[k].seq;
                 setStatus("playlist reiniciou: ressincronizando");
@@ -1098,6 +1098,11 @@ struct Player {
     double lastGapMs = 0, gapStartT = 0, switchedAt = 0, blitMs = 0;
     std::function<bool()> cancelCb;          // main liga: true = o usuario cancelou (O) ou pediu para sair
     bool cancelled = false;
+    // Filme sem som: o AvPlayer escolhe a faixa de audio pelo idioma padrao. Se nenhum audio chegar, reabre o arquivo
+    // com outro idioma (ver retryAudioLang). avLang precisa continuar vivo enquanto o player usa o ponteiro.
+    std::string avLang = "eng", vodPath;
+    int langTry = 0;
+    bool vodAudioExpected = false;
 
     static std::string chunkPath(const std::string &ext, int idx) { return "/data/live" + std::to_string(idx) + "." + ext; }
     static std::string hx8(int v) { char b[16]; snprintf(b, sizeof b, "%08X", (unsigned)v); return b; }
@@ -1123,7 +1128,7 @@ struct Player {
     bool openSource(const std::string &path, int cb, int dbg, int waitMs, bool note, KAvHandle *target = nullptr) {   // cb: 0 = o player abre sozinho | 1 = HLS (g_feed) | 2 = arquivo HTTP (g_hf)
         KAvInitData id; memset(&id, 0, sizeof id);
         id.allocate = avAlloc; id.deallocate = avFree; id.allocateTexture = avAllocTex; id.deallocateTexture = avFreeTex;
-        id.debugLevel = dbg; id.basePriority = 700; id.numOutputVideoFrameBuffers = 3; id.autoStart = true; id.defaultLanguage = "eng";
+        id.debugLevel = dbg; id.basePriority = 700; id.numOutputVideoFrameBuffers = 3; id.autoStart = true; id.defaultLanguage = avLang.c_str();
         if (cb == 1) { id.fileObj = (void *)&g_feed; id.fOpen = feedOpen; id.fClose = feedClose; id.fRead = feedRead; id.fSize = feedSize; }
         else if (cb == 2) { id.fileObj = (void *)&g_feed; id.fOpen = hfOpen; id.fClose = hfClose; id.fRead = hfRead; id.fSize = hfSize; }
         { std::lock_guard<std::mutex> l(g_avlogM); g_avlog.clear(); }
@@ -1172,6 +1177,7 @@ struct Player {
         log.clear(); frames = 0; vw = vh = 0; fps = 0; fpsFrames = 0; failed = false; addRc = 0; chunkMode = false; chunkIdx = 0; inactiveSince = 0;
         cancelled = false; restarts = switchesOk = 0; lastGapMs = 0; gapStartT = switchedAt = 0; curDur = 0; chunkT0 = 0; blitMs = 0;
         paused = false; isVod = false; lastPtsMs = 0; waitNote.clear();
+        avLang = "eng"; langTry = 0; vodPath.clear(); vodAudioExpected = false;
         h2 = 0; bHandle = 0; bState = 0; nextReady = false; prepBusy = false; gapless = true;
         if (g_tearing.load() > 0) {
             log.push_back("Encerrando a exibicao anterior...");
@@ -1208,17 +1214,20 @@ struct Player {
         // (mais estavel), e se o painel nao tiver, le o MPEG-TS continuo e corta em pedacos.
         useFeed = true;
         std::vector<std::pair<std::string, bool>> tries;            // {url, mpegts_cru}
+        // Canal "cru" (.ts / sem extensao): o fluxo MPEG-TS comeca a tocar em ~2 s; o HLS espera segmentos de 6-10 s.
+        // Entao tenta o TS direto primeiro e so cai no HLS equivalente do painel se o TS nao vier.
         if (isHls) tries.push_back({url, false});
         else {
+            tries.push_back({url, true});
             std::string hls = xtreamHlsUrl(url);
             if (!hls.empty()) tries.push_back({hls, false});
-            tries.push_back({url, true});
         }
         for (size_t ti = 0; ti < tries.size(); ti++) {
             g_feed.join(); g_feed.opens = g_feed.reads = g_feed.segs = 0; g_feedSize = 1ULL << 40;
             if (tries.size() > 1) log.push_back(std::string("Canal ao vivo: tentando ") + (tries[ti].second ? "fluxo MPEG-TS direto" : "HLS (.m3u8)"));
             g_feed.start(tries[ti].first, tries[ti].second);        // sem outFile: segmentos vao para o buffer (callbacks) e para 'recent' (arquivos)
-            for (int i = 0; i < 400 && g_feed.segs.load() < 2 && !g_feed.failed.load(); i++) {
+            const int maxWait = (tries[ti].second && ti + 1 < tries.size()) ? 160 : 400;     // TS direto com plano B: 8 s; senao 20 s
+            for (int i = 0; i < maxWait && g_feed.segs.load() < 1 && !g_feed.failed.load(); i++) {      // comeca no 1o pedaco (antes esperava 2)
                 sceKernelUsleep(50000);
                 if (cancelCb && cancelCb()) { cancelled = true; break; }
                 if (i % 2 == 0) presentCb();                    // a animacao de "Conectando..." continua rodando
@@ -1262,9 +1271,12 @@ struct Player {
             } else log.push_back("ERRO conversao TS->MP4: " + err);
         }
         if (cancelled) { failed = true; stop(); return false; }
+        if (!chunkMode && !log.empty() && log.back().find("tipo 36") != std::string::npos) {     // HEVC (H.265): o PS4 nao decodifica, nao adianta tentar
+            failed = true; log.push_back("ERRO: este canal e H.265 (HEVC), que o PS4 nao toca"); g_feed.join(); return false;
+        }
         if (chunkMode) { g_feed.discardBuf = true; g_feed.sb.reset(); }     // os segmentos so seguem para 'recent' (nao enche mais o StreamBuf)
-        // Plano B: escada de tentativas com o TS cru (varias extensoes) e depois leitura propria (callbacks)
-        static const char *exts[] = {"mp4", "m2ts", "mpg", "ts", "mkv"};
+        // Plano B (so se a conversao falhou): TS cru em poucas extensoes e depois leitura propria. Timeouts curtos: antes eram ~45 s no total.
+        static const char *exts[] = {"ts", "mpg", "m2ts"};
         if (!chunkMode)
         for (const char *ext : exts) {
             if (cancelled) break;
@@ -1272,7 +1284,7 @@ struct Player {
             log.push_back("Tentando arquivo " + path + " ...");
             presentCb();
             if (!writeFile(path, chunk)) { log.push_back("   nao consegui gravar"); continue; }
-            if (openSource(path, false, 3, 5000, true)) {
+            if (openSource(path, false, 3, 3500, true)) {
                 chunkMode = true; chunkExt = ext; chunkIdx = 0; lastSeq = last;
                 log.push_back("OK: tocando por arquivos (." + std::string(ext) + ")");
                 break;
@@ -1281,13 +1293,13 @@ struct Player {
         }
         if (chunkMode) { g_feed.discardBuf = true; g_feed.sb.reset(); }
         if (!chunkMode) {
-            static const char *names[] = {"live.mp4", "live.ts", "live.m2ts"};
+            static const char *names[] = {"live.ts"};
             for (const char *nm : names) {
                 if (cancelled) break;
                 log.push_back(std::string("Tentando leitura propria, nome ") + nm + " ...");
                 presentCb();
                 g_feedSize = 1ULL << 40;
-                if (openSource(nm, 1, 3, 6000, true)) { log.push_back("OK: tocando por leitura propria"); break; }
+                if (openSource(nm, 1, 3, 3500, true)) { log.push_back("OK: tocando por leitura propria"); break; }
             }
         }
         if (cancelled) { failed = true; stop(); return false; }
@@ -1342,6 +1354,7 @@ struct Player {
         const std::string vodExt = vodContainerExt(tip, url);        // mkv gravado como .mp4 nunca abria: o nome precisa casar com o container
         const std::string pathS = "/data/kickiptv_vod." + vodExt;
         const char *path = pathS.c_str();
+        vodPath = pathS;
         removeVodFiles();
         std::string u = url;
         auto sess = std::make_shared<NetClient::Session>(); sess->recvSec = 25;
@@ -1374,6 +1387,7 @@ struct Player {
         if (!dl->info().empty()) log.push_back("   " + dl->info());
         if (!dl->warn().empty()) log.push_back("   AVISO: " + dl->warn());
         else if (!dl->audioWarn().empty()) log.push_back("   AVISO: " + dl->audioWarn());
+        vodAudioExpected = dl->info().find("sem audio") == std::string::npos;
         // 2b) pre-buffer: o AvPlayer le o arquivo local direto, sem esperar o download. Se ele ler alem do que ja chegou, enxerga zeros
         //     (imagem bugada). Arquivos grandes/de alto bitrate precisam de mais colchao antes de abrir: 0,4% do arquivo (8 a 48 MB).
         {
@@ -1587,9 +1601,32 @@ struct Player {
             lastFrameT = t; inactiveSince = 0;
             if (chunkT0 == 0) { chunkT0 = t; if (gapStartT > 0) { lastGapMs = (t - gapStartT) * 1000.0; gapStartT = 0; } }
         }
+        // Filme que abriu mas nao entrega nenhum audio apos ~4 s: tenta outra faixa (idioma) em vez de ficar mudo
+        if (isVod && active && !paused && !failed && drew && vodAudioExpected && !vodPath.empty() && langTry < 3 &&
+            audio.state.load() == 1 && audio.chunks.load() == 0 && t - t0 > 4.0) retryAudioLang();
         if (chunkMode && h && !failed) managePipeline(t);
         if (t - lastFps >= 1.0) { fps = fpsFrames / (t - lastFps); fpsFrames = 0; lastFps = t; worstShown = worstGap; worstGap = 0; }
         return drew;
+    }
+    // Reabre o filme (arquivo local que continua baixando) pedindo outra faixa de audio: eng -> por -> spa -> jpn.
+    // So roda nos primeiros segundos, quando nenhum audio chegou; o filme recomeca do inicio.
+    void retryAudioLang() {
+        static const char *langs[] = {"eng", "por", "spa", "jpn"};
+        langTry++;
+        avLang = langs[langTry];
+        log.push_back(std::string("Sem audio: tentando a faixa '") + avLang + "'");
+        trace("vod-sem-audio-retry");
+        KAvHandle old = h;
+        audio.retarget(0);                       // a thread de audio sai do player antigo antes de fechar
+        h = 0;
+        avStopClose(old);
+        if (cancelCb && cancelCb()) { cancelled = true; failed = true; return; }
+        if (!openSource(vodPath, 0, 0, 8000, false)) {
+            avLang = "eng";
+            if (!openSource(vodPath, 0, 0, 8000, false)) { failed = true; log.push_back("ERRO: nao consegui reabrir o filme"); return; }
+        }
+        audio.retarget(h);
+        t0 = lastFps = lastFrameT = nowSec(); chunkT0 = 0;
     }
     // ---- vigia (anti-congelamento): true = a live parou de verdade e o app deve reabri-la sozinho ----
     // So age no ao vivo por pedacos. 'why' recebe o motivo (aparece na tela "Conectando..." e no log).
