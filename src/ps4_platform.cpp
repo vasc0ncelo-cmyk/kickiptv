@@ -1858,6 +1858,7 @@ int main() {
 
     traceInit();
     trace("video-ok");
+    PlaylistBuilder::maxBytes() = 1024u * 1024 * 1024;     // lista inteira (antes cortava em 90 MB); o heap do app e sem limite
     Ps4Platform pf;
     trace("pf-ok");
     App app(pf);
@@ -1974,7 +1975,7 @@ int main() {
     boot.line("[4] abrindo a interface...");
     trace("abertura");
 
-    const bool kShowIntro = false;     // a animacao e codigo novo e o app caia nela; ligue (true) so depois de confirmar que o resto abre
+    const bool kShowIntro = true;      // animacao de abertura (K + titulo + barra); false = pula
     if (kShowIntro) {   // ---- abertura animada: marca K aparece, titulo, barra de carregamento ----
         double ti = nowSec();
         for (;;) {
