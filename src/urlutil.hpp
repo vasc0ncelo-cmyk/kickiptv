@@ -72,3 +72,17 @@ inline std::string xtreamHlsUrl(const std::string &url) {
     if (id.empty() || seg[k].empty() || seg[k + 1].empty() || !std::all_of(id.begin(), id.end(), [](unsigned char c) { return std::isdigit(c); })) return "";
     return url.substr(0, hs) + "/" + (k ? "live/" : "") + seg[k] + "/" + seg[k + 1] + "/" + id + ".m3u8";
 }
+
+// Container REAL do arquivo, olhando os primeiros bytes (o AvPlayer escolhe o demuxer pelo NOME do arquivo local:
+// um .mkv gravado como .mp4 abre o player mas nunca mostra imagem). Filmes de painel IPTV costumam ser .mkv; series, .mp4.
+// Devolve "mp4" (padrao, igual ao que ja funcionava), "mkv", "avi" ou "ts".
+inline std::string vodContainerExt(const std::string &head, const std::string &url) {
+    auto u = [&](size_t i) { return i < head.size() ? (unsigned char)head[i] : 0u; };
+    if (head.size() >= 8 && head.compare(4, 4, "ftyp") == 0) return "mp4";
+    if (head.size() >= 4 && u(0) == 0x1A && u(1) == 0x45 && u(2) == 0xDF && u(3) == 0xA3) return "mkv";
+    if (head.size() >= 12 && head.compare(0, 4, "RIFF") == 0 && head.compare(8, 4, "AVI ") == 0) return "avi";
+    if (head.size() >= 1 && u(0) == 0x47 && (head.size() < 189 || u(188) == 0x47)) return "ts";
+    std::string x = urlExtension(url);
+    if (x == "mkv" || x == "avi") return x;
+    return "mp4";
+}
