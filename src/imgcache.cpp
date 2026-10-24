@@ -76,33 +76,47 @@ bool imgDecodeToCover(const std::string &body, Cover &out, int tw, int th) {
 
 std::string ImgCache::diskPath(const std::string &url) {
     uint32_t h = 2166136261u, h2 = 5381u;
-    for (unsigned char c : url) { h ^= c; h *= 16777619u; h2 = h2 * 33u + c; }
-    char b[96];
-    snprintf(b, sizeof b, "/data/kickiptv_cov/p%08x%08x.cov", h, h2);   // "p": formato novo (poster); as capas antigas pequenas sao ignoradas
-    return b;
+    for (unsigned char ch : url) { h ^= ch; h *= 16777619u; h2 = h2 * 33u + ch; }
+    char b[64];
+    snprintf(b, sizeof b, "/q%08x%08x.cv", h, h2);          // "q": formato compacto (RGB565); os formatos antigos sao ignorados
+    return diskDir() + b;
 }
 
+bool ImgCache::diskHas(const std::string &url) {
+    struct stat st;
+    return stat(diskPath(url).c_str(), &st) == 0 && st.st_size > 16;
+}
+
+// arquivo: largura, altura (int32) + w*h pixels RGB565 (metade do tamanho do BGRA, e a diferenca nao aparece em poster)
 bool ImgCache::loadDisk(const std::string &url, Cover &out) {
     FILE *f = fopen(diskPath(url).c_str(), "rb");
     if (!f) return false;
     int w = 0, h = 0;
     if (fread(&w, 4, 1, f) != 1 || fread(&h, 4, 1, f) != 1 || w != kThumbW || h != kThumbH) { fclose(f); return false; }
-    out.w = w; out.h = h;
-    out.bgra.resize((size_t)w * h);
-    size_t n = fread(out.bgra.data(), 4, out.bgra.size(), f);
+    std::vector<uint16_t> raw((size_t)w * h);
+    size_t n = fread(raw.data(), 2, raw.size(), f);
     fclose(f);
-    if (n != out.bgra.size()) return false;
+    if (n != raw.size()) return false;
+    out.w = w; out.h = h;
+    out.bgra.resize(raw.size());
+    for (size_t i = 0; i < raw.size(); i++) {
+        unsigned v = raw[i], r = (v >> 11) & 31, g = (v >> 5) & 63, b = v & 31;
+        r = (r << 3) | (r >> 2); g = (g << 2) | (g >> 4); b = (b << 3) | (b >> 2);
+        out.bgra[i] = 0xFF000000u | (r << 16) | (g << 8) | b;
+    }
     out.ready = true;
     return true;
 }
 
 void ImgCache::saveDisk(const std::string &url, const Cover &c) {
     if (!c.ready || c.bgra.empty()) return;
-    mkdir("/data/kickiptv_cov", 0777);
+    mkdir(diskDir().c_str(), 0777);
     std::string path = diskPath(url), tmp = path + ".tmp";      // grava num temporario: arquivo pela metade nunca vira capa
+    std::vector<uint16_t> raw(c.bgra.size());
+    for (size_t i = 0; i < raw.size(); i++) { uint32_t p = c.bgra[i]; raw[i] = (uint16_t)((((p >> 16) & 255) >> 3) << 11 | (((p >> 8) & 255) >> 2) << 5 | ((p & 255) >> 3)); }
     FILE *f = fopen(tmp.c_str(), "wb");
     if (!f) return;
-    bool ok = fwrite(&c.w, 4, 1, f) == 1 && fwrite(&c.h, 4, 1, f) == 1 && fwrite(c.bgra.data(), 4, c.bgra.size(), f) == c.bgra.size();
+    bool ok = fwrite(&c.w, 4, 1, f) == 1 && fwrite(&c.h, 4, 1, f) == 1 && fwrite(raw.data(), 2, raw.size(), f) == raw.size();
     ok = fclose(f) == 0 && ok;
     if (ok) rename(tmp.c_str(), path.c_str()); else remove(tmp.c_str());
 }
