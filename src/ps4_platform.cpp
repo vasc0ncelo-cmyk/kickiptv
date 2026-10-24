@@ -1,7 +1,7 @@
 // Kick IPTV para PS4: lives da Kick (HLS) + lista M3U (canais, filmes, series).
 //   Home: banner + atalhos KICK TV / FILMES / SERIES / CANAIS + LISTA M3U  (D-pad navega, X seleciona, OPTIONS sai)
 //   Kick TV: X em "Digitar @streamer" abre o teclado na tela; o link da lista M3U tambem e digitado nele.
-//   Teclado: D-pad move, X digita, QUADRADO apaga, TRIANGULO insere https://, L2 limpa, R1 = OK, O cancela.
+//   Teclado: Setas move, X digita, QUADRADO apaga, TRIANGULO insere http://, L2 limpa, R1 = OK, O cancela.
 //   Durante o video: X = pausar | L2/R2 = -10s/+10s (VOD) | setas = -30s/+30s (VOD) | L1/R1 = episodio ant/prox
 //                    QUADRADO = qualidade | TRIANGULO = ajuste de imagem (live) | L1 = memoria (live) | O = voltar
 //   HLS (.m3u8): o app baixa playlist/segmentos e entrega ao AvPlayer por callbacks de arquivo (hls.hpp / streambuf.hpp).
