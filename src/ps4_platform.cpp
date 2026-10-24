@@ -1070,6 +1070,7 @@ struct Player {
     unsigned long long lastSeq = 0;
     double inactiveSince = 0, lastFrameT = 0, hudUntil = 0;
     std::string title, url;
+    std::string waitNote;                  // linha de progresso/diagnostico na tela "Abrindo o video..." (ex.: MB baixados, por que nao desenhou)
     // diagnostico de fluidez (HUD)
     double lastDrawT = 0, worstGap = 0, worstShown = 0;      // maior intervalo entre quadros desenhados no ultimo segundo
     double convMs = 0;                                       // tempo da ultima conversao TS->MP4
@@ -1170,7 +1171,7 @@ struct Player {
     bool start(const std::string &url, const std::string &title) {
         log.clear(); frames = 0; vw = vh = 0; fps = 0; fpsFrames = 0; failed = false; addRc = 0; chunkMode = false; chunkIdx = 0; inactiveSince = 0;
         cancelled = false; restarts = switchesOk = 0; lastGapMs = 0; gapStartT = switchedAt = 0; curDur = 0; chunkT0 = 0; blitMs = 0;
-        paused = false; isVod = false; lastPtsMs = 0;
+        paused = false; isVod = false; lastPtsMs = 0; waitNote.clear();
         h2 = 0; bHandle = 0; bState = 0; nextReady = false; prepBusy = false; gapless = true;
         if (g_tearing.load() > 0) {
             log.push_back("Encerrando a exibicao anterior...");
@@ -1361,6 +1362,8 @@ struct Player {
                 lastUi = nowSec();
                 char b[96]; snprintf(b, sizeof b, "   preparando o inicio do filme... %.1f MB  (O cancela)", dl->have() / 1048576.0);
                 log.back() = b;
+                snprintf(b, sizeof b, "Baixando o início do arquivo... %.1f MB", dl->have() / 1048576.0);
+                waitNote = b;
                 presentCb();
             }
             sceKernelUsleep(20000);
@@ -1371,11 +1374,32 @@ struct Player {
         if (!dl->info().empty()) log.push_back("   " + dl->info());
         if (!dl->warn().empty()) log.push_back("   AVISO: " + dl->warn());
         else if (!dl->audioWarn().empty()) log.push_back("   AVISO: " + dl->audioWarn());
+        // 2b) pre-buffer: o AvPlayer le o arquivo local direto, sem esperar o download. Se ele ler alem do que ja chegou, enxerga zeros
+        //     (imagem bugada). Arquivos grandes/de alto bitrate precisam de mais colchao antes de abrir: 0,4% do arquivo (8 a 48 MB).
+        {
+            uint64_t need = total / 250;
+            if (need < (8u << 20)) need = 8u << 20;
+            if (need > (48u << 20)) need = 48u << 20;
+            if (need > total) need = total;
+            double pw = nowSec(), lastUi = 0;
+            while (dl->state() == 1 && dl->frontier() < need && nowSec() - pw < 30) {
+                if (cancelCb && cancelCb()) { cancelled = true; break; }
+                if (nowSec() - lastUi > 0.2) {
+                    lastUi = nowSec();
+                    char b[96]; snprintf(b, sizeof b, "Enchendo o buffer... %.0f / %.0f MB", dl->frontier() / 1048576.0, need / 1048576.0);
+                    waitNote = b; presentCb();
+                }
+                sceKernelUsleep(20000);
+            }
+            if (cancelled) { releasePfAsync(); failed = true; return false; }
+            if (dl->state() == 2) { log.push_back("ERRO: " + dl->error()); failed = true; releasePfAsync(); return false; }
+        }
+        waitNote = "Abrindo o player...";
         log.push_back("   abrindo o player...");
         presentCb();
 
         // 3) toca o arquivo local (o resto ja esta baixando)
-        if (openSource(path, 0, 0, 20000, true)) {
+        if (openSource(path, 0, 0, dl->warn().empty() ? 20000 : 8000, true)) {   // codec que o PS4 nao decodifica: nao espera 20 s
             audio.start(h); active = true; t0 = lastFps = lastFrameT = nowSec();
             isVod = true; log.push_back("OK: tocando enquanto baixa"); return true;
         }
@@ -1537,6 +1561,15 @@ struct Player {
                 int pitch, yRows; blit::strideCandidate(strideMode, (int)w, (int)hh, pitch, yRows);
                 // NUNCA desenhar com srcN==0: isso lia memoria invalida e fechava o app (CE-34878-0)
                 bool fits = srcN > 0 && blit::strideBytes(strideMode, (int)w, (int)hh) <= srcN;
+                if (!fits && srcN > 0 && blit::strideBytes(0, (int)w, (int)hh) <= srcN) {      // buffer do decoder sem a linha extra de alinhamento (ex.: 1080 sem virar 1088)
+                    pitch = (int)w; yRows = (int)hh; fits = true;
+                }
+                if (!(fits && !skipDraw) && frames == 0) {
+                    char nb[160];
+                    snprintf(nb, sizeof nb, "Sem imagem: quadro %ux%u, buffer %zu B, precisa %zu B, %s", w, hh, avail, blit::strideBytes(strideMode, (int)w, (int)hh),
+                             skipDraw ? "detectando alinhamento" : (srcN ? "nao cabe" : "sem acesso ao quadro"));
+                    waitNote = nb;
+                }
                 if (fits && !skipDraw) {
                     b0 = nowSec();
                     blitNV12(src, w, hh, pitch, yRows, r.fb, r.W, r.H);
@@ -1692,6 +1725,7 @@ struct Player {
             uiKMark(r, cx - 60, cy - 61, 120, 122, GREEN);
             uiCenterHeavy(r, cx, cy + 130, uiFit(r, title, 38, r.W - 300), TEXT, 38);
             uiCenter(r, cx, cy + 180, quietWait ? "Trocando qualidade..." : isVod ? "Abrindo o vídeo..." : "Abrindo a transmissão...", MUTED, 24);
+            if (!waitNote.empty()) uiCenter(r, cx, cy + 222, uiFit(r, waitNote, 20, r.W - 200), DIM, 20);
             uiHints(r, r.W - 73, r.H - 50, {{"O", "Cancelar"}});
             return;
         }
