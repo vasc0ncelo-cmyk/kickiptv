@@ -36,7 +36,7 @@ public:
     static const int kThumbW = 148;           // tamanho do poster na grade (2:3)
     static const int kThumbH = 222;
     static const size_t kMaxEntries = 300;    // na memoria (~130 KB cada)
-    static const int kWorkers = 4;
+    static const int kWorkers = 2;
 
     // pasta do cache em disco (os testes usam outra)
     static std::string &diskDir() { static std::string d = "/data/kickiptv_cov"; return d; }
