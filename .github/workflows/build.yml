@@ -28,6 +28,7 @@ jobs:
           g++ -std=c++17 -o k tests/test_keyboard.cpp src/m3u.cpp && ./k
           g++ -std=c++17 -o c tests/test_classify.cpp src/m3u.cpp && ./c
           g++ -std=c++17 -o w tests/test_urlutil.cpp && ./w
+          g++ -std=c++17 -pthread -o ic tests/test_imgcache.cpp src/imgcache.cpp && ./ic
           g++ -std=c++17 -pthread -o f tests/test_httpfile.cpp && ./f
           g++ -std=c++17 -pthread -o pf tests/test_progfile.cpp && ./pf
           g++ -std=c++17 -o s tests/test_tschunk.cpp && ./s
