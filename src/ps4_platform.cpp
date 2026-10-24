@@ -84,7 +84,7 @@ static void trace(const char *stage);   // (definida mais abaixo)
 // Marcadores finos do download da lista M3U: se o app fechar, a proxima abertura mostra o ULTIMO passo que foi gravado.
 static bool g_traceHttp = false;                 // so durante o download da lista M3U
 static const char *g_m3uTag = "m3u-t-";          // "t" = thread de rede | "s" = modo seguro (mesma thread)
-static bool g_safeM3U = false;                   // modo seguro: baixa a lista sem criar thread de rede
+static bool g_safeM3U = true;                    // modo seguro: baixa a lista sem criar thread de rede
 static void traceHttp(const char *what) { if (g_traceHttp) { std::string s = std::string(g_m3uTag) + what; trace(s.c_str()); } }
 static double monoSec() { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec + ts.tv_nsec / 1e9; }
 
@@ -96,7 +96,9 @@ struct NetClient {
     void L(const std::string &s) { if (log) log->push_back(s); }
     static std::string hex(int v) { char b[16]; snprintf(b, sizeof b, "%08X", (unsigned)v); return b; }
 
+    std::mutex initMu;
     bool init() {
+        std::lock_guard<std::mutex> initLk(initMu);       // capas/lista/canais podem chamar de threads diferentes: so uma inicializa
         if (ready) return true;
         if (failed) { L("(inicializacao ja falhou acima)"); return false; }
         failed = true;
@@ -578,13 +580,13 @@ struct BootScreen {
                             }
         }
     }
-    void line(const std::string &t, uint32_t c = 0xFFE8ECF4u) { if (fb) { text(48, y, t.c_str(), c, 2); y += 40; } }
+    void line(const std::string &, uint32_t = 0xFFE8ECF4u) {}      // sem lista de passos na abertura (o log continua gravado em /data)
 };
 
 // ---------- Registro de passos em /data/kickiptv.log ----------
 // Se o app cair, na proxima abertura o menu mostra em qual passo ele parou.
 static std::string g_prevStage;           // (leitura do log anterior removida: usava fread, que o app original nao importava)
-static const bool kCoversOn = false;   // capas DESLIGADAS (teste para o app abrir): nao baixa nem decodifica capas, sem threads de capa. true = liga.
+static const bool kCoversOn = true;    // capas de filmes, series e canais (versao estavel: 2 trabalhadores, rede serializada, sem baixador em massa)
 static std::string g_prevRaw = "(nenhum)";      // ultima linha do log da vez anterior, mesmo se foi saida normal
 static std::vector<std::string> g_prevTail;   // ultimas linhas do log da vez anterior (so quando o app nao saiu direito)
 static void traceInit() {
@@ -1856,14 +1858,6 @@ int main() {
 
     traceInit();
     trace("video-ok");
-    boot.line("log anterior: " + g_prevRaw, 0xFF8A93A6u);
-    if (!g_prevStage.empty()) {
-        boot.line("da ultima vez o app parou em: " + g_prevStage, 0xFFFFB020u);
-        boot.line("ultimos passos gravados:", 0xFFFFB020u);
-        for (auto &t : g_prevTail) boot.line("  " + t);
-        boot.line("(tire uma foto desta tela - continua em 12 segundos)", 0xFFFFB020u);
-        sceKernelUsleep(12 * 1000 * 1000);
-    }
     Ps4Platform pf;
     trace("pf-ok");
     App app(pf);
@@ -1872,15 +1866,14 @@ int main() {
     trace("ui-ok");
     g_covers.setFetch([](const std::string &url, std::string &body) -> bool {
         if (!kCoversOn) return false;
+        static std::mutex coverNetMx;                    // uma capa por vez na rede (a biblioteca HTTP do PS4 nao gosta de muitas chamadas juntas)
+        std::lock_guard<std::mutex> lk(coverNetMx);
         int st = 0;
         try {
-            return g_net.get(url, body, st) && st >= 200 && st < 300 && body.size() > 32;
+            return g_net.get(url, body, st, 768 * 1024) && st >= 200 && st < 300 && body.size() > 32;
         } catch (...) { return false; }
     });
-    ui.coverBackground = [](std::vector<std::string> urls) {
-        if (!kCoversOn) return;
-        try { g_covers.setBackground(std::move(urls)); } catch (...) {}
-    };
+    ui.coverBackground = [](std::vector<std::string>) {};     // SEM baixador em massa (era ele que baixava ate 1200 capas sozinho): so as capas que aparecem na tela e as proximas paginas
     ui.coverBatch = [](const std::vector<std::string> &front, const std::vector<std::string> &back) {
         if (!kCoversOn) return;
         try { g_covers.setWanted(front, back); } catch (...) {}
@@ -1979,7 +1972,6 @@ int main() {
     };
     updateClock();
     boot.line("[4] abrindo a interface...");
-    sceKernelUsleep(400000);
     trace("abertura");
 
     const bool kShowIntro = false;     // a animacao e codigo novo e o app caia nela; ligue (true) so depois de confirmar que o resto abre
