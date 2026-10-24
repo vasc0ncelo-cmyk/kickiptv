@@ -579,6 +579,8 @@ struct BootScreen {
 // ---------- Registro de passos em /data/kickiptv.log ----------
 // Se o app cair, na proxima abertura o menu mostra em qual passo ele parou.
 static std::string g_prevStage;           // (leitura do log anterior removida: usava fread, que o app original nao importava)
+static const bool kCoversOn = false;   // TESTE: false = nao baixa nem decodifica capas (para saber se elas derrubam o app). Volte para true depois.
+static std::string g_prevRaw = "(nenhum)";      // ultima linha do log da vez anterior, mesmo se foi saida normal
 static std::vector<std::string> g_prevTail;   // ultimas linhas do log da vez anterior (so quando o app nao saiu direito)
 static void traceInit() {
     // le o log da ultima vez (libkernel, como as configuracoes) para mostrar na tela em que passo o app parou
@@ -590,7 +592,8 @@ static void traceInit() {
         while (!all.empty() && (all.back() == '\n' || all.back() == '\r')) all.pop_back();
         size_t p = all.rfind('\n');
         std::string last = p == std::string::npos ? all : all.substr(p + 1);
-        if (!last.empty() && last != "fim" && last != "saindo" && last != "menu-ok" && last != "inicio") {
+        if (!last.empty()) g_prevRaw = last;
+        if (!last.empty() && last != "fim" && last != "saindo" && last != "inicio") {
             g_prevStage = last;
             std::vector<std::string> v; size_t st = 0;
             while (st < all.size()) { size_t nl = all.find('\n', st); if (nl == std::string::npos) nl = all.size(); if (nl > st) v.push_back(all.substr(st, nl - st)); st = nl + 1; }
@@ -1848,6 +1851,7 @@ int main() {
 
     traceInit();
     trace("video-ok");
+    boot.line("log anterior: " + g_prevRaw, 0xFF8A93A6u);
     if (!g_prevStage.empty()) {
         boot.line("da ultima vez o app parou em: " + g_prevStage, 0xFFFFB020u);
         boot.line("ultimos passos gravados:", 0xFFFFB020u);
@@ -1862,15 +1866,18 @@ int main() {
     UI ui(app);
     trace("ui-ok");
     g_covers.setFetch([](const std::string &url, std::string &body) -> bool {
+        if (!kCoversOn) return false;
         int st = 0;
         try {
             return g_net.get(url, body, st) && st >= 200 && st < 300 && body.size() > 32;
         } catch (...) { return false; }
     });
     ui.coverBackground = [](std::vector<std::string> urls) {
+        if (!kCoversOn) return;
         try { g_covers.setBackground(std::move(urls)); } catch (...) {}
     };
     ui.coverBatch = [](const std::vector<std::string> &front, const std::vector<std::string> &back) {
+        if (!kCoversOn) return;
         try { g_covers.setWanted(front, back); } catch (...) {}
     };
     ui.coverGet = [](const std::string &url, const uint32_t *&px, int &w, int &h) -> bool {
@@ -1908,6 +1915,7 @@ int main() {
     // Se o app cair nesse intervalo, na proxima abertura a lista NAO e carregada sozinha (o app abre e explica), em vez de cair de novo.
     double bgloadClearAt = 0;
     auto startLoader = [&](const std::string &url) {
+        trace("lista-net-init");
         g_net.init();                                                 // a rede e inicializada na thread principal
         int slot = -1; std::string cu; pf.cacheInfo(slot, cu);
         int cslot = (slot >= 0 && cu == url) ? slot : -1;              // so vale a copia DESTA url
@@ -1960,7 +1968,8 @@ int main() {
     sceKernelUsleep(400000);
     trace("abertura");
 
-    {   // ---- abertura animada: marca K aparece, titulo, barra de carregamento ----
+    const bool kShowIntro = false;     // a animacao e codigo novo e o app caia nela; ligue (true) so depois de confirmar que o resto abre
+    if (kShowIntro) {   // ---- abertura animada: marca K aparece, titulo, barra de carregamento ----
         double ti = nowSec();
         for (;;) {
             double e = nowSec() - ti;
@@ -1994,6 +2003,7 @@ int main() {
         if ((pin.held | pin.pending) & B_OPTIONS) { wantQuit = true; return true; }
         return false;
     };
+    trace("antes-lista");
     // Protecao contra "fecha sempre ao abrir": se a ultima abertura caiu durante a lista M3U, muda de estrategia.
     //  1a queda -> a proxima abertura usa o MODO SEGURO (baixa a lista sem thread de rede) e isso fica gravado;
     //  caiu ate no modo seguro -> nao carrega a lista sozinho (o app abre normalmente e mostra o passo onde parou).
@@ -2188,6 +2198,7 @@ int main() {
             size_t it = loader.items();
             if (tn - loaderSay >= 0.35 && it != loaderSayItems) {
                 loaderSay = tn; loaderSayItems = it;
+                { static size_t lastMB = 0; size_t mb = loader.bytes() / (16u << 20); if (mb != lastMB) { lastMB = mb; char b[40]; snprintf(b, sizeof b, "lista-%uMB", (unsigned)(mb * 16)); trace(b); } }
                 app.say(std::string(loader.fromNet() ? "Baixando a lista M3U... " : "Carregando a lista salva... ") + App::fmtMB(loader.bytes()) + "  |  " + std::to_string(it) + " itens");
                 dirty = true;
             }
