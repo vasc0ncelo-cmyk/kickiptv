@@ -1959,7 +1959,16 @@ int main() {
         memcpy(bufs[back], shadow, (size_t)W * H * 4);          // copia sequencial (rapida)
         sceVideoOutSubmitFlip(vh, back, ORBIS_VIDEO_OUT_FLIP_VSYNC, 0); back = (back + 1) % 3;
     };
-    auto presentMenu = [&]() { FbRenderer r(shadow, W, H); ui.render(r); flip(); };
+    ui.dbg = [](const char *st) { static int n = 0; if (n < 6) { n++; trace(st); } };      // so o 1o desenho do menu (nao enche o log)
+    auto presentMenu = [&]() {
+        FbRenderer r(shadow, W, H);
+        static bool firstDraw = true;
+        if (firstDraw) trace("menu-1o-desenho");
+        ui.render(r);
+        if (firstDraw) trace("menu-render-ok");
+        flip();
+        if (firstDraw) { firstDraw = false; trace("menu-flip-ok"); ui.dbg = nullptr; }
+    };
     auto presentWait = [&]() { FbRenderer r(shadow, W, H); player.renderWaiting(r); flip(); };
     auto presentKbd = [&]() { FbRenderer r(shadow, W, H); kbd.render(r, ((int)(nowSec() * 2)) % 2 == 0, ui.timeText, ui.dateText); flip(); };
     auto updateClock = [&]() -> bool {         // true se o minuto mudou
