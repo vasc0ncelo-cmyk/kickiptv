@@ -217,6 +217,18 @@ int main() {
         usleep(100000); d.join();                               // join() aborta
         assert(d.state() != 3);
     }
+    // 9) mkv: codec lido do cabecalho
+    {
+        std::string i, w;
+        std::string h = std::string("\x1A\x45\xDF\xA3", 4) + std::string(40, 'x') + "V_MPEGH/ISO/HEVC" + std::string(20, 'y') + "A_EAC3";
+        progfile::mkv::scan(h, i, w);
+        assert(w.find("HEVC") != std::string::npos && i.find("EAC3") != std::string::npos);
+        h = std::string("\x1A\x45\xDF\xA3", 4) + "V_MPEG4/ISO/AVC" + "A_AAC";
+        progfile::mkv::scan(h, i, w);
+        assert(w.empty() && i.find("H.264") != std::string::npos);
+        progfile::mkv::scan("ftypisom....", i, w);
+        assert(i.empty() && w.empty());
+    }
     remove(P.c_str());
     std::cout << "test_progfile OK\n";
 }
