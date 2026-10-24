@@ -43,11 +43,21 @@ struct CacheFake : Fake {
 };
 
 int main() {
-    {   // sem limite de itens: 350 mil entradas (acima do antigo teto de 300 mil)
+    {   // lista gigante (350 mil itens com capa, ~115 MB na memoria): carrega so ate o orcamento de memoria, avisa e NAO estoura
         std::string t = "#EXTM3U\n";
-        for (int i = 0; i < 350000; i++) t += "#EXTINF:-1 group-title=\"Abertos\",Canal " + std::to_string(i) + "\nhttp://h/live/" + std::to_string(i) + ".ts\n";
+        for (int i = 0; i < 350000; i++) t += "#EXTINF:-1 tvg-logo=\"http://image.tmdb.org/t/p/w300/abcdefghijkl" + std::to_string(i) + ".jpg\" group-title=\"Abertos\",Canal numero " + std::to_string(i) + "\nhttp://180381.sbs/live/Dirce0273/Sar5438/" + std::to_string(i) + ".ts\n";
         Playlist p = buildPlaylist(t);
-        assert(p.channels.size() == 350000 && !p.truncated);
+        assert(p.truncated && p.channels.size() > 150000 && p.channels.size() < 350000);
+        assert(p.channels.back().url.find("/live/") != std::string::npos);             // o que entrou esta inteiro (nada pela metade)
+        // lista media (60 mil): carrega inteira
+        std::string m = "#EXTM3U\n";
+        for (int i = 0; i < 60000; i++) m += "#EXTINF:-1 tvg-logo=\"http://image.tmdb.org/t/p/w300/abcdefghijkl" + std::to_string(i) + ".jpg\" group-title=\"Abertos\",Canal numero " + std::to_string(i) + "\nhttp://180381.sbs/live/Dirce0273/Sar5438/" + std::to_string(i) + ".ts\n";
+        Playlist q = buildPlaylist(m); assert(q.channels.size() == 60000 && !q.truncated);
+        // App avisa na tela
+        struct Big : Platform { std::string body; bool httpGet(const std::string &, std::string &b) override { b = body; return true; }
+            void play(const std::string &, const std::string &) override {} void requestText(const std::string &) override {} };
+        Big big; big.body = t; App a(big);
+        assert(a.loadM3U("http://lista") && a.list.truncated && a.lastStatus.find("lista enorme") != std::string::npos);
     }
     {   // cache: 1a vez baixa e salva; abrir o app (useCache) nao baixa; confirmar o link baixa de novo; outro link baixa
         CacheFake f; App a(f);
