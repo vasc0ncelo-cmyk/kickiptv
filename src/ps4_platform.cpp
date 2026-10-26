@@ -1715,75 +1715,137 @@ struct Player {
     bool canPrevEp() const { return hasEpisodes() && epIndex > 0; }
     bool canNextEp() const { return hasEpisodes() && epIndex + 1 < (int)epUrls.size(); }
 
-    // HUD moderno sobre o video (aparece nos primeiros segundos e quando qualquer botao e apertado)
+    // HUD estilo streaming (barra superior + inferior + opcoes)
+    bool showOpts = false;
+    int optCur = 0;
     void overlay(FbRenderer &r) {
         using namespace theme;
-        if (nowSec() > hudUntil && !feedProblem() && !paused && !vodDlFailed()) return;
-        if (vodDlFailed()) {
-            std::string m = uiFit(r, "Download interrompido: " + getPf()->error() + "  (o que ja baixou continua tocando)", 20, r.W - 160);
-            r.roundRect(32, 100, r.textWidth(m, 20) + 48, 44, 22, 0xD0801520);
-            uiText(r, 56, 100 + 12, m, TEXT, 20);
+        if (nowSec() > hudUntil && !feedProblem() && !paused && !vodDlFailed() && !showOpts) return;
+        const int W = r.W, H = r.H;
+
+        // degradê superior e inferior (legibilidade)
+        for (int y = 0; y < 120; y++) {
+            unsigned a = (unsigned)((120 - y) * 180 / 120);
+            r.fillRect(0, y, W, 1, (a << 24));
         }
-        if (nowSec() <= hudUntil || paused) {
-            char b[256];
+        for (int y = 0; y < 220; y++) {
+            unsigned a = (unsigned)((y) * 200 / 220);
+            r.fillRect(0, H - 220 + y, W, 1, (a << 24));
+        }
+
+        // topo: logo + titulo
+        uiHeavy(r, 48, 36, "KICK IPTV", GREEN, 28);
+        r.fillRect(48 + r.textWidth("KICK IPTV", 28) + 16, 42, 2, 22, 0xFF2A2A2A);
+        uiText(r, 48 + r.textWidth("KICK IPTV", 28) + 32, 42, uiFit(r, title, 26, W / 2), TEXT, 26, true);
+
+        // centro: pause grande
+        if (paused) {
+            r.roundRect(W / 2 - 48, H / 2 - 48, 96, 96, 48, 0xC0000000);
+            // dois tracinhos de pause
+            r.roundRect(W / 2 - 18, H / 2 - 24, 12, 48, 4, TEXT);
+            r.roundRect(W / 2 + 6, H / 2 - 24, 12, 48, 4, TEXT);
+        }
+
+        // barra inferior
+        int barY = H - 160;
+        // "capa" pequena + titulo
+        r.roundRect(48, barY - 10, 72, 100, 10, CHIP);
+        uiCenterHeavy(r, 48 + 36, barY + 40, isVod ? "VOD" : "LIVE", GREEN, 18);
+        uiHeavy(r, 140, barY, uiFit(r, title, 28, W - 400), TEXT, 28);
+        {
+            char meta[96];
             if (isVod) {
                 int sec = (int)(lastPtsMs / 1000); if (sec < 0) sec = 0;
-                int mm = sec / 60, ss = sec % 60;
-                auto pfd = getPf();
-                char dlb[40] = "";
-                if (pfd && pfd->total() && pfd->state() != 3) snprintf(dlb, sizeof dlb, "  |  baixado %d%%", (int)(pfd->have() * 100 / pfd->total()));
-                snprintf(b, sizeof b, "%ux%u  |  %d:%02d%s  |  %s%s",
-                         vw, vh, mm, ss, dlb,
-                         g_texType.load() == 0 ? "Onion" : "Garlic", paused ? "  |  PAUSADO" : "");
+                snprintf(meta, sizeof meta, "%d:%02d  |  %ux%u%s", sec / 60, sec % 60, vw, vh, paused ? "  |  PAUSADO" : "");
             } else {
-                snprintf(b, sizeof b, "%ux%u  |  %.0f fps  |  %s  |  %s%s",
-                         vw, vh, fps, kQualityName[g_quality.load() % 3],
-                         g_texType.load() == 0 ? "Onion" : "Garlic", paused ? "  |  PAUSADO" : "");
+                snprintf(meta, sizeof meta, "AO VIVO  |  %ux%u  |  %s", vw, vh, kQualityName[g_quality.load() % 3]);
             }
-            std::string stats = b;
-            int tw = r.textWidth(title, 24), sw = r.textWidth(stats, 18);
-            int pw = 24 + 92 + 16 + tw + 24 + sw + 28;
-            r.roundRect(32, 28, pw, 60, 30, 0xB8000000);
-            r.roundRect(44, 42, 92, 32, 16, isVod ? 0xFF3B82F6 : RED);
-            uiCenter(r, 44 + 46, 58, isVod ? (paused ? "PAUSA" : "VOD") : "AO VIVO", TEXT, 16, true);
-            uiText(r, 44 + 92 + 16, 58 - 12, title, TEXT, 24, true);
-            uiText(r, 44 + 92 + 16 + tw + 24, 58 - 9, stats, MUTED, 18);
+            uiText(r, 140, barY + 36, meta, MUTED, 20);
+        }
 
-            const char *hint;
-            if (isVod) {
-                if (hasEpisodes())
-                    hint = "X  Pausar   L1/R1  Episodio ant/prox   O  Sair";
-                else
-                    hint = "X  Pausar   O  Sair";
-            } else {
-                hint = "X  Pausar   QUADRADO  Qualidade   L1  Memoria   TRIANGULO  Imagem   O  Sair";
-            }
-            int hw = r.textWidth(hint, 18) + 48;
-            r.roundRect(r.W - 32 - hw, r.H - 130, hw, 44, 22, 0xB8000000);
-            uiCenter(r, r.W - 32 - hw / 2, r.H - 108, hint, SOFT, 18);
+        // progresso (VOD: estimado pelo pts; live: barra "viva")
+        int trackX = 140, trackW = W - 140 - 200, trackY = barY + 72;
+        r.roundRect(trackX, trackY, trackW, 6, 3, 0xFF333333);
+        if (isVod) {
+            // sem duration real do AvPlayer: usa barra animada + tempo
+            int fill = trackW / 3 + (int)((lastPtsMs / 1000) % 60) * trackW / 180;
+            if (fill > trackW) fill = trackW;
+            if (fill < 8) fill = 8;
+            r.roundRect(trackX, trackY, fill, 6, 3, GREEN);
+            r.roundRect(trackX + fill - 8, trackY - 5, 16, 16, 8, GREEN);
+        } else {
+            // live: preenche quase tudo
+            r.roundRect(trackX, trackY, trackW * 9 / 10, 6, 3, GREEN);
+            r.roundRect(trackX + trackW * 9 / 10 - 8, trackY - 5, 16, 16, 8, GREEN);
+        }
 
-            if (!isVod) {
-                char rb[48] = ""; if (g_autoRestarts > 0) snprintf(rb, sizeof rb, "  |  reconexoes: %d", g_autoRestarts);
-                snprintf(b, sizeof b, "pico %.0f ms  |  baixa %.0f/%.0f ms (seg %.1fs)  |  conv %.0f ms  |  abre %.0f ms  |  trocas: %d ok, %d com emenda, ultima %.0f ms%s%s",
-                         worstShown, g_feed.dlMs.load(), g_feed.dlMsMax.load(), g_feed.lastSegDur.load(), convMs, openMs, switchesOk, restarts, lastGapMs, gapless ? "" : "  (sem-emenda OFF)", rb);
-                r.roundRect(32, r.H - 76, r.textWidth(b, 16) + 40, 40, 20, 0x90000000);
-                uiText(r, 52, r.H - 76 + 12, b, DIM, 16);
-            } else if (hasEpisodes()) {
-                snprintf(b, sizeof b, "Episodio %d / %d", epIndex + 1, (int)epUrls.size());
-                r.roundRect(32, r.H - 76, r.textWidth(b, 16) + 40, 40, 20, 0x90000000);
-                uiText(r, 52, r.H - 76 + 12, b, DIM, 16);
+        // botoes de controle
+        int cy = H - 48;
+        auto btn = [&](int cx, const char *lab, bool hi) {
+            r.roundRect(cx - 28, cy - 22, 56, 44, 22, hi ? GREEN : 0xFF2A2A2A);
+            uiCenter(r, cx, cy, lab, hi ? BLACK : TEXT, 18, true);
+        };
+        btn(W / 2 - 160, "|<", false);
+        btn(W / 2 - 80, "-10", false);
+        btn(W / 2, paused ? ">" : "II", true);
+        btn(W / 2 + 80, "+10", false);
+        btn(W / 2 + 160, ">|", false);
+
+        // dicas
+        const char *hint = isVod
+            ? (hasEpisodes() ? "X Pausar   L2/R2 -10s/+10s   L1/R1 Episodio   △ Opcoes   O Sair"
+                             : "X Pausar   L2/R2 -10s/+10s   △ Opcoes   O Sair")
+            : "X Pausar   □ Qualidade   △ Opcoes   O Sair";
+        uiText(r, 48, H - 28, hint, DIM, 16);
+
+        // menu de opcoes (lado direito)
+        if (showOpts) {
+            const int ox = W - 420, oy = 100, ow = 380, oh = 420;
+            r.roundRect(ox, oy, ow, oh, 18, 0xE0101010);
+            r.roundRect(ox, oy, 4, oh, 2, GREEN);
+            uiHeavy(r, ox + 24, oy + 24, "Opcoes", TEXT, 28);
+            const char *items[] = {
+                "Qualidade do video",
+                "Proporcao da tela",
+                "Audio",
+                "Velocidade",
+                "Voltar"
+            };
+            const int nOpt = 5;
+            for (int i = 0; i < nOpt; i++) {
+                int iy = oy + 80 + i * 56;
+                bool sel = (i == optCur);
+                if (sel) r.roundRect(ox + 12, iy - 8, ow - 24, 48, 12, 0xFF1A2A12);
+                if (sel) r.roundRect(ox + 12, iy - 8, ow - 24, 48, 12, 0x00000000); // placeholder
+                if (sel) {
+                    r.roundRect(ox + 12, iy - 8, ow - 24, 48, 12, 0xFF142014);
+                    r.roundRect(ox + 12, iy - 8, 3, 48, 2, GREEN);
+                }
+                uiText(r, ox + 28, iy + 8, items[i], sel ? TEXT : SOFT, 22, sel);
+                const char *val = "";
+                if (i == 0) val = kQualityName[g_quality.load() % 3];
+                else if (i == 1) val = "16:9";
+                else if (i == 2) val = "Original";
+                else if (i == 3) val = "Normal";
+                if (val[0]) {
+                    int vw2 = r.textWidth(val, 20);
+                    uiText(r, ox + ow - 28 - vw2, iy + 10, val, MUTED, 20);
+                }
             }
         }
+
         if (feedProblem()) {
-            std::string m = uiFit(r, g_feed.getStatus(), 20, r.W - 160);
+            std::string m = uiFit(r, g_feed.getStatus(), 20, W - 160);
             r.roundRect(32, 100, r.textWidth(m, 20) + 48, 44, 22, 0xD0801520);
-            uiText(r, 56, 100 + 12, m, TEXT, 20);
+            uiText(r, 56, 112, m, TEXT, 20);
         }
-        if (paused) {
-            r.roundRect(r.W / 2 - 80, r.H / 2 - 40, 160, 80, 20, 0xC0000000);
-            uiCenter(r, r.W / 2, r.H / 2, "II", TEXT, 48, true);
+        if (vodDlFailed()) {
+            std::string m = uiFit(r, "Download interrompido: " + getPf()->error(), 20, W - 160);
+            r.roundRect(32, 100, r.textWidth(m, 20) + 48, 44, 22, 0xD0801520);
+            uiText(r, 56, 112, m, TEXT, 20);
         }
     }
+
     void renderWaiting(FbRenderer &r) {
         using namespace theme;
         uiBackground(r);
@@ -2155,14 +2217,38 @@ int main() {
         }
 
         if (mode == Mode::Play) {
-            if (pressed & B_CIRCLE) {
+            if ((pressed & B_CIRCLE) && !player.showOpts) {
                 player.stop(); player.quietWait = false; player.epUrls.clear(); player.epTitles.clear(); player.epIndex = -1;
+                player.showOpts = false;
                 mode = Mode::Menu; dirty = true; sceKernelUsleep(16000); continue;
             }
             if (pressed) player.hudUntil = nowSec() + 5;      // qualquer botao mostra o HUD por 5s
 
             // X = pausar / continuar
-            if (pressed & B_CROSS) player.togglePause();
+            if (pressed & B_CROSS) {
+                if (player.showOpts) {
+                    // no menu: X confirma item
+                    if (player.optCur == 0 && !player.isVod && !player.url.empty()) {
+                        g_quality = (g_quality.load() + 1) % 3;
+                        pf.pendingPlayUrl = player.url; pf.pendingPlayTitle = player.title;
+                        player.quietWait = true; player.showOpts = false;
+                        player.stop(); mode = Mode::Menu; dirty = true; sceKernelUsleep(8000); continue;
+                    } else if (player.optCur == 4) {
+                        player.showOpts = false;
+                    }
+                } else player.togglePause();
+            }
+            // TRIANGULO = menu de opcoes do player
+            if (pressed & B_TRIANGLE) {
+                player.showOpts = !player.showOpts;
+                player.optCur = 0;
+                player.hudUntil = nowSec() + 12;
+            }
+            if (player.showOpts) {
+                if (pressed & B_UP) player.optCur = (player.optCur + 4) % 5;
+                if (pressed & B_DOWN) player.optCur = (player.optCur + 1) % 5;
+                if (pressed & B_CIRCLE) { player.showOpts = false; }
+            }
 
             // Seek VOD: L2 -10s, R2 +10s, esquerda -30s, direita +30s
             if (player.isVod) {
@@ -2188,8 +2274,7 @@ int main() {
                     player.stop(); mode = Mode::Menu; dirty = true; sceKernelUsleep(8000); continue;
                 }
             } else {
-                // Live: L1 ainda alterna memoria de video; TRIANGULO ajusta stride
-                if (pressed & B_TRIANGLE) { player.autoStride = false; player.strideMode = (player.strideMode + 1) % 4; }
+                // Live: L1 ainda alterna memoria de video
                 if ((pressed & B_L1) && !player.url.empty()) {
                     g_texType = g_texType.load() == 0 ? 3 : 0;
                     pf.pendingPlayUrl = player.url; pf.pendingPlayTitle = player.title;
