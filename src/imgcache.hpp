@@ -131,13 +131,21 @@ public:
     size_t backgroundLeft() { std::lock_guard<std::mutex> l(m_); return bg_.size() - std::min(bgPos_, bg_.size()); }
     uint32_t version() const { return version_.load(); }     // muda toda vez que uma capa fica pronta (a tela se redesenha)
 
-    void shutdown() {
+    void shutdown() { shutdownFor(1e9); }
+    // Para as threads esperando no maximo 'maxSec'. false = alguma esta presa na rede: elas sao soltas (detach) e quem chamou
+    // deve encerrar o processo sem rodar destrutores (_Exit). Antes o fechar do app esperava a rede sem limite de tempo.
+    bool shutdownFor(double maxSec) {
         { std::lock_guard<std::mutex> l(m_); stop_ = true; }
         cv_.notify_all();
-        for (auto &t : ths_) if (t.joinable()) t.join();
+        auto t0 = std::chrono::steady_clock::now();
+        while (alive_.load() > 0 && std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() < maxSec)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        bool clean = alive_.load() == 0;
+        for (auto &t : ths_) if (t.joinable()) { if (clean) t.join(); else t.detach(); }
         ths_.clear();
-        for (auto &t : bgTh_) if (t.joinable()) t.join();
+        for (auto &t : bgTh_) if (t.joinable()) { if (clean) t.join(); else t.detach(); }
         bgTh_.clear();
+        return clean;
     }
     ~ImgCache() { shutdown(); }
 
@@ -155,6 +163,7 @@ private:
     std::atomic<bool> bgActive_{false};
     std::vector<std::string> bg_; size_t bgPos_ = 0;
     std::atomic<bool> paused_{false};
+    std::atomic<int> alive_{0};                // threads ainda rodando (para o shutdownFor)
     bool stop_ = false;
     std::atomic<uint32_t> version_{0};
 
@@ -162,12 +171,12 @@ private:
     void startWorkers() {
         std::lock_guard<std::mutex> l(m_);
         if (!ths_.empty() || stop_) return;
-        for (int i = 0; i < kWorkers; i++) ths_.emplace_back([this, i] { workerLoop(i); });
+        for (int i = 0; i < kWorkers; i++) { alive_++; ths_.emplace_back([this, i] { workerLoop(i); alive_--; }); }
     }
     void startBg() {
         std::lock_guard<std::mutex> l(m_);
         if (!bgTh_.empty() || stop_) return;
-        for (int i = 0; i < kBgThreads; i++) bgTh_.emplace_back([this, i] { bgLoop(kWorkers + i); });
+        for (int i = 0; i < kBgThreads; i++) { alive_++; bgTh_.emplace_back([this, i] { bgLoop(kWorkers + i); alive_--; }); }
     }
     void bgLoop(int id) {
         for (;;) {
