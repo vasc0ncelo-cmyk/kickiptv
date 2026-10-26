@@ -383,9 +383,9 @@ struct UI {
     std::string kickLast;     // ultimo @ pesquisado
     std::string m3uUrl;       // lista M3U atual
     std::string timeText, dateText;   // relogio (a plataforma atualiza)
-    int textKind = 0;         // 0 nada, 1 = @streamer, 2 = endereco M3U, 3 = busca (lupa)
-    std::string searchQ;      // filtro ativo (triangulo)
-    std::vector<uint32_t> searchHits;  // indices em movies/channels OU seriesCats flat
+    int textKind = 0;         // 0 nada, 1 = @streamer, 2 = endereco M3U, 3 = busca
+    std::string searchQ;
+    std::vector<uint32_t> searchHits;
     static const int kRows = 10;
     static const int ImgW = 148, ImgH = 222;       // tamanho do poster (igual ao da miniatura em imgcache.hpp)
     static const int kCols = 8, kGridRows = 3;     // grade de posters (Filmes, Series, Canais)
@@ -536,14 +536,25 @@ struct UI {
         if (q.size() > name.size()) return false;
         for (size_t i = 0; i + q.size() <= name.size(); i++) {
             bool ok = true;
-            for (size_t j = 0; j < q.size(); j++) {
+            for (size_t j = 0; j < q.size(); j++)
                 if (low((unsigned char)name[i + j]) != low((unsigned char)q[j])) { ok = false; break; }
-            }
             if (ok) return true;
         }
         return false;
     }
     bool searching() const { return !searchQ.empty() && browsable(tab); }
+    std::string seriesNameAt(uint32_t flatIdx) const {
+        uint32_t idx = 0;
+        for (const auto &kv : app.list.seriesTree) {
+            if (idx == flatIdx) return kv.first;
+            idx++;
+        }
+        return "";
+    }
+    void clearSearch() {
+        searchQ.clear(); searchHits.clear();
+        int t = (int)tab; cursor[t] = scroll[t] = 0;
+    }
     void rebuildSearch() {
         searchHits.clear();
         if (searchQ.empty()) return;
@@ -555,40 +566,19 @@ struct UI {
             for (uint32_t i = 0; i < (uint32_t)p.channels.size(); i++)
                 if (nameMatch(p.channels[i].name, searchQ)) searchHits.push_back(i);
         } else if (tab == Tab::Series) {
-            // indices flat: percorre todas as series de todas as categorias (unique by name via seriesTree)
             uint32_t idx = 0;
             for (const auto &kv : p.seriesTree) {
                 if (nameMatch(kv.first, searchQ)) searchHits.push_back(idx);
                 idx++;
             }
-            // guarda nomes em paralelo? melhor: searchHits = indices into ordered seriesNames
         }
-        level = 0;
-        inItems = true;
-        int t = (int)tab;
-        cursor[t] = scroll[t] = 0;
-    }
-    // nomes de series na ordem do map (igual rebuildSearch)
-    std::string seriesNameAt(uint32_t flatIdx) const {
-        uint32_t idx = 0;
-        for (const auto &kv : app.list.seriesTree) {
-            if (idx == flatIdx) return kv.first;
-            idx++;
-        }
-        return "";
+        level = 0; inItems = true;
+        int t = (int)tab; cursor[t] = scroll[t] = 0;
     }
     void startSearch() {
-        if (!browsable(tab)) {
-            app.say("Abra Filmes, Series ou Canais para buscar");
-            return;
-        }
+        if (!browsable(tab)) { app.say("Abra Filmes, Series ou Canais para buscar"); return; }
         textKind = 3;
         app.pf.requestText(searchQ.empty() ? "Buscar..." : searchQ);
-    }
-    void clearSearch() {
-        searchQ.clear(); searchHits.clear();
-        int t = (int)tab;
-        cursor[t] = scroll[t] = 0;
     }
 
     // Itens da direita (da categoria escolhida), sem copiar a lista inteira.
@@ -640,11 +630,7 @@ struct UI {
             size_t a = raw.find_first_not_of(" \t\r\n");
             size_t b = raw.find_last_not_of(" \t\r\n");
             searchQ = a == std::string::npos ? "" : raw.substr(a, b - a + 1);
-            if (searchQ.empty()) {
-                clearSearch();
-                app.say("Busca limpa");
-                return;
-            }
+            if (searchQ.empty()) { clearSearch(); app.say("Busca limpa"); return; }
             rebuildSearch();
             app.say(std::to_string(searchHits.size()) + " resultado(s) para \"" + searchQ + "\"");
             return;
@@ -653,7 +639,6 @@ struct UI {
         if (kickLast.empty() && !raw.empty()) { app.say("@ invalido"); return; }
         if (!kickLast.empty()) { app.pf.saveSetting("kick", kickLast); app.watchKick(kickLast); }
     }
-    // texto que o teclado mostra ao abrir
     std::string textInitial() const {
         if (textKind == 2) return m3uUrl;
         if (textKind == 3) return searchQ;
@@ -661,8 +646,7 @@ struct UI {
     }
 
     void setM3U(std::string url) {
-        size_t a = url.find_first_not_of(" \t\r\n");
-        size_t b = url.find_last_not_of(" \t\r\n");
+        size_t a = url.find_first_not_of(" \t\r\n"), b = url.find_last_not_of(" \t\r\n");
         url = a == std::string::npos ? "" : url.substr(a, b - a + 1);
         if (url.empty()) {                       // campo vazio = remover a lista
             m3uUrl.clear(); app.list = Playlist(); app.pf.saveSetting("m3u", ""); app.pf.cacheClear();
@@ -746,11 +730,7 @@ private:
     // O (ou seta esquerda): Series sobe um nivel; depois os itens voltam para as categorias; nas categorias volta ao inicio.
     void goBack() {
         int t = (int)tab;
-        if (searching()) {
-            clearSearch();
-            app.say("Busca limpa");
-            return;
-        }
+        if (searching()) { clearSearch(); app.say("Busca limpa"); return; }
         if (screen == Screen::Kick || !browsable(tab)) { screen = Screen::Home; return; }
         if (!inItems) { screen = Screen::Home; return; }
         if (tab == Tab::Series && level > 0) { level--; cursor[t] = 0; scroll[t] = 0; }
@@ -1151,14 +1131,11 @@ private:
         if (searching()) {
             if (c < 0 || c >= (int)searchHits.size()) return;
             uint32_t hi = searchHits[c];
-            if (tab == Tab::Channels && hi < p.channels.size()) {
-                const Entry &e = p.channels[hi]; app.pf.play(e.url, e.name);
-            } else if (tab == Tab::Movies && hi < p.movies.size()) {
-                const Entry &e = p.movies[hi]; app.pf.play(e.url, e.name);
-            } else if (tab == Tab::Series) {
+            if (tab == Tab::Channels && hi < p.channels.size()) { const Entry &e = p.channels[hi]; app.pf.play(e.url, e.name); }
+            else if (tab == Tab::Movies && hi < p.movies.size()) { const Entry &e = p.movies[hi]; app.pf.play(e.url, e.name); }
+            else if (tab == Tab::Series) {
                 curSeries = seriesNameAt(hi);
-                if (curSeries.empty()) return;
-                level = 1; clearSearch(); cursor[t] = scroll[t] = 0; inItems = true;
+                if (!curSeries.empty()) { level = 1; clearSearch(); cursor[t] = scroll[t] = 0; inItems = true; }
             }
             return;
         }
