@@ -75,7 +75,7 @@ public:
                 if (it == map_.end()) { map_[u] = std::make_shared<Cover>(); pending_.push_back(u); return; }
                 Cover &c = *it->second;
                 if (c.ready || inflight_.count(u)) return;
-                if (c.failed) { if (now - c.failedAt < 20.0) return; it->second = std::make_shared<Cover>(); }   // tenta de novo depois de 20 s
+                if (c.failed) { if (now - c.failedAt < 8.0) return; it->second = std::make_shared<Cover>(); }   // tenta de novo depois de 20 s
                 pending_.push_back(u);
             };
             for (auto &u : front) add(u);
