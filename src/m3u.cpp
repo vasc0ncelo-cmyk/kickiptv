@@ -83,24 +83,32 @@ bool parseEpisode(const std::string &name, std::string &series, int &season, int
 // 3) "S01E02" no nome  4) extensao de arquivo de video  5) padrao: canal.
 static Kind classify(const Entry &e) {
     std::string u = lower(e.url), g = fold(e.group), n = fold(e.name);
+    // 1) caminho da URL (Xtream) — decisivo
     if (has(u, "/series/")) return Kind::Series;
-    if (has(u, "/movie/") || has(u, "/movies/")) return Kind::Movie;
-    if (has(u, "/live/")) return Kind::Channel;
+    if (has(u, "/movie/") || has(u, "/movies/") || has(u, "/vod/")) return Kind::Movie;
+    if (has(u, "/live/") || has(u, "/streaming/")) return Kind::Channel;
 
-    if (hasWord(g, "canais") || hasWord(g, "canal") || hasWord(g, "channels") || hasWord(g, "live") || has(g, "tv aberta") || has(g, "tv fechada") ||
-        has(g, "ao vivo") || has(g, "24h") || has(g, "24 h") || has(g, "esporte") || has(g, "sport") || has(g, "noticia") ||
-        has(g, "abertos") || has(g, "radio") || has(g, "ppv") || has(g, "premiere") || has(g, "infantil tv")) return Kind::Channel;
+    // 2) grupo de CANAIS (mesmo se o nome parecer filme/serie — "24H SERIES" e canal ao vivo)
+    if (hasWord(g, "canais") || hasWord(g, "canal") || hasWord(g, "channels") || hasWord(g, "live") ||
+        has(g, "tv aberta") || has(g, "tv fechada") || has(g, "ao vivo") || has(g, "24h") || has(g, "24 h") ||
+        has(g, "esporte") || has(g, "sport") || has(g, "noticia") || has(g, "abertos") || has(g, "radio") ||
+        has(g, "ppv") || has(g, "premiere") || has(g, "infantil tv") || has(g, "globo") || has(g, "sbt") ||
+        has(g, "record") || has(g, "band") || has(g, "espn") || has(g, "fox sports")) return Kind::Channel;
     if (n.compare(0, 3, "24h") == 0 || n.compare(0, 4, "24 h") == 0) return Kind::Channel;
 
     std::string ext = urlExtension(u), s; int a, b;
     bool vodExt = ext == "mp4" || ext == "mkv" || ext == "avi" || ext == "mov" || ext == "wmv" || ext == "flv" ||
                   ext == "mpg" || ext == "mpeg" || ext == "m4v" || ext == "webm";
-    if (has(g, "serie") || has(g, "temporada") || has(g, "season") || has(g, "novela") || has(g, "anime") || has(g, "dorama") ||
-        hasWord(g, "doramas")) return Kind::Series;
-    if (parseEpisode(e.name, s, a, b) && (vodExt || has(g, "filme") || has(g, "movie") || has(g, "vod") || ext.empty() || ext == "ts")) return Kind::Series;
-    if (has(g, "filme") || has(g, "movie") || has(g, "cine") || has(g, "vod") || has(g, "lancamento") || has(g, "legendado") ||
-        has(g, "dublado") || has(g, "film")) return Kind::Movie;
+    // 3) series por grupo ou SxxExx em VOD
+    if (has(g, "serie") || has(g, "temporada") || has(g, "season") || has(g, "novela") || has(g, "anime") ||
+        has(g, "dorama") || hasWord(g, "doramas") || has(g, "episod")) return Kind::Series;
+    if (parseEpisode(e.name, s, a, b) && (vodExt || has(g, "filme") || has(g, "movie") || has(g, "vod"))) return Kind::Series;
+    // 4) filmes por grupo
+    if (has(g, "filme") || has(g, "movie") || has(g, "cine") || has(g, "vod") || has(g, "lancamento") ||
+        has(g, "legendado") || has(g, "dublado") || has(g, "film") || has(g, "cinema")) return Kind::Movie;
+    // 5) extensao de video sem grupo de canal = filme; .ts / sem extensao = canal
     if (vodExt) return Kind::Movie;
+    if (ext == "ts" || ext == "m3u8" || ext.empty()) return Kind::Channel;
     return Kind::Channel;
 }
 
@@ -162,7 +170,53 @@ void PlaylistBuilder::finish() {
     for (auto &s : p_.seriesTree)
         for (auto &t : s.second)
             std::stable_sort(t.second.begin(), t.second.end(), [](const Entry &a, const Entry &b) { return a.episode < b.episode; });
-    for (auto &c : p_.seriesCats) std::sort(c.series.begin(), c.series.end());   // mesma ordem do seriesTree
+    for (auto &c : p_.seriesCats) std::sort(c.series.begin(), c.series.end());
+
+    // Ordena itens de cada categoria por nome (A-Z)
+    auto byNameMovie = [&](uint32_t a, uint32_t b) {
+        return fold(p_.movies[a].name) < fold(p_.movies[b].name);
+    };
+    auto byNameChan = [&](uint32_t a, uint32_t b) {
+        return fold(p_.channels[a].name) < fold(p_.channels[b].name);
+    };
+    for (auto &c : p_.movieCats) std::sort(c.items.begin(), c.items.end(), byNameMovie);
+    for (auto &c : p_.channelCats) std::sort(c.items.begin(), c.items.end(), byNameChan);
+
+    // Categorias A-Z (exceto "Todos" que entra no topo depois)
+    auto byCatName = [](const Category &a, const Category &b) { return fold(a.name) < fold(b.name); };
+    std::sort(p_.movieCats.begin(), p_.movieCats.end(), byCatName);
+    std::sort(p_.seriesCats.begin(), p_.seriesCats.end(), byCatName);
+    std::sort(p_.channelCats.begin(), p_.channelCats.end(), byCatName);
+
+    // Categoria "Todos" = lista completa A-Z (renomeia "Todos" que veio do M3U para nao duplicar)
+    for (auto &c : p_.movieCats) if (c.name == "Todos") c.name = "Geral";
+    for (auto &c : p_.seriesCats) if (c.name == "Todos") c.name = "Geral";
+    for (auto &c : p_.channelCats) if (c.name == "Todos") c.name = "Geral";
+    if (!p_.movies.empty()) {
+        Category all;
+        all.name = "Todos";
+        all.items.resize(p_.movies.size());
+        for (uint32_t i = 0; i < (uint32_t)p_.movies.size(); i++) all.items[i] = i;
+        std::sort(all.items.begin(), all.items.end(), byNameMovie);
+        p_.movieCats.insert(p_.movieCats.begin(), std::move(all));
+    }
+    if (!p_.seriesTree.empty()) {
+        Category all;
+        all.name = "Todos";
+        for (const auto &kv : p_.seriesTree) all.series.push_back(kv.first);
+        std::sort(all.series.begin(), all.series.end(), [](const std::string &a, const std::string &b) {
+            return fold(a) < fold(b);
+        });
+        p_.seriesCats.insert(p_.seriesCats.begin(), std::move(all));
+    }
+    if (!p_.channels.empty()) {
+        Category all;
+        all.name = "Todos";
+        all.items.resize(p_.channels.size());
+        for (uint32_t i = 0; i < (uint32_t)p_.channels.size(); i++) all.items[i] = i;
+        std::sort(all.items.begin(), all.items.end(), byNameChan);
+        p_.channelCats.insert(p_.channelCats.begin(), std::move(all));
+    }
 }
 
 Playlist PlaylistBuilder::take() { return std::move(p_); }
