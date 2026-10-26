@@ -83,9 +83,9 @@ int main() {
     assert(cleanCategory("Ação - Aventura") == "Ação - Aventura" && cleanCategory("") == "Sem categoria" && cleanCategory("Filmes") == "Filmes");
     {   // as 3 abas ficam separadas por categoria e a soma bate com o total
         Playlist p = buildPlaylist(text);
-        size_t n = 0; for (auto &c : p.channelCats) n += c.items.size(); assert(n == p.channels.size() && p.channelCats.size() == 1 && p.channelCats[0].name == "Canais, HD");
-        n = 0; for (auto &c : p.movieCats) n += c.items.size(); assert(n == p.movies.size() && p.movieCats[0].name == "Acao");
-        n = 0; for (auto &c : p.seriesCats) n += c.series.size(); assert(n == p.seriesTree.size() && p.seriesCats[0].name == "Drama");
+        size_t n = 0; for (auto &c : p.channelCats) if (c.name != "Todos") n += c.items.size(); assert(n == p.channels.size() && p.channelCats[0].name == "Todos");
+        n = 0; for (auto &c : p.movieCats) if (c.name != "Todos") n += c.items.size(); assert(n == p.movies.size() && p.movieCats[0].name == "Todos");
+        n = 0; for (auto &c : p.seriesCats) if (c.name != "Todos") n += c.series.size(); assert(n == p.seriesTree.size() && p.seriesCats[0].name == "Todos");
     }
     std::cout << "OK\n";
 }
