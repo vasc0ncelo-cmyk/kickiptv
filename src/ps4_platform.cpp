@@ -1744,7 +1744,6 @@ struct Player {
         paused = !paused;
         audio.muted = paused || muted;
         hudUntil = nowSec() + 12;
-        showOpts = showOpts; // keep menu if open
     }
 
     // Seek em software + tentativa de JumpToTime (se o firmware exportar a funcao).
