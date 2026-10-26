@@ -4,6 +4,7 @@
 #include <map>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 enum class Kind { Channel, Movie, Series };
@@ -57,6 +58,7 @@ private:
     size_t count_ = 0, memBytes_ = 0;
     bool full_ = false;
     std::unordered_map<std::string, int> chanIdx_, movieIdx_, seriesIdx_;   // nome limpo da categoria -> posicao
+    std::unordered_set<std::string> seenUrl_;  // evita capa/item duplicado (mesmo URL)
     static int catFor(std::vector<Category> &cats, std::unordered_map<std::string, int> &idx, const std::string &group);
 };
 
