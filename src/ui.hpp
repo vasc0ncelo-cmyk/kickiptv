@@ -13,7 +13,7 @@
 #include <xmmintrin.h>
 #endif
 
-enum class Input { Up, Down, Left, Right, PrevTab, NextTab, Confirm, Back, PageUp, PageDown, Extra };   // Extra = triangulo: baixar todas as capas
+enum class Input { Up, Down, Left, Right, PrevTab, NextTab, Confirm, Back, PageUp, PageDown, Extra };   // Extra = triangulo: buscar (lupa)
 enum class Screen { Home, Kick, List };
 
 struct Renderer {
@@ -383,7 +383,9 @@ struct UI {
     std::string kickLast;     // ultimo @ pesquisado
     std::string m3uUrl;       // lista M3U atual
     std::string timeText, dateText;   // relogio (a plataforma atualiza)
-    int textKind = 0;         // 0 nada, 1 = @streamer, 2 = endereco M3U (o que o teclado esta pedindo)
+    int textKind = 0;         // 0 nada, 1 = @streamer, 2 = endereco M3U, 3 = busca (lupa)
+    std::string searchQ;      // filtro ativo (triangulo)
+    std::vector<uint32_t> searchHits;  // indices em movies/channels OU seriesCats flat
     static const int kRows = 10;
     static const int ImgW = 148, ImgH = 222;       // tamanho do poster (igual ao da miniatura em imgcache.hpp)
     static const int kCols = 8, kGridRows = 3;     // grade de posters (Filmes, Series, Canais)
@@ -414,6 +416,13 @@ struct UI {
     std::string itemLogo(int i) const {
         const Playlist &p = app.list;
         if (i < 0 || i >= itemCount()) return "";
+        if (searching()) {
+            uint32_t hi = searchHits[i];
+            if (tab == Tab::Movies && hi < p.movies.size()) return p.movies[hi].logo;
+            if (tab == Tab::Channels && hi < p.channels.size()) return p.channels[hi].logo;
+            if (tab == Tab::Series) return seriesLogo(seriesNameAt(hi));
+            return "";
+        }
         const Category *c = curCat();
         if (tab == Tab::Movies && c && i < (int)c->items.size())
             return p.movies[c->items[i]].logo;
@@ -518,10 +527,75 @@ struct UI {
     std::string catLabel(int i) const { const auto &v = cats(tab); return i >= 0 && i < (int)v.size() ? v[i].name : ""; }
     size_t catSize(int i) const { const auto &v = cats(tab); return i >= 0 && i < (int)v.size() ? v[i].size() : 0; }
 
+
+    static bool nameMatch(const std::string &name, const std::string &q) {
+        if (q.empty()) return true;
+        auto low = [](unsigned char c) -> char {
+            return (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : (char)c;
+        };
+        if (q.size() > name.size()) return false;
+        for (size_t i = 0; i + q.size() <= name.size(); i++) {
+            bool ok = true;
+            for (size_t j = 0; j < q.size(); j++) {
+                if (low((unsigned char)name[i + j]) != low((unsigned char)q[j])) { ok = false; break; }
+            }
+            if (ok) return true;
+        }
+        return false;
+    }
+    bool searching() const { return !searchQ.empty() && browsable(tab); }
+    void rebuildSearch() {
+        searchHits.clear();
+        if (searchQ.empty()) return;
+        const Playlist &p = app.list;
+        if (tab == Tab::Movies) {
+            for (uint32_t i = 0; i < (uint32_t)p.movies.size(); i++)
+                if (nameMatch(p.movies[i].name, searchQ)) searchHits.push_back(i);
+        } else if (tab == Tab::Channels) {
+            for (uint32_t i = 0; i < (uint32_t)p.channels.size(); i++)
+                if (nameMatch(p.channels[i].name, searchQ)) searchHits.push_back(i);
+        } else if (tab == Tab::Series) {
+            // indices flat: percorre todas as series de todas as categorias (unique by name via seriesTree)
+            uint32_t idx = 0;
+            for (const auto &kv : p.seriesTree) {
+                if (nameMatch(kv.first, searchQ)) searchHits.push_back(idx);
+                idx++;
+            }
+            // guarda nomes em paralelo? melhor: searchHits = indices into ordered seriesNames
+        }
+        level = 0;
+        inItems = true;
+        int t = (int)tab;
+        cursor[t] = scroll[t] = 0;
+    }
+    // nomes de series na ordem do map (igual rebuildSearch)
+    std::string seriesNameAt(uint32_t flatIdx) const {
+        uint32_t idx = 0;
+        for (const auto &kv : app.list.seriesTree) {
+            if (idx == flatIdx) return kv.first;
+            idx++;
+        }
+        return "";
+    }
+    void startSearch() {
+        if (!browsable(tab)) {
+            app.say("Abra Filmes, Series ou Canais para buscar");
+            return;
+        }
+        textKind = 3;
+        app.pf.requestText(searchQ.empty() ? "Buscar..." : searchQ);
+    }
+    void clearSearch() {
+        searchQ.clear(); searchHits.clear();
+        int t = (int)tab;
+        cursor[t] = scroll[t] = 0;
+    }
+
     // Itens da direita (da categoria escolhida), sem copiar a lista inteira.
     int itemCount() const {
         const Playlist &p = app.list;
         if (tab == Tab::Kick) return (int)kickActions().size();
+        if (searching()) return (int)searchHits.size();
         const Category *c = curCat();
         if (!c) return 0;
         if (tab != Tab::Series) return (int)c->items.size();
@@ -536,6 +610,13 @@ struct UI {
         const Playlist &p = app.list;
         if (i < 0 || i >= itemCount()) return "";
         if (tab == Tab::Kick) return kickLabel(kickActions()[i]);
+        if (searching()) {
+            uint32_t hi = searchHits[i];
+            if (tab == Tab::Movies && hi < p.movies.size()) return p.movies[hi].name;
+            if (tab == Tab::Channels && hi < p.channels.size()) return p.channels[hi].name;
+            if (tab == Tab::Series) return seriesNameAt(hi);
+            return "";
+        }
         const Category *c = curCat();
         if (tab == Tab::Channels) return p.channels[c->items[i]].name;
         if (tab == Tab::Movies) return p.movies[c->items[i]].name;
@@ -555,15 +636,36 @@ struct UI {
     void onText(const std::string &raw) {
         int kind = textKind; textKind = 0;
         if (kind == 2) { setM3U(raw); return; }
+        if (kind == 3) {
+            // trim
+            size_t a = raw.find_first_not_of(" 	
+"), b = raw.find_last_not_of(" 	
+");
+            searchQ = a == std::string::npos ? "" : raw.substr(a, b - a + 1);
+            if (searchQ.empty()) {
+                clearSearch();
+                app.say("Busca limpa");
+                return;
+            }
+            rebuildSearch();
+            app.say(std::to_string(searchHits.size()) + " resultado(s) para "" + searchQ + """);
+            return;
+        }
         kickLast = kickSlug(raw);
         if (kickLast.empty() && !raw.empty()) { app.say("@ invalido"); return; }
         if (!kickLast.empty()) { app.pf.saveSetting("kick", kickLast); app.watchKick(kickLast); }
     }
     // texto que o teclado mostra ao abrir
-    std::string textInitial() const { return textKind == 2 ? m3uUrl : kickLast; }
+    std::string textInitial() const {
+        if (textKind == 2) return m3uUrl;
+        if (textKind == 3) return searchQ;
+        return kickLast;
+    }
 
     void setM3U(std::string url) {
-        size_t a = url.find_first_not_of(" \t\r\n"), b = url.find_last_not_of(" \t\r\n");
+        size_t a = url.find_first_not_of(" 	
+"), b = url.find_last_not_of(" 	
+");
         url = a == std::string::npos ? "" : url.substr(a, b - a + 1);
         if (url.empty()) {                       // campo vazio = remover a lista
             m3uUrl.clear(); app.list = Playlist(); app.pf.saveSetting("m3u", ""); app.pf.cacheClear();
@@ -594,7 +696,7 @@ struct UI {
     }
 
     void handle(Input in) {
-        if (in == Input::Extra) { bulkCovers(); return; }
+        if (in == Input::Extra) { startSearch(); return; }
         if (screen == Screen::Home) { handleHome(in); return; }
         int t = (int)tab;
         switch (in) {
@@ -603,6 +705,7 @@ struct UI {
         default: break;
         }
         if (!browsable(tab)) { handleItems(in); return; }
+        if (searching()) { inItems = true; handleItems(in); return; }
         if (inItems) {
             if (in == Input::Left && !(gridMode() && cursor[t] % kCols != 0)) { goBack(); return; }   // 1a coluna: volta para as categorias (ou um nivel acima em Series)
             handleItems(in); return;
@@ -638,7 +741,7 @@ struct UI {
     }
 
 private:
-    void openTab(Tab t) { tab = t; screen = t == Tab::Kick ? Screen::Kick : Screen::List; level = 0; inItems = false; }
+    void openTab(Tab t) { tab = t; screen = t == Tab::Kick ? Screen::Kick : Screen::List; level = 0; inItems = false; searchQ.clear(); searchHits.clear(); }
     void resetBrowse() {
         for (int i = 0; i < 4; i++) cursor[i] = scroll[i] = catCur[i] = catScroll[i] = 0;
         level = 0; inItems = false;
@@ -646,6 +749,11 @@ private:
     // O (ou seta esquerda): Series sobe um nivel; depois os itens voltam para as categorias; nas categorias volta ao inicio.
     void goBack() {
         int t = (int)tab;
+        if (searching()) {
+            clearSearch();
+            app.say("Busca limpa");
+            return;
+        }
         if (screen == Screen::Kick || !browsable(tab)) { screen = Screen::Home; return; }
         if (!inItems) { screen = Screen::Home; return; }
         if (tab == Tab::Series && level > 0) { level--; cursor[t] = 0; scroll[t] = 0; }
@@ -812,7 +920,8 @@ private:
         // titulo: FILMES > Comedia > ...
         std::vector<std::string> parts;
         parts.push_back(tab == Tab::Channels ? "CANAIS" : tab == Tab::Movies ? "FILMES" : "SÉRIES");
-        if (cat) parts.push_back(cat->name);
+        if (searching()) parts.push_back("Busca: " + searchQ);
+        else if (cat) parts.push_back(cat->name);
         if (tab == Tab::Series && inItems && level >= 1) parts.push_back(curSeries);
         if (tab == Tab::Series && inItems && level >= 2) parts.push_back("Temporada " + std::to_string(curSeason));
         uiKMark(r, 73, 146, 40, 41, GREEN);
@@ -1009,7 +1118,7 @@ private:
             int hy = y0 + n * pitch + 10;
             uiFrame(r, x, hy, rw, 190, 18, 2, CARD_LINE, 0xFF0B0B0B);
             uiText(r, x + 30, hy + 20, "Como usar", GREEN, 24, true);
-            uiText(r, x + 30, hy + 62, "1. Escolha \"Digitar @streamer\" e informe o nome do canal (ex.: @dekin021).", SOFT, 22);
+            uiText(r, x + 30, hy + 62, "1. Escolha "Digitar @streamer" e informe o nome do canal (ex.: @dekin021).", SOFT, 22);
             uiText(r, x + 30, hy + 98, "2. O canal precisa estar ao vivo. Aperte O para voltar ao menu a qualquer momento.", SOFT, 22);
             uiText(r, x + 30, hy + 134, "3. As lives da Kick abrem direto aqui no PS4, sem navegador.", SOFT, 22);
         }
@@ -1019,9 +1128,9 @@ private:
         using namespace theme;
         const int W = r.width(), cy = 1043;
         std::vector<std::pair<std::string, std::string>> hints;
-        if (screen == Screen::Home) hints = {{"D-pad", "Navegar"}, {"X", "Selecionar"}, {"TRIÂNGULO", "Baixar capas"}, {"OPTIONS", "Sair"}};
-        else if (browsable(tab) && !inItems) hints = {{"L1/R1", "Abas"}, {"D-pad", "Categorias"}, {"X", "Abrir"}, {"TRIÂNGULO", "Baixar capas"}, {"O", "Início"}};
-        else if (browsable(tab)) hints = {{"L1/R1", "Abas"}, {"X", "Selecionar"}, {"O", "Categorias"}};
+        if (screen == Screen::Home) hints = {{"D-pad", "Navegar"}, {"X", "Selecionar"}, {"OPTIONS", "Sair"}};
+        else if (browsable(tab) && !inItems) hints = {{"L1/R1", "Abas"}, {"△", "Buscar"}, {"X", "Abrir"}, {"O", "Início"}};
+        else if (browsable(tab)) hints = {{"△", searching() ? "Nova busca" : "Buscar"}, {"X", "Selecionar"}, {"O", searching() ? "Limpar busca" : "Categorias"}};
         else hints = {{"L1/R1", "Abas"}, {"X", "Selecionar"}, {"O", "Voltar"}};
         int hx = uiHints(r, W - 73, cy, hints);
         const std::string &st = app.lastStatus;
@@ -1040,6 +1149,20 @@ private:
             if (c >= (int)acts.size()) return;
             if (acts[c] == KA_LAST) app.watchKick(kickLast);
             else { textKind = 1; app.pf.requestText("@ do streamer"); }
+            return;
+        }
+        if (searching()) {
+            if (c < 0 || c >= (int)searchHits.size()) return;
+            uint32_t hi = searchHits[c];
+            if (tab == Tab::Channels && hi < p.channels.size()) {
+                const Entry &e = p.channels[hi]; app.pf.play(e.url, e.name);
+            } else if (tab == Tab::Movies && hi < p.movies.size()) {
+                const Entry &e = p.movies[hi]; app.pf.play(e.url, e.name);
+            } else if (tab == Tab::Series) {
+                curSeries = seriesNameAt(hi);
+                if (curSeries.empty()) return;
+                level = 1; clearSearch(); cursor[t] = scroll[t] = 0; inItems = true;
+            }
             return;
         }
         const Category *cat = curCat();
