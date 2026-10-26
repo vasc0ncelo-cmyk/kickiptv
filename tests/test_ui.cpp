@@ -183,23 +183,31 @@ int main() {
         assert(bgCalls == 1 && bg.size() <= 3 * 14 * UI::kCols * UI::kGridRows && bg.size() >= 2 * UI::kCols * UI::kGridRows);   // so a 1a tela de cada categoria, nunca a lista toda
         assert(bg[0] == "http://img/m0.jpg");                                          // as primeiras de cada aba vem primeiro
     }
-    // --- TRIANGULO: baixa as capas de TODAS as categorias; apertar de novo cancela ---
+    // --- TRIANGULO: lupa — busca filmes/series/canais ---
     {
         Fake fb2; App ab2(fb2); UI ub2(ab2);
         std::string m = "#EXTM3U\n";
-        for (int i = 0; i < 30; i++) m += "#EXTINF:-1 tvg-logo=\"http://img/f" + std::to_string(i) + ".jpg\" group-title=\"FILMES | " + std::string(i % 2 ? "Acao" : "Drama") + "\",Filme " + std::to_string(i) + "\nhttp://h/m/" + std::to_string(i) + ".mp4\n";
-        for (int i = 0; i < 5; i++) m += "#EXTINF:-1 tvg-logo=\"http://img/c" + std::to_string(i) + ".jpg\" group-title=\"Abertos\",Canal " + std::to_string(i) + "\nhttp://h/live/" + std::to_string(i) + ".ts\n";
+        for (int i = 0; i < 10; i++) m += "#EXTINF:-1 tvg-logo=\"http://img/f" + std::to_string(i) + ".jpg\" group-title=\"FILMES\",Filme " + std::to_string(i) + "\nhttp://h/m/" + std::to_string(i) + ".mp4\n";
+        m += "#EXTINF:-1 tvg-logo=\"http://img/fx.jpg\" group-title=\"FILMES\",Matrix Reloaded\nhttp://h/m/matrix.mp4\n";
         ab2.list = buildPlaylist(m);
-        std::vector<std::string> got; bool active = false; int stops = 0;
-        ub2.coverBulk = [&](std::vector<std::string> v) { got = std::move(v); active = true; };
-        ub2.coverBulkStop = [&] { active = false; stops++; };
-        ub2.coverBulkActive = [&] { return active; };
+        ub2.screen = Screen::List; ub2.tab = Tab::Movies;
         ub2.handle(Input::Extra);
-        assert(got.size() == 35 && active && ab2.lastStatus.find("Baixando capas") == 0);
-        ub2.handle(Input::Extra); assert(!active && stops == 1 && ab2.lastStatus.find("cancelado") != std::string::npos);
-        UI ub3(ab2); got.clear(); ub3.coverBulk = [&](std::vector<std::string> v) { got = std::move(v); };
-        Playlist keep = std::move(ab2.list); ab2.list = Playlist(); ub3.handle(Input::Extra);
-        assert(got.empty() && ab2.lastStatus.find("Carregue uma lista") == 0);
+        assert(ub2.textKind == 3 && fb2.asked.find("Buscar") == 0);
+        ub2.onText("Matrix");
+        assert(ub2.searching() && ub2.itemCount() == 1 && ub2.itemLabel(0).find("Matrix") != std::string::npos);
+        assert(ab2.lastStatus.find("resultado") != std::string::npos);
+        ub2.handle(Input::Confirm);
+        assert(fb2.played == "http://h/m/matrix.mp4");
+        ub2.handle(Input::Back);   // limpa busca
+        assert(!ub2.searching());
+        // vazio limpa
+        ub2.handle(Input::Extra);
+        ub2.onText("   ");
+        assert(!ub2.searching() && ab2.lastStatus.find("Busca limpa") != std::string::npos);
+        // Kick: nao busca
+        ub2.tab = Tab::Kick; ub2.screen = Screen::Kick;
+        ub2.handle(Input::Extra);
+        assert(ab2.lastStatus.find("Abra Filmes") != std::string::npos || ab2.lastStatus.find("buscar") != std::string::npos);
     }
     // --- uiFit: corta com "..." sem estourar a largura e sem quebrar UTF-8 ---
     {
