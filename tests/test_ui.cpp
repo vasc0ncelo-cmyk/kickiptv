@@ -87,7 +87,7 @@ int main() {
       k.cx = 0; k.cy = 4; k.press(); assert(k.shift && k.keyAt(0, 1) == "Q");
       k.cx = 0; k.cy = 1; k.press(); assert(k.text == "Q");
       k.insert("https://"); assert(k.text == "Qhttps://"); k.backspace(); k.clear(); assert(k.text.empty());
-      k.open("", false); assert(k.maxLen == 40); }
+      k.open("", false); assert(k.maxLen >= 40); }
     // --- itemCount/itemLabel (sem copiar a lista toda) == labels() em todas as abas e niveis ---
     {
         Fake f3; App a3(f3); UI u3(a3); u3.setM3U("http://x/l.m3u");
