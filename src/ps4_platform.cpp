@@ -1735,7 +1735,7 @@ struct Player {
     }
     bool feedProblem() const { return useFeed && (g_feed.failed.load() || g_feed.streamEnded.load()); }
     static bool vodDlFailed() { auto d = getPf(); return d && d->state() == 2; }
-    bool hudActive() const { return nowSec() <= hudUntil || feedProblem() || paused || vodDlFailed() || showOpts; }
+    bool hudActive() const { return nowSec() <= hudUntil || feedProblem() || paused || vodDlFailed() || showOpts || showInfo; }
 
     // Pausa em software: nao chama sceAvPlayerPause (NID instavel no homebrew → CE-34878-0).
     // O loop principal para de buscar quadros e o audio fica mudo enquanto paused==true.
@@ -1786,143 +1786,186 @@ struct Player {
     bool canPrevEp() const { return hasEpisodes() && epIndex > 0; }
     bool canNextEp() const { return hasEpisodes() && epIndex + 1 < (int)epUrls.size(); }
 
-    // HUD estilo streaming (barra superior + inferior + opcoes)
+    // HUD estilo app de streaming (referencia visual)
     bool showOpts = false;
+    bool showInfo = false;
     int optCur = 0;
-    int aspectMode = 0;  // 0=16:9 fit  1=estirar  2=zoom
+    int aspectMode = 0;  // 0=16:9  1=Esticar  2=Zoom
     bool muted = false;
+    int focusCtrl = 2;   // 0=prev 1=-10 2=pause 3=+10 4=next (destaque visual)
     static const char *aspectName(int m) {
         return m == 1 ? "Esticar" : m == 2 ? "Zoom" : "16:9";
+    }
+    static void fmtTime(uint64_t ms, char *buf, size_t n) {
+        int s = (int)(ms / 1000); if (s < 0) s = 0;
+        int h = s / 3600, m = (s / 60) % 60, sec = s % 60;
+        if (h > 0) snprintf(buf, n, "%d:%02d:%02d", h, m, sec);
+        else snprintf(buf, n, "%d:%02d", m, sec);
     }
 
     void overlay(FbRenderer &r) {
         using namespace theme;
-        if (nowSec() > hudUntil && !feedProblem() && !paused && !vodDlFailed() && !showOpts) return;
+        if (nowSec() > hudUntil && !feedProblem() && !paused && !vodDlFailed() && !showOpts && !showInfo) return;
         const int W = r.W, H = r.H;
 
-        // degradê superior e inferior (legibilidade)
-        for (int y = 0; y < 120; y++) {
-            unsigned a = (unsigned)((120 - y) * 180 / 120);
+        // degradês
+        for (int y = 0; y < 140; y++) {
+            unsigned a = (unsigned)((140 - y) * 200 / 140);
             r.fillRect(0, y, W, 1, (a << 24));
         }
-        for (int y = 0; y < 220; y++) {
-            unsigned a = (unsigned)((y) * 200 / 220);
-            r.fillRect(0, H - 220 + y, W, 1, (a << 24));
+        for (int y = 0; y < 280; y++) {
+            unsigned a = (unsigned)((y) * 220 / 280);
+            r.fillRect(0, H - 280 + y, W, 1, (a << 24));
         }
 
-        // topo: logo + titulo
-        uiHeavy(r, 48, 36, "KICK IPTV", GREEN, 28);
-        r.fillRect(48 + r.textWidth("KICK IPTV", 28) + 16, 42, 2, 22, 0xFF2A2A2A);
-        uiText(r, 48 + r.textWidth("KICK IPTV", 28) + 32, 42, uiFit(r, title, 26, W / 2), TEXT, 26, true);
-
-        // centro: pause grande
-        if (paused) {
-            r.roundRect(W / 2 - 48, H / 2 - 48, 96, 96, 48, 0xC0000000);
-            // dois tracinhos de pause
-            r.roundRect(W / 2 - 18, H / 2 - 24, 12, 48, 4, TEXT);
-            r.roundRect(W / 2 + 6, H / 2 - 24, 12, 48, 4, TEXT);
-        }
-
-        // barra inferior
-        int barY = H - 160;
-        // "capa" pequena + titulo
-        r.roundRect(48, barY - 10, 72, 100, 10, CHIP);
-        uiCenterHeavy(r, 48 + 36, barY + 40, isVod ? "VOD" : "LIVE", GREEN, 18);
-        uiHeavy(r, 140, barY, uiFit(r, title, 28, W - 400), TEXT, 28);
+        // ---- TOPO ----
+        uiHeavy(r, 48, 28, "KICK IPTV", GREEN, 26);
+        int lx = 48 + r.textWidth("KICK IPTV", 26) + 18;
+        r.fillRect(lx, 34, 2, 20, 0xFF333333);
+        uiText(r, lx + 16, 32, uiFit(r, title, 24, W / 2 - 80), TEXT, 24, true);
+        // breadcrumb
         {
-            char meta[96];
-            if (isVod) {
-                int sec = (int)(displayPosMs() / 1000); if (sec < 0) sec = 0;
-                int ds = (int)(displayDurMs() / 1000);
-                snprintf(meta, sizeof meta, "%d:%02d / %d:%02d  |  %ux%u%s",
-                         sec / 60, sec % 60, ds / 60, ds % 60, vw, vh, paused ? "  |  PAUSADO" : "");
-            } else {
-                snprintf(meta, sizeof meta, "AO VIVO  |  %ux%u  |  %s", vw, vh, kQualityName[g_quality.load() % 3]);
-            }
-            uiText(r, 140, barY + 36, meta, MUTED, 20);
+            std::string crumb = isVod ? "Filmes" : "Ao vivo";
+            uiText(r, 48, 68, crumb, MUTED, 18);
+            int cx = 48 + r.textWidth(crumb, 18);
+            uiText(r, cx + 8, 68, "|", DIM, 18);
+            uiText(r, cx + 24, 68, uiFit(r, title, 18, 400), SOFT, 18);
         }
 
-        // progresso real (pts / duracao estimada)
-        int trackX = 140, trackW = W - 140 - 200, trackY = barY + 72;
-        r.roundRect(trackX, trackY, trackW, 6, 3, 0xFF333333);
+        // ---- CENTRO: pause ----
+        if (paused) {
+            r.roundRect(W / 2 - 44, H / 2 - 44, 88, 88, 44, 0xC0000000);
+            r.roundRect(W / 2 - 16, H / 2 - 22, 10, 44, 3, TEXT);
+            r.roundRect(W / 2 + 6, H / 2 - 22, 10, 44, 3, TEXT);
+        }
+
+        // ---- BARRA INFERIOR ----
+        int barY = H - 200;
+        // mini poster
+        r.roundRect(48, barY - 8, 70, 100, 10, CHIP);
+        uiCenterHeavy(r, 48 + 35, barY + 36, isVod ? "VOD" : "LIVE", GREEN, 16);
+
+        uiHeavy(r, 136, barY, uiFit(r, title, 26, W - 500), TEXT, 26);
+        {
+            char meta[128];
+            if (isVod) {
+                int ds = (int)(displayDurMs() / 1000);
+                snprintf(meta, sizeof meta, "%ux%u  ·  %s%s",
+                         vw, vh, kQualityName[g_quality.load() % 3],
+                         paused ? "  ·  PAUSADO" : "");
+            } else {
+                snprintf(meta, sizeof meta, "AO VIVO  ·  %ux%u  ·  %s",
+                         vw, vh, kQualityName[g_quality.load() % 3]);
+            }
+            uiText(r, 136, barY + 34, meta, MUTED, 18);
+        }
+
+        // progresso
+        int trackX = 136, trackW = W - 136 - 80, trackY = barY + 68;
+        r.roundRect(trackX, trackY, trackW, 5, 3, 0xFF2A2A2A);
         if (isVod) {
             uint64_t pos = displayPosMs(), dur = displayDurMs();
-            int fill = dur ? (int)((pos * (uint64_t)trackW) / dur) : 8;
-            if (fill < 8) fill = 8;
+            if (dur < 1) dur = 1;
+            int fill = (int)((pos * (uint64_t)trackW) / dur);
+            if (fill < 0) fill = 0;
             if (fill > trackW) fill = trackW;
-            r.roundRect(trackX, trackY, fill, 6, 3, GREEN);
-            r.roundRect(trackX + fill - 8, trackY - 5, 16, 16, 8, GREEN);
-            // tempos inicio/fim
-            auto fmt = [](uint64_t ms, char *buf, size_t n) {
-                int s = (int)(ms / 1000); if (s < 0) s = 0;
-                int h = s / 3600, m = (s % 3600) / 60, sec = s % 60;
-                if (h > 0) snprintf(buf, n, "%d:%02d:%02d", h, m, sec);
-                else snprintf(buf, n, "%d:%02d", m, sec);
-            };
-            char t0[16], t1[16];
-            fmt(pos, t0, sizeof t0); fmt(dur, t1, sizeof t1);
-            uiText(r, trackX, trackY + 14, t0, MUTED, 16);
-            int tw1 = r.textWidth(t1, 16);
-            uiText(r, trackX + trackW - tw1, trackY + 14, t1, MUTED, 16);
+            r.roundRect(trackX, trackY, fill, 5, 3, GREEN);
+            r.roundRect(trackX + fill - 7, trackY - 5, 14, 14, 7, GREEN);
+            char t0[32], t1[32];
+            fmtTime(pos, t0, sizeof t0);
+            fmtTime(dur, t1, sizeof t1);
+            uiText(r, trackX, trackY + 16, t0, MUTED, 16);
+            uiText(r, trackX + trackW - r.textWidth(t1, 16), trackY + 16, t1, MUTED, 16);
         } else {
-            r.roundRect(trackX, trackY, trackW * 9 / 10, 6, 3, GREEN);
-            r.roundRect(trackX + trackW * 9 / 10 - 8, trackY - 5, 16, 16, 8, GREEN);
-            uiText(r, trackX, trackY + 14, "AO VIVO", MUTED, 16);
+            r.roundRect(trackX, trackY, trackW * 9 / 10, 5, 3, GREEN);
+            r.roundRect(trackX + trackW * 9 / 10 - 7, trackY - 5, 14, 14, 7, GREEN);
+            uiText(r, trackX, trackY + 16, "AO VIVO", MUTED, 16);
         }
 
-        // botoes de controle
-        int cy = H - 48;
-        auto btn = [&](int cx, const char *lab, bool hi) {
-            r.roundRect(cx - 28, cy - 22, 56, 44, 22, hi ? GREEN : 0xFF2A2A2A);
-            uiCenter(r, cx, cy, lab, hi ? BLACK : TEXT, 18, true);
+        // controles centrais (visuais + dica de mapeamento)
+        int cy = H - 56;
+        auto ctrl = [&](int i, int cx, const char *lab) {
+            bool hi = (focusCtrl == i);
+            r.roundRect(cx - 30, cy - 24, 60, 48, 24, hi ? GREEN : 0xFF252525);
+            uiCenter(r, cx, cy, lab, hi ? BLACK : TEXT, 17, true);
         };
-        btn(W / 2 - 160, "|<", false);
-        btn(W / 2 - 80, "-10", false);
-        btn(W / 2, paused ? ">" : "II", true);
-        btn(W / 2 + 80, "+10", false);
-        btn(W / 2 + 160, ">|", false);
+        ctrl(0, W / 2 - 200, "|<");
+        ctrl(1, W / 2 - 100, "-10");
+        ctrl(2, W / 2, paused ? ">" : "II");
+        ctrl(3, W / 2 + 100, "+10");
+        ctrl(4, W / 2 + 200, ">|");
 
-        // dicas
-        const char *hint = isVod
-            ? (hasEpisodes() ? "X Pausar   L2/R2 -10s/+10s   L1/R1 Episodio   △ Opcoes   O Sair"
-                             : "X Pausar   L2/R2 -10s/+10s   △ Opcoes   O Sair")
-            : "X Pausar   □ Qualidade   △ Opcoes   O Sair";
-        uiText(r, 48, H - 28, hint, DIM, 16);
+        // volume / mudo indicador
+        {
+            const char *vs = muted ? "Mudo" : "Som";
+            uiText(r, W - 160, cy - 8, vs, muted ? 0xFFFF6666u : MUTED, 18);
+        }
 
-        // menu de opcoes (lado direito)
+        // dicas de controle
+        uiText(r, 48, H - 22,
+               isVod
+                   ? "X Pausar   L2/R2 ±10s   <-/-> ±30s   L1/R1 Episodio   △ Opcoes   O Sair"
+                   : "X Pausar   □ Qualidade   △ Opcoes   O Sair",
+               DIM, 15);
+
+        // ---- MENU OPCOES (direita) ----
         if (showOpts) {
-            const int ox = W - 420, oy = 100, ow = 380, oh = 420;
-            r.roundRect(ox, oy, ow, oh, 18, 0xE0101010);
+            const int ox = W - 440, oy = 90, ow = 400, oh = 520;
+            r.roundRect(ox, oy, ow, oh, 16, 0xF00C0C0C);
             r.roundRect(ox, oy, 4, oh, 2, GREEN);
-            uiHeavy(r, ox + 24, oy + 24, "Opcoes", TEXT, 28);
+            uiHeavy(r, ox + 24, oy + 22, "Opcoes", TEXT, 26);
+
             const char *items[] = {
                 "Qualidade do video",
                 "Proporcao da tela",
+                "Legendas",
                 "Audio",
-                "Velocidade",
+                "Velocidade de reproducao",
+                "Informacoes",
                 "Voltar"
             };
-            const int nOpt = 5;
+            const int nOpt = 7;
             for (int i = 0; i < nOpt; i++) {
-                int iy = oy + 80 + i * 56;
+                int iy = oy + 72 + i * 56;
                 bool sel = (i == optCur);
-                if (sel) r.roundRect(ox + 12, iy - 8, ow - 24, 48, 12, 0xFF1A2A12);
-                if (sel) r.roundRect(ox + 12, iy - 8, ow - 24, 48, 12, 0x00000000); // placeholder
                 if (sel) {
-                    r.roundRect(ox + 12, iy - 8, ow - 24, 48, 12, 0xFF142014);
-                    r.roundRect(ox + 12, iy - 8, 3, 48, 2, GREEN);
+                    r.roundRect(ox + 12, iy - 6, ow - 24, 48, 12, 0xFF142014);
+                    r.roundRect(ox + 12, iy - 6, 3, 48, 2, GREEN);
                 }
-                uiText(r, ox + 28, iy + 8, items[i], sel ? TEXT : SOFT, 22, sel);
+                uiText(r, ox + 28, iy + 10, items[i], sel ? TEXT : SOFT, 20, sel);
                 const char *val = "";
+                char tmp[32];
                 if (i == 0) val = kQualityName[g_quality.load() % 3];
                 else if (i == 1) val = aspectName(aspectMode);
-                else if (i == 2) val = muted ? "Mudo" : "Original";
-                else if (i == 3) val = "Normal";
-                if (val[0]) {
-                    int vw2 = r.textWidth(val, 20);
-                    uiText(r, ox + ow - 28 - vw2, iy + 10, val, MUTED, 20);
+                else if (i == 2) val = "Desativadas";
+                else if (i == 3) val = muted ? "Mudo" : "Ativo";
+                else if (i == 4) val = "Normal";
+                else if (i == 5) val = showInfo ? "Abrir" : "";
+                if (val && val[0]) {
+                    int vw2 = r.textWidth(val, 18);
+                    uiText(r, ox + ow - 28 - vw2, iy + 12, val, MUTED, 18);
                 }
             }
+            uiText(r, ox + 24, oy + oh - 36, "X alterar   O fechar", DIM, 16);
+        }
+
+        // ---- INFO ----
+        if (showInfo && !showOpts) {
+            const int ox = W / 2 - 280, oy = H / 2 - 120, ow = 560, oh = 240;
+            r.roundRect(ox, oy, ow, oh, 16, 0xF0101010);
+            r.roundRect(ox, oy, ow, oh, 16, 0x00000000);
+            r.roundRect(ox, oy, 4, oh, 2, GREEN);
+            uiHeavy(r, ox + 24, oy + 20, "Informacoes", TEXT, 26);
+            char line[192];
+            snprintf(line, sizeof line, "Titulo: %s", title.c_str());
+            uiText(r, ox + 24, oy + 70, uiFit(r, line, 20, ow - 48), SOFT, 20);
+            snprintf(line, sizeof line, "Resolucao: %ux%u", vw, vh);
+            uiText(r, ox + 24, oy + 100, line, SOFT, 20);
+            snprintf(line, sizeof line, "Tipo: %s  |  Qualidade: %s", isVod ? "Filme/Serie" : "Ao vivo", kQualityName[g_quality.load() % 3]);
+            uiText(r, ox + 24, oy + 130, line, SOFT, 20);
+            snprintf(line, sizeof line, "Proporcao: %s  |  Audio: %s", aspectName(aspectMode), muted ? "Mudo" : "Ativo");
+            uiText(r, ox + 24, oy + 160, line, SOFT, 20);
+            uiText(r, ox + 24, oy + 200, "O fechar", DIM, 16);
         }
 
         if (feedProblem()) {
@@ -2308,18 +2351,17 @@ int main() {
         }
 
         if (mode == Mode::Play) {
-            if ((pressed & B_CIRCLE) && !player.showOpts) {
+            if ((pressed & B_CIRCLE) && !player.showOpts && !player.showInfo) {
                 player.stop(); player.quietWait = false; player.epUrls.clear(); player.epTitles.clear(); player.epIndex = -1;
                 player.showOpts = false;
                 mode = Mode::Menu; dirty = true; sceKernelUsleep(16000); continue;
             }
             if (pressed) player.hudUntil = nowSec() + (player.showOpts ? 30 : 10);
 
-            // X = pausar  |  no menu = confirmar opcao
+            // X = pausar / confirmar opcao
             if (pressed & B_CROSS) {
                 if (player.showOpts) {
-                    if (player.optCur == 0) {
-                        // Qualidade (live reabre; VOD so indica no HUD)
+                    if (player.optCur == 0) { // Qualidade
                         if (!player.isVod && !player.url.empty()) {
                             g_quality = (g_quality.load() + 1) % 3;
                             pf.pendingPlayUrl = player.url; pf.pendingPlayTitle = player.title;
@@ -2327,46 +2369,62 @@ int main() {
                             player.stop(); mode = Mode::Menu; dirty = true; sceKernelUsleep(8000); continue;
                         } else {
                             g_quality = (g_quality.load() + 1) % 3;
-                            player.hudUntil = nowSec() + 12;
                         }
-                    } else if (player.optCur == 1) {
+                    } else if (player.optCur == 1) { // Proporcao
                         player.aspectMode = (player.aspectMode + 1) % 3;
-                        player.hudUntil = nowSec() + 12;
-                    } else if (player.optCur == 2) {
+                    } else if (player.optCur == 2) { // Legendas (sem tracks no AvPlayer)
+                        // permanece Desativadas
+                    } else if (player.optCur == 3) { // Audio mudo
                         player.muted = !player.muted;
                         player.audio.muted = player.paused || player.muted;
-                        player.hudUntil = nowSec() + 12;
-                    } else if (player.optCur == 3) {
-                        // velocidade: so visual por enquanto
-                        player.hudUntil = nowSec() + 12;
-                    } else if (player.optCur == 4) {
+                    } else if (player.optCur == 4) { // Velocidade: so Normal
+                        // AvPlayer homebrew nao expoe rate
+                    } else if (player.optCur == 5) { // Informacoes
+                        player.showInfo = true;
+                        player.showOpts = false;
+                    } else if (player.optCur == 6) { // Voltar
                         player.showOpts = false;
                     }
+                    player.hudUntil = nowSec() + 30;
                 } else {
                     player.togglePause();
+                    player.focusCtrl = 2;
                 }
             }
-            // TRIANGULO = menu de opcoes
+            // TRIANGULO = menu Opcoes
             if (pressed & B_TRIANGLE) {
                 player.showOpts = !player.showOpts;
+                player.showInfo = false;
                 if (player.showOpts) player.optCur = 0;
                 player.hudUntil = nowSec() + 30;
             }
             if (player.showOpts) {
-                if (pressed & B_UP) { player.optCur = (player.optCur + 4) % 5; player.hudUntil = nowSec() + 30; }
-                if (pressed & B_DOWN) { player.optCur = (player.optCur + 1) % 5; player.hudUntil = nowSec() + 30; }
-                if (pressed & B_LEFT) {
-                    // atalho: esquerda cicla o valor do item selecionado
-                    if (player.optCur == 1) player.aspectMode = (player.aspectMode + 2) % 3;
-                    if (player.optCur == 2) { player.muted = !player.muted; player.audio.muted = player.paused || player.muted; }
-                    player.hudUntil = nowSec() + 30;
-                }
-                if (pressed & B_RIGHT) {
-                    if (player.optCur == 1) player.aspectMode = (player.aspectMode + 1) % 3;
-                    if (player.optCur == 2) { player.muted = !player.muted; player.audio.muted = player.paused || player.muted; }
+                if (pressed & B_UP) { player.optCur = (player.optCur + 6) % 7; player.hudUntil = nowSec() + 30; }
+                if (pressed & B_DOWN) { player.optCur = (player.optCur + 1) % 7; player.hudUntil = nowSec() + 30; }
+                if (pressed & B_LEFT || pressed & B_RIGHT) {
+                    int dir = (pressed & B_RIGHT) ? 1 : -1;
+                    if (player.optCur == 0) g_quality = (g_quality.load() + (dir > 0 ? 1 : 2)) % 3;
+                    if (player.optCur == 1) player.aspectMode = (player.aspectMode + (dir > 0 ? 1 : 2)) % 3;
+                    if (player.optCur == 3) {
+                        player.muted = !player.muted;
+                        player.audio.muted = player.paused || player.muted;
+                    }
                     player.hudUntil = nowSec() + 30;
                 }
                 if (pressed & B_CIRCLE) { player.showOpts = false; player.hudUntil = nowSec() + 8; }
+            } else if (player.showInfo) {
+                if (pressed & B_CIRCLE) { player.showInfo = false; player.hudUntil = nowSec() + 8; }
+            }
+
+            // Destaque visual dos botoes do player
+            if (!player.showOpts && !player.showInfo) {
+                if (pressed & B_LEFT) player.focusCtrl = 1;
+                if (pressed & B_RIGHT) player.focusCtrl = 3;
+                if (pressed & B_L2) player.focusCtrl = 1;
+                if (pressed & B_R2) player.focusCtrl = 3;
+                if (pressed & B_L1) player.focusCtrl = 0;
+                if (pressed & B_R1) player.focusCtrl = 4;
+                if (pressed & B_CROSS) player.focusCtrl = 2;
             }
 
             // Seek VOD: L2 -10s, R2 +10s, esquerda -30s, direita +30s
