@@ -384,7 +384,6 @@ struct UI {
     std::string m3uUrl;       // lista M3U atual
     std::string timeText, dateText;   // relogio (a plataforma atualiza)
     int textKind = 0;         // 0 nada, 1 = @streamer, 2 = endereco M3U, 3 = busca
-    bool pendingHwTest = false;  // △ na Home: testa sceVideodec com /data/test.h264
     std::string searchQ;
     std::vector<uint32_t> searchHits;
     static const int kRows = 10;
@@ -678,11 +677,7 @@ struct UI {
     }
 
     void handle(Input in) {
-        if (in == Input::Extra) {
-            if (screen == Screen::Home) { pendingHwTest = true; return; }
-            startSearch();
-            return;
-        }
+        if (in == Input::Extra) { startSearch(); return; }
         if (screen == Screen::Home) { handleHome(in); return; }
         int t = (int)tab;
         switch (in) {
@@ -790,9 +785,6 @@ private:
             else if (homeRow == 1) openTab(tileTab(homeCol));
             else requestM3U();
             break;
-        case Input::Extra:   // △ = teste do player proprio (HW)
-            pendingHwTest = true;
-            break;
         default: break;
         }
     }
@@ -893,8 +885,6 @@ private:
             const int pcx = x + w - 90, pcy = y + h / 2;
             r.roundRect(pcx - 36, pcy - 36, 72, 72, 36, GREEN);
             r.fillRect(pcx - 15, pcy - 3, 30, 6, BLACK); r.fillRect(pcx - 3, pcy - 15, 6, 30, BLACK);
-            // dica do teste HW
-            uiText(r, x + 8, y + h + 8, "△  Teste HW player  ·  arquivo /data/test.h264", MUTED, 20);
         }
     }
 
