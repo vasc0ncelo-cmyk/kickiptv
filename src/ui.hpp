@@ -1105,7 +1105,7 @@ private:
         using namespace theme;
         const int W = r.width(), cy = 1043;
         std::vector<std::pair<std::string, std::string>> hints;
-        if (screen == Screen::Home) hints = {{"D-pad", "Navegar"}, {"X", "Selecionar"}, {"OPTIONS", "Sair"}};
+        if (screen == Screen::Home) hints = {{"D-pad", "Navegar"}, {"X", "Selecionar"}};
         else if (browsable(tab) && !inItems) hints = {{"L1/R1", "Abas"}, {"△", "Buscar"}, {"X", "Abrir"}, {"O", "Início"}};
         else if (browsable(tab)) hints = {{"△", searching() ? "Nova busca" : "Buscar"}, {"X", "Selecionar"}, {"O", searching() ? "Limpar busca" : "Categorias"}};
         else hints = {{"L1/R1", "Abas"}, {"X", "Selecionar"}, {"O", "Voltar"}};
