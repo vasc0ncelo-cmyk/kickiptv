@@ -81,6 +81,30 @@ bool parseEpisode(const std::string &name, std::string &series, int &season, int
 // Decide a aba. Ordem: 1) caminho da URL (paineis Xtream: /movie/ /series/ /live/ e decisivo)
 // 2) grupo (canais primeiro: "CANAIS | FILMES" e "24H SERIES" sao canais ao vivo, nao filmes/series)
 // 3) "S01E02" no nome  4) extensao de arquivo de video  5) padrao: canal.
+// titulo comparavel: minusculas, sem ano/qualidade/pontuacao extra
+static std::string normTitle(const std::string &name) {
+    std::string s = fold(name);
+    // remove (2019) [2020] {2021}
+    std::string out; out.reserve(s.size());
+    for (size_t i = 0; i < s.size(); ) {
+        if (s[i] == '(' || s[i] == '[' || s[i] == '{') {
+            char close = s[i] == '(' ? ')' : (s[i] == '[' ? ']' : '}');
+            size_t j = s.find(close, i);
+            if (j != std::string::npos) { i = j + 1; continue; }
+        }
+        char c = s[i++];
+        if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) out.push_back(c);
+        // ignora espacos e pontuacao para juntar "O Auto da Compadecida" variantes
+    }
+    // remove sufixos comuns de qualidade
+    const char *suf[] = {"1080p","720p","480p","2160p","4k","fhd","hd","cam","legendado","dublado","dualaudio","bluray","webdl","webrip","hdtv"};
+    for (const char *x : suf) {
+        size_t pos = out.find(x);
+        if (pos != std::string::npos) out.erase(pos, std::strlen(x));
+    }
+    return out;
+}
+
 static Kind classify(const Entry &e) {
     std::string u = lower(e.url), g = fold(e.group), n = fold(e.name);
     // 1) caminho da URL (Xtream) — decisivo
@@ -190,21 +214,18 @@ void PlaylistBuilder::finish() {
     auto byNameChan = [&](uint32_t a, uint32_t b) {
         return fold(p_.channels[a].name) < fold(p_.channels[b].name);
     };
+    // "Todos" SEM ordenar 40k nomes (isso sozinho demorava dezenas de segundos no PS4)
     if (!p_.movies.empty()) {
         Category all;
         all.name = "Todos";
         all.items.resize(p_.movies.size());
         for (uint32_t i = 0; i < (uint32_t)p_.movies.size(); i++) all.items[i] = i;
-        std::sort(all.items.begin(), all.items.end(), byNameMovie);
         p_.movieCats.insert(p_.movieCats.begin(), std::move(all));
     }
     if (!p_.seriesTree.empty()) {
         Category all;
         all.name = "Todos";
         for (const auto &kv : p_.seriesTree) all.series.push_back(kv.first);
-        std::sort(all.series.begin(), all.series.end(), [](const std::string &a, const std::string &b) {
-            return fold(a) < fold(b);
-        });
         p_.seriesCats.insert(p_.seriesCats.begin(), std::move(all));
     }
     if (!p_.channels.empty()) {
@@ -212,9 +233,9 @@ void PlaylistBuilder::finish() {
         all.name = "Todos";
         all.items.resize(p_.channels.size());
         for (uint32_t i = 0; i < (uint32_t)p_.channels.size(); i++) all.items[i] = i;
-        std::sort(all.items.begin(), all.items.end(), byNameChan);
         p_.channelCats.insert(p_.channelCats.begin(), std::move(all));
     }
+    (void)byNameMovie; (void)byNameChan;
 }
 
 Playlist PlaylistBuilder::take() { return std::move(p_); }
@@ -250,10 +271,17 @@ void PlaylistBuilder::line(std::string &raw) {
         if (memBytes_ + est > maxBytes()) { full_ = true; p_.truncated = true; extinf_.clear(); return; }
         memBytes_ += est;
     }
-    // mesma URL = duplicata da lista (aparece 2-3x na grade) — guarda so a 1a
+    // duplicata por URL OU mesmo titulo normalizado (lista IPTV repete o filme 2-3x)
     if (!e.url.empty() && !seenUrl_.insert(e.url).second) {
         extinf_.clear();
         return;
+    }
+    {
+        std::string nt = normTitle(e.name);
+        if (nt.size() >= 4 && !seenName_.insert(nt).second) {
+            extinf_.clear();
+            return;
+        }
     }
     e.kind = classify(e);
     extinf_.clear();
