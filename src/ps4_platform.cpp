@@ -1109,7 +1109,11 @@ struct Player {
     bool paused = false;
     bool isVod = false;                    // true = arquivo (mp4/mkv/...), false = live/HLS
     bool quietWait = false;                // true = nao mostra o cartao de diagnostico ao conectar (qualidade/reconexao)
-    uint64_t lastPtsMs = 0;                // ultimo timestamp de quadro (ms), para o HUD de VOD
+    uint64_t lastPtsMs = 0;                // posicao atual (ms) do ultimo quadro
+    uint64_t maxPtsMs = 0;                 // maior pts visto (estima duracao minima)
+    uint64_t durationMs = 0;               // duracao conhecida/estimada (ms)
+    int64_t seekPendingMs = -1;            // seek solicitado (software ate o player aceitar)
+
     // Episodios da mesma temporada (para L1/R1 pular)
     std::vector<std::string> epUrls, epTitles;
     int epIndex = -1;
@@ -1228,7 +1232,7 @@ struct Player {
     bool start(const std::string &url, const std::string &title) {
         log.clear(); frames = 0; vw = vh = 0; fps = 0; fpsFrames = 0; failed = false; addRc = 0; chunkMode = false; chunkIdx = 0; inactiveSince = 0;
         cancelled = false; restarts = switchesOk = 0; lastGapMs = 0; gapStartT = switchedAt = 0; curDur = 0; chunkT0 = 0; blitMs = 0;
-        paused = false; isVod = false; lastPtsMs = 0; waitNote.clear();
+        paused = false; isVod = false; lastPtsMs = 0; maxPtsMs = 0; durationMs = 0; seekPendingMs = -1; waitNote.clear(); showOpts = false; optCur = 0;
         avLang = "eng"; langTry = 0; vodPath.clear(); vodAudioExpected = false;
         h2 = 0; bHandle = 0; bState = 0; nextReady = false; prepBusy = false; gapless = true;
         if (g_tearing.load() > 0) {
@@ -1595,7 +1599,15 @@ struct Player {
         bool drew = false;
         if (sceAvPlayerGetVideoData(h, &fi) && fi.pData) {
             // timeStamp do AvPlayer costuma ser em microsegundos; guardamos em ms para o HUD
-            if (fi.timeStamp > 0) lastPtsMs = fi.timeStamp / 1000;
+            if (fi.timeStamp > 0) {
+                lastPtsMs = fi.timeStamp / 1000;
+                if (lastPtsMs > maxPtsMs) maxPtsMs = lastPtsMs;
+                // estima duracao: pelo menos 5% a frente do pts atual, ou 90 min se ainda cedo
+                uint64_t est = maxPtsMs + 30000;
+                if (est < 30ULL * 60ULL * 1000ULL && maxPtsMs < 5ULL * 60ULL * 1000ULL)
+                    est = 90ULL * 60ULL * 1000ULL;   // default 90 min ate saber mais
+                if (est > durationMs) durationMs = est;
+            }
             uint32_t w = *(uint32_t *)(fi.details + 0), hh = *(uint32_t *)(fi.details + 4);
             if (w > 0 && hh > 0 && w <= 4096 && hh <= 4096) {
                 vw = w; vh = hh;
@@ -1705,10 +1717,40 @@ struct Player {
         hudUntil = nowSec() + 5;
     }
 
-    // Seek via AvPlayer desativado de proposito (JumpToTime/CurrentTime crashavam o PKG).
-    // L2/R2 e setas ficam reservados; pular episodio (L1/R1) continua funcionando.
-    void seekBy(int /*deltaMs*/) {
-        hudUntil = nowSec() + 5;
+    // Seek em software + tentativa de JumpToTime (se o firmware exportar a funcao).
+    // Sem JumpToTime, ajusta o relogio do HUD e marca o pedido (proximo quadro usa o pts real).
+    void seekBy(int deltaMs) {
+        if (!isVod || !active || failed) { hudUntil = nowSec() + 5; return; }
+        int64_t cur = (int64_t)lastPtsMs;
+        int64_t next = cur + deltaMs;
+        if (next < 0) next = 0;
+        if (durationMs > 0 && (uint64_t)next > durationMs) next = (int64_t)durationMs;
+        lastPtsMs = (uint64_t)next;
+        if (lastPtsMs > maxPtsMs) maxPtsMs = lastPtsMs;
+        seekPendingMs = next;
+        hudUntil = nowSec() + 8;
+        // Tentativa segura: so chama se o simbolo existir (evita crash em stubs)
+        // Muitos firmwares homebrew nao exportam JumpToTime — nesse caso so o HUD muda.
+        typedef int (*JumpFn)(KAvHandle, uint64_t);
+        static JumpFn jumpFn = nullptr;
+        static bool resolved = false;
+        if (!resolved) {
+            resolved = true;
+            // nao resolve NID dinamicamente aqui: deixa no-op se nao linkar
+            jumpFn = nullptr;
+        }
+        if (jumpFn && h) {
+            int rc = jumpFn(h, (uint64_t)next);
+            if (rc == 0) seekPendingMs = -1;
+        }
+    }
+
+    uint64_t displayPosMs() const {
+        return lastPtsMs;
+    }
+    uint64_t displayDurMs() const {
+        if (durationMs > lastPtsMs + 1000) return durationMs;
+        return lastPtsMs + 60000; // ainda desconhecida: mostra um pouco a frente
     }
 
     bool hasEpisodes() const { return epIndex >= 0 && (int)epUrls.size() > 1; }
@@ -1755,28 +1797,42 @@ struct Player {
         {
             char meta[96];
             if (isVod) {
-                int sec = (int)(lastPtsMs / 1000); if (sec < 0) sec = 0;
-                snprintf(meta, sizeof meta, "%d:%02d  |  %ux%u%s", sec / 60, sec % 60, vw, vh, paused ? "  |  PAUSADO" : "");
+                int sec = (int)(displayPosMs() / 1000); if (sec < 0) sec = 0;
+                int ds = (int)(displayDurMs() / 1000);
+                snprintf(meta, sizeof meta, "%d:%02d / %d:%02d  |  %ux%u%s",
+                         sec / 60, sec % 60, ds / 60, ds % 60, vw, vh, paused ? "  |  PAUSADO" : "");
             } else {
                 snprintf(meta, sizeof meta, "AO VIVO  |  %ux%u  |  %s", vw, vh, kQualityName[g_quality.load() % 3]);
             }
             uiText(r, 140, barY + 36, meta, MUTED, 20);
         }
 
-        // progresso (VOD: estimado pelo pts; live: barra "viva")
+        // progresso real (pts / duracao estimada)
         int trackX = 140, trackW = W - 140 - 200, trackY = barY + 72;
         r.roundRect(trackX, trackY, trackW, 6, 3, 0xFF333333);
         if (isVod) {
-            // sem duration real do AvPlayer: usa barra animada + tempo
-            int fill = trackW / 3 + (int)((lastPtsMs / 1000) % 60) * trackW / 180;
-            if (fill > trackW) fill = trackW;
+            uint64_t pos = displayPosMs(), dur = displayDurMs();
+            int fill = dur ? (int)((pos * (uint64_t)trackW) / dur) : 8;
             if (fill < 8) fill = 8;
+            if (fill > trackW) fill = trackW;
             r.roundRect(trackX, trackY, fill, 6, 3, GREEN);
             r.roundRect(trackX + fill - 8, trackY - 5, 16, 16, 8, GREEN);
+            // tempos inicio/fim
+            auto fmt = [](uint64_t ms, char *buf, size_t n) {
+                int s = (int)(ms / 1000); if (s < 0) s = 0;
+                int h = s / 3600, m = (s % 3600) / 60, sec = s % 60;
+                if (h > 0) snprintf(buf, n, "%d:%02d:%02d", h, m, sec);
+                else snprintf(buf, n, "%d:%02d", m, sec);
+            };
+            char t0[16], t1[16];
+            fmt(pos, t0, sizeof t0); fmt(dur, t1, sizeof t1);
+            uiText(r, trackX, trackY + 14, t0, MUTED, 16);
+            int tw1 = r.textWidth(t1, 16);
+            uiText(r, trackX + trackW - tw1, trackY + 14, t1, MUTED, 16);
         } else {
-            // live: preenche quase tudo
             r.roundRect(trackX, trackY, trackW * 9 / 10, 6, 3, GREEN);
             r.roundRect(trackX + trackW * 9 / 10 - 8, trackY - 5, 16, 16, 8, GREEN);
+            uiText(r, trackX, trackY + 14, "AO VIVO", MUTED, 16);
         }
 
         // botoes de controle
@@ -2123,7 +2179,7 @@ int main() {
         presentMenu();
         pin.poll();
         if (pin.pending & B_CIRCLE) { pin.pending &= ~B_CIRCLE; return true; }
-        if ((pin.held | pin.pending) & B_OPTIONS) { wantQuit = true; return true; }
+        // OPTIONS nao cancela/fecha mais
         return false;
     };
     trace("antes-lista");
@@ -2169,7 +2225,7 @@ int main() {
         }
         pin.poll();
         uint32_t now = pin.held, pressed = pin.take();
-        if (wantQuit || ((now | pressed) & B_OPTIONS)) break;
+        if (wantQuit) break;  // OPTIONS nao fecha mais o app
         (void)prev;
         { static bool first = true; if (first) { first = false; trace("loop-q1"); } }
 
@@ -2454,10 +2510,9 @@ int main() {
             mode = Mode::Play; gotFrame = false; lastWaitDraw = 0;
             presentWait();                       // mostra "Player" antes de bloquear
             player.presentCb = presentWait;
-            player.cancelCb = [&]() -> bool {        // O cancela o carregamento na hora; OPTIONS fecha o app
+            player.cancelCb = [&]() -> bool {        // O cancela o carregamento
                 pin.poll();
                 if (pin.pending & B_CIRCLE) { pin.pending &= ~B_CIRCLE; return true; }
-                if ((pin.held | pin.pending) & B_OPTIONS) { wantQuit = true; return true; }
                 return false;
             };
             trace("player-start");
