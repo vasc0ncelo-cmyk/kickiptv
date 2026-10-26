@@ -2263,7 +2263,7 @@ int main() {
         if (pressed & B_R2)     { ui.handle(Input::PageDown); dirty = true; }
         if (pressed & B_CROSS)  { ui.handle(Input::Confirm);  dirty = true; }
         if (pressed & B_CIRCLE) { ui.handle(Input::Back);     dirty = true; }
-        if (pressed & B_TRIANGLE) { ui.handle(Input::Extra);  dirty = true; }       // lupa: buscar filmes/series/canais
+        if (pressed & B_TRIANGLE) { ui.handle(Input::Extra);  dirty = true; }       // lupa: buscar
         if (updateClock()) dirty = true;
         {   // andamento do lote de capas (TRIANGULO)
             static bool wasBulk = false; static double nextSay = 0;
@@ -2335,7 +2335,7 @@ int main() {
 
         if (pf.kbdRequested) {                    // X em "Digitar @streamer": abre o teclado na tela
             pf.kbdRequested = false;
-            kbd.open(ui.textInitial(), ui.textKind == 2 || ui.textKind == 3);
+            kbd.open(ui.textInitial(), ui.textKind == 2, ui.textKind == 3 ? 2 : (ui.textKind == 2 ? 1 : 0));
             mode = Mode::Kbd; dirty = true;
             continue;
         }
