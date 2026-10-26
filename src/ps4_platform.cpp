@@ -45,7 +45,6 @@
 #include <orbis/Pad.h>
 #include <orbis/AudioOut.h>
 #include "ui.hpp"
-#include "hwplayer.hpp"
 
 #include "fbrender.hpp"
 #include "keyboard.hpp"
@@ -2621,47 +2620,6 @@ int main() {
             trace("texto-processado");
             dirty = true;
         }
-        // ---- Teste do player proprio (sceVideodec) ----
-        if (ui.pendingHwTest) {
-            ui.pendingHwTest = false;
-            dirty = true;
-            app.say("Teste HW: carregando /data/test.h264 ...");
-            presentMenu(); // may not exist - use present path
-            hwplayer::Player::tryLoadApi();
-            if (!hwplayer::Player::hwAvailable()) {
-                app.say("HW: libSceVideodec NAO carregou neste firmware. Use AvPlayer.");
-                dirty = true;
-            } else {
-                hwplayer::Player hp;
-                if (!hp.openFile("/data/test.h264")) {
-                    app.say(std::string("HW: ") + hp.lastError());
-                    dirty = true;
-                } else {
-                    app.say("HW: decoder OK — tocando (O = sair)");
-                    // loop curto de reproducao
-                    for (;;) {
-                        pin.poll();
-                        uint32_t pr = pin.take();
-                        if (pr & B_CIRCLE) break;
-                        hwplayer::Frame fr;
-                        FbRenderer r(shadow, W, H);
-                        r.fillRect(0, 0, W, H, 0xFF000000u);
-                        if (hp.pump(fr) && fr.valid && fr.nv12) {
-                            blit::nv12(fr.nv12, fr.width, fr.height, fr.pitch, fr.yRows, r.fb, W, H);
-                        }
-                        // HUD minimo
-                        uiText(r, 40, 40, "TESTE HW  ·  O sair", 0xFFFFFFFFu, 28);
-                        flip();
-                        sceKernelUsleep(8000);
-                    }
-                    hp.close();
-                    app.say("Teste HW encerrado");
-                    dirty = true;
-                }
-            }
-            continue;
-        }
-
         if (!pf.pendingPlayUrl.empty()) {
             std::string url = pf.pendingPlayUrl, title = pf.pendingPlayTitle;
             pf.pendingPlayUrl.clear();
