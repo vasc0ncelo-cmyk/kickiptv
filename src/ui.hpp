@@ -384,6 +384,7 @@ struct UI {
     std::string m3uUrl;       // lista M3U atual
     std::string timeText, dateText;   // relogio (a plataforma atualiza)
     int textKind = 0;         // 0 nada, 1 = @streamer, 2 = endereco M3U, 3 = busca
+    bool pendingHwTest = false;  // △ na Home: testa sceVideodec com /data/test.h264
     std::string searchQ;
     std::vector<uint32_t> searchHits;
     static const int kRows = 10;
@@ -677,7 +678,11 @@ struct UI {
     }
 
     void handle(Input in) {
-        if (in == Input::Extra) { startSearch(); return; }
+        if (in == Input::Extra) {
+            if (screen == Screen::Home) { pendingHwTest = true; return; }
+            startSearch();
+            return;
+        }
         if (screen == Screen::Home) { handleHome(in); return; }
         int t = (int)tab;
         switch (in) {
