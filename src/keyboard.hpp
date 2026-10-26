@@ -1,7 +1,7 @@
 #pragma once
 // Teclado na tela (D-pad ou analogico esquerdo (L3) move, X ou clique no L3 digita, QUADRADO ou R3 apaga,
 // L1 ou a tecla "abc" alterna MAIUSCULAS (so a proxima letra -> travado -> desligado),
-// TRIANGULO insere "https://", L2 limpa, R1 confirma, O cancela).
+// TRIANGULO insere "http://", L2 limpa, R1 confirma, O cancela).
 // Serve para o @ do streamer e para o endereco da lista M3U.
 #include "ui.hpp"
 #include <string>
@@ -18,16 +18,27 @@ struct Keyboard {
             "q","w","e","r","t","y","u","i","o","p",
             "a","s","d","f","g","h","j","k","l",":",
             "z","x","c","v","b","n","m",".","/","-",
-            "Aa","_","?","=","&","%","@","+","<","OK"};
+            "Aa"," ","?","=","&","%","@","+","<","OK"};  // " " = espaco
         std::string s = k[y * COLS + x];
         if (shift && s.size() == 1 && s[0] >= 'a' && s[0] <= 'z') s[0] = (char)(s[0] - 32);
         return s;
     }
-    void open(const std::string &initial, bool url) {
-        text = initial; cx = cy = 0; shift = false; lock = false; isUrl = url;
-        maxLen = url ? 500 : 25;
-        title = url ? "Endereço da lista M3U" : "Digite o @ do streamer";
-        subtitle = url ? "Cole o link da sua lista (deixe vazio e confirme para remover)" : "Canal da Kick que você quer assistir";
+    void open(const std::string &initial, bool url, int mode = 0) {
+        // mode: 0 = streamer, 1 = url M3U, 2 = busca
+        text = initial; cx = cy = 0; shift = false; lock = false; isUrl = url || mode == 1;
+        if (mode == 2) {
+            maxLen = 80;
+            title = "Buscar";
+            subtitle = "Digite o nome (espaco, letras e numeros). Vazio limpa a busca.";
+        } else if (isUrl) {
+            maxLen = 500;
+            title = "Endereço da lista M3U";
+            subtitle = "Cole o link da sua lista (deixe vazio e confirme para remover)";
+        } else {
+            maxLen = 40;
+            title = "Digite o @ do streamer";
+            subtitle = "Canal da Kick que voce quer assistir";
+        }
     }
     void move(int dx, int dy) { cx = (cx + dx + COLS) % COLS; cy = (cy + dy + ROWS) % ROWS; }
     void backspace() { if (!text.empty()) text.pop_back(); }
@@ -93,7 +104,8 @@ struct Keyboard {
                 bool on = (x == cx && y == cy);
                 int px2 = kx + x * kp, py = ky + y * kp;
                 std::string k = keyAt(x, y);
-                bool special = k == "<" || k == "OK" || k == "Aa";
+                std::string label = (k == " ") ? "esp" : k;
+                bool special = k == "<" || k == "OK" || k == "Aa" || k == " ";
                 if (on) uiGlow(r, px2, py, ks, ks, 16, GREEN, 8, 130, false);
                 unsigned bg = on ? GREEN : (k == "OK" ? 0xFF14310B : (special ? CARD_LINE : CARD2));
                 r.roundRect(px2, py, ks, ks, 16, bg);
