@@ -172,26 +172,24 @@ void PlaylistBuilder::finish() {
             std::stable_sort(t.second.begin(), t.second.end(), [](const Entry &a, const Entry &b) { return a.episode < b.episode; });
     for (auto &c : p_.seriesCats) std::sort(c.series.begin(), c.series.end());
 
-    // Ordena itens de cada categoria por nome (A-Z)
+    // Categorias A-Z (rapido). Itens dentro de cada categoria ficam na ordem do M3U
+    // (ordenar 40k+ nomes em cada categoria deixava a abertura muito lenta).
+    auto byCatName = [](const Category &a, const Category &b) { return fold(a.name) < fold(b.name); };
+    std::sort(p_.movieCats.begin(), p_.movieCats.end(), byCatName);
+    std::sort(p_.seriesCats.begin(), p_.seriesCats.end(), byCatName);
+    std::sort(p_.channelCats.begin(), p_.channelCats.end(), byCatName);
+
+    for (auto &c : p_.movieCats) if (c.name == "Todos") c.name = "Geral";
+    for (auto &c : p_.seriesCats) if (c.name == "Todos") c.name = "Geral";
+    for (auto &c : p_.channelCats) if (c.name == "Todos") c.name = "Geral";
+
+    // "Todos" = lista completa; ordena SO uma vez (nao cada categoria)
     auto byNameMovie = [&](uint32_t a, uint32_t b) {
         return fold(p_.movies[a].name) < fold(p_.movies[b].name);
     };
     auto byNameChan = [&](uint32_t a, uint32_t b) {
         return fold(p_.channels[a].name) < fold(p_.channels[b].name);
     };
-    for (auto &c : p_.movieCats) std::sort(c.items.begin(), c.items.end(), byNameMovie);
-    for (auto &c : p_.channelCats) std::sort(c.items.begin(), c.items.end(), byNameChan);
-
-    // Categorias A-Z (exceto "Todos" que entra no topo depois)
-    auto byCatName = [](const Category &a, const Category &b) { return fold(a.name) < fold(b.name); };
-    std::sort(p_.movieCats.begin(), p_.movieCats.end(), byCatName);
-    std::sort(p_.seriesCats.begin(), p_.seriesCats.end(), byCatName);
-    std::sort(p_.channelCats.begin(), p_.channelCats.end(), byCatName);
-
-    // Categoria "Todos" = lista completa A-Z (renomeia "Todos" que veio do M3U para nao duplicar)
-    for (auto &c : p_.movieCats) if (c.name == "Todos") c.name = "Geral";
-    for (auto &c : p_.seriesCats) if (c.name == "Todos") c.name = "Geral";
-    for (auto &c : p_.channelCats) if (c.name == "Todos") c.name = "Geral";
     if (!p_.movies.empty()) {
         Category all;
         all.name = "Todos";
@@ -251,6 +249,11 @@ void PlaylistBuilder::line(std::string &raw) {
         size_t est = sizeof(Entry) + 3 * 32 + e.name.size() + e.url.size() + e.logo.size() + 16;
         if (memBytes_ + est > maxBytes()) { full_ = true; p_.truncated = true; extinf_.clear(); return; }
         memBytes_ += est;
+    }
+    // mesma URL = duplicata da lista (aparece 2-3x na grade) — guarda so a 1a
+    if (!e.url.empty() && !seenUrl_.insert(e.url).second) {
+        extinf_.clear();
+        return;
     }
     e.kind = classify(e);
     extinf_.clear();
