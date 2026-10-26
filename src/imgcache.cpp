@@ -35,19 +35,15 @@ bool imgDecodeToCover(const std::string &body, Cover &out, int tw, int th) {
     out.w = tw; out.h = th;
     out.bgra.assign((size_t)tw * th, BG);
 
-    // poster (2:3 aproximado): preenche cortando as sobras | outros formatos (logo, paisagem): cabe inteiro no meio
-    double ar = (double)w / h, tar = (double)tw / th;
-    bool contain = ar > 0.85 || ar < 0.5;
+    // SEMPRE preenche o poster 2:3 (cover-crop): tamanhos consistentes na grade, sem faixas vazias
+    double ar = (double)w / (double)h, tar = (double)tw / (double)th;
     int sx0 = 0, sy0 = 0, sw = w, sh = h, dx0 = 0, dy0 = 0, dw = tw, dh = th;
-    if (!contain) {
-        if (ar > tar) { sw = (int)(h * tar); sx0 = (w - sw) / 2; }
-        else { sh = (int)(w / tar); sy0 = (h - sh) / 4; }       // corta mais embaixo que em cima (rostos ficam)
-        if (sw < 1) sw = 1;
-        if (sh < 1) sh = 1;
-    } else {
-        double sc = std::min(tw * 0.86 / w, th * 0.86 / h);
-        dw = std::max(1, (int)(w * sc)); dh = std::max(1, (int)(h * sc));
-        dx0 = (tw - dw) / 2; dy0 = (th - dh) / 2;
+    if (ar > tar) {                          // imagem mais larga: corta laterais
+        sw = std::max(1, (int)(h * tar));
+        sx0 = (w - sw) / 2;
+    } else {                                 // mais alta: corta embaixo (preserva rosto no topo)
+        sh = std::max(1, (int)(w / tar));
+        sy0 = (h - sh) / 5;
     }
     // reducao por media de blocos (nitida, sem serrilhado)
     for (int j = 0; j < dh; j++) {
@@ -81,7 +77,7 @@ std::string ImgCache::diskPath(const std::string &url) {
     uint32_t h = 2166136261u, h2 = 5381u;
     for (unsigned char ch : url) { h ^= ch; h *= 16777619u; h2 = h2 * 33u + ch; }
     char b[64];
-    snprintf(b, sizeof b, "/q%08x%08x.cv", h, h2);          // "q": formato compacto (RGB565); os formatos antigos sao ignorados
+    snprintf(b, sizeof b, "/r%08x%08x.cv", h, h2);          // "r": cover-crop 2:3 (invalida cache antigo)
     return diskDir() + b;
 }
 
