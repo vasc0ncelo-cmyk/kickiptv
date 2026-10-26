@@ -1650,7 +1650,34 @@ struct Player {
                 }
                 if (fits && !skipDraw) {
                     b0 = nowSec();
-                    blitNV12(src, w, hh, pitch, yRows, r.fb, r.W, r.H);
+                    // proporcao: 0=16:9 (fit), 1=esticar, 2=zoom
+                    if (aspectMode == 1) {
+                        blitNV12(src, w, hh, pitch, yRows, r.fb, r.W, r.H);
+                    } else {
+                        double ar = (double)w / (double)hh, sar = (double)r.W / (double)r.H;
+                        int dw = r.W, dh = r.H, ox = 0, oy = 0;
+                        if (aspectMode == 0) { // contain (letterbox/pillarbox)
+                            if (ar > sar) { dh = std::max(1, (int)(r.W / ar)); oy = (r.H - dh) / 2; }
+                            else { dw = std::max(1, (int)(r.H * ar)); ox = (r.W - dw) / 2; }
+                        } else { // zoom (cover)
+                            if (ar > sar) { dw = std::max(1, (int)(r.H * ar)); ox = (r.W - dw) / 2; }
+                            else { dh = std::max(1, (int)(r.W / ar)); oy = (r.H - dh) / 2; }
+                        }
+                        // limpa barras pretas e desenha (nv12 usa stride = dw)
+                        for (int y = 0; y < r.H; y++) {
+                            uint32_t *row = r.fb + (size_t)y * r.W;
+                            for (int x = 0; x < r.W; x++) row[x] = 0xFF000000u;
+                        }
+                        if (ox == 0 && dw == r.W) {
+                            // letterbox vertical: dest comeca em oy, stride = W
+                            blitNV12(src, w, hh, pitch, yRows, r.fb + (size_t)oy * r.W, r.W, dh);
+                        } else if (oy == 0 && dh == r.H && ox == 0) {
+                            blitNV12(src, w, hh, pitch, yRows, r.fb, dw, r.H);
+                        } else {
+                            // fallback esticar se o offset horizontal complicar o stride
+                            blitNV12(src, w, hh, pitch, yRows, r.fb, r.W, r.H);
+                        }
+                    }
                     double bm = (nowSec() - b0) * 1000.0;
                     blitMs = blitMs == 0 ? bm : blitMs * 0.9 + bm * 0.1;
                     frames++; fpsFrames++;
@@ -1706,15 +1733,16 @@ struct Player {
     }
     bool feedProblem() const { return useFeed && (g_feed.failed.load() || g_feed.streamEnded.load()); }
     static bool vodDlFailed() { auto d = getPf(); return d && d->state() == 2; }
-    bool hudActive() const { return nowSec() <= hudUntil || feedProblem() || paused || vodDlFailed(); }
+    bool hudActive() const { return nowSec() <= hudUntil || feedProblem() || paused || vodDlFailed() || showOpts; }
 
     // Pausa em software: nao chama sceAvPlayerPause (NID instavel no homebrew → CE-34878-0).
     // O loop principal para de buscar quadros e o audio fica mudo enquanto paused==true.
     void togglePause() {
-        if (!h || !active || failed) return;
+        if (!h || failed) return;
         paused = !paused;
-        audio.muted = paused;
-        hudUntil = nowSec() + 5;
+        audio.muted = paused || muted;
+        hudUntil = nowSec() + 12;
+        showOpts = showOpts; // keep menu if open
     }
 
     // Seek em software + tentativa de JumpToTime (se o firmware exportar a funcao).
@@ -1760,6 +1788,12 @@ struct Player {
     // HUD estilo streaming (barra superior + inferior + opcoes)
     bool showOpts = false;
     int optCur = 0;
+    int aspectMode = 0;  // 0=16:9 fit  1=estirar  2=zoom
+    bool muted = false;
+    static const char *aspectName(int m) {
+        return m == 1 ? "Esticar" : m == 2 ? "Zoom" : "16:9";
+    }
+
     void overlay(FbRenderer &r) {
         using namespace theme;
         if (nowSec() > hudUntil && !feedProblem() && !paused && !vodDlFailed() && !showOpts) return;
@@ -1880,8 +1914,8 @@ struct Player {
                 uiText(r, ox + 28, iy + 8, items[i], sel ? TEXT : SOFT, 22, sel);
                 const char *val = "";
                 if (i == 0) val = kQualityName[g_quality.load() % 3];
-                else if (i == 1) val = "16:9";
-                else if (i == 2) val = "Original";
+                else if (i == 1) val = aspectName(aspectMode);
+                else if (i == 2) val = muted ? "Mudo" : "Original";
                 else if (i == 3) val = "Normal";
                 if (val[0]) {
                     int vw2 = r.textWidth(val, 20);
@@ -2278,32 +2312,60 @@ int main() {
                 player.showOpts = false;
                 mode = Mode::Menu; dirty = true; sceKernelUsleep(16000); continue;
             }
-            if (pressed) player.hudUntil = nowSec() + 5;      // qualquer botao mostra o HUD por 5s
+            if (pressed) player.hudUntil = nowSec() + (player.showOpts ? 30 : 10);
 
-            // X = pausar / continuar
+            // X = pausar  |  no menu = confirmar opcao
             if (pressed & B_CROSS) {
                 if (player.showOpts) {
-                    // no menu: X confirma item
-                    if (player.optCur == 0 && !player.isVod && !player.url.empty()) {
-                        g_quality = (g_quality.load() + 1) % 3;
-                        pf.pendingPlayUrl = player.url; pf.pendingPlayTitle = player.title;
-                        player.quietWait = true; player.showOpts = false;
-                        player.stop(); mode = Mode::Menu; dirty = true; sceKernelUsleep(8000); continue;
+                    if (player.optCur == 0) {
+                        // Qualidade (live reabre; VOD so indica no HUD)
+                        if (!player.isVod && !player.url.empty()) {
+                            g_quality = (g_quality.load() + 1) % 3;
+                            pf.pendingPlayUrl = player.url; pf.pendingPlayTitle = player.title;
+                            player.quietWait = true; player.showOpts = false;
+                            player.stop(); mode = Mode::Menu; dirty = true; sceKernelUsleep(8000); continue;
+                        } else {
+                            g_quality = (g_quality.load() + 1) % 3;
+                            player.hudUntil = nowSec() + 12;
+                        }
+                    } else if (player.optCur == 1) {
+                        player.aspectMode = (player.aspectMode + 1) % 3;
+                        player.hudUntil = nowSec() + 12;
+                    } else if (player.optCur == 2) {
+                        player.muted = !player.muted;
+                        player.audio.muted = player.paused || player.muted;
+                        player.hudUntil = nowSec() + 12;
+                    } else if (player.optCur == 3) {
+                        // velocidade: so visual por enquanto
+                        player.hudUntil = nowSec() + 12;
                     } else if (player.optCur == 4) {
                         player.showOpts = false;
                     }
-                } else player.togglePause();
+                } else {
+                    player.togglePause();
+                }
             }
-            // TRIANGULO = menu de opcoes do player
+            // TRIANGULO = menu de opcoes
             if (pressed & B_TRIANGLE) {
                 player.showOpts = !player.showOpts;
-                player.optCur = 0;
-                player.hudUntil = nowSec() + 12;
+                if (player.showOpts) player.optCur = 0;
+                player.hudUntil = nowSec() + 30;
             }
             if (player.showOpts) {
-                if (pressed & B_UP) player.optCur = (player.optCur + 4) % 5;
-                if (pressed & B_DOWN) player.optCur = (player.optCur + 1) % 5;
-                if (pressed & B_CIRCLE) { player.showOpts = false; }
+                if (pressed & B_UP) { player.optCur = (player.optCur + 4) % 5; player.hudUntil = nowSec() + 30; }
+                if (pressed & B_DOWN) { player.optCur = (player.optCur + 1) % 5; player.hudUntil = nowSec() + 30; }
+                if (pressed & B_LEFT) {
+                    // atalho: esquerda cicla o valor do item selecionado
+                    if (player.optCur == 1) player.aspectMode = (player.aspectMode + 2) % 3;
+                    if (player.optCur == 2) { player.muted = !player.muted; player.audio.muted = player.paused || player.muted; }
+                    player.hudUntil = nowSec() + 30;
+                }
+                if (pressed & B_RIGHT) {
+                    if (player.optCur == 1) player.aspectMode = (player.aspectMode + 1) % 3;
+                    if (player.optCur == 2) { player.muted = !player.muted; player.audio.muted = player.paused || player.muted; }
+                    player.hudUntil = nowSec() + 30;
+                }
+                if (pressed & B_CIRCLE) { player.showOpts = false; player.hudUntil = nowSec() + 8; }
             }
 
             // Seek VOD: L2 -10s, R2 +10s, esquerda -30s, direita +30s
@@ -2371,14 +2433,18 @@ int main() {
                 bool hud = player.hudActive();
                 FbRenderer r(hud ? shadow : (uint32_t *)bufs[back], W, H);
                 if (player.paused) {
-                    if (hud) { player.overlay(r); flip(); }
-                    sceKernelUsleep(16000);
+                    // sempre redesenha HUD pausado (botoes precisam responder visualmente)
+                    player.overlay(r); flip();
+                    sceKernelUsleep(12000);
                     continue;
                 }
                 if (player.poll(r)) {
                     gotFrame = true;
-                    if (hud) { player.overlay(r); flip(); }
+                    if (hud || player.showOpts) { player.overlay(r); flip(); }
                     else { sceVideoOutSubmitFlip(vh, back, ORBIS_VIDEO_OUT_FLIP_VSYNC, 0); back = (back + 1) % 3; }
+                } else if (player.showOpts || (hud && pressed)) {
+                    // sem quadro novo mas menu/HUD precisa atualizar
+                    player.overlay(r); flip();
                 }
                 else if (!gotFrame && nowSec() - lastWaitDraw > 0.12) { lastWaitDraw = nowSec(); presentWait(); }
             } else if (nowSec() - lastWaitDraw > 0.12) { lastWaitDraw = nowSec(); presentWait(); }
