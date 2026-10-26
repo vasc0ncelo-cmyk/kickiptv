@@ -637,10 +637,8 @@ struct UI {
         int kind = textKind; textKind = 0;
         if (kind == 2) { setM3U(raw); return; }
         if (kind == 3) {
-            // trim
-            size_t a = raw.find_first_not_of(" 	
-"), b = raw.find_last_not_of(" 	
-");
+            size_t a = raw.find_first_not_of(" \t\r\n");
+            size_t b = raw.find_last_not_of(" \t\r\n");
             searchQ = a == std::string::npos ? "" : raw.substr(a, b - a + 1);
             if (searchQ.empty()) {
                 clearSearch();
@@ -648,7 +646,7 @@ struct UI {
                 return;
             }
             rebuildSearch();
-            app.say(std::to_string(searchHits.size()) + " resultado(s) para "" + searchQ + """);
+            app.say(std::to_string(searchHits.size()) + " resultado(s) para \"" + searchQ + "\"");
             return;
         }
         kickLast = kickSlug(raw);
@@ -663,9 +661,8 @@ struct UI {
     }
 
     void setM3U(std::string url) {
-        size_t a = url.find_first_not_of(" 	
-"), b = url.find_last_not_of(" 	
-");
+        size_t a = url.find_first_not_of(" \t\r\n");
+        size_t b = url.find_last_not_of(" \t\r\n");
         url = a == std::string::npos ? "" : url.substr(a, b - a + 1);
         if (url.empty()) {                       // campo vazio = remover a lista
             m3uUrl.clear(); app.list = Playlist(); app.pf.saveSetting("m3u", ""); app.pf.cacheClear();
@@ -1118,7 +1115,7 @@ private:
             int hy = y0 + n * pitch + 10;
             uiFrame(r, x, hy, rw, 190, 18, 2, CARD_LINE, 0xFF0B0B0B);
             uiText(r, x + 30, hy + 20, "Como usar", GREEN, 24, true);
-            uiText(r, x + 30, hy + 62, "1. Escolha "Digitar @streamer" e informe o nome do canal (ex.: @dekin021).", SOFT, 22);
+            uiText(r, x + 30, hy + 62, "1. Escolha \"Digitar @streamer\" e informe o nome do canal (ex.: @dekin021).", SOFT, 22);
             uiText(r, x + 30, hy + 98, "2. O canal precisa estar ao vivo. Aperte O para voltar ao menu a qualquer momento.", SOFT, 22);
             uiText(r, x + 30, hy + 134, "3. As lives da Kick abrem direto aqui no PS4, sem navegador.", SOFT, 22);
         }
