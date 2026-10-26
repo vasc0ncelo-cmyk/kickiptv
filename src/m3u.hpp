@@ -58,7 +58,8 @@ private:
     size_t count_ = 0, memBytes_ = 0;
     bool full_ = false;
     std::unordered_map<std::string, int> chanIdx_, movieIdx_, seriesIdx_;   // nome limpo da categoria -> posicao
-    std::unordered_set<std::string> seenUrl_;  // evita capa/item duplicado (mesmo URL)
+    std::unordered_set<std::string> seenUrl_;   // evita duplicata por URL
+    std::unordered_set<std::string> seenName_;  // evita mesmo titulo (capa 2-3x)
     static int catFor(std::vector<Category> &cats, std::unordered_map<std::string, int> &idx, const std::string &group);
 };
 
