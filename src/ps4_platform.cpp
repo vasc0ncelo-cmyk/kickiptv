@@ -34,6 +34,7 @@
 #include "urlutil.hpp"
 #include "imgcache.hpp"
 #include "coverurl.hpp"
+#include "netgate.hpp"
 #include "listload.hpp"
 #include "tsmux.hpp"
 #include "blit.hpp"
@@ -87,6 +88,13 @@ static bool g_traceHttp = false;                 // so durante o download da lis
 static const char *g_m3uTag = "m3u-t-";          // "t" = thread de rede | "s" = modo seguro (mesma thread)
 static bool g_safeM3U = true;                    // modo seguro: baixa a lista sem criar thread de rede
 static void traceHttp(const char *what) { if (g_traceHttp) { std::string s = std::string(g_m3uTag) + what; trace(s.c_str()); } }
+// Erro ao criar template/conexao/requisicao HTTP (pool esgotado, por exemplo): grava os primeiros no log /data, com o codigo.
+static void netErr(const char *what, int rc) {
+    static std::atomic<int> n{0};
+    if (n.fetch_add(1) >= 12) return;
+    char b[64]; snprintf(b, sizeof b, "net-erro-%s-%08X", what, (unsigned)rc);
+    trace(b);
+}
 static double monoSec() { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec + ts.tv_nsec / 1e9; }
 
 struct NetClient {
@@ -108,9 +116,9 @@ struct NetClient {
         const char *names[4] = {"Net", "NetCtl", "Http", "Ssl"};
         for (int i = 0; i < 4; i++) L(std::string("carregar modulo ") + names[i] + ": " + hex(sceSysmoduleLoadModuleInternal(ids[i])));
         int rc = sceNetInit();                         L("sceNetInit: " + hex(rc));
-        int netMem = sceNetPoolCreate("kickiptv", 64 * 1024, 0); L("sceNetPoolCreate: " + hex(netMem));
-        int ssl = sceSslInit(300 * 1024);              L("sceSslInit: " + hex(ssl));
-        httpCtx = sceHttpInit(netMem, ssl, 128 * 1024); L("sceHttpInit: " + hex(httpCtx));
+        int netMem = sceNetPoolCreate("kickiptv", 512 * 1024, 0); L("sceNetPoolCreate: " + hex(netMem));   // pools maiores: varias conexoes HTTPS ao mesmo tempo (capas + video)
+        int ssl = sceSslInit(1024 * 1024);             L("sceSslInit: " + hex(ssl));
+        httpCtx = sceHttpInit(netMem, ssl, 1024 * 1024); L("sceHttpInit: " + hex(httpCtx));
         if (httpCtx < 0) return false;
         ready = true;
         failed = false;
@@ -260,7 +268,7 @@ struct NetClient {
         if (!init()) return false;
         const char *ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
         s.tmpl = sceHttpCreateTemplate(httpCtx, ua, 1 /*HTTP/1.1*/, 1);
-        if (s.tmpl < 0) { s.tmpl = -1; return false; }
+        if (s.tmpl < 0) { netErr("template", s.tmpl); s.tmpl = -1; return false; }
         sceHttpsDisableOption(s.tmpl, 0x1F);
         sceHttpSetAutoRedirect(s.tmpl, 1);
         const unsigned T = 15 * 1000 * 1000, TR = s.recvSec * 1000u * 1000u;   // conexao 15 s; envio/recepcao 8 s (conexao morta no meio de um segmento nao trava mais 15 s)
@@ -269,7 +277,7 @@ struct NetClient {
         sceHttpSetSendTimeOut(s.tmpl, TR);
         sceHttpSetRecvTimeOut(s.tmpl, TR);
         s.conn = sceHttpCreateConnectionWithURL(s.tmpl, url.c_str(), 1 /*keep-alive*/);
-        if (s.conn < 0) { s.conn = -1; closeSession(s); return false; }
+        if (s.conn < 0) { netErr("conexao", s.conn); s.conn = -1; closeSession(s); return false; }
         s.origin = originOf(url);
         return true;
     }
@@ -358,6 +366,8 @@ struct NetClient {
 
 static NetClient g_net;
 static ImgCache g_covers;
+static NetGate g_coverGate(3, 2);                // no maximo 3 capas baixando juntas; o lote de fundo usa no maximo 2 (sempre sobra vaga para a tela)
+static std::atomic<bool> g_quitting{false};
 
 // ---------- Plataforma ----------
 struct Ps4Platform : Platform {
@@ -1902,7 +1912,9 @@ int main() {
         static NetClient::Session sess[ImgCache::kWorkers + ImgCache::kBgThreads];
         if (worker < 0 || worker >= ImgCache::kWorkers + ImgCache::kBgThreads) worker = ImgCache::kWorkers;
         NetClient::Session &ss = sess[worker];
-        ss.recvSec = 10;
+        NetGate::Permit permit(g_coverGate, worker >= ImgCache::kWorkers, &g_quitting);
+        if (!permit.ok) return false;                    // app fechando
+        ss.recvSec = 8;
         std::string url = coverThumbUrl(url0);           // TMDB: pede a miniatura (~10 KB) em vez do poster gigante (500 KB+)
         int st = 0;
         try {
@@ -2086,7 +2098,13 @@ int main() {
     }
 
     trace("loop-inicio");
+    double hbNext = monoSec() + 60, hbT0 = monoSec();
     for (;;) {
+        if (monoSec() >= hbNext) {                       // 1 linha por minuto no log (/data/kickiptv.log): ate quando o app estava vivo
+            hbNext += 60;
+            char hb[64]; snprintf(hb, sizeof hb, "vivo-%dmin", (int)((monoSec() - hbT0) / 60.0 + 0.5));
+            trace(hb);
+        }
         pin.poll();
         uint32_t now = pin.held, pressed = pin.take();
         if (wantQuit || ((now | pressed) & B_OPTIONS)) break;
@@ -2387,7 +2405,8 @@ int main() {
     trace("saindo");
     pf.saveSetting("bgload", "");               // saida normal: nao foi queda
     if (!loader.cancel(2.0)) { trace("fim-forcado"); _Exit(0); }      // thread de lista presa na rede: sai sem rodar destrutores
-    g_covers.shutdown();
+    g_quitting = true;
+    if (!g_covers.shutdownFor(3.0)) { trace("fim-forcado-capas"); _Exit(0); }      // thread de capas presa na rede: sai sem esperar
     if (player.h || player.h2 || mode == Mode::Play) player.stop();
     Player::waitTeardown(10.0);
     if (g_tearing.load() > 0) { trace("fim-forcado"); _Exit(0); }   // algo travou (rede): sai sem rodar destrutores
