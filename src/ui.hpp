@@ -691,12 +691,6 @@ struct UI {
 
     void handle(Input in) {
         if (in == Input::Extra) { startSearch(); return; }
-        if (screen == Screen::Help) {
-            if (in == Input::Back || in == Input::Confirm) { screen = Screen::Home; return; }
-            if (in == Input::Up) helpScroll = std::max(0, helpScroll - 1);
-            if (in == Input::Down) helpScroll = std::min(12, helpScroll + 1);
-            return;
-        }
         if (screen == Screen::Home) { handleHome(in); return; }
         int t = (int)tab;
         switch (in) {
@@ -734,13 +728,21 @@ struct UI {
         if (dbg) dbg("ui-capas-ok");
         uiHeader(r, timeText, dateText);
         if (dbg) dbg("ui-header-ok");
-        if (screen == Screen::Home) renderHome(r); else if (screen == Screen::Help) renderHelp(r); else renderList(r);
+        if (screen == Screen::Home) renderHome(r); else renderList(r);
         if (dbg) dbg("ui-corpo-ok");
         renderFooter(r);
         if (dbg) dbg("ui-rodape-ok");
     }
 
 private:
+    void confirm(int n);
+    void renderFooter(Renderer &r);
+    void renderHome(Renderer &r);
+    void renderHelp(Renderer &r);
+    void renderList(Renderer &r);
+    void handleHome(Input in);
+    void handleItems(Input in);
+
     void openTab(Tab t) { tab = t; screen = t == Tab::Kick ? Screen::Kick : Screen::List; level = 0; inItems = false; searchQ.clear(); searchHits.clear(); }
     void resetBrowse() {
         for (int i = 0; i < 4; i++) cursor[i] = scroll[i] = catCur[i] = catScroll[i] = 0;
