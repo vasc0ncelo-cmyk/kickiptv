@@ -699,6 +699,83 @@ typedef int (*KAvLogCb)(void *ud, const char *fmt, va_list ap);
 int sceAvPlayerSetLogCallback(KAvLogCb cb, void *ud);
 }
 
+
+// Duracao do MP4 a partir do atomo mvhd (ms). 0 = nao achou.
+static uint64_t mp4DurationMsFromFile(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    // le ate 4 MB do inicio (moov costuma estar no comeco ou no fim — tenta inicio primeiro)
+    const size_t CAP = 4 * 1024 * 1024;
+    std::vector<char> buf(CAP);
+    size_t n = fread(buf.data(), 1, CAP, f);
+    if (n < 16) { fclose(f); return 0; }
+    auto scan = [](const uint8_t *d, size_t n) -> uint64_t {
+        size_t a = 0;
+        while (a + 8 <= n) {
+            uint32_t sz = (uint32_t)d[a] << 24 | (uint32_t)d[a+1] << 16 | (uint32_t)d[a+2] << 8 | d[a+3];
+            size_t hdr = 8;
+            if (sz == 1) {
+                if (a + 16 > n) break;
+                uint64_t sz64 = 0;
+                for (int i = 0; i < 8; i++) sz64 = (sz64 << 8) | d[a + 8 + i];
+                sz = (uint32_t)sz64; // truncado ok para bounds
+                hdr = 16;
+            } else if (sz == 0) sz = (uint32_t)(n - a);
+            if (sz < hdr || a + sz > n) break;
+            const char *typ = (const char *)(d + a + 4);
+            if (typ[0]=='m' && typ[1]=='o' && typ[2]=='o' && typ[3]=='v') {
+                // procura mvhd dentro do moov
+                size_t b = a + hdr, end = a + sz;
+                while (b + 8 <= end) {
+                    uint32_t s2 = (uint32_t)d[b] << 24 | (uint32_t)d[b+1] << 16 | (uint32_t)d[b+2] << 8 | d[b+3];
+                    size_t h2 = 8;
+                    if (s2 == 1) { if (b + 16 > end) break; h2 = 16; }
+                    else if (s2 == 0) s2 = (uint32_t)(end - b);
+                    if (s2 < h2 || b + s2 > end) break;
+                    if (d[b+4]=='m' && d[b+5]=='v' && d[b+6]=='h' && d[b+7]=='d') {
+                        const uint8_t *p = d + b + h2;
+                        if (b + h2 + 20 > end) break;
+                        uint8_t ver = p[0];
+                        uint32_t timescale = 0;
+                        uint64_t duration = 0;
+                        if (ver == 1) {
+                            if (b + h2 + 32 > end) break;
+                            timescale = (uint32_t)p[20] << 24 | (uint32_t)p[21] << 16 | (uint32_t)p[22] << 8 | p[23];
+                            for (int i = 0; i < 8; i++) duration = (duration << 8) | p[24 + i];
+                        } else {
+                            timescale = (uint32_t)p[12] << 24 | (uint32_t)p[13] << 16 | (uint32_t)p[14] << 8 | p[15];
+                            duration = (uint32_t)p[16] << 24 | (uint32_t)p[17] << 16 | (uint32_t)p[18] << 8 | p[19];
+                        }
+                        if (timescale > 0 && duration > 0) {
+                            return (duration * 1000ULL) / timescale;
+                        }
+                        return 0;
+                    }
+                    b += s2;
+                }
+            }
+            a += sz;
+        }
+        return 0;
+    };
+    uint64_t ms = scan((const uint8_t *)buf.data(), n);
+    // se nao achou no inicio, tenta os ultimos 2 MB (moov no fim)
+    if (ms == 0) {
+        if (fseek(f, 0, SEEK_END) == 0) {
+            long sz = ftell(f);
+            if (sz > 0) {
+                long off = sz > (long)CAP ? sz - (long)CAP : 0;
+                if (fseek(f, off, SEEK_SET) == 0) {
+                    n = fread(buf.data(), 1, CAP, f);
+                    ms = scan((const uint8_t *)buf.data(), n);
+                }
+            }
+        }
+    }
+    fclose(f);
+    return ms;
+}
+
 // Quantas desmontagens (fechar player/threads) estao rodando em segundo plano. O botao O nao espera por elas.
 static std::atomic<int> g_tearing{0};
 
@@ -1122,9 +1199,12 @@ struct Player {
     uint64_t vodContentLength = 0;         // bytes totais (Range)
     uint64_t vodBytesAtStart = 0;
     double   vodTimeAtStart = 0;
-    double   playStartWall = 0;           // relogio de parede ao iniciar (fallback de progresso)
+    double   playStartWall = 0;           // relogio de parede ao iniciar (progresso)
+    double   pauseAccum = 0;              // segundos acumulados em pausa (parede)
+    double   pauseStartedAt = 0;          // quando entrou em pausa
     uint64_t lastGoodPtsMs = 0;           // ultimo pts que avancou
     double   lastPtsWall = 0;             // quando lastPtsMs mudou
+    uint64_t fileDurMs = 0;               // duracao lida do MP4 (mvhd) se disponivel
     int64_t seekPendingMs = -1;            // seek solicitado (software ate o player aceitar)
 
     // Episodios da mesma temporada (para L1/R1 pular)
@@ -1248,7 +1328,7 @@ struct Player {
         paused = false; isVod = false; lastPtsMs = 0; maxPtsMs = 0; durationMs = 0; seekPendingMs = -1; waitNote.clear(); showOpts = false; optCur = 0;
         scrubMode = false; scrubMs = -1; seekSkip = false; seekTargetMs = 0;
         vodEstDurMs = 0; vodContentLength = 0; vodBytesAtStart = 0; vodTimeAtStart = 0;
-        playStartWall = nowSec(); lastGoodPtsMs = 0; lastPtsWall = playStartWall;
+        playStartWall = nowSec(); pauseAccum = 0; pauseStartedAt = 0; lastGoodPtsMs = 0; lastPtsWall = playStartWall; fileDurMs = 0;
         avLang = "eng"; langTry = 0; vodPath.clear(); vodAudioExpected = false;
         h2 = 0; bHandle = 0; bState = 0; nextReady = false; prepBusy = false; gapless = true;
         if (g_tearing.load() > 0) {
@@ -1488,7 +1568,17 @@ struct Player {
         // 3) toca o arquivo local (o resto ja esta baixando)
         if (openSource(path, 0, 0, dl->warn().empty() ? 20000 : 8000, true)) {   // codec que o PS4 nao decodifica: nao espera 20 s
             audio.start(h); active = true; t0 = lastFps = lastFrameT = nowSec();
-            isVod = true; log.push_back("OK: tocando enquanto baixa"); return true;
+            isVod = true;
+            // Duracao real do arquivo (mvhd) — barra e tempo total corretos
+            fileDurMs = mp4DurationMsFromFile(path);
+            if (fileDurMs > 0) {
+                durationMs = fileDurMs;
+                vodEstDurMs = fileDurMs;
+                char db[64]; snprintf(db, sizeof db, "   duracao: %u min", (unsigned)(fileDurMs / 60000ULL));
+                log.push_back(db);
+            }
+            playStartWall = nowSec(); pauseAccum = 0; pauseStartedAt = 0;
+            log.push_back("OK: tocando enquanto baixa"); return true;
         }
         failed = true;
         if (!cancelled) log.push_back(dl->warn().empty() ? "ERRO: o player nao abriu o arquivo (mande um print desta tela)" : "ERRO: " + dl->warn());
@@ -1652,10 +1742,34 @@ struct Player {
                 }
                 // barra acompanha o filme
                 if (durationMs < maxPtsMs + 5000) durationMs = maxPtsMs + 5000;
-                if (isVod && vodContentLength > 1024 && lastPtsMs > 6000 && vodEstDurMs == 0 && vw > 0) {
-                    double mbs = (vw >= 1280) ? 1.15e6 : 0.55e6;
-                    uint64_t est = (uint64_t)((double)vodContentLength / mbs * 1000.0);
-                    if (est > 30ULL * 1000ULL && est < 10ULL * 3600ULL * 1000ULL) vodEstDurMs = est;
+                if (isVod && vodContentLength > 1024 * 1024 && vodEstDurMs == 0 && fileDurMs == 0) {
+                    // estima duracao: tamanho total / taxa media observada
+                    uint64_t posMs = lastPtsMs > 3000 ? lastPtsMs : wallPosMs();
+                    if (posMs > 5000) {
+                        // bytes "consumidos" ~ proporcional ao tempo se download acompanhou
+                        double mbs = (double)vodContentLength / ((double)posMs / 1000.0); // bytes por segundo se ja tivesse acabado no posMs? wrong
+                        // melhor: assumir que a taxa de reproducao = tamanho / duracao
+                        // medimos quantos bytes o progressive ja tem na fronteira
+                        auto pf = getPf();
+                        uint64_t front = pf ? pf->frontier() : 0;
+                        if (front > 512 * 1024 && posMs > 5000) {
+                            double bps = (double)front / ((double)posMs / 1000.0);
+                            if (bps > 10000) {
+                                uint64_t est = (uint64_t)((double)vodContentLength / bps * 1000.0);
+                                if (est > 30ULL * 1000ULL && est < 10ULL * 3600ULL * 1000ULL) {
+                                    vodEstDurMs = est;
+                                    if (durationMs < est) durationMs = est;
+                                }
+                            }
+                        } else if (posMs > 8000) {
+                            // fallback: 2.5 Mbps tipico IPTV
+                            uint64_t est = (vodContentLength * 8ULL * 1000ULL) / (2500000ULL);
+                            if (est > 30ULL * 1000ULL && est < 10ULL * 3600ULL * 1000ULL) {
+                                vodEstDurMs = est;
+                                if (durationMs < est) durationMs = est;
+                            }
+                        }
+                    }
                 }
                 if (vodEstDurMs > durationMs) durationMs = vodEstDurMs;
 
@@ -1807,7 +1921,7 @@ struct Player {
     // O loop principal para de buscar quadros e o audio fica mudo enquanto paused==true.
     void togglePause() {
         if (!h || failed) return;
-        paused = !paused;
+        setPausedSoft(!paused);
         audio.muted = paused || muted;
         hudUntil = nowSec() + 12;
     }
@@ -1851,6 +1965,19 @@ struct Player {
         }
     }
 
+
+    void setPausedSoft(bool p) {
+        if (p == paused) return;
+        if (p) {
+            pauseStartedAt = nowSec();
+            paused = true;
+        } else {
+            if (pauseStartedAt > 0)
+                pauseAccum += nowSec() - pauseStartedAt;
+            pauseStartedAt = 0;
+            paused = false;
+        }
+    }
     void seekBy(int deltaMs) {
         int64_t base = scrubMode && scrubMs >= 0 ? scrubMs : (int64_t)lastPtsMs;
         seekTo(base + deltaMs);
@@ -1871,31 +1998,52 @@ struct Player {
         scrubMode = false;
     }
 
+    // Tempo decorrido de parede (descontando pausas) em ms
+    uint64_t wallPosMs() const {
+        if (playStartWall <= 0) return 0;
+        double now = nowSec();
+        double pausedNow = 0;
+        if (paused && pauseStartedAt > 0) pausedNow = now - pauseStartedAt;
+        double elapsed = now - playStartWall - pauseAccum - pausedNow;
+        if (elapsed < 0) elapsed = 0;
+        return (uint64_t)(elapsed * 1000.0);
+    }
+
     uint64_t displayPosMs() const {
         if (scrubMode && scrubMs >= 0) return (uint64_t)scrubMs;
-        if (seekSkip && seekTargetMs > lastPtsMs) return seekTargetMs;
-        // PTS do decoder quando avanca
-        if (lastPtsMs > 0 && (nowSec() - lastPtsWall) < 2.5)
+        if (seekSkip && seekTargetMs > 0) return seekTargetMs;
+
+        // 1) PTS do AvPlayer se estiver avancando de verdade
+        if (lastPtsMs > 200 && (nowSec() - lastPtsWall) < 1.2)
             return lastPtsMs;
-        // Fallback: relogio de parede (quando o AvPlayer nao manda PTS)
-        if (isVod && playStartWall > 0 && !paused) {
-            double wall = (nowSec() - playStartWall) * 1000.0;
-            if (wall < 0) wall = 0;
-            uint64_t w = (uint64_t)wall;
-            // se temos PTS antigo, nao volte atras
-            if (w < lastPtsMs) w = lastPtsMs;
+
+        // 2) Relogio de parede (confiavel no homebrew quando PTS vem 0)
+        if (isVod) {
+            uint64_t w = wallPosMs();
+            // se PTS ja foi maior, nao volta
+            if (lastPtsMs > w) w = lastPtsMs;
+            uint64_t dur = displayDurMs();
+            if (dur > 0 && w > dur) w = dur;
             return w;
         }
         return lastPtsMs;
     }
     uint64_t displayDurMs() const {
-        uint64_t d = durationMs;
+        // Prioridade: mvhd do arquivo > estimativa HTTP > maxPts > default
+        uint64_t d = 0;
+        if (fileDurMs > 1000) d = fileDurMs;
         if (vodEstDurMs > d) d = vodEstDurMs;
-        uint64_t pos = lastPtsMs > maxPtsMs ? lastPtsMs : maxPtsMs;
-        // enquanto nao sabe o fim, mostra pelo menos pos + 15 min (barra anda de verdade)
-        if (d < pos + 15ULL * 60ULL * 1000ULL)
-            d = pos + 15ULL * 60ULL * 1000ULL;
-        if (d < 60ULL * 1000ULL) d = 90ULL * 60ULL * 1000ULL; // default 1h30 ate estimar
+        if (durationMs > d) d = durationMs;
+        if (maxPtsMs + 1000 > d) d = maxPtsMs + 1000;
+        // se ainda nao sabemos: estimativa por tamanho do arquivo (assume ~1.2 MB/s video tipico IPTV)
+        if (d < 5000 && vodContentLength > 1024 * 1024) {
+            // bitrate tipico ~ 2.5 Mbps = ~320 KB/s — conservador 1 MB/s
+            d = (vodContentLength * 1000ULL) / (1024ULL * 1024ULL); // segundos se 1MB/s
+            d *= 1000ULL;
+            if (d < 60ULL * 1000ULL) d = 60ULL * 1000ULL;
+            if (d > 5ULL * 3600ULL * 1000ULL) d = 5ULL * 3600ULL * 1000ULL;
+        }
+        if (d < 1000) d = 90ULL * 60ULL * 1000ULL; // 1h30 placeholder ate medir
         return d;
     }
 
