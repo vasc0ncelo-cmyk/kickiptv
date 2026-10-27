@@ -57,10 +57,11 @@ static bool hasWord(const std::string &h, const char *w) {
 
 // Procura "S01E02" (tambem "S01 E02", "S01.E02", "T01E02") no nome.
 bool parseEpisode(const std::string &name, std::string &series, int &season, int &episode) {
+    // 1) S01E02 / T01E02 / S1.E2 / S01 E02
     for (size_t i = 0; i + 3 < name.size(); i++) {
         char c0 = (char)std::toupper((unsigned char)name[i]);
         if ((c0 != 'S' && c0 != 'T') || !std::isdigit((unsigned char)name[i + 1])) continue;
-        if (i > 0 && std::isalnum((unsigned char)name[i - 1])) continue;      // "Chess01E02" nao e episodio
+        if (i > 0 && std::isalnum((unsigned char)name[i - 1])) continue;
         size_t j = i + 1; int s = 0;
         while (j < name.size() && std::isdigit((unsigned char)name[j])) { if (s < 100000) s = s * 10 + (name[j] - '0'); j++; }
         if (j < name.size() && (name[j] == ' ' || name[j] == '.' || name[j] == '_' || name[j] == '-')) j++;
@@ -69,6 +70,26 @@ bool parseEpisode(const std::string &name, std::string &series, int &season, int
         if (j >= name.size() || !std::isdigit((unsigned char)name[j])) continue;
         int e = 0;
         while (j < name.size() && std::isdigit((unsigned char)name[j])) { if (e < 100000) e = e * 10 + (name[j] - '0'); j++; }
+        series = trim(name.substr(0, i));
+        while (!series.empty() && (series.back() == '-' || series.back() == ':' || series.back() == '|' || series.back() == ' ')) series.pop_back();
+        series = trim(series);
+        if (s < 1) s = 1;
+        if (e < 1) e = 1;
+        season = s; episode = e;
+        return !series.empty();
+    }
+    // 2) 1x02 / 12x05
+    for (size_t i = 0; i + 3 < name.size(); i++) {
+        if (!std::isdigit((unsigned char)name[i])) continue;
+        if (i > 0 && std::isalnum((unsigned char)name[i - 1])) continue;
+        size_t j = i; int s = 0;
+        while (j < name.size() && std::isdigit((unsigned char)name[j])) { if (s < 1000) s = s * 10 + (name[j] - '0'); j++; }
+        if (j >= name.size() || (name[j] != 'x' && name[j] != 'X')) continue;
+        j++;
+        if (j >= name.size() || !std::isdigit((unsigned char)name[j])) continue;
+        int e = 0;
+        while (j < name.size() && std::isdigit((unsigned char)name[j])) { if (e < 100000) e = e * 10 + (name[j] - '0'); j++; }
+        if (s < 1 || e < 1) continue;
         series = trim(name.substr(0, i));
         while (!series.empty() && (series.back() == '-' || series.back() == ':' || series.back() == '|')) series.pop_back();
         series = trim(series);
@@ -293,13 +314,25 @@ void PlaylistBuilder::line(std::string &raw) {
     } else if (e.kind == Kind::Series) {
         std::string s; int se = 1, ep = 0;
         if (parseEpisode(e.name, s, se, ep)) { e.season = se; e.episode = ep; }
-        else s = e.group.empty() ? e.name : e.group;
-        bool isNew = p_.seriesTree.find(s) == p_.seriesTree.end();
-        if (isNew) p_.seriesCats[catFor(p_.seriesCats, seriesIdx_, e.group)].series.push_back(s);   // a serie fica na categoria do 1o episodio
+        else {
+            s = e.group.empty() ? e.name : e.group;
+            if (e.season < 1) e.season = 1;
+        }
+        std::string key = normTitle(s);
+        if (key.size() < 3) key = s;
+        std::string treeName = s.empty() ? key : s;
+        for (auto &kv : p_.seriesTree) {
+            if (normTitle(kv.first) == key) { treeName = kv.first; break; }
+        }
+        bool isNew = p_.seriesTree.find(treeName) == p_.seriesTree.end();
+        if (isNew) {
+            p_.seriesCats[catFor(p_.seriesCats, seriesIdx_, e.group)].series.push_back(treeName);
+        }
         e.group.clear();
         p_.seriesEpisodes++;
-        int season = e.season;
-        p_.seriesTree[s][season].push_back(std::move(e));
+        int season = e.season < 1 ? 1 : e.season;
+        e.season = season;
+        p_.seriesTree[treeName][season].push_back(std::move(e));
     } else {
         p_.channelCats[catFor(p_.channelCats, chanIdx_, e.group)].items.push_back((uint32_t)p_.channels.size());
         e.group.clear(); p_.channels.push_back(std::move(e));
