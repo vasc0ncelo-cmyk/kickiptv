@@ -39,6 +39,7 @@
 #include "tsmux.hpp"
 #include "blit.hpp"
 #include "padin.hpp"
+#include "sfx.hpp"
 #include <orbis/libkernel.h>
 #include <orbis/VideoOut.h>
 #include <orbis/UserService.h>
@@ -1121,6 +1122,9 @@ struct Player {
     uint64_t vodContentLength = 0;         // bytes totais (Range)
     uint64_t vodBytesAtStart = 0;
     double   vodTimeAtStart = 0;
+    double   playStartWall = 0;           // relogio de parede ao iniciar (fallback de progresso)
+    uint64_t lastGoodPtsMs = 0;           // ultimo pts que avancou
+    double   lastPtsWall = 0;             // quando lastPtsMs mudou
     int64_t seekPendingMs = -1;            // seek solicitado (software ate o player aceitar)
 
     // Episodios da mesma temporada (para L1/R1 pular)
@@ -1244,6 +1248,7 @@ struct Player {
         paused = false; isVod = false; lastPtsMs = 0; maxPtsMs = 0; durationMs = 0; seekPendingMs = -1; waitNote.clear(); showOpts = false; optCur = 0;
         scrubMode = false; scrubMs = -1; seekSkip = false; seekTargetMs = 0;
         vodEstDurMs = 0; vodContentLength = 0; vodBytesAtStart = 0; vodTimeAtStart = 0;
+        playStartWall = nowSec(); lastGoodPtsMs = 0; lastPtsWall = playStartWall;
         avLang = "eng"; langTry = 0; vodPath.clear(); vodAudioExpected = false;
         h2 = 0; bHandle = 0; bState = 0; nextReady = false; prepBusy = false; gapless = true;
         if (g_tearing.load() > 0) {
@@ -1635,10 +1640,18 @@ struct Player {
         have_frame:
             // timeStamp do AvPlayer costuma ser em microsegundos; guardamos em ms para o HUD
             if (fi.timeStamp > 0) {
-                lastPtsMs = fi.timeStamp / 1000;
+                // timeStamp do AvPlayer: microsegundos → ms
+                uint64_t pts = fi.timeStamp / 1000;
+                // se o valor parecer nanos/100 (muito grande), ajusta
+                if (pts > 48ULL * 3600ULL * 1000ULL) pts = fi.timeStamp / 10000;
+                lastPtsMs = pts;
                 if (lastPtsMs > maxPtsMs) maxPtsMs = lastPtsMs;
-                // barra acompanha o filme: duracao sobe com o progresso (sem fixar 90 min)
-                if (durationMs < maxPtsMs + 3000) durationMs = maxPtsMs + 3000;
+                if (lastPtsMs != lastGoodPtsMs) {
+                    lastGoodPtsMs = lastPtsMs;
+                    lastPtsWall = nowSec();
+                }
+                // barra acompanha o filme
+                if (durationMs < maxPtsMs + 5000) durationMs = maxPtsMs + 5000;
                 if (isVod && vodContentLength > 1024 && lastPtsMs > 6000 && vodEstDurMs == 0 && vw > 0) {
                     double mbs = (vw >= 1280) ? 1.15e6 : 0.55e6;
                     uint64_t est = (uint64_t)((double)vodContentLength / mbs * 1000.0);
@@ -1859,18 +1872,30 @@ struct Player {
     }
 
     uint64_t displayPosMs() const {
-        // barra e tempo: posicao real do decoder (salvo no modo scrub manual)
         if (scrubMode && scrubMs >= 0) return (uint64_t)scrubMs;
-        if (seekSkip && seekTargetMs > lastPtsMs) return seekTargetMs; // mostrando destino
+        if (seekSkip && seekTargetMs > lastPtsMs) return seekTargetMs;
+        // PTS do decoder quando avanca
+        if (lastPtsMs > 0 && (nowSec() - lastPtsWall) < 2.5)
+            return lastPtsMs;
+        // Fallback: relogio de parede (quando o AvPlayer nao manda PTS)
+        if (isVod && playStartWall > 0 && !paused) {
+            double wall = (nowSec() - playStartWall) * 1000.0;
+            if (wall < 0) wall = 0;
+            uint64_t w = (uint64_t)wall;
+            // se temos PTS antigo, nao volte atras
+            if (w < lastPtsMs) w = lastPtsMs;
+            return w;
+        }
         return lastPtsMs;
     }
     uint64_t displayDurMs() const {
-        // duracao: a melhor estimativa disponivel (nunca menor que a posicao atual)
         uint64_t d = durationMs;
         if (vodEstDurMs > d) d = vodEstDurMs;
-        if (d < maxPtsMs + 1000) d = maxPtsMs + 1000;
-        if (d < lastPtsMs + 1000) d = lastPtsMs + 1000;
-        if (d < 1000) d = 60ULL * 1000ULL;
+        uint64_t pos = lastPtsMs > maxPtsMs ? lastPtsMs : maxPtsMs;
+        // enquanto nao sabe o fim, mostra pelo menos pos + 15 min (barra anda de verdade)
+        if (d < pos + 15ULL * 60ULL * 1000ULL)
+            d = pos + 15ULL * 60ULL * 1000ULL;
+        if (d < 60ULL * 1000ULL) d = 90ULL * 60ULL * 1000ULL; // default 1h30 ate estimar
         return d;
     }
 
@@ -2222,12 +2247,19 @@ extern "C" int sceSystemServiceGetStatus(OrbisSystemServiceStatus *status);
 
 using PadIn = PadInT<OrbisPadSrc>;
 
+static SoftSfx g_sfx;
+
 int main() {
     sceUserServiceInitialize(NULL);
     int userId = 0;
     sceUserServiceGetInitialUser(&userId);
     int padInitRc = scePadInit();
     sceAudioOutInit();
+    {
+        int uiPort = sceAudioOutOpen(0xFF, ORBIS_AUDIO_OUT_PORT_TYPE_MAIN, 0, 256, 48000, ORBIS_AUDIO_OUT_PARAM_FORMAT_S16_STEREO);
+        g_sfx.init(uiPort);
+        char b[32]; snprintf(b, sizeof b, "sfx-port=%d", uiPort); /* log apos boot */
+    }
     {
         char b[40]; snprintf(b, sizeof b, "pad-init=%d user=%d", padInitRc, userId);
         // trace ainda nao existe — usa boot depois; guarda em variavel
@@ -2850,8 +2882,8 @@ int main() {
             int nU = ((pressed & B_UP) ? 1 : 0) + st[0] * (st[0] ? pin.accel(0) : 1);
             int nD = ((pressed & B_DOWN) ? 1 : 0) + st[1] * (st[1] ? pin.accel(1) : 1);
             int nL = ((pressed & B_LEFT) ? 1 : 0) + st[2], nR = ((pressed & B_RIGHT) ? 1 : 0) + st[3];
-            for (int i = 0; i < nU; i++) ui.handle(Input::Up);
-            for (int i = 0; i < nD; i++) ui.handle(Input::Down);
+            for (int i = 0; i < nU; i++) { ui.handle(Input::Up); if (i==0) g_sfx.nav(); }
+            for (int i = 0; i < nD; i++) { ui.handle(Input::Down); if (i==0) g_sfx.nav(); }
             for (int i = 0; i < nL; i++) ui.handle(Input::Left);
             for (int i = 0; i < nR; i++) ui.handle(Input::Right);
             if (nU + nD + nL + nR > 0) dirty = true;
@@ -2860,8 +2892,8 @@ int main() {
         if (pressed & B_R1)     { ui.handle(Input::NextTab);  dirty = true; }
         if (pressed & B_L2)     { ui.handle(Input::PageUp);   dirty = true; }
         if (pressed & B_R2)     { ui.handle(Input::PageDown); dirty = true; }
-        if (pressed & B_CROSS)  { ui.handle(Input::Confirm);  dirty = true; }
-        if (pressed & B_CIRCLE) { ui.handle(Input::Back);     dirty = true; }
+        if (pressed & B_CROSS)  { ui.handle(Input::Confirm);  dirty = true; g_sfx.ok(); }
+        if (pressed & B_CIRCLE) { ui.handle(Input::Back);     dirty = true; g_sfx.back(); }
         if (pressed & B_TRIANGLE) { ui.handle(Input::Extra);  dirty = true; }       // lupa: buscar
         if (updateClock()) dirty = true;
         {   // andamento do lote de capas (TRIANGULO)
