@@ -2177,13 +2177,29 @@ enum class Mode { Menu, Play, Kbd };
 // Leitura do controle (logica em padin.hpp, testada no PC): adaptador para o scePad do PS4.
 struct OrbisPadSrc {
     static int read(int h, PadSample *out, int n) {
+        if (h < 0 || !out || n <= 0) return 0;
         OrbisPadData buf[16]; if (n > 16) n = 16;
         int k = scePadRead(h, buf, n);
         if (k < 0) k = 0;
-        for (int i = 0; i < k; i++) { out[i].buttons = buf[i].buttons; out[i].lx = buf[i].leftStick.x; out[i].ly = buf[i].leftStick.y; }
+        for (int i = 0; i < k; i++) {
+            out[i].buttons = buf[i].buttons;
+            out[i].lx = buf[i].leftStick.x;
+            out[i].ly = buf[i].leftStick.y;
+        }
+        // Alguns firmwares nao enfileiram eventos: usa o estado atual como 1 amostra
+        if (k == 0 && n > 0) {
+            OrbisPadData d;
+            if (scePadReadState(h, &d) == 0) {
+                out[0].buttons = d.buttons;
+                out[0].lx = d.leftStick.x;
+                out[0].ly = d.leftStick.y;
+                k = 1;
+            }
+        }
         return k;
     }
     static bool state(int h, PadSample &s) {
+        if (h < 0) return false;
         OrbisPadData d;
         if (scePadReadState(h, &d) != 0) return false;
         s.buttons = d.buttons; s.lx = d.leftStick.x; s.ly = d.leftStick.y;
@@ -2211,8 +2227,21 @@ int main() {
     sceUserServiceGetInitialUser(&userId);
     scePadInit();
     sceAudioOutInit();
-    int pad = scePadOpen(userId, 0, 0, NULL);
+    // Abre o controle com varios tipos (0=standard, 1=special). Se falhar, tenta de novo no loop.
+    int pad = -1;
+    for (int type = 0; type <= 1 && pad < 0; type++) {
+        pad = scePadOpen(userId, type, 0, NULL);
+        char b[48]; snprintf(b, sizeof b, "pad-open-u%d-t%d=%d", userId, type, pad);
+        trace(b);
+    }
+    if (pad < 0) {
+        // ultimo recurso: user id -1 (alguns firmwares)
+        pad = scePadOpen(-1, 0, 0, NULL);
+        char b[32]; snprintf(b, sizeof b, "pad-open-any=%d", pad);
+        trace(b);
+    }
     PadIn pin; pin.h = pad;
+    if (pad < 0) trace("AVISO: nenhum controle aberto — botoes nao vao responder");
     bool wantQuit = false;
 
     const int W = 1920, H = 1080;
@@ -2443,34 +2472,45 @@ int main() {
         }
         pin.poll();
         uint32_t now = pin.held, pressed = pin.take();
-        // --- Botao PS / outro app: libera decoder e threads (senao o PS4 mostra erro ao sair) ---
+        // --- Botao PS / outro app: libera decoder (NAO bloqueia o loop — isInBackground errado matava o controle) ---
         {
             static bool wasBg = false;
+            static int padRetryAt = 0;
             OrbisSystemServiceStatus st{};
+            // so confia se a API retornou 0 e o eventNum parece razoavel
             if (sceSystemServiceGetStatus(&st) == 0) {
-                bool bg = st.isInBackground || st.isSystemUiOverlaid;
+                bool bg = (st.isInBackground != 0);
+                // isSystemUiOverlaid sozinho NAO para o app (menu rapido / notificacao)
                 if (bg && !wasBg) {
-                    trace(st.isInBackground ? "sistema-background" : "sistema-ui");
-                    // para tudo que usa GPU/rede pesada
+                    trace("sistema-background");
                     if (mode == Mode::Play) {
                         player.stop();
                         mode = Mode::Menu;
                         dirty = true;
                     }
                     g_covers.setPaused(true);
-                    // cancela download de lista se estiver rodando
                     if (loader.stillAlive()) loader.cancel(0.1);
                 }
                 if (!bg && wasBg) {
                     trace("sistema-foreground");
                     g_covers.setPaused(false);
-                    dirty = true;   // redesenha menu ao voltar
+                    dirty = true;
                 }
                 wasBg = bg;
-                // Em background: nao gasta CPU com flip; espera voltar
-                if (st.isInBackground) {
-                    sceKernelUsleep(100000);
-                    continue;
+            }
+            // Se o pad nao abriu (ou perdeu handle), tenta reabrir a cada ~2 s
+            if (pin.h < 0) {
+                static double nextTry = 0;
+                double tn = nowSec();
+                if (tn >= nextTry) {
+                    nextTry = tn + 2.0;
+                    int np = scePadOpen(userId, 0, 0, NULL);
+                    if (np < 0) np = scePadOpen(userId, 1, 0, NULL);
+                    if (np >= 0) {
+                        pin.h = np;
+                        char b[32]; snprintf(b, sizeof b, "pad-reopen=%d", np);
+                        trace(b);
+                    }
                 }
             }
         }
