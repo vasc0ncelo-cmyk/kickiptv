@@ -46,7 +46,11 @@ int main() {
     {   // lista gigante (350 mil itens com capa, ~115 MB na memoria): carrega so ate o orcamento de memoria, avisa e NAO estoura
         std::string t = "#EXTM3U\n";
         for (int i = 0; i < 350000; i++) t += "#EXTINF:-1 tvg-logo=\"http://image.tmdb.org/t/p/w300/abcdefghijkl" + std::to_string(i) + ".jpg\" group-title=\"Abertos\",Canal numero " + std::to_string(i) + "\nhttp://180381.sbs/live/Dirce0273/Sar5438/" + std::to_string(i) + ".ts\n";
+        // Forca orcamento antigo de 90 MB so neste teste (o app usa 512 MB+ no PS4)
+        size_t oldBudget = PlaylistBuilder::maxBytes();
+        PlaylistBuilder::maxBytes() = 90u * 1024 * 1024;
         Playlist p = buildPlaylist(t);
+        PlaylistBuilder::maxBytes() = oldBudget;
         assert(p.truncated && p.channels.size() > 150000 && p.channels.size() < 350000);
         assert(p.channels.back().url.find("/live/") != std::string::npos);             // o que entrou esta inteiro (nada pela metade)
         // lista media (60 mil): carrega inteira
@@ -57,7 +61,9 @@ int main() {
         struct Big : Platform { std::string body; bool httpGet(const std::string &, std::string &b) override { b = body; return true; }
             void play(const std::string &, const std::string &) override {} void requestText(const std::string &) override {} };
         Big big; big.body = t; App a(big);
+        PlaylistBuilder::maxBytes() = 90u * 1024 * 1024;
         assert(a.loadM3U("http://lista") && a.list.truncated && a.lastStatus.find("lista enorme") != std::string::npos);
+        PlaylistBuilder::maxBytes() = oldBudget;
     }
     {   // cache: 1a vez baixa e salva; abrir o app (useCache) nao baixa; confirmar o link baixa de novo; outro link baixa
         CacheFake f; App a(f);
@@ -73,7 +79,12 @@ int main() {
     Fake f; App a(f);
     assert(a.loadM3U("http://lista"));
     assert(a.list.channels.size() == 1 && a.list.movies.size() == 1 && a.list.seriesEpisodes == 2);
-    assert(a.list.seriesTree["Dark"][1][0].episode == 1);
+    {
+        auto it = a.list.seriesTree.find("Dark");
+        assert(it != a.list.seriesTree.end() && it->second.count(1) && it->second.at(1).size() == 2);
+        int eps = 0; for (auto &e : it->second.at(1)) eps |= (1 << e.episode);
+        assert((eps & (1 << 1)) && (eps & (1 << 2)));  // tem E01 e E02 (ordem do M3U)
+    }
     a.watchKick("@Streamer");
     assert(f.playedUrl == "https://x.live/a.m3u8");
     f.playedUrl.clear(); a.watchKick("@offline");
