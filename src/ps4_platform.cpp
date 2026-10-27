@@ -1117,6 +1117,10 @@ struct Player {
     uint64_t lastPtsMs = 0;                // posicao atual (ms) do ultimo quadro
     uint64_t maxPtsMs = 0;                 // maior pts visto (estima duracao minima)
     uint64_t durationMs = 0;               // duracao conhecida/estimada (ms)
+    uint64_t vodEstDurMs = 0;              // estimativa por tamanho HTTP
+    uint64_t vodContentLength = 0;         // bytes totais (Range)
+    uint64_t vodBytesAtStart = 0;
+    double   vodTimeAtStart = 0;
     int64_t seekPendingMs = -1;            // seek solicitado (software ate o player aceitar)
 
     // Episodios da mesma temporada (para L1/R1 pular)
@@ -1893,6 +1897,28 @@ struct Player {
         int h = s / 3600, m = (s / 60) % 60, sec = s % 60;
         if (h > 0) snprintf(buf, n, "%d:%02d:%02d", h, m, sec);
         else snprintf(buf, n, "%d:%02d", m, sec);
+    }
+
+
+    void drawMiniProgress(FbRenderer &r) {
+        if (!isVod) return;
+        const int W = r.W, H = r.H;
+        int trackX = 80, trackW = W - 160, trackY = H - 36, trackH = 6;
+        uint64_t pos = displayPosMs(), dur = displayDurMs();
+        if (dur < 1) dur = 1;
+        int fill = (int)((pos * (uint64_t)trackW) / dur);
+        if (fill < 0) fill = 0;
+        if (fill > trackW) fill = trackW;
+        r.roundRect(trackX, trackY, trackW, trackH, 3, 0xAA1A1A1Au);
+        r.roundRect(trackX, trackY, std::max(fill, 2), trackH, 3, 0xFF53FC18u);
+        char t0[32], t1[32];
+        fmtTime(pos, t0, sizeof t0);
+        fmtTime(dur, t1, sizeof t1);
+        r.roundRect(trackX - 4, trackY - 28, r.textWidth(t0, 18) + 12, 24, 6, 0xAA000000u);
+        uiText(r, trackX, trackY - 26, t0, 0xFFFFFFFFu, 18);
+        int tw = r.textWidth(t1, 18);
+        r.roundRect(trackX + trackW - tw - 8, trackY - 28, tw + 12, 24, 6, 0xAA000000u);
+        uiText(r, trackX + trackW - tw, trackY - 26, t1, 0xFFAAAAAAu, 18);
     }
 
     void overlay(FbRenderer &r) {
