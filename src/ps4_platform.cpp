@@ -2544,31 +2544,46 @@ int main() {
             }
         }
         uint32_t now = pin.held | pressed;
-        // --- Botao PS / outro app: libera decoder (NAO bloqueia o loop — isInBackground errado matava o controle) ---
+        // --- Botao PS / Fechar aplicativo / troca de app ---
+        // Ao ir pro background: para player + workers o mais rapido possivel
+        // (se o usuario escolher "Fechar aplicativo", o sistema mata o processo;
+        //  se ja liberamos AvPlayer/threads, nao da CE-34878-0).
         {
             static bool wasBg = false;
-            static int padRetryAt = 0;
             OrbisSystemServiceStatus st{};
-            // so confia se a API retornou 0 e o eventNum parece razoavel
             if (sceSystemServiceGetStatus(&st) == 0) {
                 bool bg = (st.isInBackground != 0);
-                // isSystemUiOverlaid sozinho NAO para o app (menu rapido / notificacao)
                 if (bg && !wasBg) {
                     trace("sistema-background");
-                    if (mode == Mode::Play) {
-                        player.stop();
+                    g_quitting = true;                 // workers de rede/capas param
+                    g_sfx.ready = false;               // nao bloqueia em AudioOut
+                    if (mode == Mode::Play || player.h) {
+                        try { player.stop(); } catch (...) {}
                         mode = Mode::Menu;
-                        dirty = true;
                     }
                     g_covers.setPaused(true);
-                    if (loader.stillAlive()) loader.cancel(0.1);
+                    try { g_covers.cancelBackground(); } catch (...) {}
+                    if (loader.stillAlive()) {
+                        try { loader.cancel(0.05); } catch (...) {}
+                    }
+                    try { g_feed.abort(); abortHf(); abortPf(); } catch (...) {}
+                    // da um momento pro stop assincrono soltar o AvPlayer
+                    Player::waitTeardown(0.35);
+                    dirty = true;
                 }
                 if (!bg && wasBg) {
                     trace("sistema-foreground");
+                    g_quitting = false;
+                    g_sfx.ready = true;
                     g_covers.setPaused(false);
                     dirty = true;
                 }
                 wasBg = bg;
+                // Enquanto estiver em background: nao toca video nem redesenha menu pesado
+                if (bg) {
+                    sceKernelUsleep(30000);
+                    continue;
+                }
             }
             // Se o pad nao abriu (ou perdeu handle), tenta reabrir a cada ~2 s
             if (pin.h < 0) {
@@ -3031,22 +3046,28 @@ int main() {
         if (dirty) { presentMenu(); dirty = false; static bool once = false; if (!once) { once = true; trace("menu-ok"); } }
         sceKernelUsleep(4000);                     // 4 ms: o controle e lido ~200x por segundo (antes 16 ms)
     }
-    // ---- encerramento limpo (OPTIONS ou saida normal) ----
+    // ---- encerramento limpo (OPTIONS, background ou saida normal) ----
     trace("saindo");
-    pf.saveSetting("bgload", "");
-    try { if (mode == Mode::Play || player.h) player.stop(); } catch (...) {}
-    g_covers.setPaused(true);
-    if (!loader.cancel(1.0)) { trace("fim-lista-timeout"); _Exit(0); }
     g_quitting = true;
-    if (!g_covers.shutdownFor(1.5)) { trace("fim-capas-timeout"); _Exit(0); }
-    g_feed.join();
-    { auto r = takeHf(); if (r) r->join(); }
-    { auto r = takePf(); if (r) { r->join(); r.reset(); } }
+    g_sfx.ready = false;
+    try { pf.saveSetting("bgload", ""); } catch (...) {}
+    try { if (mode == Mode::Play || player.h) player.stop(); } catch (...) {}
+    try { g_covers.setPaused(true); } catch (...) {}
+    try { g_covers.cancelBackground(); } catch (...) {}
+    try { if (loader.stillAlive()) loader.cancel(0.4); } catch (...) {}
+    try { g_feed.abort(); abortHf(); abortPf(); } catch (...) {}
+    Player::waitTeardown(0.8);
+    try { if (!g_covers.shutdownFor(1.0)) trace("fim-capas-timeout"); } catch (...) {}
+    try { g_feed.join(); } catch (...) {}
+    try { auto r = takeHf(); if (r) r->join(); } catch (...) {}
+    try { auto r = takePf(); if (r) { r->join(); r.reset(); } } catch (...) {}
     try { removeVodFiles(); } catch (...) {}
-    Player::waitTeardown(1.0);
     try { blit::pool().shutdown(); } catch (...) {}
+    // fecha pad / video se ainda abertos
+    try { if (pin.h >= 0) scePadClose(pin.h); } catch (...) {}
+    try { if (vh >= 0) sceVideoOutClose(vh); } catch (...) {}
     trace("fim");
-    // _Exit evita std::terminate se alguma thread destacada ainda existir
+    // _Exit: nao roda destrutores C++ de threads destacadas (evita std::terminate)
     _Exit(0);
     return 0;
 }
