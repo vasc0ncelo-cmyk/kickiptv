@@ -30,7 +30,8 @@ struct Playlist {
     size_t seriesEpisodes = 0;   // total de episodios (os episodios em si ficam em seriesTree)
     bool truncated = false;      // a lista tinha mais itens que o limite de memoria (os ultimos ficaram de fora)
     // serie -> temporada -> episodios
-    std::map<std::string, std::map<int, std::vector<Entry>>> seriesTree;
+    // unordered_map: listas com dezenas de milhares de series nao podem usar std::map (log n por ep)
+    std::unordered_map<std::string, std::map<int, std::vector<Entry>>> seriesTree;
     bool empty() const { return channels.empty() && movies.empty() && seriesTree.empty(); }
 };
 
@@ -48,7 +49,7 @@ public:
     // somado ao resto do app, faz o sistema fechar o app. Medido: 90 MB ~ 250 mil itens (a lista que ja carregou 200 mil sem problemas).
     // Orcamento de memoria da lista (bytes estimados). Padrao 90 MB (testes); o PS4 sobe isso no inicio (heap sem limite),
     // porque lista cortada nao e aceitavel. Se a memoria acabar de verdade, App::loadM3U trata o bad_alloc e aproveita o que leu.
-    static size_t &maxBytes() { static size_t v = 90u * 1024 * 1024; return v; }
+    static size_t &maxBytes() { static size_t v = 512u * 1024 * 1024; return v; }
 
 private:
     void line(std::string &l);
