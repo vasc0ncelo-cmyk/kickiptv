@@ -82,7 +82,7 @@ private:
                         if (sh->stop) return false;
                         try { b.feed(d, n); } catch (const std::bad_alloc &) { sh->oom = true; return false; }
                         sh->bytes += n; sh->items = b.count();
-                        if (b.full() && !isNet) return false;       // copia salva: o resto nao cabe mesmo (o download segue ate o fim para a copia ficar inteira)
+                        if (b.full()) return false;                 // orcamento cheio: para parse E download (antes ficava "travado" no mesmo item)
                         return true;
                     }, sh->stop);
                 } catch (const std::bad_alloc &) { sh->oom = true; }
