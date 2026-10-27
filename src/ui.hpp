@@ -14,7 +14,7 @@
 #endif
 
 enum class Input { Up, Down, Left, Right, PrevTab, NextTab, Confirm, Back, PageUp, PageDown, Extra };   // Extra = triangulo: buscar (lupa)
-enum class Screen { Home, Kick, List };
+enum class Screen { Home, Kick, List, Help };
 
 struct Renderer {
     virtual ~Renderer() {}
@@ -691,6 +691,12 @@ struct UI {
 
     void handle(Input in) {
         if (in == Input::Extra) { startSearch(); return; }
+        if (screen == Screen::Help) {
+            if (in == Input::Back || in == Input::Confirm) { screen = Screen::Home; return; }
+            if (in == Input::Up) helpScroll = std::max(0, helpScroll - 1);
+            if (in == Input::Down) helpScroll = std::min(12, helpScroll + 1);
+            return;
+        }
         if (screen == Screen::Home) { handleHome(in); return; }
         int t = (int)tab;
         switch (in) {
@@ -728,7 +734,7 @@ struct UI {
         if (dbg) dbg("ui-capas-ok");
         uiHeader(r, timeText, dateText);
         if (dbg) dbg("ui-header-ok");
-        if (screen == Screen::Home) renderHome(r); else renderList(r);
+        if (screen == Screen::Home) renderHome(r); else if (screen == Screen::Help) renderHelp(r); else renderList(r);
         if (dbg) dbg("ui-corpo-ok");
         renderFooter(r);
         if (dbg) dbg("ui-rodape-ok");
@@ -788,7 +794,7 @@ private:
     void handleHome(Input in) {
         switch (in) {
         case Input::Up: homeRow = std::max(0, homeRow - 1); break;
-        case Input::Down: homeRow = std::min(2, homeRow + 1); break;
+        case Input::Down: homeRow = std::min(3, homeRow + 1); break;
         case Input::Left: if (homeRow == 1) homeCol = std::max(0, homeCol - 1); break;
         case Input::Right: if (homeRow == 1) homeCol = std::min(3, homeCol + 1); break;
         case Input::PrevTab: if (homeRow == 1) homeCol = std::max(0, homeCol - 1); break;
@@ -796,16 +802,68 @@ private:
         case Input::Confirm:
             if (homeRow == 0) openTab(Tab::Kick);
             else if (homeRow == 1) openTab(tileTab(homeCol));
-            else requestM3U();
+            else if (homeRow == 2) requestM3U();
+            else { screen = Screen::Help; helpScroll = 0; }
             break;
         default: break;
         }
     }
+    int helpScroll = 0;
 
     std::string listSummary() const {
         const Playlist &p = app.list;
         if (p.channels.empty() && p.movies.empty() && p.seriesTree.empty()) return m3uUrl.empty() ? "Adicione sua lista de IPTV" : "Lista sem itens - X para trocar";
         return std::to_string(p.channels.size()) + " canais  |  " + std::to_string(p.movies.size()) + " filmes  |  " + std::to_string(p.seriesTree.size()) + " séries";
+    }
+
+
+    void renderHelp(Renderer &r) {
+        using namespace theme;
+        const int W = r.width(), H = r.height();
+        uiBackground(r);
+        uiHeavy(r, 48, 40, "COMANDOS E FUNCOES", TEXT, 36);
+        uiText(r, 48, 90, "Tudo que o Kick IPTV faz — use O ou X para voltar", MUTED, 20);
+        struct Line { const char *a, *b; };
+        static const Line lines[] = {
+            {"MENU", ""},
+            {"D-pad / analogico", "Navegar"},
+            {"X", "Selecionar / abrir"},
+            {"O", "Voltar"},
+            {"△ (triangulo)", "Buscar filmes, series e canais"},
+            {"OPTIONS", "No menu: busca | Na live: troca qualidade"},
+            {"", ""},
+            {"PLAYER — FILME / SERIE", ""},
+            {"X (foco pause)", "Pausar / continuar"},
+            {"L2 / R2", "-10 s  /  +10 s"},
+            {"Setas no seek (↑)", "Entrar na barra; L2/R2 fino, L1/R1 1 min, X confirma"},
+            {"L1 / R1", "Episodio anterior / proximo"},
+            {"□ (quadrado)", "Mudo"},
+            {"△", "Menu de opcoes (proporcao, info...)"},
+            {"", ""},
+            {"PLAYER — LIVE KICK / CANAL", ""},
+            {"OPTIONS", "Ciclar qualidade (Fluido / 720 / 1080) e reconectar"},
+            {"O", "Sair do player"},
+            {"", ""},
+            {"TECLADO", ""},
+            {"X no botao #+ =", "Abre caracteres especiais"},
+            {"△", "Espaco"},
+            {"L1", "Maiusculas"},
+            {"□", "Apagar"},
+            {"R1", "Confirmar"},
+        };
+        const int n = (int)(sizeof(lines) / sizeof(lines[0]));
+        int y = 140 - helpScroll * 36;
+        for (int i = 0; i < n; i++) {
+            int yy = y + i * 36;
+            if (yy < 120 || yy > H - 80) continue;
+            if (!lines[i].b[0] && lines[i].a[0]) {
+                uiHeavy(r, 56, yy, lines[i].a, GREEN, 22);
+            } else if (lines[i].a[0]) {
+                uiText(r, 56, yy, lines[i].a, SOFT, 20);
+                uiText(r, 520, yy, lines[i].b, TEXT, 20);
+            }
+        }
+        uiText(r, 48, H - 48, "O / X voltar ao menu", DIM, 18);
     }
 
     void renderHome(Renderer &r) {
@@ -887,7 +945,7 @@ private:
         }
         // ---- Lista M3U ----
         {
-            const int x = mx, y = 865, w = fw, h = 140, rad = 26;
+            const int x = mx, y = 820, w = fw, h = 120, rad = 24;
             bool sel = homeRow == 2;
             if (sel) uiGlow(r, x, y, w, h, rad, GREEN, 18, 130, false);
             uiFrame(r, x, y, w, h, rad, sel ? 4 : 2, sel ? GREEN : CARD_LINE, sel ? SEL : CARD);
@@ -902,6 +960,16 @@ private:
     }
 
     // Filmes / Series / Canais: barra de categorias (esquerda) + itens da categoria (direita)
+        // ---- Comandos ----
+        {
+            const int x = mx, y = 968, w = fw, h = 80, rad = 20;
+            bool sel = homeRow == 3;
+            if (sel) uiGlow(r, x, y, w, h, rad, GREEN, 14, 110, false);
+            uiFrame(r, x, y, w, h, rad, sel ? 3 : 2, sel ? GREEN : CARD_LINE, sel ? SEL : CARD);
+            uiHeavy(r, x + 40, y + 24, "COMANDOS E AJUDA", TEXT, 26);
+            uiText(r, x + 400, y + 28, "Botoes, player, teclado, Kick TV", MUTED, 20);
+        }
+
     void renderBrowse(Renderer &r) {
         using namespace theme;
         const int W = r.width();
@@ -1118,7 +1186,8 @@ private:
         using namespace theme;
         const int W = r.width(), cy = 1043;
         std::vector<std::pair<std::string, std::string>> hints;
-        if (screen == Screen::Home) hints = {{"D-pad", "Navegar"}, {"X", "Selecionar"}};
+        if (screen == Screen::Home) hints = {{"D-pad", "Navegar"}, {"X", "Selecionar"}, {"△", "Buscar"}};
+        if (screen == Screen::Help) hints = {{"O", "Voltar"}, {"↑↓", "Rolar"}};
         else if (browsable(tab) && !inItems) hints = {{"L1/R1", "Abas"}, {"△", "Buscar"}, {"X", "Abrir"}, {"O", "Início"}};
         else if (browsable(tab)) hints = {{"△", searching() ? "Nova busca" : "Buscar"}, {"X", "Selecionar"}, {"O", searching() ? "Limpar busca" : "Categorias"}};
         else hints = {{"L1/R1", "Abas"}, {"X", "Selecionar"}, {"O", "Voltar"}};
