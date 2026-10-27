@@ -1234,6 +1234,7 @@ struct Player {
         log.clear(); frames = 0; vw = vh = 0; fps = 0; fpsFrames = 0; failed = false; addRc = 0; chunkMode = false; chunkIdx = 0; inactiveSince = 0;
         cancelled = false; restarts = switchesOk = 0; lastGapMs = 0; gapStartT = switchedAt = 0; curDur = 0; chunkT0 = 0; blitMs = 0;
         paused = false; isVod = false; lastPtsMs = 0; maxPtsMs = 0; durationMs = 0; seekPendingMs = -1; waitNote.clear(); showOpts = false; optCur = 0;
+        scrubMode = false; scrubMs = -1; seekSkip = false; seekTargetMs = 0;
         avLang = "eng"; langTry = 0; vodPath.clear(); vodAudioExpected = false;
         h2 = 0; bHandle = 0; bState = 0; nextReady = false; prepBusy = false; gapless = true;
         if (g_tearing.load() > 0) {
@@ -1598,16 +1599,54 @@ struct Player {
     bool poll(FbRenderer &r) {
         KAvFrameInfo fi; memset(&fi, 0, sizeof fi);
         bool drew = false;
+
+        // Seek frente: descarta ate 40 quadros por tick ate o PTS alvo
+        if (seekSkip && h && !failed) {
+            for (int i = 0; i < 40; i++) {
+                KAvFrameInfo sfi; memset(&sfi, 0, sizeof sfi);
+                if (!sceAvPlayerGetVideoData(h, &sfi) || !sfi.pData) break;
+                if (sfi.timeStamp > 0) {
+                    lastPtsMs = sfi.timeStamp / 1000;
+                    if (lastPtsMs > maxPtsMs) maxPtsMs = lastPtsMs;
+                }
+                // descarta audio correspondente (evita atraso de som)
+                { KAvFrameInfo au; memset(&au, 0, sizeof au); sceAvPlayerGetAudioData(h, &au); }
+                if (lastPtsMs + 250 >= seekTargetMs) {
+                    seekSkip = false; seekPendingMs = -1; scrubMs = -1;
+                    fi = sfi; // desenha este quadro
+                    goto have_frame;
+                }
+            }
+            // ainda nao chegou: desenha HUD sem atualizar frame se possivel
+            return false;
+        }
+
         if (sceAvPlayerGetVideoData(h, &fi) && fi.pData) {
+        have_frame:
             // timeStamp do AvPlayer costuma ser em microsegundos; guardamos em ms para o HUD
             if (fi.timeStamp > 0) {
                 lastPtsMs = fi.timeStamp / 1000;
                 if (lastPtsMs > maxPtsMs) maxPtsMs = lastPtsMs;
-                // estima duracao: pelo menos 5% a frente do pts atual, ou 90 min se ainda cedo
-                uint64_t est = maxPtsMs + 30000;
-                if (est < 30ULL * 60ULL * 1000ULL && maxPtsMs < 5ULL * 60ULL * 1000ULL)
-                    est = 90ULL * 60ULL * 1000ULL;   // default 90 min ate saber mais
+                // estima duracao com base no progresso (cresce com o filme)
+                uint64_t est = maxPtsMs + 45000;
+                if (maxPtsMs < 2ULL * 60ULL * 1000ULL)
+                    est = std::max(est, 90ULL * 60ULL * 1000ULL);
+                else
+                    est = std::max(est, maxPtsMs + maxPtsMs / 10); // +10% a frente
                 if (est > durationMs) durationMs = est;
+
+                // seek para frente: descarta quadros ate o alvo
+                if (seekSkip) {
+                    if (lastPtsMs + 200 >= seekTargetMs) {
+                        seekSkip = false;
+                        seekPendingMs = -1;
+                        scrubMs = -1;
+                    } else if (seekSkipBudget > 0) {
+                        seekSkipBudget--;
+                        // nao desenha este quadro — continua pedindo o proximo no mesmo poll
+                        // (loop abaixo)
+                    }
+                }
             }
             uint32_t w = *(uint32_t *)(fi.details + 0), hh = *(uint32_t *)(fi.details + 4);
             if (w > 0 && hh > 0 && w <= 4096 && hh <= 4096) {
@@ -1734,7 +1773,7 @@ struct Player {
     }
     bool feedProblem() const { return useFeed && (g_feed.failed.load() || g_feed.streamEnded.load()); }
     static bool vodDlFailed() { auto d = getPf(); return d && d->state() == 2; }
-    bool hudActive() const { return nowSec() <= hudUntil || feedProblem() || paused || vodDlFailed() || showOpts || showInfo; }
+    bool hudActive() const { return nowSec() <= hudUntil || feedProblem() || paused || vodDlFailed() || showOpts || showInfo || scrubMode || seekSkip; }
 
     // Pausa em software: nao chama sceAvPlayerPause (NID instavel no homebrew → CE-34878-0).
     // O loop principal para de buscar quadros e o audio fica mudo enquanto paused==true.
@@ -1745,40 +1784,79 @@ struct Player {
         hudUntil = nowSec() + 12;
     }
 
-    // Seek em software + tentativa de JumpToTime (se o firmware exportar a funcao).
-    // Sem JumpToTime, ajusta o relogio do HUD e marca o pedido (proximo quadro usa o pts real).
-    void seekBy(int deltaMs) {
+    // ---- Seek / barra de progresso ----
+    // AvPlayer homebrew: JumpToTime costuma crashar (CE-34878-0).
+    // Seek PARA FRENTE: descarta quadros ate o PTS alvo (funcional de verdade).
+    // Seek PARA TRAS: marca alvo no HUD; sem JumpToTime o PTS real so avanca.
+    bool scrubMode = false;           // foco na barra: LEFT/RIGHT movem o alvo
+    int64_t scrubMs = -1;             // posicao do cursor na barra (-1 = seguir playhead)
+    uint64_t seekTargetMs = 0;        // alvo do skip de frames
+    bool seekSkip = false;            // true = poll descarta quadros ate seekTargetMs
+    int seekSkipBudget = 0;           // quadros max por tick (evita travar o loop)
+
+    void clampTime(int64_t &ms) const {
+        if (ms < 0) ms = 0;
+        if (durationMs > 0 && (uint64_t)ms > durationMs) ms = (int64_t)durationMs;
+    }
+
+    void seekTo(int64_t targetMs) {
         if (!isVod || !active || failed) { hudUntil = nowSec() + 5; return; }
+        clampTime(targetMs);
         int64_t cur = (int64_t)lastPtsMs;
-        int64_t next = cur + deltaMs;
-        if (next < 0) next = 0;
-        if (durationMs > 0 && (uint64_t)next > durationMs) next = (int64_t)durationMs;
-        lastPtsMs = (uint64_t)next;
+        seekPendingMs = targetMs;
+        scrubMs = targetMs;
+        hudUntil = nowSec() + 10;
+
+        if (targetMs > cur + 400) {
+            // frente: pula quadros ate o PTS
+            seekTargetMs = (uint64_t)targetMs;
+            seekSkip = true;
+            seekSkipBudget = 120;   // ~4s de video a 30fps por tick de input
+            lastPtsMs = (uint64_t)targetMs; // HUD ja mostra o destino
+            if (paused) { paused = false; audio.muted = muted; } // precisa consumir quadros
+        } else if (targetMs + 400 < cur) {
+            // tras: so HUD (sem JumpToTime seguro). Usuario ve a barra; play continua.
+            lastPtsMs = (uint64_t)targetMs;
+            seekSkip = false;
+            waitNote = "Seek para tras limitado neste firmware";
+        } else {
+            lastPtsMs = (uint64_t)targetMs;
+            seekSkip = false;
+        }
         if (lastPtsMs > maxPtsMs) maxPtsMs = lastPtsMs;
-        seekPendingMs = next;
-        hudUntil = nowSec() + 8;
-        // Tentativa segura: so chama se o simbolo existir (evita crash em stubs)
-        // Muitos firmwares homebrew nao exportam JumpToTime — nesse caso so o HUD muda.
-        typedef int (*JumpFn)(KAvHandle, uint64_t);
-        static JumpFn jumpFn = nullptr;
-        static bool resolved = false;
-        if (!resolved) {
-            resolved = true;
-            // nao resolve NID dinamicamente aqui: deixa no-op se nao linkar
-            jumpFn = nullptr;
-        }
-        if (jumpFn && h) {
-            int rc = jumpFn(h, (uint64_t)next);
-            if (rc == 0) seekPendingMs = -1;
-        }
+    }
+
+    void seekBy(int deltaMs) {
+        int64_t base = scrubMode && scrubMs >= 0 ? scrubMs : (int64_t)lastPtsMs;
+        seekTo(base + deltaMs);
+    }
+
+    void scrubMove(int deltaMs) {
+        if (!isVod) return;
+        if (scrubMs < 0) scrubMs = (int64_t)lastPtsMs;
+        scrubMs += deltaMs;
+        clampTime(scrubMs);
+        scrubMode = true;
+        hudUntil = nowSec() + 12;
+    }
+
+    void scrubConfirm() {
+        if (!isVod || scrubMs < 0) return;
+        seekTo(scrubMs);
+        scrubMode = false;
     }
 
     uint64_t displayPosMs() const {
+        if (scrubMode && scrubMs >= 0) return (uint64_t)scrubMs;
+        if (seekSkip && seekTargetMs > lastPtsMs) return seekTargetMs;
         return lastPtsMs;
     }
     uint64_t displayDurMs() const {
         if (durationMs > lastPtsMs + 1000) return durationMs;
-        return lastPtsMs + 60000; // ainda desconhecida: mostra um pouco a frente
+        // estima: pelo menos 2 min a frente enquanto nao sabe
+        uint64_t guess = maxPtsMs + 120000;
+        if (guess < 5ULL * 60ULL * 1000ULL) guess = 5ULL * 60ULL * 1000ULL;
+        return guess;
     }
 
     bool hasEpisodes() const { return epIndex >= 0 && (int)epUrls.size() > 1; }
@@ -1863,26 +1941,36 @@ struct Player {
             uiText(r, 136, barY + 34, meta, MUTED, 18);
         }
 
-        // progresso
-        int trackX = 136, trackW = W - 136 - 80, trackY = barY + 68;
-        r.roundRect(trackX, trackY, trackW, 5, 3, 0xFF2A2A2A);
+        // ---- Barra de progresso / seek ----
+        int trackX = 136, trackW = W - 136 - 80, trackY = barY + 64;
+        int trackH = scrubMode ? 10 : 6;
+        r.roundRect(trackX, trackY, trackW, trackH, 4, 0xFF2A2A2A);
         if (isVod) {
             uint64_t pos = displayPosMs(), dur = displayDurMs();
             if (dur < 1) dur = 1;
             int fill = (int)((pos * (uint64_t)trackW) / dur);
             if (fill < 0) fill = 0;
             if (fill > trackW) fill = trackW;
-            r.roundRect(trackX, trackY, fill, 5, 3, GREEN);
-            r.roundRect(trackX + fill - 7, trackY - 5, 14, 14, 7, GREEN);
+            unsigned barCol = scrubMode ? 0xFF7CFF3Au : GREEN;
+            if (seekSkip) barCol = 0xFFFFCC33u; // amarelo = buscando
+            r.roundRect(trackX, trackY, std::max(fill, 2), trackH, 4, barCol);
+            // knob
+            int kx = trackX + fill - 9;
+            if (kx < trackX) kx = trackX;
+            r.roundRect(kx, trackY - 6, 18, trackH + 12, 9, barCol);
             char t0[32], t1[32];
             fmtTime(pos, t0, sizeof t0);
             fmtTime(dur, t1, sizeof t1);
-            uiText(r, trackX, trackY + 16, t0, MUTED, 16);
-            uiText(r, trackX + trackW - r.textWidth(t1, 16), trackY + 16, t1, MUTED, 16);
+            uiText(r, trackX, trackY + trackH + 10, t0, scrubMode ? GREEN : MUTED, 18);
+            uiText(r, trackX + trackW - r.textWidth(t1, 18), trackY + trackH + 10, t1, MUTED, 18);
+            if (scrubMode) {
+                uiText(r, trackX + trackW / 2 - 80, trackY - 28, "SEEK  L2/R2 fino  L1/R1 1min  X ok", TEXT, 16);
+            } else if (seekSkip) {
+                uiText(r, trackX + trackW / 2 - 60, trackY - 28, "Indo para o ponto...", 0xFFFFCC33u, 16);
+            }
         } else {
-            r.roundRect(trackX, trackY, trackW * 9 / 10, 5, 3, GREEN);
-            r.roundRect(trackX + trackW * 9 / 10 - 7, trackY - 5, 14, 14, 7, GREEN);
-            uiText(r, trackX, trackY + 16, "AO VIVO", MUTED, 16);
+            r.roundRect(trackX, trackY, trackW * 9 / 10, trackH, 4, GREEN);
+            uiText(r, trackX, trackY + trackH + 10, "AO VIVO", MUTED, 16);
         }
 
         // controles centrais (visuais + dica de mapeamento)
@@ -2422,15 +2510,33 @@ int main() {
                 if (pressed & B_LEFT)  { player.focusCtrl = (player.focusCtrl + 4) % 5; }
                 if (pressed & B_RIGHT) { player.focusCtrl = (player.focusCtrl + 1) % 5; }
 
-                // L2/R2 = ±10s  |  L1/R1 = episodio  |  UP/DOWN = ±30s
+                // Barra de seek: UP entra no modo scrub | DOWN sai
                 if (player.isVod) {
-                    if (pressed & B_L2) { player.seekBy(-10000); player.focusCtrl = 1; }
-                    if (pressed & B_R2) { player.seekBy(+10000); player.focusCtrl = 3; }
-                    if (pressed & B_UP) { player.seekBy(-30000); }
-                    if (pressed & B_DOWN) { player.seekBy(+30000); }
+                    if (pressed & B_UP) {
+                        player.scrubMode = true;
+                        if (player.scrubMs < 0) player.scrubMs = (int64_t)player.lastPtsMs;
+                        player.hudUntil = nowSec() + 15;
+                    }
+                    if (pressed & B_DOWN && player.scrubMode) {
+                        player.scrubMode = false;
+                        player.scrubMs = -1;
+                    }
+                    if (player.scrubMode) {
+                        // fino / grosso na barra
+                        if (pressed & B_L2) player.scrubMove(-5000);
+                        if (pressed & B_R2) player.scrubMove(+5000);
+                        if (pressed & B_LEFT) player.scrubMove(-15000);
+                        if (pressed & B_RIGHT) player.scrubMove(+15000);
+                        if (pressed & B_L1) player.scrubMove(-60000);
+                        if (pressed & B_R1) player.scrubMove(+60000);
+                        if (pressed & B_CROSS) { player.scrubConfirm(); }
+                    } else {
+                        if (pressed & B_L2) { player.seekBy(-10000); player.focusCtrl = 1; }
+                        if (pressed & B_R2) { player.seekBy(+10000); player.focusCtrl = 3; }
+                    }
                 }
-                // X = ativa o botao em foco
-                if (pressed & B_CROSS) {
+                // X = ativa o botao em foco (se nao confirmou scrub)
+                if ((pressed & B_CROSS) && !player.scrubMode) {
                     int f = player.focusCtrl;
                     if (f == 0) { // episodio anterior
                         if (player.canPrevEp()) {
