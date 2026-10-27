@@ -187,7 +187,17 @@ int PlaylistBuilder::catFor(std::vector<Category> &cats, std::unordered_map<std:
 static const size_t kMaxLine = 8192;
 // (sem limite de itens: a lista carrega inteira. Se a memoria acabar, App::loadM3U trata o bad_alloc e aproveita o que ja foi lido.)
 
-PlaylistBuilder::PlaylistBuilder() {}
+PlaylistBuilder::PlaylistBuilder() {
+    // Listas IPTV grandes (30k–200k): reserva evita rehash lento no meio do parse
+    seenUrl_.reserve(65536);
+    seenName_.reserve(65536);
+    seriesNorm_.reserve(16384);
+    chanIdx_.reserve(512);
+    movieIdx_.reserve(512);
+    seriesIdx_.reserve(512);
+    p_.channels.reserve(8192);
+    p_.movies.reserve(8192);
+}
 
 void PlaylistBuilder::feed(const char *d, size_t n) {
     if (full_) return;                                     // orcamento de memoria cheio: ignora o resto (nem varre os bytes)
@@ -318,14 +328,16 @@ void PlaylistBuilder::line(std::string &raw) {
             s = e.group.empty() ? e.name : e.group;
             if (e.season < 1) e.season = 1;
         }
+        // O(1): mapa normTitle -> nome da serie (o loop antigo em seriesTree era O(n²) e travava ~30k+)
         std::string key = normTitle(s);
         if (key.size() < 3) key = s;
-        std::string treeName = s.empty() ? key : s;
-        for (auto &kv : p_.seriesTree) {
-            if (normTitle(kv.first) == key) { treeName = kv.first; break; }
-        }
-        bool isNew = p_.seriesTree.find(treeName) == p_.seriesTree.end();
-        if (isNew) {
+        std::string treeName;
+        auto nit = seriesNorm_.find(key);
+        if (nit != seriesNorm_.end()) {
+            treeName = nit->second;
+        } else {
+            treeName = s.empty() ? key : s;
+            seriesNorm_.emplace(key, treeName);
             p_.seriesCats[catFor(p_.seriesCats, seriesIdx_, e.group)].series.push_back(treeName);
         }
         e.group.clear();
