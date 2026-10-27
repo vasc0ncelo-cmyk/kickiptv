@@ -729,11 +729,6 @@ struct UI {
 
     // ---------- Desenho ----------
     std::function<void(const char *)> dbg;         // diagnostico: o PS4 grava cada etapa do 1o desenho (para achar onde cai)
-    void renderFooter(Renderer &r);
-    void renderHome(Renderer &r);
-    void renderHelp(Renderer &r);
-    void renderList(Renderer &r);
-    void confirm(int n);
 
     void render(Renderer &r) {
         if (dbg) dbg("ui-render-ini");
