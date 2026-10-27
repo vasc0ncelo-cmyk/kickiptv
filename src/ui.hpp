@@ -371,8 +371,9 @@ struct UI {
     std::string lastBatchKey, lastBgKey;
     Screen screen = Screen::Home;
     Tab tab = Tab::Kick;
-    int homeRow = 1;          // 0 = banner, 1 = atalhos, 2 = lista M3U
-    int homeCol = 0;          // 0 Kick TV, 1 Filmes, 2 Series, 3 Canais
+    int homeRow = 1;          // 0 = banner, 1 = atalhos, 2 = lista M3U, 3 = comandos
+    int homeCol = 0;
+    int helpScroll = 0;
     int cursor[4] = {0, 0, 0, 0};
     int scroll[4] = {0, 0, 0, 0};
     int level = 0;            // so Series: 0 series, 1 temporadas, 2 episodios
@@ -691,6 +692,12 @@ struct UI {
 
     void handle(Input in) {
         if (in == Input::Extra) { startSearch(); return; }
+        if (screen == Screen::Help) {
+            if (in == Input::Back || in == Input::Confirm) { screen = Screen::Home; return; }
+            if (in == Input::Up) helpScroll = std::max(0, helpScroll - 1);
+            if (in == Input::Down) helpScroll = std::min(12, helpScroll + 1);
+            return;
+        }
         if (screen == Screen::Home) { handleHome(in); return; }
         int t = (int)tab;
         switch (in) {
@@ -722,26 +729,25 @@ struct UI {
 
     // ---------- Desenho ----------
     std::function<void(const char *)> dbg;         // diagnostico: o PS4 grava cada etapa do 1o desenho (para achar onde cai)
+    void renderFooter(Renderer &r);
+    void renderHome(Renderer &r);
+    void renderHelp(Renderer &r);
+    void renderList(Renderer &r);
+    void confirm(int n);
+
     void render(Renderer &r) {
         if (dbg) dbg("ui-render-ini");
         backgroundCovers();
         if (dbg) dbg("ui-capas-ok");
         uiHeader(r, timeText, dateText);
         if (dbg) dbg("ui-header-ok");
-        if (screen == Screen::Home) renderHome(r); else renderList(r);
+        if (screen == Screen::Home) renderHome(r); else if (screen == Screen::Help) renderHelp(r); else renderList(r);
         if (dbg) dbg("ui-corpo-ok");
         renderFooter(r);
         if (dbg) dbg("ui-rodape-ok");
     }
 
 private:
-    void confirm(int n);
-    void renderFooter(Renderer &r);
-    void renderHome(Renderer &r);
-    void renderHelp(Renderer &r);
-    void renderList(Renderer &r);
-    void handleHome(Input in);
-    void handleItems(Input in);
 
     void openTab(Tab t) { tab = t; screen = t == Tab::Kick ? Screen::Kick : Screen::List; level = 0; inItems = false; searchQ.clear(); searchHits.clear(); }
     void resetBrowse() {
@@ -810,7 +816,6 @@ private:
         default: break;
         }
     }
-    int helpScroll = 0;
 
     std::string listSummary() const {
         const Playlist &p = app.list;
@@ -831,26 +836,26 @@ private:
             {"D-pad / analogico", "Navegar"},
             {"X", "Selecionar / abrir"},
             {"O", "Voltar"},
-            {"△ (triangulo)", "Buscar filmes, series e canais"},
+            {"Triangulo", "Buscar filmes, series e canais"},
             {"OPTIONS", "No menu: busca | Na live: troca qualidade"},
             {"", ""},
-            {"PLAYER — FILME / SERIE", ""},
+            {"PLAYER - FILME / SERIE", ""},
             {"X (foco pause)", "Pausar / continuar"},
             {"L2 / R2", "-10 s  /  +10 s"},
-            {"Setas no seek (↑)", "Entrar na barra; L2/R2 fino, L1/R1 1 min, X confirma"},
+            {"Setas no seek (cima)", "Entrar na barra; L2/R2 fino, L1/R1 1 min, X confirma"},
             {"L1 / R1", "Episodio anterior / proximo"},
-            {"□ (quadrado)", "Mudo"},
-            {"△", "Menu de opcoes (proporcao, info...)"},
+            {"Quadrado", "Mudo"},
+            {"Triangulo", "Menu de opcoes (proporcao, info...)"},
             {"", ""},
-            {"PLAYER — LIVE KICK / CANAL", ""},
+            {"PLAYER - LIVE KICK / CANAL", ""},
             {"OPTIONS", "Ciclar qualidade (Fluido / 720 / 1080) e reconectar"},
             {"O", "Sair do player"},
             {"", ""},
             {"TECLADO", ""},
             {"X no botao #+ =", "Abre caracteres especiais"},
-            {"△", "Espaco"},
+            {"Triangulo", "Espaco"},
             {"L1", "Maiusculas"},
-            {"□", "Apagar"},
+            {"Quadrado", "Apagar"},
             {"R1", "Confirmar"},
         };
         const int n = (int)(sizeof(lines) / sizeof(lines[0]));
@@ -947,7 +952,7 @@ private:
         }
         // ---- Lista M3U ----
         {
-            const int x = mx, y = 820, w = fw, h = 120, rad = 24;
+            const int x = mx, y = 820, w = fw, h = 120, rad = 26;
             bool sel = homeRow == 2;
             if (sel) uiGlow(r, x, y, w, h, rad, GREEN, 18, 130, false);
             uiFrame(r, x, y, w, h, rad, sel ? 4 : 2, sel ? GREEN : CARD_LINE, sel ? SEL : CARD);
@@ -959,9 +964,6 @@ private:
             r.roundRect(pcx - 36, pcy - 36, 72, 72, 36, GREEN);
             r.fillRect(pcx - 15, pcy - 3, 30, 6, BLACK); r.fillRect(pcx - 3, pcy - 15, 6, 30, BLACK);
         }
-    }
-
-    // Filmes / Series / Canais: barra de categorias (esquerda) + itens da categoria (direita)
         // ---- Comandos ----
         {
             const int x = mx, y = 968, w = fw, h = 80, rad = 20;
@@ -971,7 +973,9 @@ private:
             uiHeavy(r, x + 40, y + 24, "COMANDOS E AJUDA", TEXT, 26);
             uiText(r, x + 400, y + 28, "Botoes, player, teclado, Kick TV", MUTED, 20);
         }
+    }
 
+    // Filmes / Series / Canais: barra de categorias (esquerda) + itens da categoria (direita)
     void renderBrowse(Renderer &r) {
         using namespace theme;
         const int W = r.width();
@@ -1188,8 +1192,7 @@ private:
         using namespace theme;
         const int W = r.width(), cy = 1043;
         std::vector<std::pair<std::string, std::string>> hints;
-        if (screen == Screen::Home) hints = {{"D-pad", "Navegar"}, {"X", "Selecionar"}, {"△", "Buscar"}};
-        if (screen == Screen::Help) hints = {{"O", "Voltar"}, {"↑↓", "Rolar"}};
+        if (screen == Screen::Home) hints = {{"D-pad", "Navegar"}, {"X", "Selecionar"}};
         else if (browsable(tab) && !inItems) hints = {{"L1/R1", "Abas"}, {"△", "Buscar"}, {"X", "Abrir"}, {"O", "Início"}};
         else if (browsable(tab)) hints = {{"△", searching() ? "Nova busca" : "Buscar"}, {"X", "Selecionar"}, {"O", searching() ? "Limpar busca" : "Categorias"}};
         else hints = {{"L1/R1", "Abas"}, {"X", "Selecionar"}, {"O", "Voltar"}};
