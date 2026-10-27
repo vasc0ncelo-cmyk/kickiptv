@@ -612,7 +612,7 @@ struct UI {
         if (tab == Tab::Movies) return p.movies[c->items[i]].name;
         if (level == 0) return c->series[i];
         auto &seasons = p.seriesTree.find(curSeries)->second;
-        if (level == 1) { auto it = seasons.begin(); std::advance(it, i); return "Temporada " + std::to_string(it->first); }
+        if (level == 1) { auto it = seasons.begin(); std::advance(it, i); int sn = it->first; return "Temporada " + std::to_string(sn < 1 ? 1 : sn); }
         const Entry &e = seasons.find(curSeason)->second[i];
         return e.episode ? "Ep " + std::to_string(e.episode) + " - " + e.name : e.name;
     }
@@ -1146,19 +1146,25 @@ private:
         else if (level == 0) { curSeries = cat->series[c]; level = 1; cursor[t] = scroll[t] = 0; }
         else if (level == 1) { auto &m = p.seriesTree.at(curSeries); auto it = m.begin(); std::advance(it, c); curSeason = it->first; level = 2; cursor[t] = scroll[t] = 0; }
         else {
-            const auto &eps = p.seriesTree.at(curSeries).at(curSeason);
-            const Entry &e = eps[c];
-            // Monta lista da temporada inteira para o player pular episodios com L1/R1
+            const auto &eps0 = p.seriesTree.at(curSeries).at(curSeason);
+            if (c < 0 || c >= (int)eps0.size()) return;
+            const Entry &e = eps0[c];
+            // lista ordenada por episodio para L1/R1 / auto-next
+            std::vector<Entry> eps = eps0;
+            std::sort(eps.begin(), eps.end(), [](const Entry &a, const Entry &b) {
+                if (a.episode != b.episode) return a.episode < b.episode;
+                return a.name < b.name;
+            });
             std::vector<std::string> urls, titles;
             urls.reserve(eps.size()); titles.reserve(eps.size());
-            for (const auto &ep : eps) {
-                urls.push_back(ep.url);
-                titles.push_back(ep.episode ? ("Ep " + std::to_string(ep.episode) + " - " + ep.name) : ep.name);
+            int playIdx = 0;
+            for (size_t i = 0; i < eps.size(); i++) {
+                urls.push_back(eps[i].url);
+                titles.push_back(eps[i].episode ? ("Ep " + std::to_string(eps[i].episode) + " - " + eps[i].name) : eps[i].name);
+                if (eps[i].url == e.url) playIdx = (int)i;
             }
-            app.pf.setEpisodeList(urls, titles, c);
-            app.pf.play(e.url, e.name);
-            // play() limpa a lista por padrao — reaplica apos o play
-            app.pf.setEpisodeList(urls, titles, c);
+            app.pf.play(e.url, titles[playIdx]);
+            app.pf.setEpisodeList(urls, titles, playIdx);
         }
     }
 };
