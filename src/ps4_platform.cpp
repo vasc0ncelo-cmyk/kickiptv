@@ -1784,6 +1784,10 @@ struct Player {
     bool hasEpisodes() const { return epIndex >= 0 && (int)epUrls.size() > 1; }
     bool canPrevEp() const { return hasEpisodes() && epIndex > 0; }
     bool canNextEp() const { return hasEpisodes() && epIndex + 1 < (int)epUrls.size(); }
+    bool nearEnd() const {
+        if (!isVod || durationMs < 15000) return false;
+        return lastPtsMs + 2500 >= durationMs;
+    }
 
     // HUD estilo app de streaming (referencia visual)
     bool showOpts = false;
@@ -1903,8 +1907,8 @@ struct Player {
         // dicas de controle
         uiText(r, 48, H - 22,
                isVod
-                   ? "X Pausar   L2/R2 ±10s   <-/-> ±30s   L1/R1 Episodio   △ Opcoes   O Sair"
-                   : "X Pausar   □ Qualidade   △ Opcoes   O Sair",
+                   ? "<-/-> botao   X ativar   L2/R2 ±10s   UP/DOWN ±30s   L1/R1 ep   △ Opcoes   O Sair"
+                   : "X Pausar   □ Mudo   △ Opcoes   O Sair",
                DIM, 15);
 
         // ---- MENU OPCOES (direita) ----
@@ -2350,46 +2354,19 @@ int main() {
         }
 
         if (mode == Mode::Play) {
-            if ((pressed & B_CIRCLE) && !player.showOpts && !player.showInfo) {
-                player.stop(); player.quietWait = false; player.epUrls.clear(); player.epTitles.clear(); player.epIndex = -1;
-                player.showOpts = false;
-                mode = Mode::Menu; dirty = true; sceKernelUsleep(16000); continue;
-            }
-            if (pressed) player.hudUntil = nowSec() + (player.showOpts ? 30 : 10);
-
-            // X = pausar / confirmar opcao
-            if (pressed & B_CROSS) {
-                if (player.showOpts) {
-                    if (player.optCur == 0) { // Qualidade
-                        if (!player.isVod && !player.url.empty()) {
-                            g_quality = (g_quality.load() + 1) % 3;
-                            pf.pendingPlayUrl = player.url; pf.pendingPlayTitle = player.title;
-                            player.quietWait = true; player.showOpts = false;
-                            player.stop(); mode = Mode::Menu; dirty = true; sceKernelUsleep(8000); continue;
-                        } else {
-                            g_quality = (g_quality.load() + 1) % 3;
-                        }
-                    } else if (player.optCur == 1) { // Proporcao
-                        player.aspectMode = (player.aspectMode + 1) % 3;
-                    } else if (player.optCur == 2) { // Legendas (sem tracks no AvPlayer)
-                        // permanece Desativadas
-                    } else if (player.optCur == 3) { // Audio mudo
-                        player.muted = !player.muted;
-                        player.audio.muted = player.paused || player.muted;
-                    } else if (player.optCur == 4) { // Velocidade: so Normal
-                        // AvPlayer homebrew nao expoe rate
-                    } else if (player.optCur == 5) { // Informacoes
-                        player.showInfo = true;
-                        player.showOpts = false;
-                    } else if (player.optCur == 6) { // Voltar
-                        player.showOpts = false;
-                    }
-                    player.hudUntil = nowSec() + 30;
-                } else {
-                    player.togglePause();
-                    player.focusCtrl = 2;
+            // O = sair (ou fecha menu/info primeiro)
+            if (pressed & B_CIRCLE) {
+                if (player.showOpts) { player.showOpts = false; player.hudUntil = nowSec() + 8; }
+                else if (player.showInfo) { player.showInfo = false; player.hudUntil = nowSec() + 8; }
+                else {
+                    player.stop(); player.quietWait = false;
+                    player.epUrls.clear(); player.epTitles.clear(); player.epIndex = -1;
+                    player.showOpts = false; player.showInfo = false;
+                    mode = Mode::Menu; dirty = true; sceKernelUsleep(16000); continue;
                 }
             }
+            if (pressed) player.hudUntil = nowSec() + (player.showOpts ? 30 : 12);
+
             // TRIANGULO = menu Opcoes
             if (pressed & B_TRIANGLE) {
                 player.showOpts = !player.showOpts;
@@ -2397,48 +2374,100 @@ int main() {
                 if (player.showOpts) player.optCur = 0;
                 player.hudUntil = nowSec() + 30;
             }
+
+            // ---- Menu de opcoes (△) ----
             if (player.showOpts) {
-                if (pressed & B_UP) { player.optCur = (player.optCur + 6) % 7; player.hudUntil = nowSec() + 30; }
-                if (pressed & B_DOWN) { player.optCur = (player.optCur + 1) % 7; player.hudUntil = nowSec() + 30; }
-                if (pressed & B_LEFT || pressed & B_RIGHT) {
-                    int dir = (pressed & B_RIGHT) ? 1 : -1;
+                if (pressed & B_UP) { player.optCur = (player.optCur + 6) % 7; }
+                if (pressed & B_DOWN) { player.optCur = (player.optCur + 1) % 7; }
+                auto cycleOpt = [&](int dir) {
                     if (player.optCur == 0) g_quality = (g_quality.load() + (dir > 0 ? 1 : 2)) % 3;
-                    if (player.optCur == 1) player.aspectMode = (player.aspectMode + (dir > 0 ? 1 : 2)) % 3;
+                    if (player.optCur == 1) {
+                        player.aspectMode = (player.aspectMode + (dir > 0 ? 1 : 2)) % 3;
+                        // aplica na hora: sai da pausa visual forcando redraw
+                        player.hudUntil = nowSec() + 30;
+                    }
                     if (player.optCur == 3) {
                         player.muted = !player.muted;
                         player.audio.muted = player.paused || player.muted;
                     }
-                    player.hudUntil = nowSec() + 30;
+                };
+                if (pressed & B_LEFT) cycleOpt(-1);
+                if (pressed & B_RIGHT) cycleOpt(+1);
+                if (pressed & B_CROSS) {
+                    if (player.optCur == 0) {
+                        if (!player.isVod && !player.url.empty()) {
+                            g_quality = (g_quality.load() + 1) % 3;
+                            pf.pendingPlayUrl = player.url; pf.pendingPlayTitle = player.title;
+                            player.quietWait = true; player.showOpts = false;
+                            player.stop(); mode = Mode::Menu; dirty = true; sceKernelUsleep(8000); continue;
+                        } else g_quality = (g_quality.load() + 1) % 3;
+                    } else if (player.optCur == 1) {
+                        player.aspectMode = (player.aspectMode + 1) % 3;
+                    } else if (player.optCur == 3) {
+                        player.muted = !player.muted;
+                        player.audio.muted = player.paused || player.muted;
+                    } else if (player.optCur == 5) {
+                        player.showInfo = true; player.showOpts = false;
+                    } else if (player.optCur == 6) {
+                        player.showOpts = false;
+                    }
+                    // legendas / velocidade: sem API — so feedback
                 }
-                if (pressed & B_CIRCLE) { player.showOpts = false; player.hudUntil = nowSec() + 8; }
+                player.hudUntil = nowSec() + 30;
             } else if (player.showInfo) {
-                if (pressed & B_CIRCLE) { player.showInfo = false; player.hudUntil = nowSec() + 8; }
-            }
+                // so O fecha (ja tratado)
+            } else {
+                // ---- Controles do player (HUD) ----
+                // Setas esquerda/direita: troca o botao em foco
+                if (pressed & B_LEFT)  { player.focusCtrl = (player.focusCtrl + 4) % 5; }
+                if (pressed & B_RIGHT) { player.focusCtrl = (player.focusCtrl + 1) % 5; }
 
-            // Destaque visual dos botoes do player
-            if (!player.showOpts && !player.showInfo) {
-                if (pressed & B_LEFT) player.focusCtrl = 1;
-                if (pressed & B_RIGHT) player.focusCtrl = 3;
-                if (pressed & B_L2) player.focusCtrl = 1;
-                if (pressed & B_R2) player.focusCtrl = 3;
-                if (pressed & B_L1) player.focusCtrl = 0;
-                if (pressed & B_R1) player.focusCtrl = 4;
-                if (pressed & B_CROSS) player.focusCtrl = 2;
-            }
-
-            // Seek VOD: L2 -10s, R2 +10s, esquerda -30s, direita +30s
-            if (player.isVod) {
-                if (pressed & B_L2) player.seekBy(-10000);
-                if (pressed & B_R2) player.seekBy(+10000);
-                if (pressed & B_LEFT) player.seekBy(-30000);
-                if (pressed & B_RIGHT) player.seekBy(+30000);
-                // L1/R1 = episodio anterior / proximo (quando veio de uma temporada)
+                // L2/R2 = ±10s  |  L1/R1 = episodio  |  UP/DOWN = ±30s
+                if (player.isVod) {
+                    if (pressed & B_L2) { player.seekBy(-10000); player.focusCtrl = 1; }
+                    if (pressed & B_R2) { player.seekBy(+10000); player.focusCtrl = 3; }
+                    if (pressed & B_UP) { player.seekBy(-30000); }
+                    if (pressed & B_DOWN) { player.seekBy(+30000); }
+                }
+                // X = ativa o botao em foco
+                if (pressed & B_CROSS) {
+                    int f = player.focusCtrl;
+                    if (f == 0) { // episodio anterior
+                        if (player.canPrevEp()) {
+                            player.epIndex--;
+                            pf.pendingPlayUrl = player.epUrls[player.epIndex];
+                            pf.pendingPlayTitle = player.epTitles[player.epIndex];
+                            pf.pendingEpIndex = player.epIndex;
+                            pf.pendingEpUrls = player.epUrls; pf.pendingEpTitles = player.epTitles;
+                            player.quietWait = true;
+                            player.stop(); mode = Mode::Menu; dirty = true; sceKernelUsleep(8000); continue;
+                        }
+                    } else if (f == 1) {
+                        if (player.isVod) player.seekBy(-10000);
+                    } else if (f == 2) {
+                        player.togglePause();
+                    } else if (f == 3) {
+                        if (player.isVod) player.seekBy(+10000);
+                    } else if (f == 4) {
+                        if (player.canNextEp()) {
+                            player.epIndex++;
+                            pf.pendingPlayUrl = player.epUrls[player.epIndex];
+                            pf.pendingPlayTitle = player.epTitles[player.epIndex];
+                            pf.pendingEpIndex = player.epIndex;
+                            pf.pendingEpUrls = player.epUrls; pf.pendingEpTitles = player.epTitles;
+                            player.quietWait = true;
+                            player.stop(); mode = Mode::Menu; dirty = true; sceKernelUsleep(8000); continue;
+                        }
+                    }
+                }
+                // L1/R1 tambem mudam episodio
                 if ((pressed & B_L1) && player.canPrevEp()) {
                     player.epIndex--;
                     pf.pendingPlayUrl = player.epUrls[player.epIndex];
                     pf.pendingPlayTitle = player.epTitles[player.epIndex];
-                    pf.pendingEpIndex = player.epIndex;   // mantem o indice ao reabrir
-                    player.quietWait = true;
+                    pf.pendingEpIndex = player.epIndex;
+                    pf.pendingEpUrls = player.epUrls; pf.pendingEpTitles = player.epTitles;
+                    player.focusCtrl = 0; player.quietWait = true;
                     player.stop(); mode = Mode::Menu; dirty = true; sceKernelUsleep(8000); continue;
                 }
                 if ((pressed & B_R1) && player.canNextEp()) {
@@ -2446,52 +2475,42 @@ int main() {
                     pf.pendingPlayUrl = player.epUrls[player.epIndex];
                     pf.pendingPlayTitle = player.epTitles[player.epIndex];
                     pf.pendingEpIndex = player.epIndex;
+                    pf.pendingEpUrls = player.epUrls; pf.pendingEpTitles = player.epTitles;
+                    player.focusCtrl = 4; player.quietWait = true;
+                    player.stop(); mode = Mode::Menu; dirty = true; sceKernelUsleep(8000); continue;
+                }
+                // SQUARE = mute rapido
+                if (pressed & B_SQUARE) {
+                    player.muted = !player.muted;
+                    player.audio.muted = player.paused || player.muted;
+                }
+            }
+
+            // ---- Auto-avanca episodio ao terminar ----
+            if (player.isVod && player.active && !player.failed && !player.paused && player.canNextEp() && player.nearEnd()) {
+                static double endHold = 0;
+                if (endHold < 1.0) endHold = nowSec();
+                // sem quadro novo por ~2s perto do fim
+                if (nowSec() - player.lastFrameT > 1.8 || nowSec() - endHold > 4.0) {
+                    endHold = 0;
+                    player.epIndex++;
+                    pf.pendingPlayUrl = player.epUrls[player.epIndex];
+                    pf.pendingPlayTitle = player.epTitles[player.epIndex];
+                    pf.pendingEpIndex = player.epIndex;
+                    pf.pendingEpUrls = player.epUrls; pf.pendingEpTitles = player.epTitles;
                     player.quietWait = true;
                     player.stop(); mode = Mode::Menu; dirty = true; sceKernelUsleep(8000); continue;
                 }
             } else {
-                // Live: L1 ainda alterna memoria de video
-                if ((pressed & B_L1) && !player.url.empty()) {
-                    g_texType = g_texType.load() == 0 ? 3 : 0;
-                    pf.pendingPlayUrl = player.url; pf.pendingPlayTitle = player.title;
-                    player.quietWait = true;
-                    player.stop(); mode = Mode::Menu; dirty = true; sceKernelUsleep(8000); continue;
-                }
+                // reset hold quando nao esta no fim
             }
 
-            // QUADRADO: troca qualidade e reabre sem a tela de log (quietWait)
-            if ((pressed & B_SQUARE) && !player.url.empty() && !player.isVod) {
-                g_quality = (g_quality.load() + 1) % 3;
-                pf.pendingPlayUrl = player.url; pf.pendingPlayTitle = player.title;
-                player.quietWait = true;
-                player.stop(); mode = Mode::Menu; dirty = true; sceKernelUsleep(8000); continue;
-            }
-
-            {   // anti-congelamento: se a live parou, reabre sozinho
-                std::string why;
-                if (player.wantReconnect(why)) {
-                    if (!allowAuto()) {
-                        autoMode = false;
-                        app.say("Conexao instavel: a live nao voltou depois de varias tentativas (" + why + ")");
-                        trace("auto-reconexao-desistiu");
-                        player.stop(); player.quietWait = false; mode = Mode::Menu; dirty = true; continue;
-                    }
-                    g_autoRestarts++; autoMode = true;
-                    g_reconnectNote = why;
-                    trace("auto-reconexao");
-                    pf.pendingPlayUrl = player.url; pf.pendingPlayTitle = player.title;
-                    player.quietWait = true;
-                    player.stop(); mode = Mode::Menu; dirty = true; continue;
-                }
-            }
-            if (player.h) {
-                // Sem HUD o video e desenhado DIRETO no quadro de video (so escrita, sem a copia de 8 MB).
-                // Com HUD (precisa ler pixels para a transparencia) passa pelo rascunho, como antes.
-                // Pausado: mantem o ultimo quadro + overlay.
+            // ---- Desenho ----
+            if (player.active && !player.failed) {
                 bool hud = player.hudActive();
                 FbRenderer r(hud ? shadow : (uint32_t *)bufs[back], W, H);
                 if (player.paused) {
-                    // sempre redesenha HUD pausado (botoes precisam responder visualmente)
+                    // pausado: so HUD (proporcao aplica no proximo quadro ao despausar)
                     player.overlay(r); flip();
                     sceKernelUsleep(12000);
                     continue;
@@ -2501,7 +2520,6 @@ int main() {
                     if (hud || player.showOpts) { player.overlay(r); flip(); }
                     else { sceVideoOutSubmitFlip(vh, back, ORBIS_VIDEO_OUT_FLIP_VSYNC, 0); back = (back + 1) % 3; }
                 } else if (player.showOpts || (hud && pressed)) {
-                    // sem quadro novo mas menu/HUD precisa atualizar
                     player.overlay(r); flip();
                 }
                 else if (!gotFrame && nowSec() - lastWaitDraw > 0.12) { lastWaitDraw = nowSec(); presentWait(); }
