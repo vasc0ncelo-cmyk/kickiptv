@@ -893,7 +893,7 @@ struct AudioPump {
 };
 
 // Qualidade: 0 = "Fluido" (720p max, 30 fps) | 1 = "Maxima" (720p60) | 2 = "Ultra" (1080p60)
-static std::atomic<int> g_quality{1};
+static std::atomic<int> g_quality{0};  // 0=Fluido (mais estavel na Kick)
 static const char *kQualityName[3] = {"Fluido 30fps", "Maxima 720p60", "Ultra 1080p60"};
 
 // Reconexao automatica: se a live congelar ou a rede/pipeline quebrar, o app reabre a transmissao sozinho (ver Player::wantReconnect).
@@ -993,14 +993,15 @@ struct HlsFeeder {
         unsigned long long next = 0; bool first = true; int errs = 0;
         while (run) {
             if (!g_net.getKA(sess, mediaUrl, body, st) || st < 200 || st >= 300) {
-                if (++errs > 6) { fail("playlist de midia HTTP " + std::to_string(st)); return; }
-                sleepMs(1000, run); continue;
+                if (++errs > 15) { fail("playlist de midia HTTP " + std::to_string(st)); return; }
+                setStatus("playlist: tentando de novo (" + std::to_string(st) + ")");
+                sleepMs(500, run); continue;
             }
             errs = 0;
             HlsMedia md = hlsParseMedia(body);
             if (md.hasMap) { fail("fMP4 (EXT-X-MAP) ainda nao suportado"); return; }
             if (md.segs.empty()) { sleepMs(1000, run); continue; }
-            if (first) { size_t k = md.segs.size() > 2 ? md.segs.size() - 2 : 0; next = md.segs[k].seq; first = false; }
+            if (first) { size_t k = md.segs.size() > 4 ? md.segs.size() - 4 : 0; next = md.segs[k].seq; first = false; }  // 4 segs atras = buffer anti-travamento
             else if (md.segs.back().seq + 1 < next) {            // a numeracao da playlist voltou atras (live reiniciou): ressincroniza nos 3 mais novos
                 size_t k = md.segs.size() > 3 ? md.segs.size() - 3 : 0; next = md.segs[k].seq;
                 setStatus("playlist reiniciou: ressincronizando");
@@ -1012,9 +1013,12 @@ struct HlsFeeder {
                 std::string seg; int ss = 0;
                 double d0 = nowSecF();
                 if (!g_net.getKA(sess, hlsResolve(mediaUrl, sg.uri), seg, ss, 12u << 20) || ss < 200 || ss >= 300 || seg.empty()) {
-                    if (++errs > 6) { fail("segmento HTTP " + std::to_string(ss)); return; }
+                    if (++errs > 12) { fail("segmento HTTP " + std::to_string(ss)); return; }
+                    setStatus("segmento falhou, tentando de novo...");
+                    sleepMs(400, run);
                     break;
                 }
+                errs = 0;
                 if (outFile) {
                     fwrite(seg.data(), 1, seg.size(), outFile); fflush(outFile); outBytes += seg.size();
                     if (outBytes > 1200000000ULL) { fail("limite de gravacao (1,2 GB) atingido"); return; }
@@ -1235,6 +1239,7 @@ struct Player {
         cancelled = false; restarts = switchesOk = 0; lastGapMs = 0; gapStartT = switchedAt = 0; curDur = 0; chunkT0 = 0; blitMs = 0;
         paused = false; isVod = false; lastPtsMs = 0; maxPtsMs = 0; durationMs = 0; seekPendingMs = -1; waitNote.clear(); showOpts = false; optCur = 0;
         scrubMode = false; scrubMs = -1; seekSkip = false; seekTargetMs = 0;
+        vodEstDurMs = 0; vodContentLength = 0; vodBytesAtStart = 0; vodTimeAtStart = 0;
         avLang = "eng"; langTry = 0; vodPath.clear(); vodAudioExpected = false;
         h2 = 0; bHandle = 0; bState = 0; nextReady = false; prepBusy = false; gapless = true;
         if (g_tearing.load() > 0) {
@@ -1399,6 +1404,7 @@ struct Player {
             if (!okProbe && st >= 400 && st < 500) break;
         }
         g_net.closeSession(probe);
+        if (okProbe && total > 0) vodContentLength = total;
         if (!okProbe) {
             failed = true;
             if (st == 200) log.push_back("ERRO: o servidor nao aceita Range (nao da para tocar enquanto baixa)");
@@ -1627,13 +1633,14 @@ struct Player {
             if (fi.timeStamp > 0) {
                 lastPtsMs = fi.timeStamp / 1000;
                 if (lastPtsMs > maxPtsMs) maxPtsMs = lastPtsMs;
-                // estima duracao com base no progresso (cresce com o filme)
-                uint64_t est = maxPtsMs + 45000;
-                if (maxPtsMs < 2ULL * 60ULL * 1000ULL)
-                    est = std::max<uint64_t>(est, 90ULL * 60ULL * 1000ULL);
-                else
-                    est = std::max(est, maxPtsMs + maxPtsMs / 10); // +10% a frente
-                if (est > durationMs) durationMs = est;
+                // barra acompanha o filme: duracao sobe com o progresso (sem fixar 90 min)
+                if (durationMs < maxPtsMs + 3000) durationMs = maxPtsMs + 3000;
+                if (isVod && vodContentLength > 1024 && lastPtsMs > 6000 && vodEstDurMs == 0 && vw > 0) {
+                    double mbs = (vw >= 1280) ? 1.15e6 : 0.55e6;
+                    uint64_t est = (uint64_t)((double)vodContentLength / mbs * 1000.0);
+                    if (est > 30ULL * 1000ULL && est < 10ULL * 3600ULL * 1000ULL) vodEstDurMs = est;
+                }
+                if (vodEstDurMs > durationMs) durationMs = vodEstDurMs;
 
                 // seek para frente: descarta quadros ate o alvo
                 if (seekSkip) {
@@ -1762,13 +1769,17 @@ struct Player {
     // ---- vigia (anti-congelamento): true = a live parou de verdade e o app deve reabri-la sozinho ----
     // So age no ao vivo por pedacos. 'why' recebe o motivo (aparece na tela "Conectando..." e no log).
     bool wantReconnect(std::string &why) {
-        if (!useFeed || !chunkMode || !active || paused) return false;               // pausado: nao reconecta
+        // Live Kick/HLS: se a imagem parar ou a rede cair, pede reabertura
+        if (!useFeed || !active || paused || isVod) return false;
         double t = nowSec();
-        double still = lastFrameT > 0 ? t - lastFrameT : 0;                          // ha quanto tempo nenhum quadro novo foi desenhado
-        if (failed) { why = "falha ao abrir o proximo pedaco (" + hx8(addRc) + ")"; return true; }
-        if (g_feed.streamEnded.load()) return false;                                  // a live acabou: nao adianta reconectar
-        if (g_feed.failed.load() && still > 2.0) { why = "rede: " + g_feed.getStatus(); return true; }   // espera o que ja foi baixado acabar de tocar
-        if (still > 10.0) { why = "imagem parada ha " + std::to_string((int)still) + " s"; return true; }
+        double still = lastFrameT > 0 ? t - lastFrameT : (t0 > 0 ? t - t0 : 0);
+        if (failed) { why = "falha no player (" + hx8(addRc) + ")"; return true; }
+        if (g_feed.streamEnded.load()) return false;
+        if (g_feed.failed.load() && still > 1.5) { why = "rede: " + g_feed.getStatus(); return true; }
+        // 4.5 s sem quadro = congelou (antes 10 s: usuario via travado por muito tempo)
+        if (still > 4.5 && frames > 0) { why = "imagem parada ha " + std::to_string((int)still) + " s"; return true; }
+        // abriu mas nunca desenhou em 12 s
+        if (frames == 0 && t - t0 > 12.0) { why = "sem imagem apos abrir"; return true; }
         return false;
     }
     bool feedProblem() const { return useFeed && (g_feed.failed.load() || g_feed.streamEnded.load()); }
@@ -1808,22 +1819,19 @@ struct Player {
         hudUntil = nowSec() + 10;
 
         if (targetMs > cur + 400) {
-            // frente: pula quadros ate o PTS
+            // frente: pula quadros ate o PTS (nao mexe lastPtsMs ate o decoder chegar la)
             seekTargetMs = (uint64_t)targetMs;
             seekSkip = true;
-            seekSkipBudget = 120;   // ~4s de video a 30fps por tick de input
-            lastPtsMs = (uint64_t)targetMs; // HUD ja mostra o destino
-            if (paused) { paused = false; audio.muted = muted; } // precisa consumir quadros
+            seekSkipBudget = 200;
+            if (paused) { paused = false; audio.muted = muted; }
         } else if (targetMs + 400 < cur) {
-            // tras: so HUD (sem JumpToTime seguro). Usuario ve a barra; play continua.
-            lastPtsMs = (uint64_t)targetMs;
+            // tras: HUD so (JumpToTime instavel no homebrew)
+            scrubMs = targetMs;
             seekSkip = false;
             waitNote = "Seek para tras limitado neste firmware";
         } else {
-            lastPtsMs = (uint64_t)targetMs;
             seekSkip = false;
         }
-        if (lastPtsMs > maxPtsMs) maxPtsMs = lastPtsMs;
     }
 
     void seekBy(int deltaMs) {
@@ -1847,16 +1855,19 @@ struct Player {
     }
 
     uint64_t displayPosMs() const {
+        // barra e tempo: posicao real do decoder (salvo no modo scrub manual)
         if (scrubMode && scrubMs >= 0) return (uint64_t)scrubMs;
-        if (seekSkip && seekTargetMs > lastPtsMs) return seekTargetMs;
+        if (seekSkip && seekTargetMs > lastPtsMs) return seekTargetMs; // mostrando destino
         return lastPtsMs;
     }
     uint64_t displayDurMs() const {
-        if (durationMs > lastPtsMs + 1000) return durationMs;
-        // estima: pelo menos 2 min a frente enquanto nao sabe
-        uint64_t guess = maxPtsMs + 120000;
-        if (guess < 5ULL * 60ULL * 1000ULL) guess = 5ULL * 60ULL * 1000ULL;
-        return guess;
+        // duracao: a melhor estimativa disponivel (nunca menor que a posicao atual)
+        uint64_t d = durationMs;
+        if (vodEstDurMs > d) d = vodEstDurMs;
+        if (d < maxPtsMs + 1000) d = maxPtsMs + 1000;
+        if (d < lastPtsMs + 1000) d = lastPtsMs + 1000;
+        if (d < 1000) d = 60ULL * 1000ULL;
+        return d;
     }
 
     bool hasEpisodes() const { return epIndex >= 0 && (int)epUrls.size() > 1; }
@@ -2154,6 +2165,18 @@ struct OrbisPadSrc {
     }
     static double now() { return nowSec(); }
 };
+
+// Status do sistema: botao PS / troca de app (background) — precisa parar o player antes do suspend
+struct OrbisSystemServiceStatus {
+    int32_t eventNum;
+    uint8_t isSystemUiOverlaid;
+    uint8_t isInBackground;
+    uint8_t isCpuMode7u;
+    uint8_t pad[5];
+    int32_t reserved[8];
+};
+extern "C" int sceSystemServiceGetStatus(OrbisSystemServiceStatus *status);
+
 using PadIn = PadInT<OrbisPadSrc>;
 
 int main() {
@@ -2394,7 +2417,63 @@ int main() {
         }
         pin.poll();
         uint32_t now = pin.held, pressed = pin.take();
-        if (wantQuit) break;  // OPTIONS nao fecha mais o app
+        // --- Botao PS / outro app: libera decoder e threads (senao o PS4 mostra erro ao sair) ---
+        {
+            static bool wasBg = false;
+            OrbisSystemServiceStatus st{};
+            if (sceSystemServiceGetStatus(&st) == 0) {
+                bool bg = st.isInBackground || st.isSystemUiOverlaid;
+                if (bg && !wasBg) {
+                    trace(st.isInBackground ? "sistema-background" : "sistema-ui");
+                    // para tudo que usa GPU/rede pesada
+                    if (mode == Mode::Play) {
+                        player.stop();
+                        mode = Mode::Menu;
+                        dirty = true;
+                    }
+                    g_covers.setPaused(true);
+                    // cancela download de lista se estiver rodando
+                    if (loader.stillAlive()) loader.cancel(0.1);
+                }
+                if (!bg && wasBg) {
+                    trace("sistema-foreground");
+                    g_covers.setPaused(false);
+                    dirty = true;   // redesenha menu ao voltar
+                }
+                wasBg = bg;
+                // Em background: nao gasta CPU com flip; espera voltar
+                if (st.isInBackground) {
+                    sceKernelUsleep(100000);
+                    continue;
+                }
+            }
+        }
+        // OPTIONS: NAO fecha o app (PS button faz isso).
+        //  - No player ao vivo: troca qualidade (Fluido/720/1080) e reabre (ajuda se a Kick travar)
+        //  - No player VOD: mostra/esconde HUD
+        //  - No menu: abre busca (lupa)
+        if (pressed & B_OPTIONS) {
+            if (mode == Mode::Play) {
+                if (!player.isVod && !player.url.empty()) {
+                    g_quality = (g_quality.load() + 1) % 3;
+                    app.say(std::string("Qualidade: ") + kQualityName[g_quality.load()]);
+                    pf.pendingPlayUrl = player.url;
+                    pf.pendingPlayTitle = player.title;
+                    player.quietWait = true;
+                    player.stop();
+                    mode = Mode::Menu;
+                    dirty = true;
+                    continue;
+                } else {
+                    // VOD: alterna HUD
+                    player.hudUntil = (nowSec() <= player.hudUntil) ? 0 : nowSec() + 12;
+                }
+            } else if (mode == Mode::Menu) {
+                ui.handle(Input::Extra);  // busca
+                dirty = true;
+            }
+        }
+        if (wantQuit) break;
         (void)prev;
         { static bool first = true; if (first) { first = false; trace("loop-q1"); } }
 
@@ -2419,7 +2498,8 @@ int main() {
                 if (pressed & (B_SQUARE | B_R3)) { kbd.backspace(); changed = true; bsNext = tn + 0.4; }
                 else if ((now & (B_SQUARE | B_R3)) && tn >= bsNext) { kbd.backspace(); changed = true; bsNext = tn + 0.05; }
             }
-            if (pressed & B_TRIANGLE) { kbd.insert("https://"); changed = true; }
+            if (pressed & B_TRIANGLE) { kbd.insert(" "); changed = true; }   // △ = espaco
+            if (pressed & B_R2)       { kbd.toggleSymbols(); changed = true; }
             if (pressed & B_L2)       { kbd.clear(); changed = true; }
             if (pressed & (B_CROSS | B_L3)) { done = kbd.press(); changed = true; }   // X ou clique no L3 digita a tecla
             if (pressed & B_R1)       done = true;
@@ -2611,6 +2691,25 @@ int main() {
                 // reset hold quando nao esta no fim
             }
 
+
+            // ---- Live (Kick/IPTV): reconecta sozinho se congelar ----
+            if (!player.isVod && player.active && !player.failed && !player.paused) {
+                std::string why;
+                if (player.wantReconnect(why)) {
+                    g_autoRestarts++;
+                    g_reconnectNote = why;
+                    trace("live-reconnect");
+                    pf.pendingPlayUrl = player.url;
+                    pf.pendingPlayTitle = player.title;
+                    player.quietWait = true;
+                    player.stop();
+                    mode = Mode::Menu;
+                    dirty = true;
+                    sceKernelUsleep(50000);
+                    continue;
+                }
+            }
+
             // ---- Desenho ----
             if (player.active && !player.failed) {
                 bool hud = player.hudActive();
@@ -2623,8 +2722,13 @@ int main() {
                 }
                 if (player.poll(r)) {
                     gotFrame = true;
-                    if (hud || player.showOpts) { player.overlay(r); flip(); }
-                    else { sceVideoOutSubmitFlip(vh, back, ORBIS_VIDEO_OUT_FLIP_VSYNC, 0); back = (back + 1) % 3; }
+                    if (hud || player.showOpts || player.scrubMode) { player.overlay(r); flip(); }
+                    else if (player.isVod) {
+                        // barra verde minima sempre (avanca com o filme)
+                        player.drawMiniProgress(r); flip();
+                    } else {
+                        sceVideoOutSubmitFlip(vh, back, ORBIS_VIDEO_OUT_FLIP_VSYNC, 0); back = (back + 1) % 3;
+                    }
                 } else if (player.showOpts || (hud && pressed)) {
                     player.overlay(r); flip();
                 }
@@ -2789,19 +2893,22 @@ int main() {
         if (dirty) { presentMenu(); dirty = false; static bool once = false; if (!once) { once = true; trace("menu-ok"); } }
         sceKernelUsleep(4000);                     // 4 ms: o controle e lido ~200x por segundo (antes 16 ms)
     }
-    // ---- encerramento limpo: nenhuma thread pode estar viva ao sair (std::thread ativa no fim = "terminate" = erro no PS4) ----
+    // ---- encerramento limpo (OPTIONS ou saida normal) ----
     trace("saindo");
-    pf.saveSetting("bgload", "");               // saida normal: nao foi queda
-    if (!loader.cancel(2.0)) { trace("fim-forcado"); _Exit(0); }      // thread de lista presa na rede: sai sem rodar destrutores
+    pf.saveSetting("bgload", "");
+    try { if (mode == Mode::Play || player.h) player.stop(); } catch (...) {}
+    g_covers.setPaused(true);
+    if (!loader.cancel(1.0)) { trace("fim-lista-timeout"); _Exit(0); }
     g_quitting = true;
-    if (!g_covers.shutdownFor(3.0)) { trace("fim-forcado-capas"); _Exit(0); }      // thread de capas presa na rede: sai sem esperar
-    if (player.h || player.h2 || mode == Mode::Play) player.stop();
-    Player::waitTeardown(10.0);
-    if (g_tearing.load() > 0) { trace("fim-forcado"); _Exit(0); }   // algo travou (rede): sai sem rodar destrutores
+    if (!g_covers.shutdownFor(1.5)) { trace("fim-capas-timeout"); _Exit(0); }
     g_feed.join();
     { auto r = takeHf(); if (r) r->join(); }
-    { auto r = takePf(); if (r) { r->join(); r.reset(); } removeVodFiles(); }
-    blit::pool().shutdown();
+    { auto r = takePf(); if (r) { r->join(); r.reset(); } }
+    try { removeVodFiles(); } catch (...) {}
+    Player::waitTeardown(1.0);
+    try { blit::pool().shutdown(); } catch (...) {}
     trace("fim");
+    // _Exit evita std::terminate se alguma thread destacada ainda existir
+    _Exit(0);
     return 0;
 }
