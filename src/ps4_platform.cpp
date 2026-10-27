@@ -2178,7 +2178,8 @@ enum class Mode { Menu, Play, Kbd };
 struct OrbisPadSrc {
     static int read(int h, PadSample *out, int n) {
         if (h < 0 || !out || n <= 0) return 0;
-        OrbisPadData buf[16]; if (n > 16) n = 16;
+        OrbisPadData buf[16];
+        if (n > 16) n = 16;
         int k = scePadRead(h, buf, n);
         if (k < 0) k = 0;
         for (int i = 0; i < k; i++) {
@@ -2186,23 +2187,23 @@ struct OrbisPadSrc {
             out[i].lx = buf[i].leftStick.x;
             out[i].ly = buf[i].leftStick.y;
         }
-        // Alguns firmwares nao enfileiram eventos: usa o estado atual como 1 amostra
-        if (k == 0 && n > 0) {
-            OrbisPadData d;
-            if (scePadReadState(h, &d) == 0) {
-                out[0].buttons = d.buttons;
-                out[0].lx = d.leftStick.x;
-                out[0].ly = d.leftStick.y;
-                k = 1;
-            }
-        }
         return k;
     }
     static bool state(int h, PadSample &s) {
         if (h < 0) return false;
         OrbisPadData d;
-        if (scePadReadState(h, &d) != 0) return false;
-        s.buttons = d.buttons; s.lx = d.leftStick.x; s.ly = d.leftStick.y;
+        // zera para nao ler lixo se a API preencher parcial
+        memset(&d, 0, sizeof d);
+        int rc = scePadReadState(h, &d);
+        if (rc != 0) return false;
+        s.buttons = d.buttons;
+        s.lx = d.leftStick.x;
+        s.ly = d.leftStick.y;
+        // stick neutro se valores absurdos
+        if (s.lx == 0 && s.ly == 0 && s.buttons == 0) {
+            // pode ser controle desconectado: trata stick como centro
+            s.lx = 128; s.ly = 128;
+        }
         return true;
     }
     static double now() { return nowSec(); }
@@ -2225,23 +2226,32 @@ int main() {
     sceUserServiceInitialize(NULL);
     int userId = 0;
     sceUserServiceGetInitialUser(&userId);
-    scePadInit();
+    int padInitRc = scePadInit();
     sceAudioOutInit();
-    // Abre o controle com varios tipos (0=standard, 1=special). Se falhar, tenta de novo no loop.
-    int pad = -1;
-    for (int type = 0; type <= 1 && pad < 0; type++) {
-        pad = scePadOpen(userId, type, 0, NULL);
-        char b[48]; snprintf(b, sizeof b, "pad-open-u%d-t%d=%d", userId, type, pad);
-        trace(b);
+    {
+        char b[40]; snprintf(b, sizeof b, "pad-init=%d user=%d", padInitRc, userId);
+        // trace ainda nao existe — usa boot depois; guarda em variavel
     }
-    if (pad < 0) {
-        // ultimo recurso: user id -1 (alguns firmwares)
-        pad = scePadOpen(-1, 0, 0, NULL);
-        char b[32]; snprintf(b, sizeof b, "pad-open-any=%d", pad);
-        trace(b);
+    // Abre o DualShock: tenta user atual e tipos 0/1; repete algumas vezes
+    int pad = -1;
+    for (int attempt = 0; attempt < 8 && pad < 0; attempt++) {
+        for (int type = 0; type <= 1 && pad < 0; type++) {
+            pad = scePadOpen(userId, type, 0, NULL);
+        }
+        if (pad < 0) {
+            // lista de usuarios logados
+            // ORBIS_USER_SERVICE_MAX_LOGIN_USERS is typically 4
+            // tenta userIds 1..4 comuns
+            static const int kTryUsers[] = {1, 2, 3, 4, 0, -1};
+            for (int ui = 0; ui < 6 && pad < 0; ui++) {
+                int uid = kTryUsers[ui];
+                if (uid == userId) continue;
+                pad = scePadOpen(uid, 0, 0, NULL);
+            }
+        }
+        if (pad < 0) sceKernelUsleep(100000); // 100 ms
     }
     PadIn pin; pin.h = pad;
-    if (pad < 0) trace("AVISO: nenhum controle aberto — botoes nao vao responder");
     bool wantQuit = false;
 
     const int W = 1920, H = 1080;
@@ -2462,6 +2472,11 @@ int main() {
         }
     }
 
+    {
+        char pb[64];
+        snprintf(pb, sizeof pb, "pad-status h=%d", pin.h);
+        trace(pb);
+    }
     trace("loop-inicio");
     double hbNext = monoSec() + 60, hbT0 = monoSec();
     for (;;) {
@@ -2470,8 +2485,33 @@ int main() {
             char hb[64]; snprintf(hb, sizeof hb, "vivo-%dmin", (int)((monoSec() - hbT0) / 60.0 + 0.5));
             trace(hb);
         }
+        // --- Controle: PadIn + fallback direto do scePad (se a fila falhar, o estado ainda vale) ---
         pin.poll();
-        uint32_t now = pin.held, pressed = pin.take();
+        uint32_t pressed = pin.take();
+        {
+            static uint32_t prevHw = 0;
+            OrbisPadData hw;
+            memset(&hw, 0, sizeof hw);
+            if (pin.h >= 0 && scePadReadState(pin.h, &hw) == 0) {
+                uint32_t btn = hw.buttons;
+                // edge dos botoes digitais (sem analogico)
+                pressed |= (btn & ~prevHw);
+                prevHw = btn;
+                // se PadIn nao preencheu held, usa hardware
+                if (pin.held == 0 && btn != 0) pin.held = btn;
+            } else if (pin.h < 0) {
+                // tenta abrir de novo
+                static double nextPad = 0;
+                double tn = nowSec();
+                if (tn >= nextPad) {
+                    nextPad = tn + 1.0;
+                    int np = scePadOpen(userId, 0, 0, NULL);
+                    if (np < 0) np = scePadOpen(userId, 1, 0, NULL);
+                    if (np >= 0) { pin.h = np; trace("pad-hotplug"); }
+                }
+            }
+        }
+        uint32_t now = pin.held | pressed;
         // --- Botao PS / outro app: libera decoder (NAO bloqueia o loop — isInBackground errado matava o controle) ---
         {
             static bool wasBg = false;
