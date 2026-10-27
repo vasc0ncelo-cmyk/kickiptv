@@ -222,14 +222,12 @@ void PlaylistBuilder::feed(const char *d, size_t n) {
 
 void PlaylistBuilder::finish() {
     if (!cur_.empty()) { line(cur_); cur_.clear(); }
-    for (auto &s : p_.seriesTree)
-        for (auto &t : s.second)
-            std::stable_sort(t.second.begin(), t.second.end(), [](const Entry &a, const Entry &b) { return a.episode < b.episode; });
-    for (auto &c : p_.seriesCats) std::sort(c.series.begin(), c.series.end());
 
-    // Categorias A-Z (rapido). Itens dentro de cada categoria ficam na ordem do M3U
-    // (ordenar 40k+ nomes em cada categoria deixava a abertura muito lenta).
-    auto byCatName = [](const Category &a, const Category &b) { return fold(a.name) < fold(b.name); };
+    // Nao ordena episodios aqui (dezenas de milhares de stable_sort no PS4 = travamento).
+    // Episodios sao ordenados sob demanda ao abrir a temporada (ui confirm).
+
+    // Categorias: ordenacao simples por nome (sem fold UTF-8 em cada comparacao)
+    auto byCatName = [](const Category &a, const Category &b) { return a.name < b.name; };
     std::sort(p_.movieCats.begin(), p_.movieCats.end(), byCatName);
     std::sort(p_.seriesCats.begin(), p_.seriesCats.end(), byCatName);
     std::sort(p_.channelCats.begin(), p_.channelCats.end(), byCatName);
@@ -238,14 +236,7 @@ void PlaylistBuilder::finish() {
     for (auto &c : p_.seriesCats) if (c.name == "Todos") c.name = "Geral";
     for (auto &c : p_.channelCats) if (c.name == "Todos") c.name = "Geral";
 
-    // "Todos" = lista completa; ordena SO uma vez (nao cada categoria)
-    auto byNameMovie = [&](uint32_t a, uint32_t b) {
-        return fold(p_.movies[a].name) < fold(p_.movies[b].name);
-    };
-    auto byNameChan = [&](uint32_t a, uint32_t b) {
-        return fold(p_.channels[a].name) < fold(p_.channels[b].name);
-    };
-    // "Todos" SEM ordenar 40k nomes (isso sozinho demorava dezenas de segundos no PS4)
+    // "Todos" = indices em ordem do M3U (SEM sort de 40k nomes)
     if (!p_.movies.empty()) {
         Category all;
         all.name = "Todos";
@@ -256,7 +247,11 @@ void PlaylistBuilder::finish() {
     if (!p_.seriesTree.empty()) {
         Category all;
         all.name = "Todos";
+        all.series.reserve(p_.seriesTree.size());
         for (const auto &kv : p_.seriesTree) all.series.push_back(kv.first);
+        // sort so da lista de nomes de series (bem menor que episodios)
+        if (all.series.size() < 8000)
+            std::sort(all.series.begin(), all.series.end());
         p_.seriesCats.insert(p_.seriesCats.begin(), std::move(all));
     }
     if (!p_.channels.empty()) {
@@ -266,7 +261,6 @@ void PlaylistBuilder::finish() {
         for (uint32_t i = 0; i < (uint32_t)p_.channels.size(); i++) all.items[i] = i;
         p_.channelCats.insert(p_.channelCats.begin(), std::move(all));
     }
-    (void)byNameMovie; (void)byNameChan;
 }
 
 Playlist PlaylistBuilder::take() { return std::move(p_); }
@@ -302,19 +296,19 @@ void PlaylistBuilder::line(std::string &raw) {
         if (memBytes_ + est > maxBytes()) { full_ = true; p_.truncated = true; extinf_.clear(); return; }
         memBytes_ += est;
     }
-    // duplicata por URL OU mesmo titulo normalizado (lista IPTV repete o filme 2-3x)
+    // duplicata por URL (rapido). Titulo: so filmes/canais (series tem SxxExx e nao podem cair no mesmo bucket)
     if (!e.url.empty() && !seenUrl_.insert(e.url).second) {
         extinf_.clear();
         return;
     }
-    {
+    e.kind = classify(e);
+    if (e.kind != Kind::Series) {
         std::string nt = normTitle(e.name);
         if (nt.size() >= 4 && !seenName_.insert(nt).second) {
             extinf_.clear();
             return;
         }
     }
-    e.kind = classify(e);
     extinf_.clear();
     count_++;
 
