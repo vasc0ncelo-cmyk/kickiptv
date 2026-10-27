@@ -24,7 +24,14 @@ int main() {
     assert(whole.seriesTree.size() == 300 && whole.seriesEpisodes == 3000);
     assert(whole.channels[0].name == "Canal 0 FHD");           // virgula dentro do group-title nao quebra o nome
     assert(whole.channels[0].url == "http://h/live/u/p/0.ts");  // BOM e \r\n tratados
-    assert(whole.seriesTree["Serie 7"][1].size() == 10 && whole.seriesTree["Serie 7"][1][0].episode == 1);
+    {   // o m3u.cpp nao ordena episodios (custava caro no PS4); a UI ordena ao abrir a temporada (Ui::sortedEps).
+        // Aqui so confere que todos os 10 episodios entraram na temporada certa, em qualquer ordem.
+        const auto &eps = whole.seriesTree["Serie 7"][1];
+        assert(eps.size() == 10);
+        int seen = 0;
+        for (const auto &e : eps) seen |= 1 << e.episode;
+        assert(seen == 0x7FE);                                  // bits 1..10
+    }
 
     // mesma lista, em pedacos de tamanhos diferentes (cortando linhas no meio)
     for (size_t chunk : {1u, 7u, 100u, 4093u, 65536u}) {
