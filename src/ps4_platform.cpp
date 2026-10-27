@@ -1630,7 +1630,7 @@ struct Player {
                 // estima duracao com base no progresso (cresce com o filme)
                 uint64_t est = maxPtsMs + 45000;
                 if (maxPtsMs < 2ULL * 60ULL * 1000ULL)
-                    est = std::max(est, 90ULL * 60ULL * 1000ULL);
+                    est = std::max<uint64_t>(est, 90ULL * 60ULL * 1000ULL);
                 else
                     est = std::max(est, maxPtsMs + maxPtsMs / 10); // +10% a frente
                 if (est > durationMs) durationMs = est;
