@@ -2744,7 +2744,6 @@ int main() {
                 if (bg && !wasBg) {
                     trace("sistema-background");
                     g_quitting = true;                 // workers de rede/capas param
-                    g_sfx.ready = false;               // nao bloqueia em AudioOut
                     if (mode == Mode::Play || player.h) {
                         try { player.stop(); } catch (...) {}
                         mode = Mode::Menu;
