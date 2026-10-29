@@ -335,10 +335,36 @@ void PlaylistBuilder::line(std::string &raw) {
             p_.seriesCats[catFor(p_.seriesCats, seriesIdx_, e.group)].series.push_back(treeName);
         }
         e.group.clear();
-        p_.seriesEpisodes++;
         int season = e.season < 1 ? 1 : e.season;
         e.season = season;
-        p_.seriesTree[treeName][season].push_back(std::move(e));
+        auto &vec = p_.seriesTree[treeName][season];
+        // Dedup por numero do episodio: PT + EN do mesmo ep viram 1 entrada
+        if (e.episode > 0) {
+            auto score = [](const Entry &x) {
+                std::string n = x.name;
+                for (char &c : n) c = (char)tolower((unsigned char)c);
+                int s = 0;
+                if (n.find("dublado") != std::string::npos || n.find("portug") != std::string::npos ||
+                    n.find("pt-br") != std::string::npos || n.find("ptbr") != std::string::npos ||
+                    n.find("[pt]") != std::string::npos || n.find("(pt)") != std::string::npos) s += 3;
+                if (n.find("dual") != std::string::npos) s += 2;
+                if (n.find("legendado") != std::string::npos || n.find("legend") != std::string::npos) s += 1;
+                if (n.find("english") != std::string::npos || n.find("[en]") != std::string::npos ||
+                    n.find("(en)") != std::string::npos || n.find(" eng") != std::string::npos) s -= 1;
+                return s;
+            };
+            bool replaced = false;
+            for (auto &ex : vec) {
+                if (ex.episode == e.episode) {
+                    if (score(e) > score(ex)) ex = std::move(e);
+                    replaced = true;
+                    break;
+                }
+            }
+            if (replaced) { extinf_.clear(); return; }
+        }
+        p_.seriesEpisodes++;
+        vec.push_back(std::move(e));
     } else {
         p_.channelCats[catFor(p_.channelCats, chanIdx_, e.group)].items.push_back((uint32_t)p_.channels.size());
         e.group.clear(); p_.channels.push_back(std::move(e));
