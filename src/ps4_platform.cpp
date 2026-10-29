@@ -39,7 +39,6 @@
 #include "tsmux.hpp"
 #include "blit.hpp"
 #include "padin.hpp"
-#include "sfx.hpp"
 #include <orbis/libkernel.h>
 #include <orbis/VideoOut.h>
 #include <orbis/UserService.h>
@@ -1205,6 +1204,8 @@ struct Player {
     uint64_t lastGoodPtsMs = 0;           // ultimo pts que avancou
     double   lastPtsWall = 0;             // quando lastPtsMs mudou
     uint64_t fileDurMs = 0;               // duracao lida do MP4 (mvhd) se disponivel
+    uint64_t playedMs = 0;                // tempo de reproducao (so avanca com frames)
+    double   lastPaceWall = 0;            // pacing A/V
     int64_t seekPendingMs = -1;            // seek solicitado (software ate o player aceitar)
 
     // Episodios da mesma temporada (para L1/R1 pular)
@@ -1328,7 +1329,7 @@ struct Player {
         paused = false; isVod = false; lastPtsMs = 0; maxPtsMs = 0; durationMs = 0; seekPendingMs = -1; waitNote.clear(); showOpts = false; optCur = 0;
         scrubMode = false; scrubMs = -1; seekSkip = false; seekTargetMs = 0;
         vodEstDurMs = 0; vodContentLength = 0; vodBytesAtStart = 0; vodTimeAtStart = 0;
-        playStartWall = nowSec(); pauseAccum = 0; pauseStartedAt = 0; lastGoodPtsMs = 0; lastPtsWall = playStartWall; fileDurMs = 0;
+        playStartWall = nowSec(); pauseAccum = 0; pauseStartedAt = 0; lastGoodPtsMs = 0; lastPtsWall = playStartWall; fileDurMs = 0; playedMs = 0; lastPaceWall = 0;
         avLang = "eng"; langTry = 0; vodPath.clear(); vodAudioExpected = false;
         h2 = 0; bHandle = 0; bState = 0; nextReady = false; prepBusy = false; gapless = true;
         if (g_tearing.load() > 0) {
@@ -1571,13 +1572,27 @@ struct Player {
             isVod = true;
             // Duracao real do arquivo (mvhd) — barra e tempo total corretos
             fileDurMs = mp4DurationMsFromFile(path);
+            // mvhd parcial/errado: se o arquivo e grande e a duracao veio < 12 min, descarta
+            if (fileDurMs > 0 && fileDurMs < 12ULL * 60ULL * 1000ULL && vodContentLength > 150ULL * 1024ULL * 1024ULL)
+                fileDurMs = 0;
+            if (fileDurMs == 0 && vodContentLength > 1024 * 1024) {
+                // estimativa ~2.0 Mbps (comum em IPTV 1080p comprimido)
+                uint64_t est = (vodContentLength * 8ULL) / 2000ULL; // ms se 2 Mbps
+                if (est > 5ULL * 60ULL * 1000ULL && est < 6ULL * 3600ULL * 1000ULL) {
+                    fileDurMs = 0;
+                    vodEstDurMs = est;
+                    durationMs = est;
+                    char db[64]; snprintf(db, sizeof db, "   duracao est.: %u min", (unsigned)(est / 60000ULL));
+                    log.push_back(db);
+                }
+            }
             if (fileDurMs > 0) {
                 durationMs = fileDurMs;
                 vodEstDurMs = fileDurMs;
                 char db[64]; snprintf(db, sizeof db, "   duracao: %u min", (unsigned)(fileDurMs / 60000ULL));
                 log.push_back(db);
             }
-            playStartWall = nowSec(); pauseAccum = 0; pauseStartedAt = 0;
+            playStartWall = nowSec(); pauseAccum = 0; pauseStartedAt = 0; playedMs = 0; lastPaceWall = nowSec();
             log.push_back("OK: tocando enquanto baixa"); return true;
         }
         failed = true;
@@ -1740,8 +1755,36 @@ struct Player {
                     lastGoodPtsMs = lastPtsMs;
                     lastPtsWall = nowSec();
                 }
-                // barra acompanha o filme
-                if (durationMs < maxPtsMs + 5000) durationMs = maxPtsMs + 5000;
+                // progresso: PTS se valido; senao +tempo desde ultimo frame (congela se tela preta)
+                {
+                    double nw = nowSec();
+                    if (lastPtsMs > playedMs + 200) {
+                        playedMs = lastPtsMs;
+                    } else if (lastPaceWall > 0) {
+                        double dt = nw - lastPaceWall;
+                        if (dt > 0 && dt < 0.12)
+                            playedMs += (uint64_t)(dt * 1000.0);
+                        else if (dt >= 0.12 && dt < 0.5)
+                            playedMs += 33; // um frame
+                        // dt grande = stall: nao avanca
+                    } else {
+                        playedMs += 33;
+                    }
+                    lastPaceWall = nw;
+                }
+                // pacing A/V: nao deixar o video correr na frente do tempo real (som some + imagem acelerada)
+                if (!seekSkip && isVod && playStartWall > 0) {
+                    double mediaSec = (double)playedMs / 1000.0;
+                    double wallSec = nowSec() - playStartWall - pauseAccum;
+                    if (paused && pauseStartedAt > 0) wallSec -= (nowSec() - pauseStartedAt);
+                    if (mediaSec > wallSec + 0.05) {
+                        int us = (int)((mediaSec - wallSec) * 1000000.0);
+                        if (us > 5000 && us < 80000) sceKernelUsleep(us);
+                    }
+                }
+                // barra: so estende duration se PTS for confiavel e perto do fim conhecido
+                if (lastPtsMs > 1000 && durationMs > 0 && lastPtsMs + 3000 > durationMs)
+                    durationMs = lastPtsMs + 5000;
                 if (isVod && vodContentLength > 1024 * 1024 && vodEstDurMs == 0 && fileDurMs == 0) {
                     // estima duracao: tamanho total / taxa media observada
                     uint64_t posMs = lastPtsMs > 3000 ? lastPtsMs : wallPosMs();
@@ -1998,7 +2041,7 @@ struct Player {
         scrubMode = false;
     }
 
-    // Tempo decorrido de parede (descontando pausas) em ms
+    // Tempo de parede so para estimativa de bitrate (NAO para a barra — barra usa playedMs)
     uint64_t wallPosMs() const {
         if (playStartWall <= 0) return 0;
         double now = nowSec();
@@ -2012,21 +2055,15 @@ struct Player {
     uint64_t displayPosMs() const {
         if (scrubMode && scrubMs >= 0) return (uint64_t)scrubMs;
         if (seekSkip && seekTargetMs > 0) return seekTargetMs;
-
-        // 1) PTS do AvPlayer se estiver avancando de verdade
-        if (lastPtsMs > 200 && (nowSec() - lastPtsWall) < 1.2)
-            return lastPtsMs;
-
-        // 2) Relogio de parede (confiavel no homebrew quando PTS vem 0)
-        if (isVod) {
-            uint64_t w = wallPosMs();
-            // se PTS ja foi maior, nao volta
-            if (lastPtsMs > w) w = lastPtsMs;
-            uint64_t dur = displayDurMs();
-            if (dur > 0 && w > dur) w = dur;
-            return w;
-        }
-        return lastPtsMs;
+        // playedMs so avanca quando chega frame (nao corre na tela preta)
+        uint64_t p = playedMs;
+        if (lastPtsMs > p) p = lastPtsMs;
+        uint64_t dur = 0;
+        if (fileDurMs > 1000) dur = fileDurMs;
+        else if (vodEstDurMs > 1000) dur = vodEstDurMs;
+        else if (durationMs > 1000) dur = durationMs;
+        if (dur > 0 && p > dur) p = dur;
+        return p;
     }
     uint64_t displayDurMs() const {
         // Prioridade: mvhd do arquivo > estimativa HTTP > maxPts > default
@@ -2051,8 +2088,14 @@ struct Player {
     bool canPrevEp() const { return hasEpisodes() && epIndex > 0; }
     bool canNextEp() const { return hasEpisodes() && epIndex + 1 < (int)epUrls.size(); }
     bool nearEnd() const {
-        if (!isVod || durationMs < 15000) return false;
-        return lastPtsMs + 2500 >= durationMs;
+        if (!isVod) return false;
+        uint64_t dur = displayDurMs();
+        uint64_t pos = displayPosMs();
+        if (dur < 20000) return false;
+        // ultimos 4 segundos OU player inativo perto do fim
+        if (pos + 4000 >= dur) return true;
+        if (frames > 30 && (nowSec() - lastFrameT) > 2.5 && pos + 20000 >= dur) return true;
+        return false;
     }
 
     // HUD estilo app de streaming (referencia visual)
@@ -2395,8 +2438,6 @@ extern "C" int sceSystemServiceGetStatus(OrbisSystemServiceStatus *status);
 
 using PadIn = PadInT<OrbisPadSrc>;
 
-static SoftSfx g_sfx;
-
 int main() {
     sceUserServiceInitialize(NULL);
     int userId = 0;
@@ -2405,7 +2446,6 @@ int main() {
     sceAudioOutInit();
     {
         int uiPort = sceAudioOutOpen(0xFF, ORBIS_AUDIO_OUT_PORT_TYPE_MAIN, 0, 256, 48000, ORBIS_AUDIO_OUT_PARAM_FORMAT_S16_STEREO);
-        g_sfx.init(uiPort);
         char b[32]; snprintf(b, sizeof b, "sfx-port=%d", uiPort); /* log apos boot */
     }
     {
@@ -2722,7 +2762,6 @@ int main() {
                 if (!bg && wasBg) {
                     trace("sistema-foreground");
                     g_quitting = false;
-                    g_sfx.ready = true;
                     g_covers.setPaused(false);
                     dirty = true;
                 }
@@ -2973,23 +3012,49 @@ int main() {
                 }
             }
 
-            // ---- Auto-avanca episodio ao terminar ----
-            if (player.isVod && player.active && !player.failed && !player.paused && player.canNextEp() && player.nearEnd()) {
-                static double endHold = 0;
-                if (endHold < 1.0) endHold = nowSec();
-                // sem quadro novo por ~2s perto do fim
-                if (nowSec() - player.lastFrameT > 1.8 || nowSec() - endHold > 4.0) {
-                    endHold = 0;
-                    player.epIndex++;
-                    pf.pendingPlayUrl = player.epUrls[player.epIndex];
-                    pf.pendingPlayTitle = player.epTitles[player.epIndex];
-                    pf.pendingEpIndex = player.epIndex;
-                    pf.pendingEpUrls = player.epUrls; pf.pendingEpTitles = player.epTitles;
-                    player.quietWait = true;
-                    player.stop(); mode = Mode::Menu; dirty = true; sceKernelUsleep(8000); continue;
+            // ---- audio-recover: se o som sumiu no VOD, reabre a bomba de audio ----
+            if (player.isVod && player.active && !player.paused && !player.muted && player.h) {
+                static double lastAudCheck = 0;
+                static unsigned lastChunks = 0;
+                double tn = nowSec();
+                if (tn - lastAudCheck > 3.0) {
+                    unsigned c = player.audio.chunks.load();
+                    // video andando mas audio parado ha 3s
+                    if (player.frames > 90 && c == lastChunks) {
+                        try {
+                            player.audio.start(player.h);
+                            player.audio.muted = false;
+                            trace("audio-recover");
+                        } catch (...) {}
+                    }
+                    lastChunks = player.audio.chunks.load();
+                    lastAudCheck = tn;
                 }
-            } else {
-                // reset hold quando nao esta no fim
+            }
+
+            // ---- Auto-avanca episodio ao terminar ----
+            if (player.isVod && player.canNextEp() && !player.paused) {
+                static double endHold = 0;
+                bool atEnd = player.nearEnd();
+                bool dead = (player.frames > 20 && (nowSec() - player.lastFrameT) > 3.5);
+                bool ended = (!player.active || player.failed) && player.frames > 20;
+                if (atEnd || (dead && player.displayPosMs() + 30000 >= player.displayDurMs()) || ended) {
+                    if (endHold < 1.0) endHold = nowSec();
+                    if (nowSec() - endHold > 1.2) {
+                        endHold = 0;
+                        player.epIndex++;
+                        if (player.epIndex < (int)player.epUrls.size()) {
+                            pf.pendingPlayUrl = player.epUrls[player.epIndex];
+                            pf.pendingPlayTitle = player.epTitles[player.epIndex];
+                            pf.pendingEpIndex = player.epIndex;
+                            pf.pendingEpUrls = player.epUrls; pf.pendingEpTitles = player.epTitles;
+                            player.quietWait = true;
+                            player.stop(); mode = Mode::Menu; dirty = true; sceKernelUsleep(8000); continue;
+                        }
+                    }
+                } else {
+                    endHold = 0;
+                }
             }
 
 
@@ -3045,8 +3110,8 @@ int main() {
             int nU = ((pressed & B_UP) ? 1 : 0) + st[0] * (st[0] ? pin.accel(0) : 1);
             int nD = ((pressed & B_DOWN) ? 1 : 0) + st[1] * (st[1] ? pin.accel(1) : 1);
             int nL = ((pressed & B_LEFT) ? 1 : 0) + st[2], nR = ((pressed & B_RIGHT) ? 1 : 0) + st[3];
-            for (int i = 0; i < nU; i++) { ui.handle(Input::Up); if (i==0) g_sfx.nav(); }
-            for (int i = 0; i < nD; i++) { ui.handle(Input::Down); if (i==0) g_sfx.nav(); }
+            for (int i = 0; i < nU; i++) { ui.handle(Input::Up); }
+            for (int i = 0; i < nD; i++) { ui.handle(Input::Down); }
             for (int i = 0; i < nL; i++) ui.handle(Input::Left);
             for (int i = 0; i < nR; i++) ui.handle(Input::Right);
             if (nU + nD + nL + nR > 0) dirty = true;
@@ -3055,8 +3120,8 @@ int main() {
         if (pressed & B_R1)     { ui.handle(Input::NextTab);  dirty = true; }
         if (pressed & B_L2)     { ui.handle(Input::PageUp);   dirty = true; }
         if (pressed & B_R2)     { ui.handle(Input::PageDown); dirty = true; }
-        if (pressed & B_CROSS)  { ui.handle(Input::Confirm);  dirty = true; g_sfx.ok(); }
-        if (pressed & B_CIRCLE) { ui.handle(Input::Back);     dirty = true; g_sfx.back(); }
+        if (pressed & B_CROSS)  { ui.handle(Input::Confirm);  dirty = true; }
+        if (pressed & B_CIRCLE) { ui.handle(Input::Back);     dirty = true; }
         if (pressed & B_TRIANGLE) { ui.handle(Input::Extra);  dirty = true; }       // lupa: buscar
         if (updateClock()) dirty = true;
         {   // andamento do lote de capas (TRIANGULO)
@@ -3197,7 +3262,6 @@ int main() {
     // ---- encerramento limpo (OPTIONS, background ou saida normal) ----
     trace("saindo");
     g_quitting = true;
-    g_sfx.ready = false;
     try { pf.saveSetting("bgload", ""); } catch (...) {}
     try { if (mode == Mode::Play || player.h) player.stop(); } catch (...) {}
     try { g_covers.setPaused(true); } catch (...) {}
