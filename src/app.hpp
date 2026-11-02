@@ -129,27 +129,44 @@ struct App {
                " | Series: " + std::to_string(list.seriesTree.size());
     }
 
-    void watchKick(const std::string &input) {
+    // Busca playback_url fresco (as URLs da CDN da Kick expiram em poucos minutos)
+    // err: mensagem de erro; retorno vazio = falha
+    std::string resolveKickHls(const std::string &input, std::string *err = nullptr) {
         std::string slug = kickSlug(input);
-        if (slug.empty()) { say("@ invalido"); return; }
+        if (slug.empty()) { if (err) *err = "@ invalido"; return ""; }
         std::string body;
         int st = 0; bool got = false;
-        for (const std::string &u : kickApiUrls(slug)) {          // v2 primeiro; se for recusada tenta a v1
+        for (const std::string &u : kickApiUrls(slug)) {
             body.clear();
             if (pf.httpGetKick(u, body) && !body.empty()) { got = true; break; }
             st = pf.lastHttpStatus();
-            if (st == 404) break;                                  // o canal nao existe: a outra versao tambem nao acharia
+            if (st == 404) break;
         }
         if (!got) {
-            if (st == 404) say("Falha: o canal @" + slug + " nao existe na Kick");
-            else if (st == 403 || st == 429 || st == 503) say("Falha ao consultar a Kick (HTTP " + std::to_string(st) + "): a Kick recusou o pedido do PS4 - tente de novo em instantes");
-            else if (st > 0) say("Falha ao consultar a Kick (HTTP " + std::to_string(st) + ")");
-            else say("Falha ao consultar a Kick (sem resposta - confira a internet do PS4)");
+            if (err) {
+                if (st == 404) *err = "canal nao existe";
+                else if (st > 0) *err = "Kick HTTP " + std::to_string(st);
+                else *err = "Kick sem resposta";
+            }
+            return "";
+        }
+        if (!kickIsLive(body)) { if (err) *err = "@" + slug + " offline"; return ""; }
+        std::string hls = jsonString(body, "playback_url");
+        if (hls.empty() && err) *err = "sem playback_url";
+        return hls;
+    }
+
+    void watchKick(const std::string &input) {
+        std::string slug = kickSlug(input);
+        if (slug.empty()) { say("@ invalido"); return; }
+        std::string err, hls = resolveKickHls(slug, &err);
+        if (hls.empty()) {
+            if (err.find("offline") != std::string::npos) say("@" + slug + " esta offline");
+            else if (err.find("nao existe") != std::string::npos) say("Falha: o canal @" + slug + " nao existe na Kick");
+            else if (!err.empty()) say("Falha ao consultar a Kick (" + err + ")");
+            else say("Falha ao consultar a Kick");
             return;
         }
-        if (!kickIsLive(body)) { say("@" + slug + " esta offline"); return; }
-        std::string hls = jsonString(body, "playback_url");
-        if (hls.empty()) { say("Stream nao encontrado"); return; }
         say("Assistindo @" + slug);
         pf.play(hls, "@" + slug);
     }
