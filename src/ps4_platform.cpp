@@ -377,6 +377,8 @@ struct Ps4Platform : Platform {
     bool hasPendingText = false;
     bool kbdRequested = false;               // UI pediu o teclado
     std::string pendingPlayUrl, pendingPlayTitle;
+    std::string pendingKickSlug; // reconectar live Kick com URL nova
+
     std::vector<std::string> pendingEpUrls, pendingEpTitles;
     int pendingEpIndex = -1;
     std::atomic<int> lastStatus_{0};
@@ -1382,6 +1384,13 @@ struct Player {
         }
         if (!g_reconnectNote.empty()) { log.push_back("Reconexao automatica #" + std::to_string(g_autoRestarts) + ": " + g_reconnectNote); g_reconnectNote.clear(); }
         this->title = title; this->url = url; hudUntil = nowSec() + 8;
+        // titulo "@slug" = live Kick: guarda slug para renovar o m3u8 na reconexao
+        kickSlug.clear();
+        if (!title.empty() && title[0] == '@') {
+            kickSlug = title.substr(1);
+            while (!kickSlug.empty() && (kickSlug.back()==' '||kickSlug.back()=='\n')) kickSlug.pop_back();
+        }
+
         lastDrawT = 0; worstGap = worstShown = 0; convMs = 0; openMs = 800; copyMs = 0; autoStride = true; strideLocked = false; lockW = lockH = 0; strideMode = 1; strideUndecided = 0;
         log.push_back("Reproduzindo: " + title);
         {   // host e tamanho da URL
@@ -1997,13 +2006,13 @@ struct Player {
         if (g_feed.sb.underruns.load() > 8 && frames > 30) {
             why = "buffer dessincronizado"; return true;
         }
-        // feeder vivo mas sem segmento novo ha 10s e imagem andando → vai travar
-        if (frames > 60 && (t - lastFeedSegWall) > 10.0) {
+        // sem segmento novo: so reconecta se a imagem tambem parou (evita reboot desnecessario)
+        if (frames > 90 && (t - lastFeedSegWall) > 14.0 && still > 2.0) {
             why = "sem segmentos novos ha " + std::to_string((int)(t - lastFeedSegWall)) + " s";
             return true;
         }
-        // 3.2 s sem quadro = congelou
-        if (still > 3.2 && frames > 0) { why = "imagem parada ha " + std::to_string((int)still) + " s"; return true; }
+        // 4 s sem quadro = congelou de verdade
+        if (still > 4.0 && frames > 0) { why = "imagem parada ha " + std::to_string((int)still) + " s"; return true; }
         if (frames == 0 && t - t0 > 10.0) { why = "sem imagem apos abrir"; return true; }
         return false;
     }
@@ -2640,29 +2649,33 @@ int main() {
     // Nunca chama stop() no meio do poll sem pausar audio e abortar o feeder antes —
     // isso era a causa do CE ao apertar △/OPTIONS na Kick.
     auto safeRestartLive = [&](const std::string &why) {
-        if (player.url.empty()) return;
+        if (player.url.empty() && player.kickSlug.empty()) return;
         trace((std::string("safe-restart:") + why).c_str());
         player.quietWait = true;
         player.showOpts = false;
         player.showInfo = false;
         player.scrubMode = false;
         player.seekSkip = false;
-        // 1) para de puxar A/V na thread do player
         player.paused = true;
         player.audio.muted = true;
         try { player.audio.retarget(0); } catch (...) {}
-        // 2) acorda o feeder bloqueado
         try { g_feed.abort(); } catch (...) {}
-        sceKernelUsleep(40000);
-        std::string u = player.url, ti = player.title;
-        // 3) desmonta AvPlayer em background
+        sceKernelUsleep(50000);
+        std::string u = player.url, ti = player.title, slug = player.kickSlug;
         try { player.stop(); } catch (...) {}
-        // 4) espera um pouco o teardown + limpa buffer HLS
-        Player::waitTeardown(0.5);
+        Player::waitTeardown(0.6);
         try { g_feed.join(); } catch (...) {}
         try { g_feed.sb.reset(); } catch (...) {}
-        pf.pendingPlayUrl = u;
-        pf.pendingPlayTitle = ti;
+        // Kick: NAO reusa o m3u8 antigo (expira). Pede playback_url novo na API.
+        if (!slug.empty()) {
+            pf.pendingKickSlug = slug;
+            pf.pendingPlayUrl.clear();
+            pf.pendingPlayTitle = "@" + slug;
+            app.say("Reconectando @" + slug + "...");
+        } else {
+            pf.pendingPlayUrl = u;
+            pf.pendingPlayTitle = ti;
+        }
         mode = Mode::Menu;
         dirty = true;
     };
@@ -3289,6 +3302,37 @@ int main() {
             if (listLoad && !typed.empty()) bgloadClearAt = nowSec() + 4.0;
             trace("texto-processado");
             dirty = true;
+        }
+        // Kick: resolve URL fresca antes de abrir o player
+        if (!pf.pendingKickSlug.empty()) {
+            std::string slug = pf.pendingKickSlug;
+            pf.pendingKickSlug.clear();
+            presentWait();
+            std::string err, hls;
+            for (int attempt = 0; attempt < 3 && hls.empty(); attempt++) {
+                if (attempt) sceKernelUsleep(400000);
+                err.clear();
+                hls = app.resolveKickHls(slug, &err);
+            }
+            if (hls.empty()) {
+                app.say("Reconexao falhou: " + (err.empty() ? "sem stream" : err));
+                player.failed = true;
+                player.log.clear();
+                player.log.push_back("Reconexao @" + slug + " falhou: " + err);
+                player.log.push_back("Aperte O e tente assistir de novo.");
+                mode = Mode::Play; // mostra erro no cartao
+                // força tela de erro minima
+                for (int i = 0; i < 60; i++) {
+                    presentWait();
+                    sceKernelUsleep(100000);
+                    pin.poll();
+                    if (pin.take() & (B_CIRCLE | B_CROSS)) break;
+                }
+                mode = Mode::Menu; dirty = true; continue;
+            }
+            pf.pendingPlayUrl = hls;
+            pf.pendingPlayTitle = "@" + slug;
+            // cai no bloco abaixo
         }
         if (!pf.pendingPlayUrl.empty()) {
             std::string url = pf.pendingPlayUrl, title = pf.pendingPlayTitle;
