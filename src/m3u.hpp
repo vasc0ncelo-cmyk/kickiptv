@@ -62,6 +62,7 @@ private:
     std::unordered_set<std::string> seenUrl_;   // evita duplicata por URL
     std::unordered_set<std::string> seenName_;  // evita mesmo titulo (capa 2-3x)
     std::unordered_map<std::string, std::string> seriesNorm_; // normTitle -> nome na arvore (O(1))
+    std::unordered_map<std::string, uint32_t> movieNorm_; // base name -> index em movies (preferir PT)
     static int catFor(std::vector<Category> &cats, std::unordered_map<std::string, int> &idx, const std::string &group);
 };
 
