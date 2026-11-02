@@ -1,4 +1,38 @@
 #include "m3u.hpp"
+#include <cstring>
+
+static int langScoreName(std::string n) {
+    for (char &c : n) c = (char)tolower((unsigned char)c);
+    int s = 0;
+    if (n.find("dublado") != std::string::npos || n.find("portug") != std::string::npos ||
+        n.find("pt-br") != std::string::npos || n.find("ptbr") != std::string::npos ||
+        n.find("[pt]") != std::string::npos || n.find("(pt)") != std::string::npos ||
+        n.find(" nacional") != std::string::npos || n.find("audio pt") != std::string::npos) s += 4;
+    if (n.find("dual") != std::string::npos) s += 2;
+    if (n.find("legendado") != std::string::npos) s += 1;
+    if (n.find("english") != std::string::npos || n.find("[en]") != std::string::npos ||
+        n.find("(en)") != std::string::npos || n.find(" eng") != std::string::npos ||
+        n.find("legendado eng") != std::string::npos) s -= 2;
+    return s;
+}
+static std::string movieBaseKey(std::string n) {
+    for (char &c : n) c = (char)tolower((unsigned char)c);
+    // remove markers comuns
+    for (const char *x : {"(dublado)","(legendado)","[dublado]","[legendado]"," dublado"," legendado",
+                          " dual audio"," dualaudio"," pt-br"," ptbr"," (pt)"," [pt]"," (en)"," [en]"}) {
+        for (;;) {
+            size_t p = n.find(x);
+            if (p == std::string::npos) break;
+            n.erase(p, strlen(x));
+        }
+    }
+    // so alfanumerico
+    std::string o;
+    for (char c : n) if ((c>='a'&&c<='z')||(c>='0'&&c<='9')) o.push_back(c);
+    return o;
+}
+
+
 #include "urlutil.hpp"
 #include <algorithm>
 #include <cctype>
@@ -192,6 +226,7 @@ PlaylistBuilder::PlaylistBuilder() {
     seenUrl_.reserve(65536);
     seenName_.reserve(65536);
     seriesNorm_.reserve(16384);
+    movieNorm_.reserve(16384);
     chanIdx_.reserve(512);
     movieIdx_.reserve(512);
     seriesIdx_.reserve(512);
@@ -313,8 +348,33 @@ void PlaylistBuilder::line(std::string &raw) {
     count_++;
 
     if (e.kind == Kind::Movie) {
-        p_.movieCats[catFor(p_.movieCats, movieIdx_, e.group)].items.push_back((uint32_t)p_.movies.size());
-        e.group.clear(); p_.movies.push_back(std::move(e));
+        {
+            std::string key = movieBaseKey(e.name);
+            int sc = langScoreName(e.name) + langScoreName(e.group);
+            if (!key.empty()) {
+                auto it = movieNorm_.find(key);
+                if (it != movieNorm_.end() && it->second < p_.movies.size()) {
+                    Entry &ex = p_.movies[it->second];
+                    int scEx = langScoreName(ex.name);
+                    if (sc > scEx) {
+                        // substitui pela versao mais PT
+                        std::string logo = e.logo.empty() ? ex.logo : e.logo;
+                        std::string url = e.url;
+                        std::string name = e.name;
+                        ex.name = std::move(name);
+                        ex.url = std::move(url);
+                        if (!logo.empty()) ex.logo = std::move(logo);
+                    }
+                    extinf_.clear();
+                    return;
+                }
+            }
+            uint32_t ix = (uint32_t)p_.movies.size();
+            p_.movieCats[catFor(p_.movieCats, movieIdx_, e.group)].items.push_back(ix);
+            if (!key.empty()) movieNorm_[key] = ix;
+            e.group.clear();
+            p_.movies.push_back(std::move(e));
+        }
     } else if (e.kind == Kind::Series) {
         std::string s; int se = 1, ep = 0;
         if (parseEpisode(e.name, s, se, ep)) { e.season = se; e.episode = ep; }
@@ -340,19 +400,7 @@ void PlaylistBuilder::line(std::string &raw) {
         auto &vec = p_.seriesTree[treeName][season];
         // Dedup por numero do episodio: PT + EN do mesmo ep viram 1 entrada
         if (e.episode > 0) {
-            auto score = [](const Entry &x) {
-                std::string n = x.name;
-                for (char &c : n) c = (char)tolower((unsigned char)c);
-                int s = 0;
-                if (n.find("dublado") != std::string::npos || n.find("portug") != std::string::npos ||
-                    n.find("pt-br") != std::string::npos || n.find("ptbr") != std::string::npos ||
-                    n.find("[pt]") != std::string::npos || n.find("(pt)") != std::string::npos) s += 3;
-                if (n.find("dual") != std::string::npos) s += 2;
-                if (n.find("legendado") != std::string::npos || n.find("legend") != std::string::npos) s += 1;
-                if (n.find("english") != std::string::npos || n.find("[en]") != std::string::npos ||
-                    n.find("(en)") != std::string::npos || n.find(" eng") != std::string::npos) s -= 1;
-                return s;
-            };
+            auto score = [](const Entry &x) { return langScoreName(x.name); };
             bool replaced = false;
             for (auto &ex : vec) {
                 if (ex.episode == e.episode) {
