@@ -1698,41 +1698,38 @@ struct Player {
         return true;
     }
     void managePipeline(double t) {
-        bool inactive = !sceAvPlayerIsActive(h);
+        if (!chunkMode || !h || !active || failed || g_tearing.load() > 0) return;
+        // Sem segundo AvPlayer (gapless=false): so prepara e troca no mesmo handle — bem menos CE
+        gapless = false;
+        h2 = 0;
+        bool inactive = false;
+        try { inactive = !sceAvPlayerIsActive(h); } catch (...) { inactive = true; }
         if (inactive && inactiveSince == 0) inactiveSince = t;
-        int fresh = 0; { std::lock_guard<std::mutex> l(g_feed.rm); for (auto &sg : g_feed.recent) if (sg.first > lastSeq) fresh++; }
-        // 1) comeca a preparar o proximo pedaco assim que houver 2 segmentos novos
-        if (!prepBusy.load() && !nextReady.load() && !h2 && fresh >= 2) startPrep();
-        // 2) segundo player
-        if (bState.load() == 2) {
-            h2 = bHandle; bState = 0;
-            double m = (nowSec() - openT0) * 1000.0;                  // quanto levou para abrir: ajusta quando abrir o proximo
-            if (m > 50 && m < 4000) openMs = openMs * 0.5 + m * 0.5;
-        }
-        else if (bState.load() == 3) { bState = 0; gapless = false; log.push_back("segundo player nao abriu: troca com emenda"); }
+        if (!inactive) inactiveSince = 0;
+        int fresh = 0;
+        { std::lock_guard<std::mutex> l(g_feed.rm); for (auto &sg : g_feed.recent) if (sg.first > lastSeq) fresh++; }
+        if (!prepBusy.load() && !nextReady.load() && fresh >= 2) startPrep();
         double el = chunkT0 > 0 ? t - chunkT0 : 0;
-        if (gapless && nextReady.load() && !h2 && bState.load() == 0 && chunkT0 > 0 && curDur > 0 && el >= curDur - (openMs / 1000.0 + 0.25)) openNextAsync();
-        // 3) troca
-        bool ended = inactive && t - inactiveSince > 0.03;
-        bool overdue = curDur > 0 && chunkT0 > 0 && el > curDur + 0.6;
-        bool stalled = t - lastFrameT > 3.0;
-        if (nextReady.load()) {
-            if (h2 && (ended || overdue || stalled)) switchChunk(t);
-            else if (!h2 && bState.load() == 0 && (ended || stalled)) switchChunk(t);
-        } else if ((ended || stalled) && !prepBusy.load() && fresh >= 1) startPrep();
-        // segundo player que nao entregou video depois da troca: desliga o modo sem emenda
-        if (switchedAt > 0 && chunkT0 == 0 && t - switchedAt > 2.5 && gapless) { gapless = false; log.push_back("sem quadros apos a troca: modo sem emenda desligado"); }
+        bool ended = inactive && inactiveSince > 0 && (t - inactiveSince) > 0.35;
+        bool overdue = curDur > 0 && chunkT0 > 0 && el > curDur + 0.8;
+        bool stalled = lastFrameT > 0 && (t - lastFrameT) > 3.5;
+        if (nextReady.load() && (ended || overdue || stalled)) {
+            switchChunk(t);
+        } else if ((ended || stalled) && !prepBusy.load() && fresh >= 1) {
+            startPrep();
+        }
     }
     // Desmonta TUDO em segundo plano: o botao O volta ao menu na hora (antes travava ate a rede responder).
     void stop() {
         KAvHandle hh = h, hh2 = h2;
         h = 0; h2 = 0; active = false; chunkMode = false;
+        try { audio.retarget(0); } catch (...) {}
         g_feed.abort();                                      // acorda leituras bloqueadas
         abortHf();
         abortPf();
         g_tearing++;
         std::thread([this, hh, hh2] {
-            audio.stop();
+            try { audio.stop(); } catch (...) {}
             if (openTh.joinable()) openTh.join();
             KAvHandle hb = bState.load() == 2 ? bHandle : 0;
             bState = 0;
@@ -1758,6 +1755,7 @@ struct Player {
     }
     // chama a cada iteracao; retorna true se desenhou um quadro novo
     bool poll(FbRenderer &r) {
+        if (paused || !active || failed || !h || g_tearing.load() > 0) return false;
         KAvFrameInfo fi; memset(&fi, 0, sizeof fi);
         bool drew = false;
 
@@ -1957,7 +1955,7 @@ struct Player {
         // Filme que abriu mas nao entrega nenhum audio apos ~4 s: tenta outra faixa (idioma) em vez de ficar mudo
         if (isVod && active && !paused && !failed && drew && vodAudioExpected && !vodPath.empty() && langTry < 3 &&
             audio.state.load() == 1 && audio.chunks.load() == 0 && t - t0 > 4.0) retryAudioLang();
-        if (chunkMode && h && !failed) managePipeline(t);
+        if (chunkMode && h && !failed && active && g_tearing.load() == 0) managePipeline(t);
         if (t - lastFps >= 1.0) { fps = fpsFrames / (t - lastFps); fpsFrames = 0; lastFps = t; worstShown = worstGap; worstGap = 0; }
         return drew;
     }
@@ -2637,6 +2635,39 @@ int main() {
         rtT[rtI++ % 12] = tn; return true;
     };
 
+
+    // Reinicia live com seguranca (troca de qualidade / reconexao).
+    // Nunca chama stop() no meio do poll sem pausar audio e abortar o feeder antes —
+    // isso era a causa do CE ao apertar △/OPTIONS na Kick.
+    auto safeRestartLive = [&](const std::string &why) {
+        if (player.url.empty()) return;
+        trace(std::string("safe-restart:") + why);
+        player.quietWait = true;
+        player.showOpts = false;
+        player.showInfo = false;
+        player.scrubMode = false;
+        player.seekSkip = false;
+        // 1) para de puxar A/V na thread do player
+        player.paused = true;
+        player.audio.muted = true;
+        try { player.audio.retarget(0); } catch (...) {}
+        // 2) acorda o feeder bloqueado
+        try { g_feed.abort(); } catch (...) {}
+        sceKernelUsleep(40000);
+        std::string u = player.url, ti = player.title;
+        // 3) desmonta AvPlayer em background
+        try { player.stop(); } catch (...) {}
+        // 4) espera um pouco o teardown + limpa buffer HLS
+        Player::waitTeardown(0.5);
+        try { g_feed.join(); } catch (...) {}
+        try { g_feed.sb.reset(); } catch (...) {}
+        pf.pendingPlayUrl = u;
+        pf.pendingPlayTitle = ti;
+        mode = Mode::Menu;
+        dirty = true;
+    };
+
+
     // A memoria de video e "write-combined": ESCREVER e rapido, mas LER e lentissimo. O desenho novo (transparencia,
     // texto suave) le pixels, entao desenhamos tudo numa tela de rascunho na RAM normal e so copiamos para o video.
     // O rascunho fica em memoria "cacheada" do sistema (tipo 0), fora do heap do libc.
@@ -2848,13 +2879,9 @@ int main() {
             if (mode == Mode::Play) {
                 if (!player.isVod && !player.url.empty()) {
                     g_quality = (g_quality.load() + 1) % 3;
-                    app.say(std::string("Qualidade: ") + kQualityName[g_quality.load()]);
-                    pf.pendingPlayUrl = player.url;
-                    pf.pendingPlayTitle = player.title;
-                    player.quietWait = true;
-                    player.stop();
-                    mode = Mode::Menu;
-                    dirty = true;
+                    app.say(std::string("Qualidade: ") + kQualityName[g_quality.load() % 3]);
+                    safeRestartLive("options-quality");
+                    sceKernelUsleep(30000);
                     continue;
                 } else {
                     // VOD: alterna HUD
@@ -2957,9 +2984,10 @@ int main() {
                     if (player.optCur == 0) {
                         if (!player.isVod && !player.url.empty()) {
                             g_quality = (g_quality.load() + 1) % 3;
-                            pf.pendingPlayUrl = player.url; pf.pendingPlayTitle = player.title;
-                            player.quietWait = true; player.showOpts = false;
-                            player.stop(); mode = Mode::Menu; dirty = true; sceKernelUsleep(8000); continue;
+                            app.say(std::string("Qualidade: ") + kQualityName[g_quality.load() % 3]);
+                            safeRestartLive("opts-quality");
+                            sceKernelUsleep(30000);
+                            continue;
                         } else g_quality = (g_quality.load() + 1) % 3;
                     } else if (player.optCur == 1) {
                         player.aspectMode = (player.aspectMode + 1) % 3;
@@ -3114,28 +3142,18 @@ int main() {
             if (!player.isVod && player.active && !player.failed && !player.paused) {
                 std::string why;
                 if (player.wantReconnect(why)) {
-                    if (!allowAuto()) {
-                        app.say("Live travou demais. Aperte X ou mude a qualidade (OPTIONS).");
-                        // ainda tenta UMA vez depois do limite
-                    }
+                    if (!allowAuto())
+                        app.say("Live instavel — reconectando...");
                     g_autoRestarts++;
                     g_reconnectNote = why;
-                    trace("live-reconnect");
-                    pf.pendingPlayUrl = player.url;
-                    pf.pendingPlayTitle = player.title;
-                    player.quietWait = true;
-                    try { player.stop(); } catch (...) {}
-                    // limpa feeder para nao reaproveitar buffer morto
-                    try { g_feed.join(); g_feed.sb.reset(); } catch (...) {}
-                    mode = Mode::Menu;
-                    dirty = true;
-                    sceKernelUsleep(80000);
+                    safeRestartLive(why);
+                    sceKernelUsleep(50000);
                     continue;
                 }
             }
 
             // ---- Desenho ----
-            if (player.active && !player.failed) {
+            if (player.active && !player.failed && g_tearing.load() == 0) {
                 bool hud = player.hudActive();
                 FbRenderer r(hud ? shadow : (uint32_t *)bufs[back], W, H);
                 if (player.paused) {
