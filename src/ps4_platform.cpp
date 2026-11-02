@@ -1224,7 +1224,9 @@ struct Player {
     bool failed = false, useFeed = false;
     unsigned lastFeedSegs = 0;
     double lastFeedSegWall = 0;
-    std::string kickSlug;   // live Kick: renova playback_url na API ao reconectar
+    std::string kickSlug;
+    std::string nextKickUrl;
+    double kickUrlAt = 0;
 
     std::vector<std::string> log;
     int frames = 0, strideMode = 0;
@@ -1386,7 +1388,7 @@ struct Player {
         if (!g_reconnectNote.empty()) { log.push_back("Reconexao automatica #" + std::to_string(g_autoRestarts) + ": " + g_reconnectNote); g_reconnectNote.clear(); }
         this->title = title; this->url = url; hudUntil = nowSec() + 8;
         // titulo "@slug" = live Kick: guarda slug para renovar o m3u8 na reconexao
-        kickSlug.clear();
+        kickSlug.clear(); nextKickUrl.clear(); kickUrlAt = nowSec();
         if (!title.empty() && title[0] == '@') {
             kickSlug = title.substr(1);
             while (!kickSlug.empty() && (kickSlug.back()==' '||kickSlug.back()=='\n')) kickSlug.pop_back();
@@ -1429,12 +1431,17 @@ struct Player {
         for (size_t ti = 0; ti < tries.size(); ti++) {
             g_feed.join(); g_feed.opens = g_feed.reads = g_feed.segs = 0; g_feedSize = 1ULL << 40;
             if (tries.size() > 1) log.push_back(std::string("Canal ao vivo: tentando ") + (tries[ti].second ? "fluxo MPEG-TS direto" : "HLS (.m3u8)"));
-            g_feed.start(tries[ti].first, tries[ti].second);        // sem outFile: segmentos vao para o buffer (callbacks) e para 'recent' (arquivos)
-            const int maxWait = (tries[ti].second && ti + 1 < tries.size()) ? 160 : 400;     // TS direto com plano B: 8 s; senao 20 s
-            for (int i = 0; i < maxWait && g_feed.segs.load() < 1 && !g_feed.failed.load(); i++) {      // comeca no 1o pedaco (antes esperava 2)
+            g_feed.start(tries[ti].first, tries[ti].second);
+            const bool isKick = !kickSlug.empty();
+            const int needSegs = isKick ? 3 : (tries[ti].second ? 1 : 2);
+            const int maxWait = (tries[ti].second && ti + 1 < tries.size()) ? 160 : (isKick ? 500 : 400);
+            for (int i = 0; i < maxWait && (int)g_feed.segs.load() < needSegs && !g_feed.failed.load(); i++) {
                 sceKernelUsleep(50000);
                 if (cancelCb && cancelCb()) { cancelled = true; break; }
-                if (i % 2 == 0) presentCb();                    // a animacao de "Conectando..." continua rodando
+                if (i % 2 == 0) {
+                    waitNote = "Pre-buffer " + std::to_string(g_feed.segs.load()) + "/" + std::to_string(needSegs) + " segmentos...";
+                    presentCb();
+                }
             }
             if (cancelled) { failed = true; stop(); return false; }
             log.push_back(std::string(tries[ti].second ? "MPEG-TS" : "HLS") + ": pedacos baixados=" + std::to_string(g_feed.segs.load()) + "  " + g_feed.getStatus());
@@ -2667,12 +2674,18 @@ int main() {
         Player::waitTeardown(0.6);
         try { g_feed.join(); } catch (...) {}
         try { g_feed.sb.reset(); } catch (...) {}
-        // Kick: NAO reusa o m3u8 antigo (expira). Pede playback_url novo na API.
         if (!slug.empty()) {
-            pf.pendingKickSlug = slug;
-            pf.pendingPlayUrl.clear();
             pf.pendingPlayTitle = "@" + slug;
-            app.say("Reconectando @" + slug + "...");
+            if (!player.nextKickUrl.empty()) {
+                pf.pendingPlayUrl = player.nextKickUrl;
+                player.nextKickUrl.clear();
+                pf.pendingKickSlug.clear();
+                app.say("Reconectando @" + slug + " (link novo)...");
+            } else {
+                pf.pendingKickSlug = slug;
+                pf.pendingPlayUrl.clear();
+                app.say("Reconectando @" + slug + "...");
+            }
         } else {
             pf.pendingPlayUrl = u;
             pf.pendingPlayTitle = ti;
@@ -3153,6 +3166,27 @@ int main() {
 
 
             // ---- Live (Kick/IPTV): reconecta sozinho se congelar ----
+            if (!player.isVod && player.active && !player.failed && !player.paused
+                && !player.kickSlug.empty() && player.frames > 120) {
+                double tn = nowSec();
+                if (player.kickUrlAt < 1.0) player.kickUrlAt = tn;
+                if (tn - player.kickUrlAt >= 210.0) {
+                    player.kickUrlAt = tn;
+                    std::string err, hls = app.resolveKickHls(player.kickSlug, &err);
+                    if (!hls.empty()) {
+                        player.nextKickUrl = hls;
+                        trace("kick-url-refreshed");
+                        bool weak = g_feed.failed.load()
+                            || (player.lastFeedSegWall > 1.0 && tn - player.lastFeedSegWall > 6.0);
+                        if (weak) {
+                            g_reconnectNote = "renovacao do link Kick";
+                            safeRestartLive("kick-url-proactive");
+                            sceKernelUsleep(40000);
+                            continue;
+                        }
+                    }
+                }
+            }
             if (!player.isVod && player.active && !player.failed && !player.paused) {
                 std::string why;
                 if (player.wantReconnect(why)) {
