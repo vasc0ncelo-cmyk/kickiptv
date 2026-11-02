@@ -2641,7 +2641,7 @@ int main() {
     // isso era a causa do CE ao apertar △/OPTIONS na Kick.
     auto safeRestartLive = [&](const std::string &why) {
         if (player.url.empty()) return;
-        trace(std::string("safe-restart:") + why);
+        trace((std::string("safe-restart:") + why).c_str());
         player.quietWait = true;
         player.showOpts = false;
         player.showInfo = false;
