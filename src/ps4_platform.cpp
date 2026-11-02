@@ -1068,46 +1068,84 @@ struct HlsFeeder {
             variantFps = (int)(v[i].fps + 0.5); variantH = v[i].height;
         }
         unsigned long long next = 0; bool first = true; int errs = 0;
+        int segsSinceSess = 0;
+        double lastSegWall = nowSecF();
         while (run) {
-            if (!g_net.getKA(sess, mediaUrl, body, st) || st < 200 || st >= 300) {
-                if (++errs > 15) { fail("playlist de midia HTTP " + std::to_string(st)); return; }
-                setStatus("playlist: tentando de novo (" + std::to_string(st) + ")");
-                sleepMs(500, run); continue;
+            // CDN Kick: conexao keep-alive costuma morrer ~alguns minutos — renova
+            if (segsSinceSess >= 30 || (errs > 0 && segsSinceSess >= 3)) {
+                g_net.closeSession(sess);
+                segsSinceSess = 0;
+                setStatus("renovando conexao...");
             }
-            errs = 0;
+            if (!first && nowSecF() - lastSegWall > 12.0) {
+                g_net.closeSession(sess);
+                first = true;
+                lastSegWall = nowSecF();
+                setStatus("live sem segmento: ressincronizando");
+            }
+            if (!g_net.getKA(sess, mediaUrl, body, st) || st < 200 || st >= 300) {
+                g_net.closeSession(sess);
+                if (++errs > 40) { fail("playlist de midia HTTP " + std::to_string(st)); return; }
+                setStatus("playlist: tentando de novo (" + std::to_string(st) + ")");
+                sleepMs(400, run); continue;
+            }
             HlsMedia md = hlsParseMedia(body);
             if (md.hasMap) { fail("fMP4 (EXT-X-MAP) ainda nao suportado"); return; }
-            if (md.segs.empty()) { sleepMs(1000, run); continue; }
-            if (first) { size_t k = md.segs.size() > 4 ? md.segs.size() - 4 : 0; next = md.segs[k].seq; first = false; }  // 4 segs atras = buffer anti-travamento
-            else if (md.segs.back().seq + 1 < next) {            // a numeracao da playlist voltou atras (live reiniciou): ressincroniza nos 3 mais novos
-                size_t k = md.segs.size() > 3 ? md.segs.size() - 3 : 0; next = md.segs[k].seq;
+            if (md.segs.empty()) { sleepMs(800, run); continue; }
+            if (first) {
+                size_t k = md.segs.size() > 3 ? md.segs.size() - 3 : 0;
+                next = md.segs[k].seq; first = false;
+            } else if (md.segs.back().seq + 1 < next) {
+                size_t k = md.segs.size() > 2 ? md.segs.size() - 2 : 0;
+                next = md.segs[k].seq;
+                sb.reset();
                 setStatus("playlist reiniciou: ressincronizando");
+            } else if (next + 6 < md.segs.front().seq) {
+                size_t k = md.segs.size() > 2 ? md.segs.size() - 2 : 0;
+                next = md.segs[k].seq;
+                sb.reset();
+                setStatus("adiantando para a borda ao vivo");
+            } else if (next > md.segs.back().seq + 2) {
+                size_t k = md.segs.size() > 2 ? md.segs.size() - 2 : 0;
+                next = md.segs[k].seq;
             }
             bool got = false;
+            int downloaded = 0;
             for (auto &sg : md.segs) {
                 if (!run) break;
                 if (sg.seq < next) continue;
+                if (downloaded >= 4) break;
                 std::string seg; int ss = 0;
                 double d0 = nowSecF();
                 if (!g_net.getKA(sess, hlsResolve(mediaUrl, sg.uri), seg, ss, 12u << 20) || ss < 200 || ss >= 300 || seg.empty()) {
-                    if (++errs > 12) { fail("segmento HTTP " + std::to_string(ss)); return; }
-                    setStatus("segmento falhou, tentando de novo...");
-                    sleepMs(400, run);
+                    g_net.closeSession(sess);
+                    if (++errs > 25) { fail("segmento HTTP " + std::to_string(ss)); return; }
+                    setStatus("segmento falhou, renovando...");
+                    sleepMs(350, run);
                     break;
                 }
                 errs = 0;
+                segsSinceSess++;
+                lastSegWall = nowSecF();
                 if (outFile) {
                     fwrite(seg.data(), 1, seg.size(), outFile); fflush(outFile); outBytes += seg.size();
                     if (outBytes > 1200000000ULL) { fail("limite de gravacao (1,2 GB) atingido"); return; }
                 } else if (!discardBuf.load()) sb.append((const uint8_t *)seg.data(), seg.size());
                 { double dm = (nowSecF() - d0) * 1000.0; dlMs = dm; if (dm > dlMsMax.load()) dlMsMax = dm; }
                 lastSegDur = sg.dur;
-                { std::lock_guard<std::mutex> l(rm); recent.push_back({++localId, seg}); while (recent.size() > 8) recent.pop_front(); }
-                next = sg.seq + 1; segs++; got = true;
+                { std::lock_guard<std::mutex> l(rm); recent.push_back({++localId, seg}); while (recent.size() > 6) recent.pop_front(); }
+                next = sg.seq + 1; segs++; got = true; downloaded++;
                 setStatus("ao vivo: segmento " + std::to_string(sg.seq) + " (" + std::to_string(seg.size() / 1024) + " KB)");
             }
             if (md.endList && !got) { setStatus("fim da transmissao"); streamEnded = true; return; }
-            if (!got) { int ms = (int)(md.target * 500); sleepMs(ms < 300 ? 300 : (ms > 1500 ? 1500 : ms), run); }
+            if (!got) {
+                int ms = (int)(md.target > 0.5 ? md.target * 400 : 800);
+                if (ms < 400) ms = 400;
+                if (ms > 2000) ms = 2000;
+                sleepMs(ms, run);
+            } else if (downloaded >= 4) {
+                sleepMs(100, run);
+            }
         }
     }
 };
@@ -1182,6 +1220,9 @@ struct Player {
     AudioPump audio;
     int addRc = 0;
     bool failed = false, useFeed = false;
+    unsigned lastFeedSegs = 0;
+    double lastFeedSegWall = 0;
+
     std::vector<std::string> log;
     int frames = 0, strideMode = 0;
     unsigned vw = 0, vh = 0;
@@ -1354,7 +1395,7 @@ struct Player {
         log.push_back("modulo AvPlayer (0xA5): " + hx8(sceSysmoduleLoadModule(0x00A5)));
         log.push_back("modulo AvPlayerStreaming: " + hx8(sceSysmoduleLoadModuleInternal(0x80000050)));
         bool isHls = url.find(".m3u8") != std::string::npos;
-        useFeed = false;
+        useFeed = false; lastFeedSegs = 0; lastFeedSegWall = 0;
         // Filmes/series: URL com extensao (.mp4...) OU caminho /movie/ /series/ do painel (muitas vezes SEM extensao).
         // Se cair no pipeline de "ao vivo" (MPEG-TS), o PS4 fecha com CE-34878-0.
         if (!isHls && urlIsVod(url)) {
@@ -1947,13 +1988,25 @@ struct Player {
         if (!useFeed || !active || paused || isVod) return false;
         double t = nowSec();
         double still = lastFrameT > 0 ? t - lastFrameT : (t0 > 0 ? t - t0 : 0);
+        // progresso dos segmentos HLS
+        unsigned sg = (unsigned)g_feed.segs.load();
+        if (sg > lastFeedSegs) { lastFeedSegs = sg; lastFeedSegWall = t; }
+        if (lastFeedSegWall < 1.0) lastFeedSegWall = t0 > 0 ? t0 : t;
         if (failed) { why = "falha no player (" + hx8(addRc) + ")"; return true; }
         if (g_feed.streamEnded.load()) return false;
-        if (g_feed.failed.load() && still > 1.5) { why = "rede: " + g_feed.getStatus(); return true; }
-        // 4.5 s sem quadro = congelou (antes 10 s: usuario via travado por muito tempo)
-        if (still > 4.5 && frames > 0) { why = "imagem parada ha " + std::to_string((int)still) + " s"; return true; }
-        // abriu mas nunca desenhou em 12 s
-        if (frames == 0 && t - t0 > 12.0) { why = "sem imagem apos abrir"; return true; }
+        if (g_feed.failed.load() && still > 1.2) { why = "rede: " + g_feed.getStatus(); return true; }
+        // buffer dessincronizado (player leu posicao ja descartada)
+        if (g_feed.sb.underruns.load() > 8 && frames > 30) {
+            why = "buffer dessincronizado"; return true;
+        }
+        // feeder vivo mas sem segmento novo ha 10s e imagem andando → vai travar
+        if (frames > 60 && (t - lastFeedSegWall) > 10.0) {
+            why = "sem segmentos novos ha " + std::to_string((int)(t - lastFeedSegWall)) + " s";
+            return true;
+        }
+        // 3.2 s sem quadro = congelou
+        if (still > 3.2 && frames > 0) { why = "imagem parada ha " + std::to_string((int)still) + " s"; return true; }
+        if (frames == 0 && t - t0 > 10.0) { why = "sem imagem apos abrir"; return true; }
         return false;
     }
     bool feedProblem() const { return useFeed && (g_feed.failed.load() || g_feed.streamEnded.load()); }
@@ -2575,13 +2628,13 @@ int main() {
         trace("lista-bg-inicio");
     };
 
-    // Reconexao automatica: no maximo 5 tentativas em 2 minutos (depois desiste e avisa, para nao ficar em loop se a live acabou)
-    double rtT[5] = {0, 0, 0, 0, 0}; int rtI = 0; bool autoMode = false;
+    // Reconexao automatica: ate 12 tentativas em 3 minutos (Kick pode precisar renovar varias vezes)
+    double rtT[12] = {}; int rtI = 0; bool autoMode = false;
     auto allowAuto = [&]() -> bool {
         double tn = nowSec(); int n = 0;
-        for (double x : rtT) if (x > 0 && tn - x < 120.0) n++;
-        if (n >= 5) { for (double &x : rtT) x = 0; return false; }
-        rtT[rtI++ % 5] = tn; return true;
+        for (double x : rtT) if (x > 0 && tn - x < 180.0) n++;
+        if (n >= 12) return false;
+        rtT[rtI++ % 12] = tn; return true;
     };
 
     // A memoria de video e "write-combined": ESCREVER e rapido, mas LER e lentissimo. O desenho novo (transparencia,
@@ -3061,16 +3114,22 @@ int main() {
             if (!player.isVod && player.active && !player.failed && !player.paused) {
                 std::string why;
                 if (player.wantReconnect(why)) {
+                    if (!allowAuto()) {
+                        app.say("Live travou demais. Aperte X ou mude a qualidade (OPTIONS).");
+                        // ainda tenta UMA vez depois do limite
+                    }
                     g_autoRestarts++;
                     g_reconnectNote = why;
                     trace("live-reconnect");
                     pf.pendingPlayUrl = player.url;
                     pf.pendingPlayTitle = player.title;
                     player.quietWait = true;
-                    player.stop();
+                    try { player.stop(); } catch (...) {}
+                    // limpa feeder para nao reaproveitar buffer morto
+                    try { g_feed.join(); g_feed.sb.reset(); } catch (...) {}
                     mode = Mode::Menu;
                     dirty = true;
-                    sceKernelUsleep(50000);
+                    sceKernelUsleep(80000);
                     continue;
                 }
             }
