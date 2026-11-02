@@ -14,7 +14,7 @@
 #endif
 
 enum class Input { Up, Down, Left, Right, PrevTab, NextTab, Confirm, Back, PageUp, PageDown, Extra };   // Extra = triangulo: buscar (lupa)
-enum class Screen { Home, Kick, List, Help };
+enum class Screen { Home, Kick, List, Help, Detail };
 
 struct Renderer {
     virtual ~Renderer() {}
@@ -387,6 +387,13 @@ struct UI {
     int textKind = 0;         // 0 nada, 1 = @streamer, 2 = endereco M3U, 3 = busca
     std::string searchQ;
     std::vector<uint32_t> searchHits;
+    // Pagina de detalhes (filme / serie)
+    bool detailSeries = false;
+    std::string detailTitle, detailLogo, detailUrl, detailGroup;
+    int detailSeasonIdx = 0;
+    int detailFocus = 0;       // 0 Assistir, 1 temporadas, 2 episodios
+    int detailEpCur = 0;
+    std::vector<int> detailSeasons;
     static const int kRows = 10;
     static const int ImgW = 148, ImgH = 222;       // tamanho do poster (igual ao da miniatura em imgcache.hpp)
     static const int kCols = 8, kGridRows = 3;     // grade de posters (Filmes, Series, Canais)
