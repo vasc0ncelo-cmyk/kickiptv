@@ -1339,9 +1339,9 @@ private:
     void renderDetail(Renderer &r) {
         const Playlist &p = app.list;
         // fundo
-        r.fillRect(0, 0, r.W, r.H, 0xFF0A0A0Eu);
+        r.fillRect(0, 0, r.width(), r.height(), 0xFF0A0A0Eu);
         // barra topo
-        r.fillRect(0, 0, r.W, 72, 0xFF0C0C10u);
+        r.fillRect(0, 0, r.width(), 72, 0xFF0C0C10u);
         uiHeavy(r, 48, 22, "KICK IPTV", 0xFF53FC18u, 28);
         uiText(r, 48, 90, detailSeries ? "Series" : "Filmes", 0xFF888899u, 18);
         uiText(r, 130, 90, "|  " + uiFit(r, detailTitle, 20, 800), 0xFFCCCCDDu, 20);
@@ -1372,7 +1372,7 @@ private:
 
         // titulo + botao
         int tx = px + pw + 40;
-        uiHeavy(r, tx, 140, uiFit(r, detailTitle, 36, r.W - tx - 60), 0xFFFFFFFFu, 36);
+        uiHeavy(r, tx, 140, uiFit(r, detailTitle, 36, r.width() - tx - 60), 0xFFFFFFFFu, 36);
         // tags
         int tagY = 200;
         uiText(r, tx, tagY, detailSeries ? "Serie" : "Filme", 0xFF53FC18u, 18);
@@ -1387,7 +1387,7 @@ private:
 
         if (!detailSeries) {
             uiText(r, tx, 340, detailUrl.empty() ? "Sem link de video nesta lista" : "Pronto para reproduzir", 0xFFAAAAAAu, 18);
-            uiText(r, 48, r.H - 40, "O Voltar   X Assistir", 0xFF888899u, 16);
+            uiText(r, 48, r.height() - 40, "O Voltar   X Assistir", 0xFF888899u, 16);
             return;
         }
 
@@ -1423,12 +1423,12 @@ private:
             int row = i - start;
             int ry = ey + row * 44;
             bool sel = (i == detailEpCur && detailFocus == 2);
-            if (sel) r.roundRect(tx, ry - 4, r.W - tx - 60, 40, 8, 0xFF142014u);
+            if (sel) r.roundRect(tx, ry - 4, r.width() - tx - 60, 40, 8, 0xFF142014u);
             std::string lab = eps[i].episode ? (std::to_string(eps[i].episode) + ". " + eps[i].name) : eps[i].name;
-            uiText(r, tx + 12, ry + 8, uiFit(r, lab, 20, r.W - tx - 100), sel ? 0xFF53FC18u : 0xFFDDDDDDu, 20);
+            uiText(r, tx + 12, ry + 8, uiFit(r, lab, 20, r.width() - tx - 100), sel ? 0xFF53FC18u : 0xFFDDDDDDu, 20);
         }
         if (eps.empty()) uiText(r, tx, ey, "Nenhum episodio nesta temporada", 0xFFFF8888u, 18);
-        uiText(r, 48, r.H - 40, "O Voltar   D-pad navegar   X Assistir / abrir", 0xFF888899u, 16);
+        uiText(r, 48, r.height() - 40, "O Voltar   D-pad navegar   X Assistir / abrir", 0xFF888899u, 16);
     }
 
     void confirm(int n) {
