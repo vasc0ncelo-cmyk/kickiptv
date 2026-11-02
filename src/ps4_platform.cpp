@@ -1224,6 +1224,7 @@ struct Player {
     bool failed = false, useFeed = false;
     unsigned lastFeedSegs = 0;
     double lastFeedSegWall = 0;
+    std::string kickSlug;   // live Kick: renova playback_url na API ao reconectar
 
     std::vector<std::string> log;
     int frames = 0, strideMode = 0;
