@@ -1337,78 +1337,77 @@ private:
         }
     }
     void renderDetail(Renderer &r) {
+        const int W = r.width(), H = r.height();
         const Playlist &p = app.list;
-        // fundo
-        r.fillRect(0, 0, r.width(), r.height(), 0xFF0A0A0Eu);
-        // barra topo
-        r.fillRect(0, 0, r.width(), 72, 0xFF0C0C10u);
-        uiHeavy(r, 48, 22, "KICK IPTV", 0xFF53FC18u, 28);
-        uiText(r, 48, 90, detailSeries ? "Series" : "Filmes", 0xFF888899u, 18);
-        uiText(r, 130, 90, "|  " + uiFit(r, detailTitle, 20, 800), 0xFFCCCCDDu, 20);
+        // fundo escuro
+        r.fillRect(0, 0, W, H, 0xFF08080Cu);
+        // faixa verde no topo (estilo Kick)
+        r.fillRect(0, 0, W, 6, 0xFF53FC18u);
+        r.fillRect(0, 6, W, 70, 0xFF0C0C12u);
+        uiHeavy(r, 48, 24, "KICK IPTV", 0xFF53FC18u, 28);
+        uiText(r, 48, 88, detailSeries ? "Series" : "Filmes", 0xFF6A6A78u, 18);
+        uiText(r, 140, 88, uiFit(r, detailTitle, 20, W - 200), 0xFFE8E8F0u, 20);
 
-        // poster
-        int px = 48, py = 130, pw = 280, ph = 400;
-        r.roundRect(px - 2, py - 2, pw + 4, ph + 4, 12, 0xFF53FC18u);
-        r.roundRect(px, py, pw, ph, 10, 0xFF1A1A22u);
+        // poster grande
+        int px = 56, py = 130, pw = 300, ph = 450;
+        r.roundRect(px - 3, py - 3, pw + 6, ph + 6, 14, 0xFF53FC18u);
+        r.roundRect(px, py, pw, ph, 12, 0xFF14141Cu);
         bool drewCover = false;
-        if (!detailLogo.empty() && coverGet) {
-            const uint32_t *pxl = nullptr; int cw = 0, ch = 0;
-            if (coverGet(detailLogo, pxl, cw, ch) && pxl && cw > 0 && ch > 0) {
-                // scale nearest into poster box
-                for (int y = 0; y < ph; y++) {
-                    int sy = y * ch / ph;
-                    for (int x = 0; x < pw; x++) {
-                        int sx = x * cw / pw;
-                        r.pixel(px + x, py + y, pxl[sy * cw + sx]);
-                    }
+        if (!detailLogo.empty()) {
+            if (coverRequest) coverRequest(detailLogo);
+            if (coverGet) {
+                const uint32_t *pxl = nullptr; int cw = 0, ch = 0;
+                if (coverGet(detailLogo, pxl, cw, ch) && pxl && cw > 0 && ch > 0) {
+                    r.blitImage(px, py, pw, ph, pxl, cw, ch);
+                    drewCover = true;
                 }
-                drewCover = true;
-            } else if (coverRequest) coverRequest(detailLogo);
+            }
         }
         if (!drewCover) {
-            uiCenter(r, px + pw / 2, py + ph / 2 - 10, detailSeries ? "SERIE" : "FILME", 0xFF53FC18u, 22);
-            uiCenter(r, px + pw / 2, py + ph / 2 + 20, uiFit(r, detailTitle, 16, pw - 20), 0xFFAAAAAAu, 16);
+            uiCenter(r, px + pw / 2, py + ph / 2 - 16, detailSeries ? "SERIE" : "FILME", 0xFF53FC18u, 24);
+            uiCenter(r, px + pw / 2, py + ph / 2 + 20, uiFit(r, detailTitle, 18, pw - 24), 0xFF9A9AAAu, 18);
         }
 
-        // titulo + botao
-        int tx = px + pw + 40;
-        uiHeavy(r, tx, 140, uiFit(r, detailTitle, 36, r.width() - tx - 60), 0xFFFFFFFFu, 36);
-        // tags
+        int tx = px + pw + 48;
+        uiHeavy(r, tx, 140, uiFit(r, detailTitle, 40, W - tx - 48), 0xFFFFFFFFu, 40);
         int tagY = 200;
-        uiText(r, tx, tagY, detailSeries ? "Serie" : "Filme", 0xFF53FC18u, 18);
-        if (detailSeries && !detailSeasons.empty())
-            uiText(r, tx + 100, tagY, std::to_string(detailSeasons.size()) + " temporadas", 0xFFAAAAAAu, 18);
+        r.roundRect(tx, tagY, 90, 28, 8, 0xFF1A3A1Au);
+        uiText(r, tx + 14, tagY + 5, detailSeries ? "Serie" : "Filme", 0xFF53FC18u, 16);
+        if (detailSeries && !detailSeasons.empty()) {
+            r.roundRect(tx + 100, tagY, 160, 28, 8, 0xFF1A1A22u);
+            uiText(r, tx + 112, tagY + 5, std::to_string(detailSeasons.size()) + " temporadas", 0xFFCCCCDDu, 16);
+        }
 
-        // Assistir Agora
         bool focusWatch = (detailFocus == 0);
-        uint32_t btn = focusWatch ? 0xFF53FC18u : 0xFF1A2A1Au;
-        r.roundRect(tx, 250, 320, 56, 14, btn);
-        uiHeavy(r, tx + 40, 265, "  ASSISTIR AGORA", focusWatch ? 0xFF111111u : 0xFF53FC18u, 24);
+        r.roundRect(tx, 250, 340, 60, 16, focusWatch ? 0xFF53FC18u : 0xFF162216u);
+        uiHeavy(r, tx + 48, 266, "  ASSISTIR AGORA", focusWatch ? 0xFF0A0A0Eu : 0xFF53FC18u, 26);
 
         if (!detailSeries) {
-            uiText(r, tx, 340, detailUrl.empty() ? "Sem link de video nesta lista" : "Pronto para reproduzir", 0xFFAAAAAAu, 18);
-            uiText(r, 48, r.height() - 40, "O Voltar   X Assistir", 0xFF888899u, 16);
+            uiText(r, tx, 340, detailUrl.empty() ? "Sem link de video nesta lista" : "Toque em X para comecar", 0xFF9A9AAAu, 20);
+            uiText(r, 48, H - 36, "O Voltar    X Assistir", 0xFF6A6A78u, 16);
             return;
         }
 
-        // Temporadas
         int sy = 340;
-        uiText(r, tx, sy, "Temporadas", 0xFF888899u, 16);
-        sy += 28;
+        uiText(r, tx, sy, "Temporadas", 0xFF6A6A78u, 16);
+        sy += 30;
         int nSea = (int)detailSeasons.size();
-        for (int i = 0; i < nSea && i < 8; i++) {
-            int bx = tx + i * 150;
+        int maxSeaShow = 8;
+        int seaStart = 0;
+        if (detailSeasonIdx >= maxSeaShow) seaStart = detailSeasonIdx - maxSeaShow + 1;
+        for (int j = 0; j < maxSeaShow && seaStart + j < nSea; j++) {
+            int i = seaStart + j;
+            int bx = tx + j * 148;
             bool sel = (i == detailSeasonIdx);
             bool foc = (detailFocus == 1 && sel);
-            r.roundRect(bx, sy, 140, 48, 10, foc ? 0xFF53FC18u : (sel ? 0xFF1A3A1Au : 0xFF1A1A22u));
+            r.roundRect(bx, sy, 138, 46, 12, foc ? 0xFF53FC18u : (sel ? 0xFF1A3A1Au : 0xFF16161Eu));
             std::string lab = "Temp. " + std::to_string(detailSeasons[i] < 1 ? 1 : detailSeasons[i]);
-            uiText(r, bx + 16, sy + 14, lab, foc ? 0xFF111111u : 0xFFFFFFFFu, 18);
+            uiText(r, bx + 18, sy + 12, lab, foc ? 0xFF0A0A0Eu : 0xFFFFFFFFu, 18);
         }
 
-        // Episodios
         int ey = sy + 70;
-        uiText(r, tx, ey, "Episodios", 0xFF888899u, 16);
-        ey += 30;
+        uiText(r, tx, ey, "Episodios", 0xFF6A6A78u, 16);
+        ey += 28;
         int sn = nSea > 0 ? detailSeasons[detailSeasonIdx < nSea ? detailSeasonIdx : 0] : 1;
         curSeason = sn;
         std::vector<Entry> eps;
@@ -1417,18 +1416,22 @@ private:
             auto it = sit->second.find(sn);
             if (it != sit->second.end()) eps = sortedEps(it->second);
         }
-        int maxShow = 8;
-        int start = std::max(0, detailEpCur - 3);
-        for (int i = start; i < (int)eps.size() && i < start + maxShow; i++) {
-            int row = i - start;
-            int ry = ey + row * 44;
+        int maxShow = 9;
+        int startEp = std::max(0, detailEpCur - 4);
+        for (int i = startEp; i < (int)eps.size() && i < startEp + maxShow; i++) {
+            int row = i - startEp;
+            int ry = ey + row * 42;
             bool sel = (i == detailEpCur && detailFocus == 2);
-            if (sel) r.roundRect(tx, ry - 4, r.width() - tx - 60, 40, 8, 0xFF142014u);
-            std::string lab = eps[i].episode ? (std::to_string(eps[i].episode) + ". " + eps[i].name) : eps[i].name;
-            uiText(r, tx + 12, ry + 8, uiFit(r, lab, 20, r.width() - tx - 100), sel ? 0xFF53FC18u : 0xFFDDDDDDu, 20);
+            if (sel) r.roundRect(tx, ry - 4, W - tx - 56, 38, 10, 0xFF142814u);
+            std::string lab = eps[i].episode
+                ? (std::to_string(eps[i].episode) + ". " + eps[i].name)
+                : eps[i].name;
+            uiText(r, tx + 14, ry + 6, uiFit(r, lab, 20, W - tx - 90),
+                   sel ? 0xFF53FC18u : 0xFFDDDDDDu, 20);
         }
-        if (eps.empty()) uiText(r, tx, ey, "Nenhum episodio nesta temporada", 0xFFFF8888u, 18);
-        uiText(r, 48, r.height() - 40, "O Voltar   D-pad navegar   X Assistir / abrir", 0xFF888899u, 16);
+        if (eps.empty())
+            uiText(r, tx, ey, "Nenhum episodio nesta temporada", 0xFFFF8888u, 18);
+        uiText(r, 48, H - 36, "O Voltar   D-pad navegar   X Assistir", 0xFF6A6A78u, 16);
     }
 
     void confirm(int n) {
