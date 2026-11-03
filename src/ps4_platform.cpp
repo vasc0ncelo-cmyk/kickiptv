@@ -2210,96 +2210,71 @@ struct Player {
         if (nowSec() > hudUntil && !feedProblem() && !paused && !vodDlFailed() && !showOpts && !showInfo) return;
         const int W = r.W, H = r.H;
 
-        // degradês
-        for (int y = 0; y < 140; y++) {
-            unsigned a = (unsigned)((140 - y) * 200 / 140);
+        // ---- overlay estilo YouTube ----
+        for (int y = 0; y < 120; y++) {
+            unsigned a = (unsigned)((120 - y) * 180 / 120);
             r.fillRect(0, y, W, 1, (a << 24));
         }
-        for (int y = 0; y < 280; y++) {
-            unsigned a = (unsigned)((y) * 220 / 280);
-            r.fillRect(0, H - 280 + y, W, 1, (a << 24));
+        for (int y = 0; y < 220; y++) {
+            unsigned a = (unsigned)((y) * 210 / 220);
+            r.fillRect(0, H - 220 + y, W, 1, (a << 24));
         }
 
-        // ---- TOPO ----
-        uiHeavy(r, 48, 28, "KICK IPTV", GREEN, 26);
-        int lx = 48 + r.textWidth("KICK IPTV", 26) + 18;
-        r.fillRect(lx, 34, 2, 20, 0xFF333333);
-        uiText(r, lx + 16, 32, uiFit(r, title, 24, W / 2 - 80), TEXT, 24, true);
-        // breadcrumb
+        // ---- TOPO: titulo ----
+        uiHeavy(r, 48, 28, uiFit(r, title, 28, W - 120), 0xFFFFFFFFu, 28);
         {
-            std::string crumb = isVod ? "Filmes" : "Ao vivo";
-            uiText(r, 48, 68, crumb, MUTED, 18);
-            int cx = 48 + r.textWidth(crumb, 18);
-            uiText(r, cx + 8, 68, "|", DIM, 18);
-            uiText(r, cx + 24, 68, uiFit(r, title, 18, 400), SOFT, 18);
+            std::string sub = isVod ? (hasEpisodes() ? "Serie" : "Filme") : "Ao vivo · Kick IPTV";
+            uiText(r, 48, 64, sub, 0xFFB0B0B0u, 18);
         }
 
-        // ---- CENTRO: pause ----
+        // ---- CENTRO: pause grande ----
         if (paused) {
-            r.roundRect(W / 2 - 44, H / 2 - 44, 88, 88, 44, 0xC0000000);
-            r.roundRect(W / 2 - 16, H / 2 - 22, 10, 44, 3, TEXT);
-            r.roundRect(W / 2 + 6, H / 2 - 22, 10, 44, 3, TEXT);
+            r.roundRect(W / 2 - 50, H / 2 - 50, 100, 100, 50, 0xCC000000u);
+            r.roundRect(W / 2 - 18, H / 2 - 26, 12, 52, 3, 0xFFFFFFFFu);
+            r.roundRect(W / 2 + 6, H / 2 - 26, 12, 52, 3, 0xFFFFFFFFu);
         }
 
-        // ---- BARRA INFERIOR ----
-        int barY = H - 200;
-        // mini poster
-        r.roundRect(48, barY - 8, 70, 100, 10, CHIP);
-        uiCenterHeavy(r, 48 + 35, barY + 36, isVod ? "VOD" : "LIVE", GREEN, 16);
-
-        uiHeavy(r, 136, barY, uiFit(r, title, 26, W - 500), TEXT, 26);
-        {
-            char meta[128];
-            if (isVod) {
-                int ds = (int)(displayDurMs() / 1000);
-                snprintf(meta, sizeof meta, "%ux%u  ·  %s%s",
-                         vw, vh, kQualityName[g_quality.load() % 3],
-                         paused ? "  ·  PAUSADO" : "");
-            } else {
-                snprintf(meta, sizeof meta, "AO VIVO  ·  %ux%u  ·  %s",
-                         vw, vh, kQualityName[g_quality.load() % 3]);
-            }
-            uiText(r, 136, barY + 34, meta, MUTED, 18);
-        }
-
-        // ---- Barra de progresso / seek ----
-        int trackX = 136, trackW = W - 136 - 80, trackY = barY + 64;
-        int trackH = scrubMode ? 10 : 6;
-        r.roundRect(trackX, trackY, trackW, trackH, 4, 0xFF2A2A2A);
+        // ---- BARRA DE PROGRESSO (vermelho YouTube) ----
+        const unsigned YT_RED = 0xFFFF0000u;
+        const unsigned YT_GRAY = 0xFF555555u;
+        const unsigned YT_WHITE = 0xFFFFFFFFu;
+        int trackX = 48, trackW = W - 96, trackY = H - 110;
+        int trackH = scrubMode ? 8 : 5;
         if (isVod) {
-            uint64_t pos = displayPosMs(), dur = displayDurMs();
+            uint64_t pos = displayPosMs();
+            uint64_t dur = displayDurMs();
             if (dur < 1) dur = 1;
-            int fill = (int)((pos * (uint64_t)trackW) / dur);
-            if (fill < 0) fill = 0;
-            if (fill > trackW) fill = trackW;
-            unsigned barCol = scrubMode ? 0xFF7CFF3Au : GREEN;
-            if (seekSkip) barCol = 0xFFFFCC33u; // amarelo = buscando
-            r.roundRect(trackX, trackY, std::max(fill, 2), trackH, 4, barCol);
+            if (pos > dur) pos = dur;
+            double frac = (double)pos / (double)dur;
+            r.roundRect(trackX, trackY, trackW, trackH, 3, YT_GRAY);
+            int filled = (int)(trackW * frac);
+            if (filled < 2 && pos > 0) filled = 2;
+            r.roundRect(trackX, trackY, filled, trackH, 3, YT_RED);
             // knob
-            int kx = trackX + fill - 9;
+            int kx = trackX + filled - 8;
             if (kx < trackX) kx = trackX;
-            r.roundRect(kx, trackY - 6, 18, trackH + 12, 9, barCol);
+            r.roundRect(kx, trackY - 5, 16, trackH + 10, 8, YT_WHITE);
             char t0[32], t1[32];
             fmtTime(pos, t0, sizeof t0);
             fmtTime(dur, t1, sizeof t1);
-            uiText(r, trackX, trackY + trackH + 10, t0, scrubMode ? GREEN : MUTED, 18);
-            uiText(r, trackX + trackW - r.textWidth(t1, 18), trackY + trackH + 10, t1, MUTED, 18);
-            if (scrubMode) {
-                uiText(r, trackX + trackW / 2 - 80, trackY - 28, "SEEK  L2/R2 fino  L1/R1 1min  X ok", TEXT, 16);
-            } else if (seekSkip) {
-                uiText(r, trackX + trackW / 2 - 60, trackY - 28, "Indo para o ponto...", 0xFFFFCC33u, 16);
-            }
+            uiText(r, trackX, trackY + trackH + 12, t0, YT_WHITE, 18);
+            uiText(r, trackX + trackW - r.textWidth(t1, 18), trackY + trackH + 12, t1, 0xFFCCCCCCu, 18);
+            if (scrubMode)
+                uiText(r, trackX + trackW / 2 - 100, trackY - 26, "SEEK  L2/R2  L1/R1 1min  X ok", YT_WHITE, 16);
+            else if (seekSkip)
+                uiText(r, trackX + trackW / 2 - 70, trackY - 26, "Indo para o ponto...", 0xFFFFCC33u, 16);
         } else {
-            r.roundRect(trackX, trackY, trackW * 9 / 10, trackH, 4, GREEN);
-            uiText(r, trackX, trackY + trackH + 10, "AO VIVO", MUTED, 16);
+            r.roundRect(trackX, trackY, trackW, trackH, 3, YT_GRAY);
+            r.roundRect(trackX, trackY, trackW * 9 / 10, trackH, 3, YT_RED);
+            uiText(r, trackX, trackY + trackH + 12, "AO VIVO", YT_RED, 16);
         }
 
-        // controles centrais (visuais + dica de mapeamento)
-        int cy = H - 56;
+        // ---- CONTROLES centrais estilo YT ----
+        int cy = H - 58;
         auto ctrl = [&](int i, int cx, const char *lab) {
             bool hi = (focusCtrl == i);
-            r.roundRect(cx - 30, cy - 24, 60, 48, 24, hi ? GREEN : 0xFF252525);
-            uiCenter(r, cx, cy, lab, hi ? BLACK : TEXT, 17, true);
+            r.roundRect(cx - 32, cy - 26, 64, 52, 26, hi ? 0xFFFFFFFF : 0xAA222222);
+            uiCenter(r, cx, cy, lab, hi ? 0xFF111111u : 0xFFFFFFFFu, 18, true);
         };
         ctrl(0, W / 2 - 200, "|<");
         ctrl(1, W / 2 - 100, "-10");
@@ -2307,18 +2282,16 @@ struct Player {
         ctrl(3, W / 2 + 100, "+10");
         ctrl(4, W / 2 + 200, ">|");
 
-        // volume / mudo indicador
         {
             const char *vs = muted ? "Mudo" : "Som";
-            uiText(r, W - 160, cy - 8, vs, muted ? 0xFFFF6666u : MUTED, 18);
+            uiText(r, W - 160, cy - 8, vs, muted ? 0xFFFF6666u : 0xFFAAAAAAu, 18);
         }
 
-        // dicas de controle
         uiText(r, 48, H - 22,
                isVod
-                   ? "<-/-> botao   X ativar   L2/R2 ±10s   UP/DOWN ±30s   L1/R1 ep   △ Opcoes   O Sair"
-                   : "X Pausar   □ Mudo   △ Opcoes   O Sair",
-               DIM, 15);
+                   ? "L2 -10s   R2 +10s   X pausa   UP seek   L1/R1 ep   △ Opcoes   O sair"
+                   : "X pausa   □ mudo   △ Opcoes   O sair",
+               0xFF888888u, 15);
 
         // ---- MENU OPCOES (direita) ----
         if (showOpts) {
