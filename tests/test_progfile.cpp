@@ -229,6 +229,35 @@ int main() {
         progfile::mkv::scan("ftypisom....", i, w);
         assert(i.empty() && w.empty());
     }
+    // 10) mkv: duracao (Segment\\Info\\Duration x TimecodeScale) — barra de progresso/seek de filmes MKV
+    {
+        auto be = [](uint64_t v, int n) { std::string s; for (int i = n - 1; i >= 0; i--) s += (char)((v >> (i * 8)) & 255); return s; };
+        auto f64 = [&](double v) { uint64_t u; memcpy(&u, &v, 8); return be(u, 8); };
+        auto f32 = [&](float v) { uint32_t u; memcpy(&u, &v, 4); return be(u, 4); };
+        auto el = [&](const std::string &id, const std::string &data) { return id + std::string(1, (char)(0x80 | data.size())) + data; };
+        const std::string kInfoId("\x15\x49\xA9\x66", 4), kScaleId("\x2A\xD7\xB1", 3), kDurId("\x44\x89", 2);
+        std::string pre = std::string("\x1A\x45\xDF\xA3", 4) + std::string(30, 'x');
+        // escala padrao (1 ms por tick): 7.200.000 ticks = 2 h
+        std::string info = el(kScaleId, be(1000000, 3)) + el(kDurId, f64(7200000.0)) + el("\x4D\x80", "libx");
+        std::string h = pre + kInfoId + std::string(1, (char)(0x80 | info.size())) + info + std::string(100, 'z');
+        assert(progfile::mkv::durationMs(h) == 7200000ull);
+        // float de 32 bits e escala diferente (100 us por tick): 90000 ticks = 9 s
+        info = el(kScaleId, be(100000, 3)) + el(kDurId, f32(90000.0f));
+        h = pre + kInfoId + std::string(1, (char)(0x80 | info.size())) + info;
+        assert(progfile::mkv::durationMs(h) == 9000ull);
+        // sem TimecodeScale: usa o padrao de 1.000.000 ns
+        info = el(kDurId, f64(5400000.0));
+        h = pre + kInfoId + std::string(1, (char)(0x80 | info.size())) + info;
+        assert(progfile::mkv::durationMs(h) == 5400000ull);
+        // sem Duration / lixo / cabecalho cortado: 0, sem travar nem ler fora do buffer
+        info = el(kScaleId, be(1000000, 3));
+        h = pre + kInfoId + std::string(1, (char)(0x80 | info.size())) + info;
+        assert(progfile::mkv::durationMs(h) == 0);
+        assert(progfile::mkv::durationMs("") == 0);
+        assert(progfile::mkv::durationMs(std::string("\x15\x49\xA9\x66", 4)) == 0);
+        assert(progfile::mkv::durationMs(std::string("\x15\x49\xA9\x66\x88\x44\x89\x88", 8)) == 0);   // Duration prometida alem do fim
+        assert(progfile::mkv::durationMs(std::string(500, '\xFF')) == 0);
+    }
     remove(P.c_str());
     std::cout << "test_progfile OK\n";
 }
