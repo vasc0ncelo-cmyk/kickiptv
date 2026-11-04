@@ -2,6 +2,9 @@
 // Navegacao e desenho das telas. Independente de plataforma: o PS4 so implementa Renderer + leitura do pad.
 // Telas: Home (banner + 4 atalhos + lista M3U), Kick TV (digitar @streamer) e listas (Filmes / Series / Canais).
 #include "app.hpp"
+#include "coverurl.hpp"
+#include "detailmeta.hpp"
+#include "sans.hpp"
 #include <algorithm>
 #include <functional>
 #include <cctype>
@@ -35,6 +38,19 @@ struct Renderer {
     virtual bool glow(int, int, int, int, int, unsigned, int, int, bool) { return false; }   // true = brilho desenhado
     virtual void blitImage(int /*x*/, int /*y*/, int /*dw*/, int /*dh*/,
                            const uint32_t * /*px*/, int /*sw*/, int /*sh*/) {}
+    // Imagem com cantos de cima (rTop) e de baixo (rBot) arredondados. Padrao: sem arredondar.
+    virtual void blitImageRound(int x, int y, int dw, int dh, const uint32_t *px, int sw, int sh, int /*rTop*/, int /*rBot*/) {
+        blitImage(x, y, dw, dh, px, sw, sh);
+    }
+    // Mascara de cobertura 0..255 (w x h) pintada com argb: usada pelo texto proporcional (sans.hpp). Padrao: pixel a pixel.
+    virtual void drawMask(int x, int y, int w, int h, const uint8_t *a, unsigned argb) {
+        for (int j = 0; j < h; j++)
+            for (int i = 0; i < w; i++) {
+                unsigned v = a[(size_t)j * w + i];
+                if (!v) continue;
+                pixel(x + i, y + j, (((argb >> 24) * v / 255) << 24) | (argb & 0xFFFFFF));
+            }
+    }
 };
 
 // ---------- Tema (cores ARGB) ----------
@@ -389,11 +405,16 @@ struct UI {
     std::vector<uint32_t> searchHits;
     // Pagina de detalhes (filme / serie)
     bool detailSeries = false;
-    std::string detailTitle, detailLogo, detailUrl, detailGroup;
+    std::string detailTitle, detailLogo, detailUrl, detailGroup;   // titulo ja limpo (sem ano/qualidade); detailGroup = categoria
     int detailSeasonIdx = 0;
     int detailFocus = 0;       // 0 Assistir, 1 temporadas, 2 episodios
     int detailEpCur = 0;
+    int detailEpScroll = 0, detailSeaScroll = 0;   // primeiro cartao / aba visivel
     std::vector<int> detailSeasons;
+    DetailMeta detailMeta;
+    // Gancho opcional: preenche sinopse/nota/generos/duracao (ex.: TMDB). Chamado ao abrir a pagina, ja com o que da para tirar do nome.
+    std::function<bool(const std::string &title, bool series, DetailMeta &)> metaLookup;
+    static const int kDetEps = 5, kDetTabs = 5;    // cartoes e abas visiveis por vez
     static const int kRows = 10;
     static const int ImgW = 148, ImgH = 222;       // tamanho do poster (igual ao da miniatura em imgcache.hpp)
     static const int kCols = 8, kGridRows = 3;     // grade de posters (Filmes, Series, Canais)
@@ -716,6 +737,16 @@ struct UI {
         app.say("Baixando capas de todas as categorias (" + std::to_string(n) + " itens)...  TRIANGULO cancela");
     }
 
+    // categoria de um filme / serie (quando aberto pela busca)
+    std::string movieCategoryOf(uint32_t idx) const {
+        for (const auto &c : app.list.movieCats) for (uint32_t i : c.items) if (i == idx) return c.name;
+        return "";
+    }
+    std::string seriesCategoryOf(const std::string &name) const {
+        for (const auto &c : app.list.seriesCats) for (const auto &n : c.series) if (n == name) return c.name;
+        return "";
+    }
+
     void handle(Input in) {
         if (screen == Screen::Detail) { handleDetail(in); return; }
         if (in == Input::Extra) { startSearch(); return; }
@@ -765,7 +796,7 @@ struct UI {
         if (dbg) dbg("ui-header-ok");
         if (screen == Screen::Home) renderHome(r); else if (screen == Screen::Help) renderHelp(r); else if (screen == Screen::Detail) renderDetail(r); else renderList(r);
         if (dbg) dbg("ui-corpo-ok");
-        renderFooter(r);
+        if (screen != Screen::Detail) renderFooter(r);      // a pagina de detalhes desenha o proprio rodape
         if (dbg) dbg("ui-rodape-ok");
     }
 
@@ -1227,212 +1258,16 @@ private:
         uiText(r, 98, cy - 11, uiFit(r, st, 22, hx - 98 - 30), SOFT, 22);
     }
 
-    void openMovieDetail(const Entry &e) {
-        detailSeries = false;
-        detailTitle = e.name;
-        detailLogo = e.logo;
-        detailUrl = e.url;
-        detailGroup = e.group;
-        detailFocus = 0;
-        detailEpCur = 0;
-        detailSeasons.clear();
-        screen = Screen::Detail;
-        if (e.url.empty()) app.say("Este filme nao tem link de video");
-        else app.say("Detalhes do filme");
-    }
-    void openSeriesDetail(const std::string &name) {
-        detailSeries = true;
-        detailTitle = name;
-        detailLogo = seriesLogo(name);
-        detailUrl.clear();
-        detailGroup.clear();
-        detailFocus = 0;
-        detailEpCur = 0;
-        detailSeasons.clear();
-        detailSeasonIdx = 0;
-        const Playlist &p = app.list;
-        auto it = p.seriesTree.find(name);
-        if (it != p.seriesTree.end()) {
-            for (const auto &kv : it->second) detailSeasons.push_back(kv.first);
-            if (!detailSeasons.empty()) curSeason = detailSeasons[0];
-        }
-        curSeries = name;
-        screen = Screen::Detail;
-        app.say("Detalhes da serie");
-    }
-    void playSeriesEpisode(int epIndex) {
-        const Playlist &p = app.list;
-        auto sit = p.seriesTree.find(curSeries);
-        if (sit == p.seriesTree.end()) return;
-        auto seasonIt = sit->second.find(curSeason);
-        if (seasonIt == sit->second.end()) return;
-        auto eps = sortedEps(seasonIt->second);
-        if (epIndex < 0 || epIndex >= (int)eps.size()) return;
-        const Entry &e = eps[epIndex];
-        if (e.url.empty()) { app.say("Episodio sem link"); return; }
-        std::vector<std::string> urls, titles;
-        for (const auto &ep : eps) {
-            urls.push_back(ep.url);
-            titles.push_back(ep.episode ? ("Ep " + std::to_string(ep.episode) + " - " + ep.name) : ep.name);
-        }
-        app.pf.play(e.url, titles[epIndex]);
-        app.pf.setEpisodeList(urls, titles, epIndex);
-    }
-    void handleDetail(Input in) {
-        const Playlist &p = app.list;
-        if (in == Input::Back) {
-            screen = Screen::List;
-            return;
-        }
-        if (!detailSeries) {
-            if (in == Input::Confirm) {
-                if (detailUrl.empty()) app.say("Sem link de video");
-                else app.pf.play(detailUrl, detailTitle);
-            }
-            return;
-        }
-        // serie
-        int nSea = (int)detailSeasons.size();
-        auto eps = [&]() -> std::vector<Entry> {
-            if (nSea <= 0) return {};
-            int sn = detailSeasons[detailSeasonIdx < nSea ? detailSeasonIdx : 0];
-            curSeason = sn;
-            auto sit = p.seriesTree.find(curSeries);
-            if (sit == p.seriesTree.end()) return {};
-            auto it = sit->second.find(sn);
-            if (it == sit->second.end()) return {};
-            return sortedEps(it->second);
-        };
-        if (in == Input::Up) {
-            if (detailFocus == 2) detailEpCur = std::max(0, detailEpCur - 1);
-            else detailFocus = std::max(0, detailFocus - 1);
-        }
-        if (in == Input::Down) {
-            if (detailFocus < 2) detailFocus++;
-            else {
-                auto e = eps();
-                detailEpCur = std::min(std::max(0, (int)e.size() - 1), detailEpCur + 1);
-            }
-        }
-        if (in == Input::Left && detailFocus == 1 && nSea > 0) {
-            detailSeasonIdx = (detailSeasonIdx + nSea - 1) % nSea;
-            detailEpCur = 0;
-            curSeason = detailSeasons[detailSeasonIdx];
-        }
-        if (in == Input::Right && detailFocus == 1 && nSea > 0) {
-            detailSeasonIdx = (detailSeasonIdx + 1) % nSea;
-            detailEpCur = 0;
-            curSeason = detailSeasons[detailSeasonIdx];
-        }
-        if (in == Input::Confirm) {
-            auto e = eps();
-            if (detailFocus == 0) {
-                if (!e.empty()) playSeriesEpisode(0);
-                else app.say("Sem episodios");
-            } else if (detailFocus == 2) {
-                if (!e.empty()) playSeriesEpisode(detailEpCur);
-            } else {
-                detailFocus = 2; // vai para lista de eps
-            }
-        }
-    }
-    void renderDetail(Renderer &r) {
-        const int W = r.width(), H = r.height();
-        const Playlist &p = app.list;
-        // fundo escuro
-        r.fillRect(0, 0, W, H, 0xFF08080Cu);
-        // faixa verde no topo (estilo Kick)
-        r.fillRect(0, 0, W, 6, 0xFF53FC18u);
-        r.fillRect(0, 6, W, 70, 0xFF0C0C12u);
-        uiHeavy(r, 48, 24, "KICK IPTV", 0xFF53FC18u, 28);
-        uiText(r, 48, 88, detailSeries ? "Series" : "Filmes", 0xFF6A6A78u, 18);
-        uiText(r, 140, 88, uiFit(r, detailTitle, 20, W - 200), 0xFFE8E8F0u, 20);
-
-        // poster grande
-        int px = 56, py = 130, pw = 300, ph = 450;
-        r.roundRect(px - 3, py - 3, pw + 6, ph + 6, 14, 0xFF53FC18u);
-        r.roundRect(px, py, pw, ph, 12, 0xFF14141Cu);
-        bool drewCover = false;
-        if (!detailLogo.empty()) {
-            if (coverRequest) coverRequest(detailLogo);
-            if (coverGet) {
-                const uint32_t *pxl = nullptr; int cw = 0, ch = 0;
-                if (coverGet(detailLogo, pxl, cw, ch) && pxl && cw > 0 && ch > 0) {
-                    r.blitImage(px, py, pw, ph, pxl, cw, ch);
-                    drewCover = true;
-                }
-            }
-        }
-        if (!drewCover) {
-            uiCenter(r, px + pw / 2, py + ph / 2 - 16, detailSeries ? "SERIE" : "FILME", 0xFF53FC18u, 24);
-            uiCenter(r, px + pw / 2, py + ph / 2 + 20, uiFit(r, detailTitle, 18, pw - 24), 0xFF9A9AAAu, 18);
-        }
-
-        int tx = px + pw + 48;
-        uiHeavy(r, tx, 140, uiFit(r, detailTitle, 40, W - tx - 48), 0xFFFFFFFFu, 40);
-        int tagY = 200;
-        r.roundRect(tx, tagY, 90, 28, 8, 0xFF1A3A1Au);
-        uiText(r, tx + 14, tagY + 5, detailSeries ? "Serie" : "Filme", 0xFF53FC18u, 16);
-        if (detailSeries && !detailSeasons.empty()) {
-            r.roundRect(tx + 100, tagY, 160, 28, 8, 0xFF1A1A22u);
-            uiText(r, tx + 112, tagY + 5, std::to_string(detailSeasons.size()) + " temporadas", 0xFFCCCCDDu, 16);
-        }
-
-        bool focusWatch = (detailFocus == 0);
-        r.roundRect(tx, 250, 340, 60, 16, focusWatch ? 0xFF53FC18u : 0xFF162216u);
-        uiHeavy(r, tx + 48, 266, "  ASSISTIR AGORA", focusWatch ? 0xFF0A0A0Eu : 0xFF53FC18u, 26);
-
-        if (!detailSeries) {
-            uiText(r, tx, 340, detailUrl.empty() ? "Sem link de video nesta lista" : "Toque em X para comecar", 0xFF9A9AAAu, 20);
-            uiText(r, 48, H - 36, "O Voltar    X Assistir", 0xFF6A6A78u, 16);
-            return;
-        }
-
-        int sy = 340;
-        uiText(r, tx, sy, "Temporadas", 0xFF6A6A78u, 16);
-        sy += 30;
-        int nSea = (int)detailSeasons.size();
-        int maxSeaShow = 8;
-        int seaStart = 0;
-        if (detailSeasonIdx >= maxSeaShow) seaStart = detailSeasonIdx - maxSeaShow + 1;
-        for (int j = 0; j < maxSeaShow && seaStart + j < nSea; j++) {
-            int i = seaStart + j;
-            int bx = tx + j * 148;
-            bool sel = (i == detailSeasonIdx);
-            bool foc = (detailFocus == 1 && sel);
-            r.roundRect(bx, sy, 138, 46, 12, foc ? 0xFF53FC18u : (sel ? 0xFF1A3A1Au : 0xFF16161Eu));
-            std::string lab = "Temp. " + std::to_string(detailSeasons[i] < 1 ? 1 : detailSeasons[i]);
-            uiText(r, bx + 18, sy + 12, lab, foc ? 0xFF0A0A0Eu : 0xFFFFFFFFu, 18);
-        }
-
-        int ey = sy + 70;
-        uiText(r, tx, ey, "Episodios", 0xFF6A6A78u, 16);
-        ey += 28;
-        int sn = nSea > 0 ? detailSeasons[detailSeasonIdx < nSea ? detailSeasonIdx : 0] : 1;
-        curSeason = sn;
-        std::vector<Entry> eps;
-        auto sit = p.seriesTree.find(curSeries);
-        if (sit != p.seriesTree.end()) {
-            auto it = sit->second.find(sn);
-            if (it != sit->second.end()) eps = sortedEps(it->second);
-        }
-        int maxShow = 9;
-        int startEp = std::max(0, detailEpCur - 4);
-        for (int i = startEp; i < (int)eps.size() && i < startEp + maxShow; i++) {
-            int row = i - startEp;
-            int ry = ey + row * 42;
-            bool sel = (i == detailEpCur && detailFocus == 2);
-            if (sel) r.roundRect(tx, ry - 4, W - tx - 56, 38, 10, 0xFF142814u);
-            std::string lab = eps[i].episode
-                ? (std::to_string(eps[i].episode) + ". " + eps[i].name)
-                : eps[i].name;
-            uiText(r, tx + 14, ry + 6, uiFit(r, lab, 20, W - tx - 90),
-                   sel ? 0xFF53FC18u : 0xFFDDDDDDu, 20);
-        }
-        if (eps.empty())
-            uiText(r, tx, ey, "Nenhum episodio nesta temporada", 0xFFFF8888u, 18);
-        uiText(r, 48, H - 36, "O Voltar   D-pad navegar   X Assistir", 0xFF6A6A78u, 16);
-    }
+public:
+    // Pagina de detalhes (detailpage.hpp)
+    void openMovieDetail(const Entry &e, const std::string &category);
+    void openSeriesDetail(const std::string &name, const std::string &category);
+    void playSeriesEpisode(int epIndex);
+    void handleDetail(Input in);
+    void renderDetail(Renderer &r);
+    std::vector<Entry> detailEpisodes() const;
+    void wantDetailCovers(const std::string &poster, const std::vector<std::string> &front, const std::vector<std::string> &back);
+private:
 
     void confirm(int n) {
         int t = (int)tab, c = cursor[t];
@@ -1452,10 +1287,10 @@ private:
                 if (e.url.empty()) app.say("Canal sem link");
                 else app.pf.play(e.url, e.name);
             } else if (tab == Tab::Movies && hi < p.movies.size()) {
-                openMovieDetail(p.movies[hi]);
+                openMovieDetail(p.movies[hi], movieCategoryOf(hi));
             } else if (tab == Tab::Series) {
                 curSeries = seriesNameAt(hi);
-                if (!curSeries.empty()) { clearSearch(); openSeriesDetail(curSeries); }
+                if (!curSeries.empty()) { std::string nm = curSeries; clearSearch(); openSeriesDetail(nm, seriesCategoryOf(nm)); }
             }
             return;
         }
@@ -1466,9 +1301,9 @@ private:
             if (e.url.empty()) app.say("Canal sem link");
             else app.pf.play(e.url, e.name);
         } else if (tab == Tab::Movies) {
-            openMovieDetail(p.movies[cat->items[c]]);
+            openMovieDetail(p.movies[cat->items[c]], cat->name);
         } else if (level == 0) {
-            openSeriesDetail(cat->series[c]);
+            openSeriesDetail(cat->series[c], cat->name);
         } else if (level == 1) {
             auto &m = p.seriesTree.at(curSeries);
             auto it = m.begin(); std::advance(it, c);
@@ -1478,3 +1313,5 @@ private:
         }
     }
 };
+
+#include "detailpage.hpp"
