@@ -179,6 +179,57 @@ struct FbRenderer : Renderer {
         }
     }
 
+    // Mascara de cobertura (texto proporcional): mistura 'argb' sobre o destino conforme a cobertura de cada pixel.
+    void drawMask(int x, int y, int w, int h, const uint8_t *m, unsigned argb) override {
+        const int A = argb >> 24;
+        for (int j = 0; j < h; j++) {
+            int py = y + j;
+            if (py < 0 || py >= H) continue;
+            uint32_t *row = fb + (size_t)py * W;
+            const uint8_t *src = m + (size_t)j * w;
+            for (int i = 0; i < w; i++) {
+                int cv = src[i];
+                if (!cv) continue;
+                int px = x + i;
+                if (px < 0 || px >= W) continue;
+                int a = A >= 255 ? cv : (A * cv + 127) / 255;
+                row[px] = a >= 255 ? (argb | 0xFF000000u) : blendPx(row[px], argb, a);
+            }
+        }
+    }
+    // Imagem com cantos arredondados em cima (rTop) e/ou embaixo (rBot), bordas suavizadas.
+    void blitImageRound(int x, int y, int dw, int dh, const uint32_t *px, int sw, int sh, int rTop, int rBot) override {
+        if (!px || sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) return;
+        if (rTop * 2 > dw) rTop = dw / 2;
+        if (rBot * 2 > dw) rBot = dw / 2;
+        for (int j = 0; j < dh; j++) {
+            int dy = y + j;
+            if (dy < 0 || dy >= H) continue;
+            // cobertura do canto nesta linha: so as colunas dentro do raio precisam de conta
+            int rad = 0; float cyc = 0;
+            if (j < rTop) { rad = rTop; cyc = (float)rTop; }
+            else if (j >= dh - rBot) { rad = rBot; cyc = (float)(dh - rBot); }
+            float ddy = rad ? (j + 0.5f) - cyc : 0.f;
+            uint32_t *dst = fb + (size_t)dy * W;
+            const uint32_t *src = px + (size_t)(sh == dh ? j : j * sh / dh) * sw;
+            for (int i = 0; i < dw; i++) {
+                int dx = x + i;
+                if (dx < 0 || dx >= W) continue;
+                float cov = 1.f;
+                if (rad && (i < rad || i >= dw - rad)) {
+                    float ddx = i < rad ? (i + 0.5f) - (float)rad : (i + 0.5f) - (float)(dw - rad);
+                    cov = (float)rad - fsqrt(ddx * ddx + ddy * ddy) + 0.5f;
+                    if (cov <= 0.f) continue;
+                    if (cov > 1.f) cov = 1.f;
+                }
+                uint32_t c = src[sw == dw ? i : i * sw / dw];
+                unsigned a = (unsigned)((c >> 24) * cov + 0.5f);
+                if (a >= 255) dst[dx] = c | 0xFF000000u;
+                else if (a > 0) dst[dx] = blendPx(dst[dx], c, (int)a);
+            }
+        }
+    }
+
     void fillRect(int x, int y, int w, int h, unsigned argb) override {
         int x0 = x < 0 ? 0 : x, y0 = y < 0 ? 0 : y;
         int x1 = x + w > W ? W : x + w, y1 = y + h > H ? H : y + h;
