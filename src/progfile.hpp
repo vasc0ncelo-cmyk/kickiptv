@@ -200,6 +200,54 @@ inline void scan(const std::string &head, std::string &info, std::string &warn) 
     else if (has(head, "A_MPEG/L3")) a = "MP3";
     if (!v.empty() || !a.empty()) info = "mkv  |  video " + (v.empty() ? std::string("?") : v) + "  |  audio " + (a.empty() ? std::string("?") : a);
 }
+
+// Duracao (ms) lida de Segment\Info: Duration (float) x TimecodeScale (ns por tick; padrao 1.000.000). 0 = nao achou.
+// Sem isso a barra de progresso/seek de filmes MKV usava uma estimativa por tamanho do arquivo (errada na maioria dos filmes).
+inline uint64_t durationMs(const std::string &h) {
+    const uint8_t *d = (const uint8_t *)h.data();
+    const size_t n = h.size();
+    static const uint8_t kInfo[4] = {0x15, 0x49, 0xA9, 0x66};
+    auto vlen = [](uint8_t b) -> int { for (int l = 1; l <= 8; l++) if (b & (0x80 >> (l - 1))) return l; return 0; };
+    for (size_t i = 0; i + 5 < n; i++) {
+        if (memcmp(d + i, kInfo, 4) != 0) continue;
+        size_t p = i + 4;
+        int sl = vlen(d[p]);
+        if (sl == 0 || p + (size_t)sl > n) continue;
+        uint64_t size = d[p] & (0xFFu >> sl);
+        for (int k = 1; k < sl; k++) size = (size << 8) | d[p + k];
+        p += (size_t)sl;
+        if (size == 0 || size > 65536) continue;                      // o Info e pequeno; fora disso nao e o elemento de verdade
+        const size_t end = std::min<size_t>(n, p + (size_t)size);
+        uint64_t scale = 1000000; double dur = 0; bool haveDur = false;
+        while (p + 2 <= end) {
+            int il = vlen(d[p]);
+            if (il == 0 || il > 4 || p + (size_t)il >= end) break;
+            uint32_t id = 0;
+            for (int k = 0; k < il; k++) id = (id << 8) | d[p + k];
+            p += (size_t)il;
+            int cl = vlen(d[p]);
+            if (cl == 0 || p + (size_t)cl > end) break;
+            uint64_t csz = d[p] & (0xFFu >> cl);
+            for (int k = 1; k < cl; k++) csz = (csz << 8) | d[p + k];
+            p += (size_t)cl;
+            if (csz > end - p) break;
+            if (id == 0x2AD7B1 && csz >= 1 && csz <= 8) {
+                scale = 0;
+                for (uint64_t k = 0; k < csz; k++) scale = (scale << 8) | d[p + k];
+            } else if (id == 0x4489 && (csz == 4 || csz == 8)) {
+                if (csz == 4) { uint32_t u = 0; for (int k = 0; k < 4; k++) u = (u << 8) | d[p + k]; float f; memcpy(&f, &u, 4); dur = f; }
+                else { uint64_t u = 0; for (int k = 0; k < 8; k++) u = (u << 8) | d[p + k]; double f; memcpy(&f, &u, 8); dur = f; }
+                haveDur = true;
+            }
+            p += (size_t)csz;
+        }
+        if (haveDur && dur > 0 && scale > 0) {
+            double ms = dur * (double)scale / 1e6;
+            if (ms >= 1000.0 && ms < 48.0 * 3600.0 * 1000.0) return (uint64_t)ms;
+        }
+    }
+    return 0;
+}
 }  // namespace mkv
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -222,6 +270,7 @@ public:
     std::string warn() { std::lock_guard<std::mutex> l(m_); return warn_; }       // "" = parece compativel
     std::string audioWarn() { std::lock_guard<std::mutex> l(m_); return audioWarn_; }
     bool relocated() const { return remap_.load(); }                              // o indice estava no fim e foi movido para o comeco
+    uint64_t durationMs() const { return mkvDur_.load(); }                        // MKV: duracao lida do cabecalho (0 = desconhecida)
 
 private:
     void fail(const std::string &e) { { std::lock_guard<std::mutex> l(m_); if (state_ != 2) err_ = e; } state_ = 2; }
@@ -330,7 +379,7 @@ private:
         std::string head0;
         if (!fetchRetry(0, std::min<uint64_t>(total_, kBlock) - 1, head0)) return;
         bool mp4f = head0.size() >= 12 && memcmp(head0.data() + 4, "ftyp", 4) == 0;
-        if (!mp4f) { std::string i, w; mkv::scan(head0, i, w); std::lock_guard<std::mutex> l(m_); if (!i.empty()) info_ = i; warn_ = w; }
+        if (!mp4f) { std::string i, w; mkv::scan(head0, i, w); mkvDur_ = mkv::durationMs(head0); std::lock_guard<std::mutex> l(m_); if (!i.empty()) info_ = i; warn_ = w; }
         uint64_t mo = 0, ms = 0;
         if (mp4f && !findMoov(head0, mo, ms)) return;
         if (ms > kMaxIndex) { fail("indice do filme grande demais"); return; }
@@ -401,6 +450,7 @@ private:
     std::atomic<bool> stop_{false};
     std::atomic<bool> remap_{false};
     std::atomic<uint64_t> prep_{0};
+    std::atomic<uint64_t> mkvDur_{0};
     uint64_t ftypEnd_ = 0, moovOff_ = 0, moovSize_ = 0;      // so valem com remap_ (definidos antes de remap_ ficar true)
 };
 
