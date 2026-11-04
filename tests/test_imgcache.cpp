@@ -1,5 +1,6 @@
 // Capas: decodificacao (poster preenche / logo fica inteiro) e fila por prioridade com varios downloads.
 #include "../src/imgcache.hpp"
+#include "../src/coverurl.hpp"
 #include <cassert>
 #include <set>
 #include <chrono>
@@ -111,6 +112,25 @@ int main() {
         std::this_thread::sleep_for(std::chrono::milliseconds(400));
         assert(fetched.load() == 12);
         bg.shutdown();
+    }
+    // --- variante de tamanho ("url#LxA", pagina de detalhes): decodifica nesse tamanho, guarda no disco e nao mistura com a miniatura ---
+    {
+        std::atomic<int> fetched{0}; std::string lastKey;
+        ImgCache v;
+        v.setFetch([&](const std::string &u, std::string &body) { fetched++; lastKey = u; body.assign((const char *)kPoster, sizeof kPoster); return true; });
+        std::string big = coverVariantKey("http://img/var.png", 200, 120), thumb = "http://img/var.png";
+        v.setWanted({big, thumb}, {});
+        assert(waitFor([&] { return v.getPtr(big) && v.getPtr(thumb); }));
+        auto cb = v.getPtr(big), ct = v.getPtr(thumb);
+        assert(cb->w == 200 && cb->h == 120 && (int)cb->bgra.size() == 200 * 120);
+        assert(ct->w == ImgCache::kThumbW && ct->h == ImgCache::kThumbH);
+        v.shutdown();
+        assert(ImgCache::diskHas(big) && ImgCache::diskHas(thumb) && fetched.load() == 2);
+        ImgCache v2;                                                                         // app reaberto: a variante volta do disco com o tamanho certo
+        v2.setFetch([&](const std::string &, std::string &) { fetched++; return false; });
+        v2.setWanted({big}, {});
+        auto c2 = v2.getPtr(big); assert(c2 && c2->w == 200 && c2->h == 120 && fetched.load() == 2);
+        v2.shutdown();
     }
     // --- baixador por thread: cada thread recebe o seu numero (0..kWorkers-1) para reaproveitar a propria conexao ---
     {
