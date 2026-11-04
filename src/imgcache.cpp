@@ -1,4 +1,5 @@
 #include "imgcache.hpp"
+#include "coverurl.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -88,10 +89,12 @@ bool ImgCache::diskHas(const std::string &url) {
 
 // arquivo: largura, altura (int32) + w*h pixels RGB565 (metade do tamanho do BGRA, e a diferenca nao aparece em poster)
 bool ImgCache::loadDisk(const std::string &url, Cover &out) {
+    int tw = kThumbW, th = kThumbH;
+    { std::string base; int vw, vh; if (coverSplitVariant(url, base, vw, vh)) { tw = vw; th = vh; } }   // variante "url#LxA": o arquivo tem esse tamanho
     FILE *f = fopen(diskPath(url).c_str(), "rb");
     if (!f) return false;
     int w = 0, h = 0;
-    if (fread(&w, 4, 1, f) != 1 || fread(&h, 4, 1, f) != 1 || w != kThumbW || h != kThumbH) { fclose(f); return false; }
+    if (fread(&w, 4, 1, f) != 1 || fread(&h, 4, 1, f) != 1 || w != tw || h != th) { fclose(f); return false; }
     std::vector<uint16_t> raw((size_t)w * h);
     size_t n = fread(raw.data(), 2, raw.size(), f);
     fclose(f);
@@ -126,7 +129,9 @@ void ImgCache::loadOne(const std::string &url, int worker) {
     if (!fetch_) { finish(url, Cover{}, false); return; }
     std::string body;
     bool ok = fetch_(worker, url, body) && body.size() > 32 && body.size() < 3 * 1024 * 1024;
-    if (ok) ok = imgDecodeToCover(body, c, kThumbW, kThumbH);
+    int tw = kThumbW, th = kThumbH;
+    { std::string base; int vw, vh; if (coverSplitVariant(url, base, vw, vh)) { tw = vw; th = vh; } }     // variante: decodifica no tamanho pedido
+    if (ok) ok = imgDecodeToCover(body, c, tw, th);
     if (ok) saveDisk(url, c);
     finish(url, std::move(c), ok);
 }
