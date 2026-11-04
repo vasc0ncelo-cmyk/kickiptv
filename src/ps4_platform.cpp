@@ -2,7 +2,7 @@
 //   Home: banner + atalhos KICK TV / FILMES / SERIES / CANAIS + LISTA M3U  (D-pad navega, X seleciona, OPTIONS sai)
 //   Kick TV: X em "Digitar @streamer" abre o teclado na tela; o link da lista M3U tambem e digitado nele.
 //   Teclado: Setas move, X digita, QUADRADO apaga, TRIANGULO insere http://, L2 limpa, R1 = OK, O cancela.
-//   Durante o video: X = pausar | L2/R2 = -10s/+10s (VOD) | setas = -30s/+30s (VOD) | L1/R1 = episodio ant/prox
+//   Durante o video: X = pausar | L2/R2 = toque -10s/+10s, SEGURAR anda a barra (cada vez mais rapido) e pula ao soltar (VOD) | L1/R1 = episodio ant/prox
 //                    QUADRADO = qualidade | TRIANGULO = ajuste de imagem (live) | L1 = memoria (live) | O = voltar
 //   HLS (.m3u8): o app baixa playlist/segmentos e entrega ao AvPlayer por callbacks de arquivo (hls.hpp / streambuf.hpp).
 // Headers do C++ primeiro (mesma ordem do sample "threading" do OpenOrbis): evita conflito de tipos com os headers orbis.
@@ -694,11 +694,23 @@ bool sceAvPlayerGetVideoData(KAvHandle h, KAvFrameInfo *fi);
 bool sceAvPlayerGetAudioData(KAvHandle h, KAvFrameInfo *fi);
 int sceAvPlayerStop(KAvHandle h);
 int sceAvPlayerClose(KAvHandle h);
-// Pause/Resume/JumpToTime/CurrentTime: em alguns firmwares/stubs do homebrew essas NIDs
+// Pause/Resume/CurrentTime: em alguns firmwares/stubs do homebrew essas NIDs
 // crasham o app (CE-34878-0) ao abrir VOD. Pausa e tempo ficam em software no Player.
+// JumpToTime (seek de verdade, frente e tras) e declarada "weak": se o stub do toolchain nao tiver o simbolo o link NAO quebra
+// (o app usa o seek antigo). Como essa chamada ja deu CE-34878-0 em alguns firmwares, ha uma trava (ver kJumpGuardFile abaixo).
+int sceAvPlayerJumpToTime(KAvHandle h, uint64_t ms) __attribute__((weak));
 typedef int (*KAvLogCb)(void *ud, const char *fmt, va_list ap);
 int sceAvPlayerSetLogCallback(KAvLogCb cb, void *ud);
 }
+
+// Trava do salto (JumpToTime): o marcador kJumpGuardFile fica gravado enquanto um salto esta em andamento (ate passar um tempo
+// com imagem estavel). Se o app CAIR nesse intervalo, na abertura seguinte o salto e desligado de vez (kNoJumpFile) e o app volta ao
+// seek antigo. Para religar: apague /data/kickiptv_nojump (ex.: por FTP).
+static const char *kJumpGuardFile = "/data/kickiptv_jumpguard";
+static const char *kNoJumpFile = "/data/kickiptv_nojump";
+static std::atomic<int> g_jumpMode{0};                 // 1 = usa JumpToTime | 0 = desligado (definido na abertura do app)
+static bool fileExists(const char *p) { FILE *f = fopen(p, "rb"); if (!f) return false; fclose(f); return true; }
+static void touchFile(const char *p) { FILE *f = fopen(p, "wb"); if (f) { fwrite("1", 1, 1, f); fclose(f); } }
 
 
 // Duracao do MP4 a partir do atomo mvhd (ms). 0 = nao achou.
@@ -888,6 +900,7 @@ struct AudioPump {
     std::thread th;
     std::atomic<bool> run{false};
     std::atomic<bool> muted{false};     // pausa em software: nao le/escreve audio
+    std::atomic<bool> flush{false};     // apos um salto no filme: descarta o audio que ja estava convertido
     std::atomic<int> state{0};          // 0 parado | 1 aguardando audio | 2 tocando | -1 erro ao abrir o audio
     std::atomic<int> openRc{0};
     std::atomic<unsigned> rate{0}, chans{0};
@@ -921,6 +934,7 @@ struct AudioPump {
         std::vector<uint8_t> pcm;
         float prevL = 0, prevR = 0, phase = 0;
         while (run) {
+            if (flush.exchange(false)) { acc.clear(); prevL = prevR = 0; }
             if (muted.load()) { sceKernelUsleep(8000); continue; }
             KAvFrameInfo au; memset(&au, 0, sizeof au);
             unsigned ch = 0, sr = 0, sz = 0;
@@ -1374,6 +1388,9 @@ struct Player {
         cancelled = false; restarts = switchesOk = 0; lastGapMs = 0; gapStartT = switchedAt = 0; curDur = 0; chunkT0 = 0; blitMs = 0;
         paused = false; isVod = false; lastPtsMs = 0; maxPtsMs = 0; durationMs = 0; seekPendingMs = -1; waitNote.clear(); showOpts = false; optCur = 0;
         scrubMode = false; scrubMs = -1; seekSkip = false; seekTargetMs = 0;
+        trigScrub = false; trigDir = 0; trigBlock = true;       // trigBlock: um L2/R2 ainda apertado do menu nao vira seek
+        pendJumpMs = -1; pendJumpNeed = 0; jumpPct = 0; jumpTargetMs = -1; jumpSettleUntil = 0; jumpErrors = 0;
+        if (jumpGuardOn) { remove(kJumpGuardFile); jumpGuardOn = false; }
         vodEstDurMs = 0; vodContentLength = 0; vodBytesAtStart = 0; vodTimeAtStart = 0;
         playStartWall = nowSec(); pauseAccum = 0; pauseStartedAt = 0; lastGoodPtsMs = 0; lastPtsWall = playStartWall; fileDurMs = 0; playedMs = 0; lastPaceWall = 0;
         avLang = "eng"; langTry = 0; vodPath.clear(); vodAudioExpected = false;
@@ -1630,6 +1647,7 @@ struct Player {
             isVod = true;
             // Duracao real do arquivo (mvhd) — barra e tempo total corretos
             fileDurMs = mp4DurationMsFromFile(path);
+            if (fileDurMs == 0) fileDurMs = dl->durationMs();      // MKV: duracao lida do cabecalho (Segment\Info)
             // mvhd parcial/errado: se o arquivo e grande e a duracao veio < 12 min, descarta
             if (fileDurMs > 0 && fileDurMs < 12ULL * 60ULL * 1000ULL && vodContentLength > 150ULL * 1024ULL * 1024ULL)
                 fileDurMs = 0;
@@ -1740,6 +1758,8 @@ struct Player {
     void stop() {
         KAvHandle hh = h, hh2 = h2;
         h = 0; h2 = 0; active = false; chunkMode = false;
+        pendJumpMs = -1; trigScrub = false; trigDir = 0;
+        if (jumpGuardOn) { remove(kJumpGuardFile); jumpGuardOn = false; }          // saiu de proposito: nao e queda
         try { audio.retarget(0); } catch (...) {}
         g_feed.abort();                                      // acorda leituras bloqueadas
         abortHf();
@@ -1800,7 +1820,7 @@ struct Player {
         if (sceAvPlayerGetVideoData(h, &fi) && fi.pData) {
         have_frame:
             // timeStamp do AvPlayer costuma ser em microsegundos; guardamos em ms para o HUD
-            if (fi.timeStamp > 0) {
+            if (fi.timeStamp > 0 && !staleAfterJump(fi.timeStamp)) {
                 // timeStamp do AvPlayer: microsegundos → ms
                 uint64_t pts = fi.timeStamp / 1000;
                 // se o valor parecer nanos/100 (muito grande), ajusta
@@ -2026,7 +2046,7 @@ struct Player {
     }
     bool feedProblem() const { return useFeed && (g_feed.failed.load() || g_feed.streamEnded.load()); }
     static bool vodDlFailed() { auto d = getPf(); return d && d->state() == 2; }
-    bool hudActive() const { return nowSec() <= hudUntil || feedProblem() || paused || vodDlFailed() || showOpts || showInfo || scrubMode || seekSkip; }
+    bool hudActive() const { return nowSec() <= hudUntil || feedProblem() || paused || vodDlFailed() || showOpts || showInfo || scrubMode || seekSkip || pendJumpMs >= 0; }
 
     // Pausa em software: nao chama sceAvPlayerPause (NID instavel no homebrew → CE-34878-0).
     // O loop principal para de buscar quadros e o audio fica mudo enquanto paused==true.
@@ -2038,28 +2058,81 @@ struct Player {
     }
 
     // ---- Seek / barra de progresso ----
-    // AvPlayer homebrew: JumpToTime costuma crashar (CE-34878-0).
-    // Seek PARA FRENTE: descarta quadros ate o PTS alvo (funcional de verdade).
-    // Seek PARA TRAS: marca alvo no HUD; sem JumpToTime o PTS real so avanca.
+    // Seek de verdade = sceAvPlayerJumpToTime (frente e tras). O filme e baixado EM ORDEM para o disco; se o ponto pedido ainda nao
+    // foi baixado, o salto espera o download chegar la (HUD: "Baixando ate o ponto... NN%") — pular para uma area ainda vazia
+    // faria o player ler zeros. Se o JumpToTime estiver desligado (queda anterior / simbolo ausente) cai no seek antigo:
+    // frente = descarta quadros ate o PTS alvo; tras = so marca no HUD.
+    // L2/R2: toque = -10s/+10s | SEGURAR = a barra anda sozinha (cada vez mais rapido) e o salto acontece ao SOLTAR.
     bool scrubMode = false;           // foco na barra: LEFT/RIGHT movem o alvo
     int64_t scrubMs = -1;             // posicao do cursor na barra (-1 = seguir playhead)
-    uint64_t seekTargetMs = 0;        // alvo do skip de frames
-    bool seekSkip = false;            // true = poll descarta quadros ate seekTargetMs
+    int64_t scrubFromMs = 0;          // onde a barra estava quando o scrub comecou (o HUD mostra a diferenca)
+    uint64_t seekTargetMs = 0;        // alvo do skip de frames (seek antigo)
+    bool seekSkip = false;            // true = poll descarta quadros ate seekTargetMs (seek antigo)
     int seekSkipBudget = 0;           // quadros max por tick (evita travar o loop)
+    // L2/R2 segurados
+    bool trigScrub = false;           // scrub iniciado por L2/R2 (confirma sozinho ao soltar)
+    bool trigBlock = false;           // ignora L2/R2 ate soltar (cancelou o scrub com DOWN / gatilho ja estava apertado ao abrir)
+    int trigDir = 0;                  // -1 = L2 | +1 = R2
+    double trigStart = 0, trigLast = 0;
+    // salto de verdade
+    int64_t pendJumpMs = -1;          // alvo aguardando o download chegar la (-1 = nenhum)
+    uint64_t pendJumpNeed = 0;        // bytes contiguos no disco necessarios antes de pular
+    int jumpPct = 0;                  // andamento do download ate o ponto (HUD)
+    int64_t jumpTargetMs = -1;        // acabou de pular: quadros velhos que ainda estavam na fila sao ignorados no relogio
+    double jumpSettleUntil = 0;
+    bool jumpGuardOn = false;         // marcador de seguranca gravado (ver kJumpGuardFile)
+    double jumpGuardAt = 0;
+    int jumpErrors = 0;
 
+    int64_t seekLimitMs() const {     // nao deixa mirar nos ultimos 5 s (senao o "fim do filme" pularia o episodio sem querer)
+        uint64_t d = displayDurMs();
+        return (int64_t)(d > 8000 ? d - 5000 : d);
+    }
     void clampTime(int64_t &ms) const {
         if (ms < 0) ms = 0;
-        if (durationMs > 0 && (uint64_t)ms > durationMs) ms = (int64_t)durationMs;
+        int64_t lim = seekLimitMs();
+        if (ms > lim) ms = lim;
+    }
+    // posicao real de reproducao (ignora a barra de scrub)
+    uint64_t realPosMs() const {
+        uint64_t p = playedMs;
+        if (lastPtsMs > p) p = lastPtsMs;
+        uint64_t d = displayDurMs();
+        return p > d ? d : p;
+    }
+    bool jumpUsable() const { return g_jumpMode.load() == 1 && sceAvPlayerJumpToTime != nullptr && h != 0; }
+    // quantos bytes (contiguos, desde o inicio) precisam estar no disco para tocar a partir de 'ms'.
+    // Proporcional ao tamanho + folga (VBR: o ponto real do video varia) — o player nunca le alem do que ja chegou.
+    uint64_t jumpNeedBytes(int64_t ms) const {
+        uint64_t total = vodContentLength;
+        if (total == 0) return 0;
+        uint64_t dur = displayDurMs();
+        double frac = dur > 0 ? (double)ms / (double)dur : 1.0;
+        if (frac < 0) frac = 0;
+        if (frac > 1) frac = 1;
+        double need = frac * (double)total * 1.06 + 16.0 * 1048576.0;
+        return need >= (double)total ? total : (uint64_t)need;
     }
 
     void seekTo(int64_t targetMs) {
         if (!isVod || !active || failed) { hudUntil = nowSec() + 5; return; }
         clampTime(targetMs);
-        int64_t cur = (int64_t)lastPtsMs;
-        seekPendingMs = targetMs;
-        scrubMs = targetMs;
+        int64_t cur = (int64_t)realPosMs();
         hudUntil = nowSec() + 10;
 
+        if (jumpUsable()) {
+            scrubMode = false; scrubMs = -1; seekSkip = false;
+            if (targetMs + 400 > cur && targetMs < cur + 400) { pendJumpMs = -1; return; }       // praticamente no mesmo ponto
+            pendJumpMs = targetMs;
+            pendJumpNeed = targetMs > cur ? jumpNeedBytes(targetMs) : 0;                          // para tras o arquivo ja esta no disco
+            jumpPct = 0;
+            serviceJump();                                                                        // pula agora se o download ja chegou la
+            return;
+        }
+
+        // ---- seek antigo (JumpToTime desligado) ----
+        seekPendingMs = targetMs;
+        scrubMs = targetMs;
         if (targetMs > cur + 400) {
             // frente: pula quadros ate o PTS (nao mexe lastPtsMs ate o decoder chegar la)
             seekTargetMs = (uint64_t)targetMs;
@@ -2067,13 +2140,116 @@ struct Player {
             seekSkipBudget = 200;
             if (paused) { paused = false; audio.muted = muted; }
         } else if (targetMs + 400 < cur) {
-            // tras: HUD so (JumpToTime instavel no homebrew)
+            // tras: HUD so
             scrubMs = targetMs;
             seekSkip = false;
-            waitNote = "Seek para tras limitado neste firmware";
+            waitNote = "Seek para tras indisponivel (salto desligado)";
         } else {
             seekSkip = false;
         }
+    }
+
+    // chamada a cada volta do laco principal: espera o download chegar ao ponto pedido e entao pula; solta a trava de seguranca
+    void serviceJump() {
+        double t = nowSec();
+        // a trava so solta depois de um quadro NOVO desenhado e de um tempo sem cair
+        if (jumpGuardOn && t - jumpGuardAt > 2.0 && lastFrameT > jumpGuardAt) {
+            remove(kJumpGuardFile); jumpGuardOn = false; trace("seek-jump-estavel");
+        }
+        if (pendJumpMs < 0) return;
+        if (!isVod || !active || failed || !h || !jumpUsable()) { pendJumpMs = -1; return; }
+        if (pendJumpNeed > 0) {
+            auto pf = getPf();
+            if (pf && pf->state() == 2) { pendJumpMs = -1; waitNote = "Download falhou: nao deu para pular"; return; }
+            uint64_t front = (!pf || pf->state() == 3) ? vodContentLength : pf->frontier();
+            if (front < pendJumpNeed) {
+                jumpPct = (int)(front * 100 / pendJumpNeed);
+                if (hudUntil < t + 2) hudUntil = t + 2;
+                return;
+            }
+        }
+        doJump();
+    }
+    void doJump() {
+        int64_t ms = pendJumpMs; pendJumpMs = -1;
+        double t = nowSec();
+        if (paused) { setPausedSoft(false); audio.muted = muted; }          // pausado: volta a tocar no novo ponto
+        touchFile(kJumpGuardFile); jumpGuardOn = true; jumpGuardAt = t;
+        trace("seek-jump-inicio");
+        int rc = 0;
+        {   // a thread de audio nao pode estar dentro do player enquanto ele pula
+            std::lock_guard<std::mutex> l(audio.hm);
+            rc = sceAvPlayerJumpToTime(h, (uint64_t)ms);
+        }
+        if (rc < 0) {
+            trace("seek-jump-erro");
+            remove(kJumpGuardFile); jumpGuardOn = false;
+            waitNote = "Nao consegui pular (" + hx8(rc) + ")";
+            if (++jumpErrors >= 3) { g_jumpMode = 0; trace("seek-jump-desligado-erros"); }
+            hudUntil = t + 6;
+            return;
+        }
+        jumpErrors = 0;
+        trace("seek-jump-ok");
+        audio.flush = true;
+        jumpTargetMs = ms; jumpSettleUntil = t + 1.5;
+        lastPtsMs = lastGoodPtsMs = (uint64_t)ms; playedMs = (uint64_t)ms; lastPtsWall = t;
+        playStartWall = t - (double)ms / 1000.0; pauseAccum = 0; pauseStartedAt = 0; lastPaceWall = 0;   // relogio do pacing A/V no novo ponto
+        scrubMode = false; scrubMs = -1; seekSkip = false;
+        hudUntil = t + 5;
+    }
+    // logo apos um salto o player ainda pode entregar quadros velhos: ignora-os no relogio ate chegar perto do alvo (ou 1,5 s)
+    bool staleAfterJump(uint64_t ts) {
+        if (jumpTargetMs < 0) return false;
+        uint64_t pts = ts / 1000;
+        if (pts > 48ULL * 3600ULL * 1000ULL) pts = ts / 10000;
+        int64_t diff = (int64_t)pts - jumpTargetMs;
+        if (diff < 0) diff = -diff;
+        if (diff <= 10000 || nowSec() > jumpSettleUntil) { jumpTargetMs = -1; return false; }
+        return true;
+    }
+
+    // L2/R2: dir = -1 (L2) | 0 (nenhum) | +1 (R2). Chamar a cada volta do laco enquanto o filme toca.
+    //  - ao apertar: ja anda 10 s (toque rapido = o antigo -10s/+10s)
+    //  - segurando (> 0,35 s): a barra acelera: 20 -> 60 -> 150 -> 300 s por segundo
+    //  - ao soltar: pula para onde a barra parou
+    void triggerScrub(int dir, double t) {
+        if (!isVod || !active || failed) { trigScrub = false; trigDir = 0; return; }
+        if (dir == 0) {
+            trigBlock = false;
+            if (trigScrub) {
+                trigScrub = false; trigDir = 0;
+                if (scrubMode && scrubMs >= 0) scrubConfirm();
+            }
+            return;
+        }
+        if (trigBlock) return;
+        if (!trigScrub || dir != trigDir) {
+            if (!scrubMode || scrubMs < 0) {
+                scrubMs = pendJumpMs >= 0 ? pendJumpMs : (int64_t)realPosMs();
+                scrubFromMs = scrubMs;
+            }
+            trigScrub = true; trigDir = dir; trigStart = trigLast = t;
+            scrubMode = true;
+            scrubMs += (int64_t)dir * 10000;
+            clampTime(scrubMs);
+            focusCtrl = dir < 0 ? 1 : 3;
+        } else {
+            double held = t - trigStart, dt = t - trigLast;
+            trigLast = t;
+            if (dt > 0.25) dt = 0.25;
+            if (held > 0.35) {
+                double rate = held < 1.5 ? 20.0 : held < 3.0 ? 60.0 : held < 5.0 ? 150.0 : 300.0;
+                scrubMs += (int64_t)((double)dir * rate * dt * 1000.0);
+                clampTime(scrubMs);
+            }
+        }
+        hudUntil = t + 4;
+    }
+    void cancelScrub() {
+        scrubMode = false; scrubMs = -1; trigScrub = false;
+        if (trigDir != 0) trigBlock = true;       // gatilho ainda apertado: so volta a valer depois de soltar
+        trigDir = 0;
     }
 
 
@@ -2090,7 +2266,7 @@ struct Player {
         }
     }
     void seekBy(int deltaMs) {
-        int64_t base = scrubMode && scrubMs >= 0 ? scrubMs : (int64_t)lastPtsMs;
+        int64_t base = scrubMode && scrubMs >= 0 ? scrubMs : pendJumpMs >= 0 ? pendJumpMs : (int64_t)realPosMs();
         seekTo(base + deltaMs);
     }
 
@@ -2122,6 +2298,7 @@ struct Player {
 
     uint64_t displayPosMs() const {
         if (scrubMode && scrubMs >= 0) return (uint64_t)scrubMs;
+        if (pendJumpMs >= 0) return (uint64_t)pendJumpMs;          // esperando o download chegar: a barra fica no ponto pedido
         if (seekSkip && seekTargetMs > 0) return seekTargetMs;
         // playedMs so avanca quando chega frame (nao corre na tela preta)
         uint64_t p = playedMs;
@@ -2257,12 +2434,25 @@ struct Player {
             char t0[32], t1[32];
             fmtTime(pos, t0, sizeof t0);
             fmtTime(dur, t1, sizeof t1);
+            // Fundo opaco atras dos textos que mudam: pausado, o HUD e redesenhado sempre sobre o mesmo quadro e o texto novo borraria o antigo.
+            r.roundRect(trackX - 6, trackY + trackH + 8, r.textWidth(t0, 18) + 12, 26, 6, 0xFF000000u);
             uiText(r, trackX, trackY + trackH + 12, t0, YT_WHITE, 18);
             uiText(r, trackX + trackW - r.textWidth(t1, 18), trackY + trackH + 12, t1, 0xFFCCCCCCu, 18);
-            if (scrubMode)
-                uiText(r, trackX + trackW / 2 - 100, trackY - 26, "SEEK  L2/R2  L1/R1 1min  X ok", YT_WHITE, 16);
-            else if (seekSkip)
-                uiText(r, trackX + trackW / 2 - 70, trackY - 26, "Indo para o ponto...", 0xFFFFCC33u, 16);
+            {
+                std::string st; unsigned col = YT_WHITE;
+                if (scrubMode && trigScrub) {                                  // segurando L2/R2: mostra quanto ja andou
+                    int64_t dl = scrubMs - scrubFromMs;
+                    char dtx[32]; fmtTime((uint64_t)(dl < 0 ? -dl : dl), dtx, sizeof dtx);
+                    st = std::string(dl < 0 ? "<< -" : ">> +") + dtx + "   solte para ir";
+                } else if (scrubMode) st = "SEEK  L2/R2  L1/R1 1min  X ok";
+                else if (pendJumpMs >= 0) { st = "Baixando ate o ponto... " + std::to_string(jumpPct) + "%"; col = 0xFFFFCC33u; }
+                else if (seekSkip || (jumpTargetMs >= 0 && nowSec() < jumpSettleUntil)) { st = "Indo para o ponto..."; col = 0xFFFFCC33u; }
+                if (!st.empty()) {
+                    int tw = r.textWidth(st, 16), cx0 = trackX + trackW / 2;
+                    r.roundRect(cx0 - tw / 2 - 10, trackY - 30, tw + 20, 26, 6, 0xFF000000u);
+                    uiText(r, cx0 - tw / 2, trackY - 26, st, col, 16);
+                }
+            }
         } else {
             r.roundRect(trackX, trackY, trackW, trackH, 3, YT_GRAY);
             r.roundRect(trackX, trackY, trackW * 9 / 10, trackH, 3, YT_RED);
@@ -2289,7 +2479,7 @@ struct Player {
 
         uiText(r, 48, H - 22,
                isVod
-                   ? "L2 -10s   R2 +10s   X pausa   UP seek   L1/R1 ep   △ Opcoes   O sair"
+                   ? "L2/R2 voltar/avancar (segure)   X pausa   UP seek   L1/R1 ep   △ Opcoes   O sair"
                    : "X pausa   □ mudo   △ Opcoes   O sair",
                0xFF888888u, 15);
 
@@ -2744,6 +2934,11 @@ int main() {
         return false;
     };
     trace("antes-lista");
+    {   // Salto no filme (JumpToTime): se o app caiu no meio de um salto na vez anterior, desliga o salto de vez (volta ao seek antigo)
+        if (fileExists(kJumpGuardFile)) { remove(kJumpGuardFile); touchFile(kNoJumpFile); trace("seek-jump-queda-desligado"); }
+        g_jumpMode = (fileExists(kNoJumpFile) || !sceAvPlayerJumpToTime) ? 0 : 1;
+        trace(g_jumpMode.load() ? "seek-jump-ligado" : "seek-jump-desligado");
+    }
     // Protecao contra "fecha sempre ao abrir": se a ultima abertura caiu durante a lista M3U, muda de estrategia.
     //  1a queda -> a proxima abertura usa o MODO SEGURO (baixa a lista sem thread de rede) e isso fica gravado;
     //  caiu ate no modo seguro -> nao carrega a lista sozinho (o app abre normalmente e mostra o passo onde parou).
@@ -3013,27 +3208,24 @@ int main() {
                 // Barra de seek: UP entra no modo scrub | DOWN sai
                 if (player.isVod) {
                     if (pressed & B_UP) {
+                        if (!player.scrubMode || player.scrubMs < 0) {
+                            player.scrubMs = player.pendJumpMs >= 0 ? player.pendJumpMs : (int64_t)player.realPosMs();
+                            player.scrubFromMs = player.scrubMs;
+                        }
                         player.scrubMode = true;
-                        if (player.scrubMs < 0) player.scrubMs = (int64_t)player.lastPtsMs;
                         player.hudUntil = nowSec() + 15;
                     }
-                    if (pressed & B_DOWN && player.scrubMode) {
-                        player.scrubMode = false;
-                        player.scrubMs = -1;
-                    }
+                    if ((pressed & B_DOWN) && player.scrubMode) player.cancelScrub();
                     if (player.scrubMode) {
-                        // fino / grosso na barra
-                        if (pressed & B_L2) player.scrubMove(-5000);
-                        if (pressed & B_R2) player.scrubMove(+5000);
+                        // fino / grosso na barra (L2/R2 tem tratamento proprio logo abaixo)
                         if (pressed & B_LEFT) player.scrubMove(-15000);
                         if (pressed & B_RIGHT) player.scrubMove(+15000);
                         if (pressed & B_L1) player.scrubMove(-60000);
                         if (pressed & B_R1) player.scrubMove(+60000);
                         if (pressed & B_CROSS) { player.scrubConfirm(); }
-                    } else {
-                        if (pressed & B_L2) { player.seekBy(-10000); player.focusCtrl = 1; }
-                        if (pressed & B_R2) { player.seekBy(+10000); player.focusCtrl = 3; }
                     }
+                    // L2/R2: toque = -10s/+10s | SEGURAR = a barra anda sozinha (acelerando) e o filme pula ao SOLTAR
+                    player.triggerScrub(((now & B_R2) ? 1 : 0) - ((now & B_L2) ? 1 : 0), nowSec());
                 }
                 // X = ativa o botao em foco (se nao confirmou scrub)
                 if ((pressed & B_CROSS) && !player.scrubMode) {
@@ -3067,7 +3259,7 @@ int main() {
                     }
                 }
                 // L1/R1 tambem mudam episodio
-                if ((pressed & B_L1) && player.canPrevEp()) {
+                if ((pressed & B_L1) && !player.scrubMode && player.canPrevEp()) {
                     player.epIndex--;
                     pf.pendingPlayUrl = player.epUrls[player.epIndex];
                     pf.pendingPlayTitle = player.epTitles[player.epIndex];
@@ -3076,7 +3268,7 @@ int main() {
                     player.focusCtrl = 0; player.quietWait = true;
                     player.stop(); mode = Mode::Menu; dirty = true; sceKernelUsleep(8000); continue;
                 }
-                if ((pressed & B_R1) && player.canNextEp()) {
+                if ((pressed & B_R1) && !player.scrubMode && player.canNextEp()) {
                     player.epIndex++;
                     pf.pendingPlayUrl = player.epUrls[player.epIndex];
                     pf.pendingPlayTitle = player.epTitles[player.epIndex];
@@ -3173,10 +3365,16 @@ int main() {
                 }
             }
 
+            player.serviceJump();       // salto pendente (espera o download chegar ao ponto) + trava de seguranca
+
             // ---- Desenho ----
             if (player.active && !player.failed && g_tearing.load() == 0) {
                 bool hud = player.hudActive();
-                FbRenderer r(hud ? shadow : (uint32_t *)bufs[back], W, H);
+                // CORRECAO DO "CONGELA APOS ~5 s": filme/serie SEMPRE desenha no rascunho (shadow) e o flip() copia para a tela.
+                // Antes, com o HUD apagado, o quadro ia direto para a tela (bufs[back]) e logo em seguida o flip() copiava o
+                // rascunho (com a ultima imagem do HUD) POR CIMA dele = imagem parada com o som seguindo. Mexer no analogico
+                // religava o HUD (que usava o rascunho) e o video "voltava".
+                FbRenderer r((hud || player.isVod) ? shadow : (uint32_t *)bufs[back], W, H);
                 if (player.paused) {
                     // pausado: so HUD (proporcao aplica no proximo quadro ao despausar)
                     player.overlay(r); flip();
