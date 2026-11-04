@@ -2551,7 +2551,7 @@ int main() {
         NetGate::Permit permit(g_coverGate, worker >= ImgCache::kWorkers, &g_quitting);
         if (!permit.ok) return false;                    // app fechando
         ss.recvSec = 8;
-        std::string url = coverThumbUrl(url0);           // TMDB: pede a miniatura (~10 KB) em vez do poster gigante (500 KB+)
+        std::string url = coverFetchUrl(url0);           // TMDB: usa coverFetchUrl (variante/tamanho correto; miniatura se nao houver variante)
         int st = 0;
         try {
             return g_net.getKA(ss, url, body, st, 768 * 1024) && st >= 200 && st < 300 && body.size() > 32;
