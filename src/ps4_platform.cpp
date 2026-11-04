@@ -708,6 +708,10 @@ int sceAvPlayerSetLogCallback(KAvLogCb cb, void *ud);
 // seek antigo. Para religar: apague /data/kickiptv_nojump (ex.: por FTP).
 static const char *kJumpGuardFile = "/data/kickiptv_jumpguard";
 static const char *kNoJumpFile = "/data/kickiptv_nojump";
+// Segundo plano: por padrao o app ENCERRA SOZINHO logo depois de ir para o inicio do PS4 (com player/rede ja parados). Se ele ficasse
+// vivo, o sistema precisava mata-lo ao "Fechar aplicativo" / ao abrir outro app e dava CE-34878-0 (o app nao morria a tempo).
+// Para manter o comportamento antigo (app continua vivo no segundo plano), crie o arquivo /data/kickiptv_keepbg (ex.: por FTP).
+static const char *kKeepBgFile = "/data/kickiptv_keepbg";
 static std::atomic<int> g_jumpMode{0};                 // 1 = usa JumpToTime | 0 = desligado (definido na abertura do app)
 static bool fileExists(const char *p) { FILE *f = fopen(p, "rb"); if (!f) return false; fclose(f); return true; }
 static void touchFile(const char *p) { FILE *f = fopen(p, "wb"); if (f) { fwrite("1", 1, 1, f); fclose(f); } }
@@ -3016,11 +3020,15 @@ int main() {
         // (se o usuario escolher "Fechar aplicativo", o sistema mata o processo;
         //  se ja liberamos AvPlayer/threads, nao da CE-34878-0).
         {
-            static bool wasBg = false;
+            static bool wasBg = false, seenFg = false, keepBg = false;
+            static double bgSince = 0;
             OrbisSystemServiceStatus st{};
             if (sceSystemServiceGetStatus(&st) == 0) {
                 bool bg = (st.isInBackground != 0);
+                if (!bg) seenFg = true;                // so conta como "foi para o inicio" depois de ter estado na frente uma vez
                 if (bg && !wasBg) {
+                    bgSince = nowSec();
+                    keepBg = fileExists(kKeepBgFile);
                     trace("sistema-background");
                     g_quitting = true;                 // workers de rede/capas param
                     if (mode == Mode::Play || player.h) {
@@ -3035,6 +3043,7 @@ int main() {
                     try { g_feed.abort(); abortHf(); abortPf(); } catch (...) {}
                     // da um momento pro stop assincrono soltar o AvPlayer
                     Player::waitTeardown(0.35);
+                    trace("bg-parado");
                     dirty = true;
                 }
                 if (!bg && wasBg) {
@@ -3046,6 +3055,16 @@ int main() {
                 wasBg = bg;
                 // Enquanto estiver em background: nao toca video nem redesenha menu pesado
                 if (bg) {
+                    // Ficou no inicio do PS4 por mais de 1 s: encerra sozinho (nada de esperar o sistema matar o processo).
+                    // Sem esperar threads de rede (_Exit); o estado (lista/ultimo streamer) ja fica salvo em disco.
+                    if (seenFg && !keepBg && nowSec() - bgSince > 1.0) {
+                        trace("bg-saindo");
+                        g_quitting = true;
+                        try { pf.saveSetting("bgload", ""); } catch (...) {}
+                        try { removeVodFiles(); } catch (...) {}
+                        trace("fim-bg");
+                        _Exit(0);
+                    }
                     sceKernelUsleep(30000);
                     continue;
                 }
