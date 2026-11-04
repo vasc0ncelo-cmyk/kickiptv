@@ -73,6 +73,29 @@ int main() {
         ui.openMovieDetail(app.list.movies[0], ""); ui.render(r);
         for (size_t i = (size_t)W * H; i < g.size(); i++) assert(g[i] == 0xAABBCCDDu);
     }
+    // --- capa do FILME: a pagina de detalhes tem que PEDIR o poster (antes so series pediam; filme ficava sem capa) ---
+    {
+        std::string m2 = "#EXTM3U\n#EXTINF:-1 tvg-logo=\"http://img/poster_filme.jpg\" group-title=\"FILMES | A\xC3\xA7\xC3\xA3o\",Matrix (1999)\nhttp://h/movie/9.mp4\n";
+        Fake f2; App app2(f2); app2.list = buildPlaylist(m2); UI ui2(app2);
+        std::vector<std::string> gotFront, gotBack; int calls = 0;
+        ui2.coverBatch = [&](const std::vector<std::string> &fr, const std::vector<std::string> &bk) { calls++; gotFront = fr; gotBack = bk; };
+        assert(app2.list.movies.size() == 1 && app2.list.movies[0].logo == "http://img/poster_filme.jpg");
+        ui2.openMovieDetail(app2.list.movies[0], "");
+        const int W = 1920, H = 1080;
+        std::vector<uint32_t> g((size_t)W * H, 0);
+        FbRenderer r(g.data(), W, H);
+        ui2.render(r);
+        assert(calls == 1 && gotFront.size() == 1 && gotBack.empty());
+        std::string url; int cw = 0, ch = 0;
+        assert(coverSplitVariant(gotFront[0], url, cw, ch) && url == "http://img/poster_filme.jpg" && cw > 100 && ch > 100);   // o mesmo tamanho que o desenho usa
+        ui2.render(r); assert(calls == 1);                                      // mesmo quadro: nao repete o pedido
+        // desenho: se a capa estiver pronta no cache, ela e usada (nao aparece o texto "FILME")
+        int gets = 0; std::string askedKey;
+        ui2.coverGet = [&](const std::string &k, const uint32_t *&px, int &w, int &h) {
+            gets++; askedKey = k; static std::vector<uint32_t> pix(8 * 8, 0xFF336699u); px = pix.data(); w = 8; h = 8; return true; };
+        ui2.render(r);
+        assert(gets >= 1 && askedKey == gotFront[0]);                           // desenho e pedido usam a MESMA chave
+    }
     // --- ao voltar, as capas da lista voltam a ser pedidas ---
     { ui.openMovieDetail(app.list.movies[0], ""); ui.lastBatchKey = "x"; ui.handle(Input::Back); assert(ui.lastBatchKey.empty()); }
     std::cout << "OK\n";
