@@ -393,6 +393,14 @@ inline void UI::renderDetail(Renderer &r) {
             dp::triRight(r, (float)x + F(262), F(789.5f), F(14), F(17), GREEN);
         }
     }
+    // ---- capa quando NAO ha temporadas/episodios (filme, ou serie sem temporadas) ----
+    // O pedido de download da capa (wantDetailCovers) so rodava dentro do bloco de episodios acima: em FILMES ninguem mandava baixar
+    // o poster do detalhe (ele so aparecia se por acaso ja estivesse no cache). Aqui pedimos so o poster, com a MESMA chave/tamanho
+    // que o desenho do poster usa (poster = 337x345 menos a borda).
+    if (!(detailSeries && nSea > 0)) {
+        const int pbw = S(2) < 2 ? 2 : S(2);
+        wantDetailCovers(coverVariantKey(detailLogo, S(337) - 2 * pbw, S(345) - 2 * pbw), {}, {});
+    }
     // ---- rodape ----
     {
         r.fillRect(0, S(860), W, S(3), GREEN);
