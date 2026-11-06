@@ -86,6 +86,7 @@ unsigned int sceLibcHeapExtendedAlloc = 1;
 size_t sceLibcHeapSize = 0xFFFFFFFFFFFFFFFFULL;   // SCE_LIBC_HEAP_SIZE_EXTENDED_ALLOC_NO_LIMIT
 }
 static void trace(const char *stage);   // (definida mais abaixo)
+static std::atomic<int> g_grDbg{0};       // diagnostico: quantas chamadas de NetClient::getRange ainda vao pro log
 // Marcadores finos do download da lista M3U: se o app fechar, a proxima abertura mostra o ULTIMO passo que foi gravado.
 static bool g_traceHttp = false;                 // so durante o download da lista M3U
 static const char *g_m3uTag = "m3u-t-";          // "t" = thread de rede | "s" = modo seguro (mesma thread)
@@ -319,19 +320,28 @@ struct NetClient {
     // GET de um trecho [from, to] (inclusive) reaproveitando a conexao de 's' (so UMA thread por sessao). Devolve false em erro de rede.
     // 'status': 206 = ok | 416 = alem do fim | 200 = o servidor ignorou o Range (nao le o resto: derruba a conexao).
     bool getRange(Session &s, const std::string &url, uint64_t from, uint64_t to, std::string &body, int &status, uint64_t *total = nullptr) {
+        bool lg = g_grDbg.load() > 0;                  // diagnostico: so as primeiras chamadas vao pro log
+        if (lg) { g_grDbg--; trace("gr-ini"); }
         for (int attempt = 0; attempt < 2; attempt++) {
             status = 0; body.clear();
             bool fresh = false;
-            if (s.conn < 0 || s.origin != originOf(url)) { if (!openSession(s, url)) return false; fresh = true; }
+            if (s.conn < 0 || s.origin != originOf(url)) { if (lg) trace("gr-abrindo"); if (!openSession(s, url)) { if (lg) trace("gr-abrir-falhou"); return false; } fresh = true; if (lg) trace("gr-aberta"); }
             int req = sceHttpCreateRequestWithURL(s.conn, 0 /*GET*/, url.c_str(), 0);
+            if (lg) trace("gr-req");
             bool ok = false, clean = false;
             size_t want = (size_t)(to - from + 1);
+            if (lg) trace("gr-reserve");
             body.reserve(want);
+            if (lg) trace("gr-reserve-ok");
             if (req >= 0) {
                 sceHttpAddRequestHeader(req, "Accept", "*/*", 0);
                 char rb[64]; snprintf(rb, sizeof rb, "bytes=%llu-%llu", (unsigned long long)from, (unsigned long long)to);
                 sceHttpAddRequestHeader(req, "Range", rb, 0);
-                if (sceHttpSendRequest(req, NULL, 0) >= 0 && sceHttpGetStatusCode(req, &status) >= 0) {
+                if (lg) trace("gr-enviando");
+                int src = sceHttpSendRequest(req, NULL, 0);
+                if (lg) { char lb[64]; snprintf(lb, sizeof lb, "gr-enviado rc=%08X", (unsigned)src); trace(lb); }
+                if (src >= 0 && sceHttpGetStatusCode(req, &status) >= 0) {
+                    if (lg) { char lb[64]; snprintf(lb, sizeof lb, "gr-status=%d", status); trace(lb); }
                     ok = true;
                     if (total) {                                          // "Content-Range: bytes 0-0/TOTAL": o tamanho vem numa requisicao so
                         char *hd = nullptr; size_t hn = 0;
@@ -348,8 +358,11 @@ struct NetClient {
                     if (status == 206 || status == 416 || (status == 200 && from == 0)) {
                         clean = true;
                         std::vector<char> buf(128 * 1024);
+                        bool firstRd = true;
                         for (;;) {
+                            if (lg && firstRd) trace("gr-lendo");
                             int n = sceHttpReadData(req, buf.data(), buf.size());
+                            if (lg && firstRd) { firstRd = false; char lb[64]; snprintf(lb, sizeof lb, "gr-leu n=%d", n); trace(lb); }
                             if (n < 0) { ok = clean = false; break; }
                             if (n == 0) break;
                             body.append(buf.data(), (size_t)n);
@@ -1631,6 +1644,7 @@ struct Player {
         rd->setOnExit([s1] { g_net.closeSession(*s1); });
         rd->setProbe([total] { return total; });
         setHf(rd);
+        g_grDbg = 2;                       // loga os passos das 2 primeiras chamadas de rede do leitor
         rd->start();
         trace("nat-reader-ok");
 
@@ -1658,6 +1672,8 @@ struct Player {
             if (cancelCb && cancelCb()) { cancelled = true; rd->abort(); }
             if (nowSec() - lastUi > 0.2) {
                 lastUi = nowSec();
+                static int uiN = 0;
+                if (uiN < 4) { char ub[48]; snprintf(ub, sizeof ub, "nat-ui-%d t=%.1f", uiN++, nowSec() - tw); trace(ub); }
                 char b[96]; snprintf(b, sizeof b, "Nativo: lendo o indice... %.1f s  (O cancela)", nowSec() - tw);
                 waitNote = b; presentCb();
             }
