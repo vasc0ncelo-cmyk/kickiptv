@@ -242,22 +242,30 @@ bool Player::openFile(const std::string &path, int maxW, int maxH) {
     return true;
 }
 
-bool Player::pump(Frame &out) {
-    out = Frame{};
-    if (!open_ || !g_api.loaded) return false;
-
-    std::vector<uint8_t> au;
-    if (!nextAccessUnit(au)) {
-        err_ = "fim do arquivo";
+bool Player::openStream(int maxW, int maxH) {
+    close();
+    err_.clear();
+    if (!tryLoadApi()) {
+        err_ = "HW decoder indisponivel";
         return false;
     }
+    if (!initDecoder(maxW, maxH)) return false;
+    pos_ = 0;
+    ptsTick_ = 0;
+    open_ = true;
+    return true;
+}
+
+bool Player::feedAu(const uint8_t *au, size_t n, uint64_t ptsMs, uint64_t dtsMs, Frame &out) {
+    out = Frame{};
+    if (!open_ || !g_api.loaded || !au || n == 0) return false;
 
     vdec::InputData in{};
     in.thisSize = sizeof(in);
-    in.pAuData = au.data();
-    in.auSize = au.size();
-    in.ptsData = ptsTick_++;
-    in.dtsData = in.ptsData;
+    in.pAuData = const_cast<uint8_t *>(au);
+    in.auSize = n;
+    in.ptsData = ptsMs;
+    in.dtsData = dtsMs;
     in.attachedData = 0;
 
     vdec::FrameBuffer fb{};
@@ -270,7 +278,7 @@ bool Player::pump(Frame &out) {
 
     int rc = g_api.decode(&ctrl_, &in, &fb, &pic);
     if (rc != 0 || !pic.isValid) {
-        // alguns frames (só SPS) não produzem picture — não é erro fatal
+        // alguns AUs (SPS/PPS, reordenacao) nao produzem picture — nao e erro fatal
         return false;
     }
 
@@ -282,6 +290,19 @@ bool Player::pump(Frame &out) {
     out.ptsMs = pic.ptsData;
     out.valid = true;
     return true;
+}
+
+bool Player::pump(Frame &out) {
+    out = Frame{};
+    if (!open_ || !g_api.loaded) return false;
+
+    std::vector<uint8_t> au;
+    if (!nextAccessUnit(au)) {
+        err_ = "fim do arquivo";
+        return false;
+    }
+    uint64_t t = ptsTick_++;
+    return feedAu(au.data(), au.size(), t, t, out);
 }
 
 void Player::close() {
