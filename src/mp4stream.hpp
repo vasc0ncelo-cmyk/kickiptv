@@ -19,6 +19,10 @@
 
 namespace mp4s {
 
+// Gancho opcional de log (o app aponta para o trace()). nullptr = sem log.
+inline void (*g_trace)(const char *) = nullptr;
+inline void T(const char *s) { if (g_trace) g_trace(s); }
+
 // Le 'len' bytes em 'pos'. Retorna quantos leu. Menos que 'len' (ou 0) = nao chegou a tempo / erro.
 using ReadAt = std::function<int(uint8_t *dst, uint64_t pos, uint32_t len, int timeoutMs)>;
 
@@ -36,8 +40,11 @@ public:
         reset();
         rd_ = rd; total_ = total;
         std::vector<uint8_t> moov;
-        if (!findMoov(moov, err, timeoutMs)) return false;
-        if (!parseMoov(moov, err)) return false;
+        T("dm-open");
+        if (!findMoov(moov, err, timeoutMs)) { T("dm-moov-falhou"); return false; }
+        T("dm-moov-lido");
+        if (!parseMoov(moov, err)) { T("dm-parse-falhou"); return false; }
+        T("dm-parse-ok");
         return true;
     }
 
@@ -108,6 +115,7 @@ private:
         while (pos + 8 <= total_ && boxes++ < 64) {
             uint8_t h[16] = {0};
             uint32_t n = (uint32_t)std::min<uint64_t>(16, total_ - pos);
+            T("dm-caixa");
             if (!readFull(h, pos, n, timeoutMs)) { err = "falha ao ler cabecalho do MP4"; return false; }
             uint64_t size = mp4ab::be32(h);
             uint32_t type = mp4ab::be32(h + 4);
@@ -121,6 +129,7 @@ private:
                 uint64_t body = size - hdr;
                 if (body < 8 || body > (96ull << 20)) { err = "moov com tamanho absurdo"; return false; }
                 if (pos + size > total_) { err = "moov passa do fim do arquivo"; return false; }
+                T("dm-moov-alloc");
                 moov.resize((size_t)body);
                 if (!readFull(moov.data(), pos + hdr, body, timeoutMs)) { err = "falha ao ler o indice (moov)"; return false; }
                 return true;
