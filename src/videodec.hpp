@@ -8,9 +8,11 @@
 
 namespace vdec {
 
-// codecType: 1 = AVC (H.264) — o mais comum em IPTV/VOD
+// codecType do AVC (H.264). NAO CONFIRMADO: o valor 1 deu 0x80C10001 no console; a referencia publica (shadPS4) usa 0 para AVC.
+// O hwplayer testa os dois em ordem e registra qual funcionou.
 enum : uint32_t {
-    kCodecAvc = 1,
+    kCodecAvc = 0,
+    kCodecAvcAlt = 1,
 };
 
 struct ConfigInfo {
