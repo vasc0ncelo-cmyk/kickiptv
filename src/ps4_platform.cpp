@@ -3139,8 +3139,21 @@ int main() {
             if (!wasSafe) { g_safeM3U = true; pf.saveSetting("safem3u", "1"); trace("modo-seguro-ligado"); }
             else skipAuto = true;
         }
+        // Ultimas linhas do log da vez anterior (onde o app parou). Aparece junto de qualquer aviso abaixo.
+        std::string stageNote;
+        {
+            if (!g_prevTail.empty()) {
+                for (size_t i = g_prevTail.size() > 4 ? g_prevTail.size() - 4 : 0; i < g_prevTail.size(); i++) {
+                    if (!stageNote.empty()) stageNote += " | ";
+                    stageNote += g_prevTail[i];
+                }
+            } else if (g_prevRaw != "(nenhum)") stageNote = g_prevRaw;
+            if (!stageNote.empty()) stageNote = "  [LOG: " + stageNote + "]";
+        }
         if (ui.hasSavedList() && skipAuto) {
-            app.say("A lista M3U fechou o app na ultima vez - abra LISTA M3U e aperte X.");
+            app.say("A lista M3U fechou o app na ultima vez - abra LISTA M3U e aperte X." + stageNote);
+        } else if (ui.hasSavedList() && !stageNote.empty() && !g_prevStage.empty()) {
+            app.say("O app fechou na ultima vez." + stageNote);   // queda fora da lista M3U: mostra onde parou
         } else if (ui.hasSavedList()) {
             // Abre o app e carrega a lista SALVA em segundo plano (le o arquivo guardado no console: nao baixa nada).
             // So baixa da rede se nao houver copia salva desta lista. Se o app cair nisso, a proxima abertura nao repete (protecao acima).
