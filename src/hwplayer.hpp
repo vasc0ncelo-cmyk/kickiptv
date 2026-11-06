@@ -17,6 +17,9 @@
 
 namespace hwplayer {
 
+// Gancho opcional de log (o app aponta para o trace() que grava /data/kickiptv.log). nullptr = sem log.
+extern void (*g_trace)(const char *);
+
 struct Frame {
     const uint8_t *nv12 = nullptr; // Y + UV intercalado (ou planar conforme o decoder)
     int width  = 0;
