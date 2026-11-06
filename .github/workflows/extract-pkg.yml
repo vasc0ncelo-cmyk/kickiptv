@@ -1,0 +1,58 @@
+# Abre um .pkg (de um app seu ou de quem autorizou) no GitHub Actions, sem precisar de PC.
+# Como usar pelo celular: Actions > "Extrair PKG" > Run workflow > preencha "fonte":
+#   - release:NOME_DO_TAG   (recomendado: crie uma Release em RASCUNHO, anexe o .pkg e use o nome do tag; rascunho nao fica publico)
+#   - ou um link direto https://... para o .pkg
+# Resultado: o relatorio aparece no log do job e os arquivos extraidos ficam no artifact "pkg-extraido".
+name: Extrair PKG
+on:
+  workflow_dispatch:
+    inputs:
+      fonte:
+        description: "release:TAG (rascunho com o .pkg anexado) ou link direto https://..."
+        required: true
+permissions:
+  contents: read
+jobs:
+  extrair:
+    runs-on: ubuntu-22.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+      DOTNET_ROLL_FORWARD: Major
+      DOTNET_SYSTEM_GLOBALIZATION_INVARIANT: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain OpenOrbis (PkgTool)
+        run: bash scripts/get_toolchain.sh
+      - name: Obter o .pkg
+        run: |
+          mkdir -p in out
+          SRC="${{ github.event.inputs.fonte }}"
+          case "$SRC" in
+            release:*) gh release download "${SRC#release:}" --repo "$GITHUB_REPOSITORY" --pattern '*.pkg' --dir in ;;
+            http*)     curl -L --fail -o in/app.pkg "$SRC" ;;
+            *) echo "fonte invalida: use release:TAG ou um link http(s)"; exit 1 ;;
+          esac
+          ls -la in
+      - name: Extrair
+        run: |
+          T="$OO_PS4_TOOLCHAIN/bin/linux/PkgTool.Core"
+          echo "== comandos do PkgTool"; "$T" 2>&1 | head -40 || true
+          P=$(ls in/*.pkg | head -n1)
+          echo "== entradas"; "$T" pkg_listentries "$P" 2>&1 | head -60 || true
+          # tenta os nomes de comando conhecidos; o primeiro que funcionar basta
+          "$T" pkg_extract "$P" out 2>&1 | tail -20 || true
+          [ -n "$(find out -type f | head -n1)" ] || "$T" img_extract "$P" out 2>&1 | tail -20 || true
+          echo "== arquivos extraidos"; find out -type f -printf '%s  %p\n' | head -100
+      - name: Relatorio (o que procurar no payload / eboot)
+        run: |
+          for f in $(find out -type f \( -name '*.bin' -o -name '*.elf' -o -name '*.prx' -o -name 'eboot*' \)); do
+            echo "=================== $f ($(stat -c %s "$f") bytes)"
+            file "$f" | head -1
+            strings -n 5 "$f" | grep -E "9090|2121|127\.0\.0\.1|localhost|http|/data/|\.pkg|payload|bgft|AppInst|install|socket|json|POST|GET " | sort -u | head -60
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pkg-extraido
+          path: out
+          if-no-files-found: warn
