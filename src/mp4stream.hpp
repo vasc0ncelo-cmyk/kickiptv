@@ -168,6 +168,7 @@ private:
         std::vector<std::pair<uint32_t, uint32_t>> stts, ctts;   // contagem, delta/offset
         std::vector<uint32_t> stss;
         bool hasStss = false;
+        const char *other = nullptr;   // video que NAO e H.264 (para dar uma mensagem clara)
     };
 
     bool parseTrak(const std::vector<uint8_t> &b, size_t from, size_t to, Trak &t) {
@@ -200,6 +201,10 @@ private:
                         if (children(b, p + 86, p + esz, ext))        // extensoes do VisualSampleEntry comecam em +86
                             for (auto &c : ext) if (c.type == mp4ab::fourcc("avcC")) { t.avcC.assign(d + c.data, d + c.end); t.avc = true; }
                     }
+                    if (ety == mp4ab::fourcc("hvc1") || ety == mp4ab::fourcc("hev1") || ety == mp4ab::fourcc("dvh1") || ety == mp4ab::fourcc("dvhe")) t.other = "HEVC (H.265)";
+                    else if (ety == mp4ab::fourcc("vp09")) t.other = "VP9";
+                    else if (ety == mp4ab::fourcc("av01")) t.other = "AV1";
+                    else if (ety == mp4ab::fourcc("mp4v")) t.other = "MPEG-4 Part 2";
                     p += esz;
                 }
             } else if (x.type == mp4ab::fourcc("stsz") && e - a >= 12) {
@@ -254,14 +259,19 @@ private:
         if (!children(b, 0, b.size(), top)) { err = "moov corrompido"; return false; }
         Trak t;
         bool found = false;
+        const char *other = nullptr;
         for (auto &x : top) {
             if (x.type == mp4ab::fourcc("cmov")) { err = "moov comprimido (cmov) nao suportado"; return false; }
             if (x.type != mp4ab::fourcc("trak")) continue;
             Trak cur;
             if (!parseTrak(b, x.data, x.end, cur)) continue;
+            if (cur.other && !other) other = cur.other;
             if (cur.avc && !cur.sizes.empty() && !cur.chunkOff.empty()) { t = std::move(cur); found = true; break; }
         }
-        if (!found) { err = "MP4 sem trilha de video H.264 (avc1)"; return false; }
+        if (!found) {
+            err = other ? std::string("o video e ") + other + ", nao H.264 (o decoder nativo so faz H.264)" : "MP4 sem trilha de video H.264 (avc1)";
+            return false;
+        }
         if (t.timescale == 0) t.timescale = 1000;
         if (t.stsc.empty()) t.stsc.push_back({1, 1});
         width_ = t.w; height_ = t.h;
