@@ -1593,7 +1593,7 @@ struct Player {
         body.clear();
         useNative = true;
         isVod = true;
-        h = nullptr;
+        h = 0;
         active = true;
         failed = false;
         paused = false;
