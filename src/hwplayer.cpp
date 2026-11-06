@@ -15,12 +15,7 @@ int sceKernelDlsym(int handle, const char *name, void **addr);
 }
 
 namespace hwplayer {
-
-void (*g_trace)(const char *) = nullptr;
-
 namespace {
-
-void T(const char *s) { if (g_trace) g_trace(s); }
 
 vdec::Api g_api;
 
@@ -43,7 +38,6 @@ const char *kModuleCandidates[] = {
 
 bool Player::tryLoadApi() {
     if (g_api.loaded) return true;
-    T("vdec-load");
 
     for (int i = 0; kModuleCandidates[i]; i++) {
         int mod = -1;
@@ -72,7 +66,6 @@ bool Player::tryLoadApi() {
 
         g_api.module = mod;
         g_api.loaded = true;
-        T("vdec-load-ok");
         return true;
     }
 
@@ -169,15 +162,7 @@ bool Player::initDecoder(int maxW, int maxH) {
 
     res_ = {};
     res_.thisSize = sizeof(res_);
-    T("vdec-query");
     int q = g_api.queryResourceInfo(&cfg, &res_);
-    {
-        char b[200];
-        snprintf(b, sizeof b, "vdec-query-rc=%08X cpu=%llu gpu=%llu frame=%llu align=%u", (unsigned)q,
-                 (unsigned long long)res_.cpuMemorySize, (unsigned long long)res_.cpuGpuMemorySize,
-                 (unsigned long long)res_.maxFrameBufferSize, (unsigned)res_.frameBufferAlignment);
-        T(b);
-    }
     if (q != 0) {
         // fallback: tamanhos razoáveis se Query falhar
         res_.cpuMemorySize = 8ull * 1024 * 1024;
@@ -191,13 +176,11 @@ bool Player::initDecoder(int maxW, int maxH) {
     res_.pCpuMemory = cpuMem_.data();
     res_.pCpuGpuMemory = cpuGpuMem_.data();
 
-    if (g_api.mapMemory) { T("vdec-map"); int mr = g_api.mapMemory(); char mb[48]; snprintf(mb, sizeof mb, "vdec-map-rc=%08X", (unsigned)mr); T(mb); }
+    if (g_api.mapMemory) g_api.mapMemory();
 
     ctrl_ = {};
     ctrl_.thisSize = sizeof(ctrl_);
-    T("vdec-create");
     int rc = g_api.createDecoder(&cfg, &res_, &ctrl_);
-    { char cb[64]; snprintf(cb, sizeof cb, "vdec-create-rc=%08X", (unsigned)rc); T(cb); }
     if (rc != 0) {
         char b[96];
         snprintf(b, sizeof b, "sceVideodecCreateDecoder falhou: 0x%08X", (unsigned)rc);
@@ -259,10 +242,10 @@ bool Player::openFile(const std::string &path, int maxW, int maxH) {
     return true;
 }
 
-bool Player::openStream(int maxW, int maxH) {
+bool Player::open(int maxW, int maxH) {
     close();
     err_.clear();
-    if (!tryLoadApi()) {
+    if (!tryLoadApi() || !g_api.loaded) {
         err_ = "HW decoder indisponivel";
         return false;
     }
@@ -273,16 +256,16 @@ bool Player::openStream(int maxW, int maxH) {
     return true;
 }
 
-bool Player::feedAu(const uint8_t *au, size_t n, uint64_t ptsMs, uint64_t dtsMs, Frame &out) {
+bool Player::feedAu(const uint8_t *data, size_t size, Frame &out) {
     out = Frame{};
-    if (!open_ || !g_api.loaded || !au || n == 0) return false;
+    if (!open_ || !g_api.loaded || !data || size < 4) return false;
 
     vdec::InputData in{};
     in.thisSize = sizeof(in);
-    in.pAuData = const_cast<uint8_t *>(au);
-    in.auSize = n;
-    in.ptsData = ptsMs;
-    in.dtsData = dtsMs;
+    in.pAuData = (uint8_t *)data;
+    in.auSize = size;
+    in.ptsData = ptsTick_++;
+    in.dtsData = in.ptsData;
     in.attachedData = 0;
 
     vdec::FrameBuffer fb{};
@@ -293,15 +276,8 @@ bool Player::feedAu(const uint8_t *au, size_t n, uint64_t ptsMs, uint64_t dtsMs,
     vdec::PictureInfo pic{};
     pic.thisSize = sizeof(pic);
 
-    static int nDec = 0;
-    bool logIt = nDec < 4;
-    if (logIt) { char b[96]; snprintf(b, sizeof b, "vdec-decode-%d size=%zu", nDec, n); T(b); }
     int rc = g_api.decode(&ctrl_, &in, &fb, &pic);
-    if (logIt) { char b[96]; snprintf(b, sizeof b, "vdec-decode-%d-rc=%08X valid=%u", nDec, (unsigned)rc, (unsigned)pic.isValid); T(b); nDec++; }
-    if (rc != 0 || !pic.isValid) {
-        // alguns AUs (SPS/PPS, reordenacao) nao produzem picture — nao e erro fatal
-        return false;
-    }
+    if (rc != 0 || !pic.isValid) return false;
 
     out.nv12 = (const uint8_t *)fb.pFrameBuffer;
     out.width = (int)pic.frameWidth;
@@ -322,8 +298,37 @@ bool Player::pump(Frame &out) {
         err_ = "fim do arquivo";
         return false;
     }
-    uint64_t t = ptsTick_++;
-    return feedAu(au.data(), au.size(), t, t, out);
+
+    vdec::InputData in{};
+    in.thisSize = sizeof(in);
+    in.pAuData = au.data();
+    in.auSize = au.size();
+    in.ptsData = ptsTick_++;
+    in.dtsData = in.ptsData;
+    in.attachedData = 0;
+
+    vdec::FrameBuffer fb{};
+    fb.thisSize = sizeof(fb);
+    fb.pFrameBuffer = frameBuf_.data();
+    fb.frameBufferSize = frameBuf_.size();
+
+    vdec::PictureInfo pic{};
+    pic.thisSize = sizeof(pic);
+
+    int rc = g_api.decode(&ctrl_, &in, &fb, &pic);
+    if (rc != 0 || !pic.isValid) {
+        // alguns frames (só SPS) não produzem picture — não é erro fatal
+        return false;
+    }
+
+    out.nv12 = (const uint8_t *)fb.pFrameBuffer;
+    out.width = (int)pic.frameWidth;
+    out.height = (int)pic.frameHeight;
+    out.pitch = (int)(pic.framePitch ? pic.framePitch : pic.frameWidth);
+    out.yRows = (int)pic.frameHeight;
+    out.ptsMs = pic.ptsData;
+    out.valid = true;
+    return true;
 }
 
 void Player::close() {
