@@ -15,7 +15,12 @@ int sceKernelDlsym(int handle, const char *name, void **addr);
 }
 
 namespace hwplayer {
+
+void (*g_trace)(const char *) = nullptr;
+
 namespace {
+
+void T(const char *s) { if (g_trace) g_trace(s); }
 
 vdec::Api g_api;
 
@@ -38,6 +43,7 @@ const char *kModuleCandidates[] = {
 
 bool Player::tryLoadApi() {
     if (g_api.loaded) return true;
+    T("vdec-load");
 
     for (int i = 0; kModuleCandidates[i]; i++) {
         int mod = -1;
@@ -66,6 +72,7 @@ bool Player::tryLoadApi() {
 
         g_api.module = mod;
         g_api.loaded = true;
+        T("vdec-load-ok");
         return true;
     }
 
@@ -162,7 +169,15 @@ bool Player::initDecoder(int maxW, int maxH) {
 
     res_ = {};
     res_.thisSize = sizeof(res_);
+    T("vdec-query");
     int q = g_api.queryResourceInfo(&cfg, &res_);
+    {
+        char b[200];
+        snprintf(b, sizeof b, "vdec-query-rc=%08X cpu=%llu gpu=%llu frame=%llu align=%u", (unsigned)q,
+                 (unsigned long long)res_.cpuMemorySize, (unsigned long long)res_.cpuGpuMemorySize,
+                 (unsigned long long)res_.maxFrameBufferSize, (unsigned)res_.frameBufferAlignment);
+        T(b);
+    }
     if (q != 0) {
         // fallback: tamanhos razoáveis se Query falhar
         res_.cpuMemorySize = 8ull * 1024 * 1024;
@@ -176,11 +191,13 @@ bool Player::initDecoder(int maxW, int maxH) {
     res_.pCpuMemory = cpuMem_.data();
     res_.pCpuGpuMemory = cpuGpuMem_.data();
 
-    if (g_api.mapMemory) g_api.mapMemory();
+    if (g_api.mapMemory) { T("vdec-map"); int mr = g_api.mapMemory(); char mb[48]; snprintf(mb, sizeof mb, "vdec-map-rc=%08X", (unsigned)mr); T(mb); }
 
     ctrl_ = {};
     ctrl_.thisSize = sizeof(ctrl_);
+    T("vdec-create");
     int rc = g_api.createDecoder(&cfg, &res_, &ctrl_);
+    { char cb[64]; snprintf(cb, sizeof cb, "vdec-create-rc=%08X", (unsigned)rc); T(cb); }
     if (rc != 0) {
         char b[96];
         snprintf(b, sizeof b, "sceVideodecCreateDecoder falhou: 0x%08X", (unsigned)rc);
@@ -276,7 +293,11 @@ bool Player::feedAu(const uint8_t *au, size_t n, uint64_t ptsMs, uint64_t dtsMs,
     vdec::PictureInfo pic{};
     pic.thisSize = sizeof(pic);
 
+    static int nDec = 0;
+    bool logIt = nDec < 4;
+    if (logIt) { char b[96]; snprintf(b, sizeof b, "vdec-decode-%d size=%zu", nDec, n); T(b); }
     int rc = g_api.decode(&ctrl_, &in, &fb, &pic);
+    if (logIt) { char b[96]; snprintf(b, sizeof b, "vdec-decode-%d-rc=%08X valid=%u", nDec, (unsigned)rc, (unsigned)pic.isValid); T(b); nDec++; }
     if (rc != 0 || !pic.isValid) {
         // alguns AUs (SPS/PPS, reordenacao) nao produzem picture — nao e erro fatal
         return false;
