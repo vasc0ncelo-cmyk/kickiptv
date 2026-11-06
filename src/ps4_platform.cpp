@@ -1563,6 +1563,8 @@ struct Player {
     bool tryStartNative(const std::string &url) {
         useNative = false;
         failed = false;
+        hwplayer::g_trace = trace;
+        trace("nat-inicio");
         waitNote = "Nativo: preparando...";
         presentCb();
 
@@ -1572,12 +1574,14 @@ struct Player {
             presentCb();
             return false;
         }
+        trace("nat-boot-ok");
         releaseHfAsync();
         releasePfAsync();
         while (g_tearing.load() > 0) {
             if (cancelCb && cancelCb()) { cancelled = true; failed = true; return false; }
             presentCb(); sceKernelUsleep(30000);
         }
+        trace("nat-probe");
 
         // 1) tamanho do arquivo: UMA requisicao Range (igual ao caminho do AvPlayer)
         log.push_back("   conectando ao servidor...");
@@ -1599,6 +1603,7 @@ struct Player {
             return false;
         }
         vodContentLength = total;
+        trace("nat-probe-ok");
         { char tb[96]; snprintf(tb, sizeof tb, "   arquivo de %.0f MB (streaming, nada vai pro disco)", total / 1048576.0); log.back() = tb; }
 
         // 2) leitor por blocos de 1 MB com Range, 2 conexoes, cache de 24 MB. Mesmo componente que o AvPlayer usava.
@@ -1618,6 +1623,7 @@ struct Player {
         rd->setProbe([total] { return total; });
         setHf(rd);
         rd->start();
+        trace("nat-reader-ok");
 
         // 3) le o indice (moov) numa thread: a tela continua respondendo e o O cancela
         waitNote = "Nativo: lendo o indice do filme...";
@@ -1640,6 +1646,7 @@ struct Player {
             sceKernelUsleep(20000);
         }
         th.join();
+        trace(idxOk ? "nat-indice-ok" : "nat-indice-falhou");
         if (cancelled) { failed = true; native.close(); releaseHfAsync(); return false; }
         if (!idxOk) {
             std::string why = native.lastError();
@@ -1653,6 +1660,7 @@ struct Player {
         // 4) decoder (thread principal)
         waitNote = "Nativo: abrindo decoder sceVideodec...";
         presentCb();
+        trace("nat-decoder");
         if (!native.openStreamDecoder()) {
             log.push_back("Nativo: " + native.lastError());
             waitNote = native.lastError(); presentCb();
@@ -1661,6 +1669,7 @@ struct Player {
         }
         { char b[96]; snprintf(b, sizeof b, "   video %ux%u, %.0f min", native.width(), native.height(), native.durationMs() / 60000.0); log.push_back(b); }
 
+        trace("nat-decoder-ok");
         useNative = true;
         isVod = true;
         h = 0;
@@ -1932,7 +1941,11 @@ struct Player {
         if (useNative) {
             if (!native.isOpen()) return false;
             hwplayer::Frame fr;
+            static bool firstPump = true;
+            if (firstPump) { firstPump = false; trace("nat-pump-1"); }
             bool got = native.pump(fr, nowSec());
+            static bool firstFrame = true;
+            if (got && firstFrame) { firstFrame = false; trace("nat-primeiro-quadro"); }
             if (auto rdr = getHf()) {
                 if (rdr->state() == 2 && !failed) { failed = true; log.push_back("ERRO: " + rdr->error()); return false; }
             }
