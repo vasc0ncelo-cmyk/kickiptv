@@ -26,6 +26,7 @@
 #include <string.h>
 #include <time.h>
 #include "hls.hpp"
+#include "nativeplayer.hpp"
 #include "streambuf.hpp"
 #include "netstream.hpp"
 #include "httpfile.hpp"
@@ -1254,6 +1255,8 @@ struct Player {
     // Controles de reproducao: pausa em SOFTWARE (sem sceAvPlayerPause — evita CE-34878-0)
     bool paused = false;
     bool isVod = false;                    // true = arquivo (mp4/mkv/...), false = live/HLS
+    bool useNative = false;                // true = sceVideodec (sem AvPlayer)
+    nativeplayer::Session native;
     bool quietWait = false;                // true = nao mostra o cartao de diagnostico ao conectar (qualidade/reconexao)
     uint64_t lastPtsMs = 0;                // posicao atual (ms) do ultimo quadro
     uint64_t maxPtsMs = 0;                 // maior pts visto (estima duracao minima)
@@ -1433,7 +1436,10 @@ struct Player {
         // Se cair no pipeline de "ao vivo" (MPEG-TS), o PS4 fecha com CE-34878-0.
         if (!isHls && urlIsVod(url)) {
             isVod = true;
-            try { return startFile(url); }
+            try {
+                if (tryStartNative(url)) return true;
+                return startFile(url);
+            }
             catch (...) { failed = true; log.push_back("ERRO: sem memoria ao abrir o arquivo"); trace("vod-excecao"); releaseHfAsync(); releasePfAsync(); return false; }
         }
 
@@ -1549,6 +1555,54 @@ struct Player {
     // entrega bytes ao AvPlayer pelos mesmos callbacks de arquivo usados no HLS/live.
     // Nao baixa o filme inteiro para o disco — comeca a tocar assim que o buffer enche.
     // VOD estavel: 1) URL HTTP direta  2) download local completo. NUNCA cb=2 (fecha o app).
+    bool tryStartNative(const std::string &url) {
+        useNative = false;
+        std::string low = url;
+        for (char &c : low) if (c >= 'A' && c <= 'Z') c = char(c - 'A' + 'a');
+        bool okExt = low.find(".mp4") != std::string::npos
+                  || low.find(".h264") != std::string::npos
+                  || low.find(".264") != std::string::npos;
+        if (!okExt && (low.find("/movie/") != std::string::npos || low.find("/series/") != std::string::npos))
+            okExt = true;
+        if (!okExt) {
+            log.push_back("Nativo: URL nao candidata — AvPlayer");
+            return false;
+        }
+        if (!nativeplayer::boot()) {
+            log.push_back("Nativo: sceVideodec indisponivel — AvPlayer");
+            return false;
+        }
+        log.push_back("Nativo: baixando H.264 (sem AvPlayer)...");
+        std::string body;
+        int st = 0;
+        const size_t kMax = 80u * 1024u * 1024u;
+        if (!g_net.get(url, body, st, kMax) || st < 200 || st >= 300 || body.size() < 1024) {
+            log.push_back("Nativo: download falhou HTTP " + std::to_string(st) + " size=" + std::to_string(body.size()));
+            return false;
+        }
+        if (body.size() >= kMax - 1024) {
+            log.push_back("Nativo: arquivo grande — AvPlayer progressive");
+            return false;
+        }
+        log.push_back("Nativo: " + std::to_string(body.size() / 1024) + " KB, abrindo decoder...");
+        if (!native.openMemory((const uint8_t *)body.data(), body.size())) {
+            log.push_back("Nativo: " + native.lastError());
+            native.close();
+            return false;
+        }
+        body.clear();
+        useNative = true;
+        isVod = true;
+        h = nullptr;
+        active = true;
+        failed = false;
+        paused = false;
+        playStartWall = nowSec();
+        t0 = lastFps = lastFrameT = nowSec();
+        log.push_back("Nativo: OK (sceVideodec)");
+        return true;
+    }
+
     bool startFile(const std::string &url) {
         std::string ext = urlExtension(url);
         log.push_back(std::string("Filme/serie") + (ext.empty() ? "" : " ." + ext));
@@ -1760,6 +1814,10 @@ struct Player {
     }
     // Desmonta TUDO em segundo plano: o botao O volta ao menu na hora (antes travava ate a rede responder).
     void stop() {
+        if (useNative) {
+            try { native.close(); } catch (...) {}
+            useNative = false;
+        }
         KAvHandle hh = h, hh2 = h2;
         h = 0; h2 = 0; active = false; chunkMode = false;
         pendJumpMs = -1; trigScrub = false; trigDir = 0;
@@ -1796,7 +1854,32 @@ struct Player {
     }
     // chama a cada iteracao; retorna true se desenhou um quadro novo
     bool poll(FbRenderer &r) {
-        if (paused || !active || failed || !h || g_tearing.load() > 0) return false;
+        if (paused || !active || failed || g_tearing.load() > 0) return false;
+        if (useNative) {
+            if (!native.isOpen()) return false;
+            hwplayer::Frame fr;
+            if (!native.pump(fr) || !fr.valid || !fr.nv12) return false;
+            int w = fr.width, hh = fr.height;
+            if (w <= 0 || hh <= 0) return false;
+            vw = (unsigned)w; vh = (unsigned)hh;
+            if (fr.ptsMs > 0) {
+                lastPtsMs = fr.ptsMs;
+                if (lastPtsMs > maxPtsMs) maxPtsMs = lastPtsMs;
+                playedMs = lastPtsMs;
+            }
+            int pitch = fr.pitch > 0 ? fr.pitch : w;
+            int yRows = fr.yRows > 0 ? fr.yRows : hh;
+            for (int y = 0; y < r.H; y++) {
+                uint32_t *row = r.fb + (size_t)y * r.W;
+                for (int x = 0; x < r.W; x++) row[x] = 0xFF000000u;
+            }
+            blitNV12(fr.nv12, (uint32_t)w, (uint32_t)hh, pitch, yRows, r.fb, r.W, r.H);
+            frames++; fpsFrames++;
+            double tt = nowSec();
+            lastDrawT = tt; lastFrameT = tt;
+            return true;
+        }
+        if (!h) return false;
         KAvFrameInfo fi; memset(&fi, 0, sizeof fi);
         bool drew = false;
 
