@@ -1,13 +1,4 @@
-// hwplayer.hpp — protótipo de player próprio (fase 1):
-//   arquivo local H.264 Annex-B  →  sceVideodec  →  NV12  →  tela (blit existente)
-//
-// Fases futuras (ainda NÃO implementadas aqui):
-//   2) HTTP Range + seek
-//   3) live HLS / IPTV
-//
-// Caminho NATIVO (sem AvPlayer) para H.264.
-// Integração: nativeplayer.hpp
-// Se o módulo de hardware não carregar, open() retorna false.
+// hwplayer — sceVideodec, um access unit por vez (sem carregar o arquivo inteiro na RAM)
 #pragma once
 
 #include "videodec.hpp"
@@ -17,14 +8,11 @@
 
 namespace hwplayer {
 
-// Gancho opcional de log (o app aponta para o trace() que grava /data/kickiptv.log). nullptr = sem log.
-extern void (*g_trace)(const char *);
-
 struct Frame {
-    const uint8_t *nv12 = nullptr; // Y + UV intercalado (ou planar conforme o decoder)
+    const uint8_t *nv12 = nullptr;
     int width  = 0;
     int height = 0;
-    int pitch  = 0;   // bytes por linha Y
+    int pitch  = 0;
     int yRows  = 0;
     uint64_t ptsMs = 0;
     bool valid = false;
@@ -35,27 +23,14 @@ public:
     Player() = default;
     ~Player() { close(); }
 
-    // Tenta carregar libSceVideodec (ou variantes de nome no firmware).
-    // Chame uma vez no boot do app.
     static bool tryLoadApi();
-
-    // true se a API de hardware está disponível neste console.
     static bool hwAvailable();
 
-    // Abre um arquivo .h264 / .264 em Annex-B (NAL com start codes 00 00 01).
-    // MP4/MKV ainda não: precisa demux (fase 2).
+    bool open(int maxW = 1920, int maxH = 1080);
     bool openFile(const std::string &path, int maxW = 1920, int maxH = 1080);
 
-    // Modo STREAMING: abre so o decoder (sem arquivo). Quem chama entrega cada access unit com feedAu().
-    // Nao usa RAM para o arquivo — o demux (mp4stream.hpp) le sample por sample.
-    bool openStream(int maxW = 1920, int maxH = 1080);
-
-    // Decodifica UM access unit (Annex-B). Retorna true se saiu um quadro novo em 'out'.
-    // false sem erro = o decoder ainda guarda quadros (reordenacao de B-frames) — normal.
-    bool feedAu(const uint8_t *au, size_t n, uint64_t ptsMs, uint64_t dtsMs, Frame &out);
-
-    // Alimenta o próximo access unit e, se houver quadro pronto, preenche 'out'.
-    // Retorna true se 'out' tem frame novo.
+    // Empurra AU Annex-B; se houver quadro, preenche out.
+    bool feedAu(const uint8_t *data, size_t size, Frame &out);
     bool pump(Frame &out);
 
     void close();
