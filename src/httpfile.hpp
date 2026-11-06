@@ -115,7 +115,10 @@ public:
             if (it == blocks_.end()) {
                 want_ = idx; wantSet_ = true;
                 cv_.notify_all();
-                cv_.wait_for(l, std::chrono::milliseconds(100));
+                {   // espera no maximo o que resta do timeout (leitura com timeout curto nao pode prender a tela por 100 ms)
+                    auto left = (long)timeoutMs - (long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+                    cv_.wait_for(l, std::chrono::milliseconds(std::max<long>(1, std::min<long>(100, left))));
+                }
                 if (stop_ || state_ != 1 || timedOut()) return 0;
                 continue;
             }
