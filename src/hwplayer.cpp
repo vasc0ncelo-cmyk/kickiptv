@@ -18,22 +18,28 @@ int64_t sceKernelGetDirectMemorySize(void);
 }
 
 namespace hwplayer {
+void (*traceHook)(const char *) = nullptr;
 namespace {
+void T(const char *s) { if (traceHook) traceHook(s); }
+const char *kGuardFile = "/data/kickiptv_hwguard";   // existe = a ultima tentativa de decodificar derrubou o app
+
 
 vdec::Api g_api;
 
 // Memoria CPU/GPU do decoder: o hardware exige alinhamento (>= 64 KB) e memoria que a GPU enxerga.
 // Um std::vector comum nao serve. Pegamos memoria direta uma vez (e reaproveitamos nas proximas aberturas).
 struct DirectBlock { void *ptr = nullptr; size_t size = 0; };
-DirectBlock g_gpuBlock;
-void *directAlloc(size_t size, size_t align) {
-    if (g_gpuBlock.ptr && g_gpuBlock.size >= size) return g_gpuBlock.ptr;
+DirectBlock g_gpuBlock, g_fbBlock;
+void *directAlloc(DirectBlock &blk, size_t size, size_t align) {
+    if (blk.ptr && blk.size >= size) return blk.ptr;
     int64_t phys = 0; void *addr = nullptr;
     if (sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), size, align, 0, &phys) < 0) return nullptr;
     if (sceKernelMapDirectMemory(&addr, size, 0x33, 0, phys, align) < 0) return nullptr;
-    g_gpuBlock.ptr = addr; g_gpuBlock.size = size;
+    blk.ptr = addr; blk.size = size;
     return addr;
 }
+bool sane(uint64_t v, uint64_t max) { return v <= max; }
+bool pow2(uint64_t v) { return v && !(v & (v - 1)); }
 size_t roundUp(size_t v, size_t a) { return (v + a - 1) / a * a; }
 
 bool resolveOne(int mod, const char *name, void **out) {
@@ -59,6 +65,7 @@ bool Player::tryLoadApi() {
     for (int i = 0; kModuleCandidates[i]; i++) {
         int mod = -1;
         int res = 0;
+        { char b[160]; snprintf(b, sizeof b, "hw-loadmodule %s", kModuleCandidates[i]); T(b); }
         int rc = sceKernelLoadStartModule(kModuleCandidates[i], 0, nullptr, 0, nullptr, &res);
         if (rc < 0) continue;
         mod = rc;
@@ -81,6 +88,7 @@ bool Player::tryLoadApi() {
             continue;
         }
 
+        T("hw-simbolos-ok");
         g_api.module = mod;
         g_api.loaded = true;
         return true;
@@ -168,6 +176,14 @@ bool Player::initDecoder(int maxW, int maxH) {
     }
 
     // Tenta cada codecType candidato (ver videodec.hpp). Guarda o diagnostico de cada tentativa.
+    // Protecao contra queda repetida: se a tentativa anterior derrubou o app (marcador ainda no disco), nao tenta de novo.
+    if (FILE *g = fopen(kGuardFile, "rb")) {
+        fclose(g);
+        remove(kGuardFile);        // so bloqueia UMA vez: o aviso aparece, e a proxima tentativa ja roda de novo
+        err_ = "o decoder nativo derrubou o app na ultima tentativa (veja a etapa no menu inicial). Tente de novo para repetir.";
+        T("hw-guard-bloqueou");
+        return false;
+    }
     static const uint32_t kCodecs[] = {vdec::kCodecAvc, vdec::kCodecAvcAlt};
     std::string diag;
     for (uint32_t codec : kCodecs) {
@@ -183,39 +199,57 @@ bool Player::initDecoder(int maxW, int maxH) {
 
         res_ = {};
         res_.thisSize = sizeof(res_);
+        T("hw-query");
         int q = g_api.queryResourceInfo(&cfg, &res_);
         char b[200];
         snprintf(b, sizeof b, "[codec=%u q=0x%08X cpu=%llu gpu=%llu fb=%llu al=%u] ", (unsigned)codec, (unsigned)q,
                  (unsigned long long)res_.cpuMemorySize, (unsigned long long)res_.cpuGpuMemorySize,
                  (unsigned long long)res_.maxFrameBufferSize, (unsigned)res_.frameBufferAlignment);
         diag += b;
+        T(b);
         if (q != 0) continue;                          // sem os tamanhos reais nao adianta chutar: tenta o proximo codec
+        // Layout errado de ResourceInfo = lixo nos tamanhos. Nao aloca nem chama o decoder com isso.
+        if (!sane(res_.cpuMemorySize, 256ull << 20) || !sane(res_.cpuGpuMemorySize, 512ull << 20) || !sane(res_.maxFrameBufferSize, 64ull << 20) ||
+            (res_.frameBufferAlignment && (!pow2(res_.frameBufferAlignment) || res_.frameBufferAlignment > (16u << 20)))) {
+            diag += "[tamanhos absurdos: layout de ResourceInfo nao bate com o da biblioteca] ";
+            T("hw-resinfo-absurdo");
+            continue;
+        }
 
         size_t align = res_.frameBufferAlignment > 0x10000 ? res_.frameBufferAlignment : 0x10000;
         size_t cpuSz = roundUp((size_t)res_.cpuMemorySize, 0x10000);
         size_t gpuSz = roundUp((size_t)res_.cpuGpuMemorySize, 0x10000);
+        T("hw-alloc");
         cpuMem_.assign(cpuSz + align, 0);               // alinhado "na mao" dentro do vetor
         uintptr_t cp = ((uintptr_t)cpuMem_.data() + align - 1) & ~(uintptr_t)(align - 1);
         res_.pCpuMemory = (void *)cp;
-        res_.pCpuGpuMemory = gpuSz ? directAlloc(gpuSz, align) : nullptr;
+        res_.pCpuGpuMemory = gpuSz ? directAlloc(g_gpuBlock, gpuSz, align) : nullptr;
         if (gpuSz && !res_.pCpuGpuMemory) { diag += "[sem memoria direta p/ GPU] "; continue; }
 
-        if (g_api.mapMemory) g_api.mapMemory();
+        // Frame buffer: o hardware escreve o NV12 nele, entao tambem precisa ser memoria direta (visivel para a GPU).
+        size_t fbSize = res_.maxFrameBufferSize ? (size_t)res_.maxFrameBufferSize : (size_t)maxW * maxH * 3 / 2 + 65536;
+        fbSize = roundUp(fbSize, 0x10000);
+        fbAligned_ = (uint8_t *)directAlloc(g_fbBlock, fbSize, align);
+        if (!fbAligned_) { diag += "[sem memoria direta p/ frame buffer] "; continue; }
+        fbSize_ = fbSize;
+
+        if (g_api.mapMemory) { T("hw-mapmemory"); g_api.mapMemory(); }
 
         ctrl_ = {};
         ctrl_.thisSize = sizeof(ctrl_);
+        if (FILE *g = fopen(kGuardFile, "wb")) { fwrite("x", 1, 1, g); fclose(g); }   // apaga depois do 1o decode bem-sucedido
+        T("hw-create");
         int rc = g_api.createDecoder(&cfg, &res_, &ctrl_);
         if (rc != 0) {
+            remove(kGuardFile);
             snprintf(b, sizeof b, "create=0x%08X ", (unsigned)rc);
             diag += b;
+            T(b);
             continue;
         }
 
+        T("hw-create-ok");
         created_ = true;
-        size_t fbSize = res_.maxFrameBufferSize ? (size_t)res_.maxFrameBufferSize : (size_t)maxW * maxH * 3 / 2 + 65536;
-        frameBuf_.assign(fbSize + align, 0);
-        fbAligned_ = (uint8_t *)(((uintptr_t)frameBuf_.data() + align - 1) & ~(uintptr_t)(align - 1));
-        fbSize_ = fbSize;
         codecUsed_ = codec;
         return true;
     }
@@ -305,7 +339,11 @@ bool Player::feedAu(const uint8_t *data, size_t size, Frame &out) {
     vdec::PictureInfo pic{};
     pic.thisSize = sizeof(pic);
 
+    if (decodes_ < 3) { char b[64]; snprintf(b, sizeof b, "hw-decode-%d au=%u", decodes_, (unsigned)size); T(b); }
     int rc = g_api.decode(&ctrl_, &in, &fb, &pic);
+    if (decodes_ < 3) { char b[64]; snprintf(b, sizeof b, "hw-decode-ret rc=0x%08X valid=%u", (unsigned)rc, (unsigned)pic.isValid); T(b); }
+    decodes_++;
+    if (rc == 0) remove(kGuardFile);                 // sobreviveu ao 1o decode: nao e mais suspeito de derrubar o app
     if (rc != 0 || !pic.isValid) return false;
 
     out.nv12 = (const uint8_t *)fb.pFrameBuffer;
@@ -362,12 +400,11 @@ bool Player::pump(Frame &out) {
 
 void Player::close() {
     if (created_ && g_api.loaded && g_api.deleteDecoder) g_api.deleteDecoder(&ctrl_);   // nao depende do layout do campo "handle"
-    created_ = false; fbAligned_ = nullptr; fbSize_ = 0;
+    created_ = false; fbAligned_ = nullptr; fbSize_ = 0; decodes_ = 0;
     ctrl_ = {};
     file_.clear();
     cpuMem_.clear();
     cpuGpuMem_.clear();
-    frameBuf_.clear();
     pos_ = 0;
     open_ = false;
 }
