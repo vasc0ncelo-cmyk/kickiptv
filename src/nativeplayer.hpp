@@ -3,8 +3,10 @@
 // Indice (moov) via Range + 1 sample por frame via Range.
 #include "hwplayer.hpp"
 #include "mp4annexb.hpp"
+#include "mp4stream.hpp"
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <string>
 #include <vector>
@@ -38,13 +40,9 @@ inline std::string scanCodecs(const uint8_t *p, size_t n) {
     return found;
 }
 
-inline bool tryParseBuf(const uint8_t *p, size_t n, mp4ab::Track &tr, std::string &err) {
-    tr = mp4ab::Track{};
-    err.clear();
-    if (n < 16) { err = "buffer curto"; return false; }
-    return mp4ab::parse(p, n, tr, err) && !tr.samples.empty() && !tr.extradata.empty();
-}
-
+// Sessao de reproducao nativa: indice (moov) lido com poucas requisicoes Range + 1 sample por vez.
+// IMPORTANTE: o indice vem do mp4s::Demuxer (mp4stream.hpp). O mp4ab::parse antigo procurava o avcC no lugar errado do avc1,
+// misturava as trilhas de audio e video e nao entendia stsc: falhava com QUALQUER MP4 real ("MP4 sem trilha avc1/avcC").
 class Session {
 public:
     bool openUrl(const std::string &url, uint64_t totalHint, FetchRange fetch) {
@@ -53,106 +51,41 @@ public:
         url_ = url;
         if (!boot()) { err_ = "sceVideodec indisponivel neste firmware"; return false; }
         if (!fetch_) { err_ = "sem fetch"; return false; }
+        total_ = totalHint;
+        if (total_ < 1024) { err_ = "tamanho do arquivo desconhecido"; return false; }
 
-        uint64_t total = totalHint;
-
-        // --- HEAD: ate 16 MB (indice faststart costuma estar aqui) ---
-        const uint64_t headMax = 16ull * 1024ull * 1024ull;
-        uint64_t headTo = headMax - 1;
-        if (total > 0 && headTo >= total) headTo = total - 1;
+        // Primeiros bytes: so para dar uma mensagem clara quando nao e MP4.
         std::string head;
-        if (!fetch_(0, headTo, head) || head.size() < 32) {
-            err_ = "falha ao ler inicio do arquivo";
+        if (!fetch_(0, 63, head) || head.size() < 16) { err_ = "falha ao ler inicio do arquivo"; return false; }
+        if ((uint8_t)head[0] == 0x47) { err_ = "arquivo e MPEG-TS (nao MP4). Nativo ainda so MP4 H.264"; return false; }
+        if ((uint8_t)head[0] == 0x1A && (uint8_t)head[1] == 0x45 && (uint8_t)head[2] == 0xDF && (uint8_t)head[3] == 0xA3) {
+            err_ = "arquivo e MKV. Nativo ainda so MP4 H.264";
             return false;
         }
 
-        // TS puro?
-        if ((uint8_t)head[0] == 0x47) {
-            err_ = "arquivo e MPEG-TS (nao MP4). Nativo ainda so MP4 avc1";
-            return false;
-        }
-        // MKV?
-        if ((uint8_t)head[0]==0x1A && (uint8_t)head[1]==0x45 && (uint8_t)head[2]==0xDF && (uint8_t)head[3]==0xA3) {
-            err_ = "arquivo e MKV. Nativo ainda so MP4 avc1";
-            return false;
-        }
-
-        std::string scanH = scanCodecs((const uint8_t *)head.data(), head.size());
-        mp4ab::Track tr;
+        // Leitura por Range para o demuxer. Funciona com o moov no comeco OU no fim (anda pelas caixas lendo so cabecalhos).
+        rd_ = [this](uint8_t *dst, uint64_t pos, uint32_t len, int) -> int {
+            if (!fetch_ || len == 0) return 0;
+            std::string b;
+            if (!fetch_(pos, pos + len - 1, b) || b.empty()) return 0;
+            size_t n = std::min<size_t>(b.size(), len);
+            memcpy(dst, b.data(), n);
+            return (int)n;
+        };
         std::string perr;
-        bool parsed = tryParseBuf((const uint8_t *)head.data(), head.size(), tr, perr);
-
-        // --- TAIL: se nao achou, baixa ultimos 8 MB (moov no fim) ---
-        std::string scanT;
-        if (!parsed && total > headMax) {
-            uint64_t tailSz = 8ull * 1024ull * 1024ull;
-            uint64_t tailFrom = total > tailSz ? total - tailSz : 0;
-            std::string tail;
-            if (fetch_(tailFrom, total - 1, tail) && tail.size() > 64) {
-                scanT = scanCodecs((const uint8_t *)tail.data(), tail.size());
-                // procura atom moov no tail e monta ftyp minimo + moov
-                const uint8_t *p = (const uint8_t *)tail.data();
-                size_t n = tail.size();
-                for (size_t i = 0; i + 8 < n; i++) {
-                    if (p[i+4]=='m'&&p[i+5]=='o'&&p[i+6]=='o'&&p[i+7]=='v') {
-                        uint32_t sz = mp4ab::be32(p + i);
-                        if (sz < 8 || i + sz > n) {
-                            // box grande demais p/ o tail — tenta parse no tail inteiro a partir de i
-                            sz = (uint32_t)std::min((size_t)0x7fffffff, n - i);
-                        }
-                        std::vector<uint8_t> syn;
-                        const uint8_t ftyp[] = {
-                            0,0,0,24, 'f','t','y','p', 'i','s','o','m',0,0,2,0, 'i','s','o','m','m','p','4','1'
-                        };
-                        syn.insert(syn.end(), ftyp, ftyp+24);
-                        syn.insert(syn.end(), p + i, p + i + std::min((size_t)sz, n - i));
-                        if (tryParseBuf(syn.data(), syn.size(), tr, perr)) {
-                            parsed = true;
-                            break;
-                        }
-                    }
-                }
-                // ultima tentativa: parse no tail cru (alguns arquivos tem ftyp+moov so no fim — raro)
-                if (!parsed) tryParseBuf((const uint8_t *)tail.data(), tail.size(), tr, perr), parsed = !tr.samples.empty() && !tr.extradata.empty();
-            }
-        }
-
-        if (!parsed) {
-            // diagnostico util
-            std::string det = "head[" + scanH + "]";
-            if (!scanT.empty()) det += " tail[" + scanT + "]";
-            if (perr.size()) det += " | " + perr;
-            // mensagens claras
-            if (scanH.find("HEVC") != std::string::npos || scanT.find("HEVC") != std::string::npos)
-                err_ = "video e HEVC (h.265), nao H.264. Decoder nativo so avc1 por enquanto. " + det;
-            else if (scanH.find("moov") == std::string::npos && scanT.find("moov") == std::string::npos)
-                err_ = "MP4 sem atom moov no inicio/fim (talvez fMP4/fragmentado). " + det;
-            else
-                err_ = "MP4 sem trilha avc1/avcC. " + det;
+        if (!dm_.open(rd_, total_, perr)) {
+            err_ = perr + " | " + scanCodecs((const uint8_t *)head.data(), head.size());
             return false;
         }
-
-        int nalLen = 4;
-        if (!mp4ab::avcCToAnnexB(tr.extradata, spsPps_, nalLen)) {
-            err_ = "avcC invalido";
-            return false;
-        }
-        nalLen_ = nalLen;
-        samples_ = std::move(tr.samples);
-        width_ = tr.width;
-        height_ = tr.height;
+        width_ = dm_.width();
+        height_ = dm_.height();
         sampleIdx_ = 0;
-        total_ = total;
 
-        int mw = width_ ? (int)width_ : 1920;
-        int mh = height_ ? (int)height_ : 1080;
-        if (!hw_.open(mw, mh)) {
+        if (!hw_.open(width_ ? (int)width_ : 1920, height_ ? (int)height_ : 1080)) {
             err_ = hw_.lastError().empty() ? "decoder open falhou" : hw_.lastError();
             return false;
         }
-        hwplayer::Frame fr;
-        hw_.feedAu(spsPps_.data(), spsPps_.size(), fr);
-        open_ = true;
+        open_ = true;      // o SPS/PPS vai junto com cada sample de sincronismo (Demuxer::readAnnexB)
         return true;
     }
 
@@ -190,29 +123,20 @@ public:
 
     bool pump(hwplayer::Frame &out) {
         out = hwplayer::Frame{};
-        if (!open_ || sampleIdx_ >= samples_.size()) return false;
-        const mp4ab::Sample &s = samples_[sampleIdx_];
-        if (s.size == 0 || s.size > 4u * 1024u * 1024u) { sampleIdx_++; return false; }
-        std::string raw;
-        if (!fetch_((uint64_t)s.off, (uint64_t)s.off + s.size - 1, raw) || raw.size() < s.size) {
-            err_ = "Range sample falhou";
-            return false;
-        }
+        if (!open_ || sampleIdx_ >= dm_.count()) return false;
         std::vector<uint8_t> au;
-        if (!mp4ab::sampleToAnnexB((const uint8_t *)raw.data(), raw.size(), nalLen_, au)) {
-            sampleIdx_++;
-            return false;
-        }
-        raw.clear();
+        int r = dm_.readAnnexB(sampleIdx_, au, 15000);
+        if (r == 0) { err_ = "Range sample falhou"; return false; }      // ainda nao chegou: tenta o mesmo de novo
         sampleIdx_++;
+        if (r < 0) return false;                                          // sample invalido: pula
         return hw_.feedAu(au.data(), au.size(), out);
     }
 
     void close() {
         hw_.close();
         open_ = false;
-        samples_.clear();
-        spsPps_.clear();
+        dm_ = mp4s::Demuxer();
+        rd_ = nullptr;
         fetch_ = nullptr;
         err_.clear();
         sampleIdx_ = 0;
@@ -222,7 +146,7 @@ public:
     const std::string &lastError() const { return err_; }
     uint32_t width() const { return width_; }
     uint32_t height() const { return height_; }
-    size_t sampleCount() const { return samples_.size(); }
+    size_t sampleCount() const { return dm_.count(); }
     size_t sampleIndex() const { return sampleIdx_; }
 
 private:
@@ -230,9 +154,8 @@ private:
     std::string err_, url_;
     FetchRange fetch_;
     hwplayer::Player hw_;
-    std::vector<mp4ab::Sample> samples_;
-    std::vector<uint8_t> spsPps_;
-    int nalLen_ = 4;
+    mp4s::Demuxer dm_;
+    mp4s::ReadAt rd_;
     size_t sampleIdx_ = 0;
     uint32_t width_ = 0, height_ = 0;
     uint64_t total_ = 0;
