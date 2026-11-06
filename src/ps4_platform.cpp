@@ -1613,10 +1613,18 @@ struct Player {
         std::string u = url;
         auto s1 = std::make_shared<NetClient::Session>(); s1->recvSec = 25;
         auto fetch1 = [u, s1](uint64_t from, uint64_t to, std::string &body) -> int {
+            static std::atomic<int> nf{0};
+            int k = nf++;
+            bool lg = k < 3;                                  // so as 3 primeiras chamadas vao pro log
+            char lb[96];
+            if (lg) { snprintf(lb, sizeof lb, "net-%d-ini from=%llu", k, (unsigned long long)from); trace(lb); }
             NetGate::Permit permit(g_coverGate, false, &g_quitting);
-            if (!permit.ok) return 0;
+            if (!permit.ok) { if (lg) trace("net-permit-negado"); return 0; }
+            if (lg) trace("net-permit-ok");
             int status = 0;
-            if (!g_net.getRange(*s1, u, from, to, body, status)) return 0;
+            bool okNet = g_net.getRange(*s1, u, from, to, body, status);
+            if (lg) { snprintf(lb, sizeof lb, "net-%d-fim ok=%d st=%d n=%zu", k, (int)okNet, status, body.size()); trace(lb); }
+            if (!okNet) return 0;
             return status;
         };
         auto rd = std::make_shared<httpfile::Reader>(fetch1, 24, 6);
@@ -1629,7 +1637,15 @@ struct Player {
         // 3) le o indice (moov) numa thread: a tela continua respondendo e o O cancela
         waitNote = "Nativo: lendo o indice do filme...";
         presentCb();
-        mp4s::ReadAt readAt = [rd](uint8_t *d, uint64_t pos, uint32_t len, int to) -> int { return rd->read(d, pos, len, to); };
+        mp4s::ReadAt readAt = [rd](uint8_t *d, uint64_t pos, uint32_t len, int to) -> int {
+            static std::atomic<int> nr{0};
+            int k = nr++;
+            char lb[96];
+            if (k < 3) { snprintf(lb, sizeof lb, "rd-%d-ini pos=%llu len=%u", k, (unsigned long long)pos, (unsigned)len); trace(lb); }
+            int n = rd->read(d, pos, len, to);
+            if (k < 3) { snprintf(lb, sizeof lb, "rd-%d-fim n=%d", k, n); trace(lb); }
+            return n;
+        };
         std::atomic<int> idxDone{0};
         bool idxOk = false;
         std::thread th([&] {
@@ -3145,15 +3161,15 @@ int main() {
         std::string stageNote;
         {
             if (!g_prevTail.empty()) {
-                for (size_t k = 0; k < g_prevTail.size() && k < 5; k++) {      // mais recente primeiro (o fim da linha pode ser cortado na tela)
-                    if (!stageNote.empty()) stageNote += " < ";
+                for (size_t k = 0; k < g_prevTail.size() && k < 8; k++) {      // mais recente primeiro (o fim da linha pode ser cortado na tela)
+                    if (!stageNote.empty()) stageNote += "<";
                     stageNote += g_prevTail[g_prevTail.size() - 1 - k];
                 }
             } else if (g_prevRaw != "(nenhum)") stageNote = g_prevRaw;
-            if (!stageNote.empty()) stageNote = "  [LOG: " + stageNote + "]";
+            if (!stageNote.empty()) stageNote = " [" + stageNote + "]";
         }
         if (ui.hasSavedList() && skipAuto) {
-            app.say("A lista M3U fechou o app na ultima vez - abra LISTA M3U e aperte X." + stageNote);
+            app.say((stageNote.empty() ? std::string("A lista M3U fechou o app na ultima vez - abra LISTA M3U e aperte X.") : std::string("M3U: abra e aperte X.")) + stageNote);
         } else if (ui.hasSavedList() && !stageNote.empty() && !g_prevStage.empty()) {
             app.say("O app fechou na ultima vez." + stageNote);   // queda fora da lista M3U: mostra onde parou
         } else if (ui.hasSavedList()) {
