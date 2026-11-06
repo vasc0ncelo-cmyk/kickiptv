@@ -12,12 +12,29 @@ int sceKernelLoadStartModule(const char *path, size_t args, const void *argp, ui
 int sceKernelStopUnloadModule(int handle, size_t args, const void *argp, uint32_t flags,
                               void *opt, int *res);
 int sceKernelDlsym(int handle, const char *name, void **addr);
+int sceKernelAllocateDirectMemory(int64_t searchStart, int64_t searchEnd, size_t length, size_t alignment, int type, int64_t *physOut);
+int sceKernelMapDirectMemory(void **addr, size_t length, int prot, int flags, int64_t physStart, size_t alignment);
+int64_t sceKernelGetDirectMemorySize(void);
 }
 
 namespace hwplayer {
 namespace {
 
 vdec::Api g_api;
+
+// Memoria CPU/GPU do decoder: o hardware exige alinhamento (>= 64 KB) e memoria que a GPU enxerga.
+// Um std::vector comum nao serve. Pegamos memoria direta uma vez (e reaproveitamos nas proximas aberturas).
+struct DirectBlock { void *ptr = nullptr; size_t size = 0; };
+DirectBlock g_gpuBlock;
+void *directAlloc(size_t size, size_t align) {
+    if (g_gpuBlock.ptr && g_gpuBlock.size >= size) return g_gpuBlock.ptr;
+    int64_t phys = 0; void *addr = nullptr;
+    if (sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), size, align, 0, &phys) < 0) return nullptr;
+    if (sceKernelMapDirectMemory(&addr, size, 0x33, 0, phys, align) < 0) return nullptr;
+    g_gpuBlock.ptr = addr; g_gpuBlock.size = size;
+    return addr;
+}
+size_t roundUp(size_t v, size_t a) { return (v + a - 1) / a * a; }
 
 bool resolveOne(int mod, const char *name, void **out) {
     *out = nullptr;
@@ -150,48 +167,60 @@ bool Player::initDecoder(int maxW, int maxH) {
         return false;
     }
 
-    vdec::ConfigInfo cfg{};
-    cfg.thisSize = sizeof(cfg);
-    cfg.codecType = vdec::kCodecAvc;
-    cfg.profile = 100;
-    cfg.maxLevel = 51;
-    cfg.maxFrameWidth = maxW;
-    cfg.maxFrameHeight = maxH;
-    cfg.maxDpbFrameCount = 6;
-    cfg.videodecFlags = 0;
+    // Tenta cada codecType candidato (ver videodec.hpp). Guarda o diagnostico de cada tentativa.
+    static const uint32_t kCodecs[] = {vdec::kCodecAvc, vdec::kCodecAvcAlt};
+    std::string diag;
+    for (uint32_t codec : kCodecs) {
+        vdec::ConfigInfo cfg{};
+        cfg.thisSize = sizeof(cfg);
+        cfg.codecType = codec;
+        cfg.profile = 100;
+        cfg.maxLevel = 51;
+        cfg.maxFrameWidth = maxW;
+        cfg.maxFrameHeight = maxH;
+        cfg.maxDpbFrameCount = 6;
+        cfg.videodecFlags = 0;
 
-    res_ = {};
-    res_.thisSize = sizeof(res_);
-    int q = g_api.queryResourceInfo(&cfg, &res_);
-    if (q != 0) {
-        // fallback: tamanhos razoáveis se Query falhar
-        res_.cpuMemorySize = 8ull * 1024 * 1024;
-        res_.cpuGpuMemorySize = 32ull * 1024 * 1024;
-        res_.maxFrameBufferSize = (uint64_t)maxW * maxH * 3 / 2 + 65536;
-        res_.frameBufferAlignment = 0x10000;
+        res_ = {};
+        res_.thisSize = sizeof(res_);
+        int q = g_api.queryResourceInfo(&cfg, &res_);
+        char b[200];
+        snprintf(b, sizeof b, "[codec=%u q=0x%08X cpu=%llu gpu=%llu fb=%llu al=%u] ", (unsigned)codec, (unsigned)q,
+                 (unsigned long long)res_.cpuMemorySize, (unsigned long long)res_.cpuGpuMemorySize,
+                 (unsigned long long)res_.maxFrameBufferSize, (unsigned)res_.frameBufferAlignment);
+        diag += b;
+        if (q != 0) continue;                          // sem os tamanhos reais nao adianta chutar: tenta o proximo codec
+
+        size_t align = res_.frameBufferAlignment > 0x10000 ? res_.frameBufferAlignment : 0x10000;
+        size_t cpuSz = roundUp((size_t)res_.cpuMemorySize, 0x10000);
+        size_t gpuSz = roundUp((size_t)res_.cpuGpuMemorySize, 0x10000);
+        cpuMem_.assign(cpuSz + align, 0);               // alinhado "na mao" dentro do vetor
+        uintptr_t cp = ((uintptr_t)cpuMem_.data() + align - 1) & ~(uintptr_t)(align - 1);
+        res_.pCpuMemory = (void *)cp;
+        res_.pCpuGpuMemory = gpuSz ? directAlloc(gpuSz, align) : nullptr;
+        if (gpuSz && !res_.pCpuGpuMemory) { diag += "[sem memoria direta p/ GPU] "; continue; }
+
+        if (g_api.mapMemory) g_api.mapMemory();
+
+        ctrl_ = {};
+        ctrl_.thisSize = sizeof(ctrl_);
+        int rc = g_api.createDecoder(&cfg, &res_, &ctrl_);
+        if (rc != 0) {
+            snprintf(b, sizeof b, "create=0x%08X ", (unsigned)rc);
+            diag += b;
+            continue;
+        }
+
+        created_ = true;
+        size_t fbSize = res_.maxFrameBufferSize ? (size_t)res_.maxFrameBufferSize : (size_t)maxW * maxH * 3 / 2 + 65536;
+        frameBuf_.assign(fbSize + align, 0);
+        fbAligned_ = (uint8_t *)(((uintptr_t)frameBuf_.data() + align - 1) & ~(uintptr_t)(align - 1));
+        fbSize_ = fbSize;
+        codecUsed_ = codec;
+        return true;
     }
-
-    cpuMem_.assign((size_t)res_.cpuMemorySize, 0);
-    cpuGpuMem_.assign((size_t)res_.cpuGpuMemorySize, 0);
-    res_.pCpuMemory = cpuMem_.data();
-    res_.pCpuGpuMemory = cpuGpuMem_.data();
-
-    if (g_api.mapMemory) g_api.mapMemory();
-
-    ctrl_ = {};
-    ctrl_.thisSize = sizeof(ctrl_);
-    int rc = g_api.createDecoder(&cfg, &res_, &ctrl_);
-    if (rc != 0) {
-        char b[96];
-        snprintf(b, sizeof b, "sceVideodecCreateDecoder falhou: 0x%08X", (unsigned)rc);
-        err_ = b;
-        return false;
-    }
-
-    frameBuf_.assign((size_t)(res_.maxFrameBufferSize ? res_.maxFrameBufferSize
-                                                      : (size_t)maxW * maxH * 3 / 2 + 65536),
-                     0);
-    return true;
+    err_ = "sceVideodecCreateDecoder falhou " + diag;
+    return false;
 }
 
 bool Player::openFile(const std::string &path, int maxW, int maxH) {
@@ -270,8 +299,8 @@ bool Player::feedAu(const uint8_t *data, size_t size, Frame &out) {
 
     vdec::FrameBuffer fb{};
     fb.thisSize = sizeof(fb);
-    fb.pFrameBuffer = frameBuf_.data();
-    fb.frameBufferSize = frameBuf_.size();
+    fb.pFrameBuffer = fbAligned_;
+    fb.frameBufferSize = fbSize_;
 
     vdec::PictureInfo pic{};
     pic.thisSize = sizeof(pic);
@@ -309,8 +338,8 @@ bool Player::pump(Frame &out) {
 
     vdec::FrameBuffer fb{};
     fb.thisSize = sizeof(fb);
-    fb.pFrameBuffer = frameBuf_.data();
-    fb.frameBufferSize = frameBuf_.size();
+    fb.pFrameBuffer = fbAligned_;
+    fb.frameBufferSize = fbSize_;
 
     vdec::PictureInfo pic{};
     pic.thisSize = sizeof(pic);
@@ -332,9 +361,8 @@ bool Player::pump(Frame &out) {
 }
 
 void Player::close() {
-    if (open_ && g_api.loaded && g_api.deleteDecoder && ctrl_.handle) {
-        g_api.deleteDecoder(&ctrl_);
-    }
+    if (created_ && g_api.loaded && g_api.deleteDecoder) g_api.deleteDecoder(&ctrl_);   // nao depende do layout do campo "handle"
+    created_ = false; fbAligned_ = nullptr; fbSize_ = 0;
     ctrl_ = {};
     file_.clear();
     cpuMem_.clear();
