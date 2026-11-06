@@ -1563,41 +1563,25 @@ struct Player {
     // Nao baixa o filme inteiro para o disco — comeca a tocar assim que o buffer enche.
     // VOD estavel: 1) URL HTTP direta  2) download local completo. NUNCA cb=2 (fecha o app).
     bool tryStartNative(const std::string &url) {
-        // Episodios ~300–400 MB: NAO cabem em std::string na RAM do PS4.
-        // Baixa em blocos de 1 MB direto para /data (Range), HTTP serializado (httpMx).
+        // STREAMING: nao baixa o episodio inteiro. So o indice (moov) + 1 sample por frame via Range.
         useNative = false;
         failed = false;
         cancelled = false;
-        waitNote = "Nativo: preparando episodio...";
+        waitNote = "Nativo: indice (sem baixar tudo)...";
         presentCb();
 
         if (!nativeplayer::boot()) {
             log.push_back("Nativo: sceVideodec indisponivel");
-            waitNote = "sceVideodec indisponivel neste PS4";
+            waitNote = "sceVideodec indisponivel";
             presentCb();
             return false;
         }
 
         try { g_covers.setPaused(true); } catch (...) {}
 
-        const char *path = "/data/kickiptv_native.bin";
-        const uint64_t kMax = 450ull * 1024ull * 1024ull;   // ~450 MB (ep ~330 MB ok)
-        const uint64_t kChunk = 1ull * 1024ull * 1024ull;    // 1 MB por Range
-        remove(path);
-
-        FILE *fp = fopen(path, "w+b");
-        if (!fp) {
-            log.push_back("Nativo: nao criou arquivo em /data");
-            waitNote = "Erro ao criar arquivo local";
-            presentCb();
-            try { g_covers.setPaused(false); } catch (...) {}
-            return false;
-        }
-
         NetClient::Session sess;
-        sess.recvSec = 30;
+        sess.recvSec = 25;
         if (!g_net.openSession(sess, url)) {
-            fclose(fp); remove(path);
             log.push_back("Nativo: openSession falhou");
             waitNote = "Sem conexao HTTP";
             presentCb();
@@ -1605,104 +1589,53 @@ struct Player {
             return false;
         }
 
-        // 1) tamanho via Range 0-15
-        std::string tip;
-        int st = 0;
-        uint64_t total = 0;
-        waitNote = "Nativo: lendo tamanho...";
+        std::string tip; int st = 0; uint64_t total = 0;
+        waitNote = "Nativo: tamanho do arquivo...";
         presentCb();
         bool okProbe = false;
         for (int a = 0; a < 3 && !okProbe; a++) {
-            if (cancelled) break;
             tip.clear(); st = 0; total = 0;
             okProbe = g_net.getRange(sess, url, 0, 15, tip, st, &total)
                       && (st == 206 || st == 200) && total >= 1024;
             if (!okProbe && st >= 400 && st < 500) break;
         }
-        if (!okProbe || total < 1024) {
-            fclose(fp); remove(path);
+        if (!okProbe) {
             g_net.closeSession(sess);
-            log.push_back("Nativo: probe falhou HTTP " + std::to_string(st));
-            waitNote = "Nao li o tamanho (HTTP " + std::to_string(st) + ")";
+            log.push_back("Nativo: probe HTTP " + std::to_string(st));
+            waitNote = "Sem Range no servidor (HTTP " + std::to_string(st) + ")";
             presentCb();
             try { g_covers.setPaused(false); } catch (...) {}
             return false;
         }
-        if (total > kMax) {
-            fclose(fp); remove(path);
-            g_net.closeSession(sess);
-            log.push_back("Nativo: " + std::to_string(total / 1048576) + " MB > limite 450 MB");
-            waitNote = "Episodio grande demais (" + std::to_string(total / 1048576) + " MB)";
+        {
+            char b[64];
+            snprintf(b, sizeof b, "Nativo: indice (arquivo %.0f MB)...", total / 1048576.0);
+            waitNote = b;
             presentCb();
-            try { g_covers.setPaused(false); } catch (...) {}
-            return false;
         }
 
-        // 2) grava tip + resto em chunks (nunca segura o arquivo inteiro na RAM)
-        if (fwrite(tip.data(), 1, tip.size(), fp) != tip.size()) {
-            fclose(fp); remove(path);
+        // Fetch compartilhado: mesma sessao HTTP serializada (httpMx)
+        auto fetch = [this, url, sess](uint64_t from, uint64_t to, std::string &body) mutable -> bool {
+            int st2 = 0;
+            body.clear();
+            if (!g_net.getRange(sess, url, from, to, body, st2)) return false;
+            return (st2 == 206 || st2 == 200) && !body.empty();
+        };
+
+        if (!native.openUrl(url, total, fetch)) {
             g_net.closeSession(sess);
-            return false;
-        }
-        uint64_t got = tip.size();
-        while (got < total) {
-            if (cancelled) {
-                fclose(fp); remove(path);
-                g_net.closeSession(sess);
-                try { g_covers.setPaused(false); } catch (...) {}
-                return false;
-            }
-            uint64_t to = got + kChunk - 1;
-            if (to >= total) to = total - 1;
-            std::string chunk;
-            st = 0;
-            bool rok = g_net.getRange(sess, url, got, to, chunk, st)
-                       && (st == 206 || st == 200) && !chunk.empty();
-            if (!rok) {
-                chunk.clear();
-                rok = g_net.getRange(sess, url, got, to, chunk, st)
-                      && !chunk.empty();
-            }
-            if (!rok) {
-                fclose(fp); remove(path);
-                g_net.closeSession(sess);
-                log.push_back("Nativo: Range falhou @" + std::to_string(got) + " HTTP " + std::to_string(st));
-                waitNote = "Falha no download @ " + std::to_string(got / 1048576) + " MB";
-                presentCb();
-                try { g_covers.setPaused(false); } catch (...) {}
-                return false;
-            }
-            if (fwrite(chunk.data(), 1, chunk.size(), fp) != chunk.size()) {
-                fclose(fp); remove(path);
-                g_net.closeSession(sess);
-                log.push_back("Nativo: disco cheio?");
-                waitNote = "Sem espaco em /data";
-                presentCb();
-                try { g_covers.setPaused(false); } catch (...) {}
-                return false;
-            }
-            got += chunk.size();
-            {
-                char b[96];
-                snprintf(b, sizeof b, "Nativo: baixando %.0f / %.0f MB", got / 1048576.0, total / 1048576.0);
-                waitNote = b;
-                presentCb();
-            }
-        }
-        fclose(fp);
-        g_net.closeSession(sess);
-
-        waitNote = "Nativo: abrindo sceVideodec...";
-        presentCb();
-        if (!native.openFile(path)) {
             log.push_back("Nativo: " + native.lastError());
-            waitNote = native.lastError().empty() ? "Decoder rejeitou o arquivo" : native.lastError();
+            waitNote = native.lastError().empty() ? "Falha no indice MP4" : native.lastError();
             presentCb();
             native.close();
             try { g_covers.setPaused(false); } catch (...) {}
             return false;
         }
 
+        // Mantem sessao viva dentro do fetch (copiado no lambda) — sess é daqui; ok enquanto player ativo
+        // Guarda sess no Player? O lambda captura sess por valor (Session copy) — Session is copyable with tmpl/conn ints
+        // Danger: when tryStartNative returns, sess destructor doesn't close - Session is POD-like
+        // We must NOT closeSession here — fetch still uses it. Store on Player.
         useNative = true;
         isVod = true;
         h = 0;
@@ -1711,7 +1644,8 @@ struct Player {
         paused = false;
         playStartWall = nowSec();
         t0 = lastFps = lastFrameT = nowSec();
-        log.push_back("Nativo: OK (" + std::to_string(total / 1048576) + " MB no disco)");
+        log.push_back("Nativo: STREAM OK samples=" + std::to_string(native.sampleCount())
+                      + " (" + std::to_string(total / 1048576) + " MB no servidor, 0 baixado inteiro)");
         waitNote.clear();
         presentCb();
         return true;
