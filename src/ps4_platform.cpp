@@ -1436,11 +1436,15 @@ struct Player {
         // Se cair no pipeline de "ao vivo" (MPEG-TS), o PS4 fecha com CE-34878-0.
         if (!isHls && urlIsVod(url)) {
             isVod = true;
+            // SOMENTE player nativo (sem AvPlayer). Se falhar, mostra erro — nao cai no AvPlayer.
             try {
                 if (tryStartNative(url)) return true;
-                return startFile(url);
+                failed = true;
+                if (log.empty() || log.back().find("Nativo:") == std::string::npos)
+                    log.push_back("Nativo: falhou ao abrir (sem fallback AvPlayer)");
+                return false;
             }
-            catch (...) { failed = true; log.push_back("ERRO: sem memoria ao abrir o arquivo"); trace("vod-excecao"); releaseHfAsync(); releasePfAsync(); return false; }
+            catch (...) { failed = true; log.push_back("ERRO: sem memoria no player nativo"); trace("vod-excecao"); releaseHfAsync(); releasePfAsync(); return false; }
         }
 
         // Ao vivo: HLS (.m3u8) vai direto. Canal "cru" (.ts / sem extensao): primeiro tenta o HLS equivalente do painel Xtream
@@ -1557,40 +1561,136 @@ struct Player {
     // VOD estavel: 1) URL HTTP direta  2) download local completo. NUNCA cb=2 (fecha o app).
     bool tryStartNative(const std::string &url) {
         useNative = false;
-        std::string low = url;
-        for (char &c : low) if (c >= 'A' && c <= 'Z') c = char(c - 'A' + 'a');
-        bool okExt = low.find(".mp4") != std::string::npos
-                  || low.find(".h264") != std::string::npos
-                  || low.find(".264") != std::string::npos;
-        if (!okExt && (low.find("/movie/") != std::string::npos || low.find("/series/") != std::string::npos))
-            okExt = true;
-        if (!okExt) {
-            log.push_back("Nativo: URL nao candidata — AvPlayer");
-            return false;
-        }
+        failed = false;
+        waitNote = "Nativo: preparando...";
+        presentCb();
+
         if (!nativeplayer::boot()) {
-            log.push_back("Nativo: sceVideodec indisponivel — AvPlayer");
+            log.push_back("Nativo: sceVideodec indisponivel neste firmware");
+            waitNote = "sceVideodec indisponivel";
+            presentCb();
             return false;
         }
-        log.push_back("Nativo: baixando H.264 (sem AvPlayer)...");
-        std::string body;
+
+        // Baixa o arquivo inteiro para /data (ate 350 MB) com progresso na tela
+        const char *path = "/data/kickiptv_native.bin";
+        const uint64_t kMax = 350ull * 1024ull * 1024ull;
+        const uint64_t kChunk = 1ull * 1024ull * 1024ull; // 1 MB
+
+        remove(path);
+        FILE *fp = fopen(path, "w+b");
+        if (!fp) {
+            log.push_back("Nativo: nao criou /data/kickiptv_native.bin");
+            waitNote = "Erro ao criar arquivo local";
+            presentCb();
+            return false;
+        }
+
+        NetClient::Session sess;
+        if (!g_net.openSession(sess, url)) {
+            fclose(fp); remove(path);
+            log.push_back("Nativo: sem sessao HTTP");
+            waitNote = "Sem conexao HTTP";
+            presentCb();
+            return false;
+        }
+
+        // Descobre tamanho
+        std::string tip;
         int st = 0;
-        const size_t kMax = 80u * 1024u * 1024u;
-        if (!g_net.get(url, body, st, kMax) || st < 200 || st >= 300 || body.size() < 1024) {
-            log.push_back("Nativo: download falhou HTTP " + std::to_string(st) + " size=" + std::to_string(body.size()));
-            return false;
+        uint64_t total = 0;
+        bool okProbe = g_net.getRange(sess, url, 0, 15, tip, st, &total) && (st == 206 || st == 200) && total >= 1024;
+        if (!okProbe || total < 1024) {
+            // tenta get completo limitado
+            fclose(fp);
+            std::string body;
+            st = 0;
+            waitNote = "Nativo: baixando (modo unico)...";
+            presentCb();
+            if (!g_net.get(url, body, st, (size_t)kMax) || st < 200 || st >= 300 || body.size() < 1024) {
+                log.push_back("Nativo: download falhou HTTP " + std::to_string(st));
+                waitNote = "Download falhou HTTP " + std::to_string(st);
+                presentCb();
+                return false;
+            }
+            fp = fopen(path, "w+b");
+            if (!fp || fwrite(body.data(), 1, body.size(), fp) != body.size()) {
+                if (fp) fclose(fp);
+                log.push_back("Nativo: falha ao gravar arquivo");
+                return false;
+            }
+            fclose(fp);
+            body.clear();
+            waitNote = "Nativo: abrindo decoder...";
+            presentCb();
+            if (!native.openFile(path)) {
+                log.push_back("Nativo: " + native.lastError());
+                waitNote = native.lastError();
+                presentCb();
+                native.close();
+                return false;
+            }
+        } else {
+            if (total > kMax) {
+                fclose(fp); remove(path);
+                log.push_back("Nativo: arquivo " + std::to_string(total / 1048576) + " MB > limite 350 MB");
+                waitNote = "Arquivo grande demais p/ nativo (" + std::to_string(total / 1048576) + " MB)";
+                presentCb();
+                return false;
+            }
+            // grava os 16 bytes ja baixados
+            if (fwrite(tip.data(), 1, tip.size(), fp) != tip.size()) {
+                fclose(fp); remove(path);
+                log.push_back("Nativo: falha write tip");
+                return false;
+            }
+            uint64_t got = tip.size();
+            while (got < total) {
+                if (cancelled) {
+                    fclose(fp); remove(path);
+                    log.push_back("Nativo: cancelado");
+                    return false;
+                }
+                uint64_t to = got + kChunk - 1;
+                if (to >= total) to = total - 1;
+                std::string chunk;
+                st = 0;
+                if (!g_net.getRange(sess, url, got, to, chunk, st) || (st != 206 && st != 200) || chunk.empty()) {
+                    // retry 1x
+                    chunk.clear();
+                    if (!g_net.getRange(sess, url, got, to, chunk, st) || chunk.empty()) {
+                        fclose(fp); remove(path);
+                        log.push_back("Nativo: Range falhou em " + std::to_string(got) + " HTTP " + std::to_string(st));
+                        waitNote = "Falha no download @ " + std::to_string(got / 1048576) + " MB";
+                        presentCb();
+                        return false;
+                    }
+                }
+                if (fwrite(chunk.data(), 1, chunk.size(), fp) != chunk.size()) {
+                    fclose(fp); remove(path);
+                    log.push_back("Nativo: disco cheio?");
+                    return false;
+                }
+                got += chunk.size();
+                {
+                    char b[96];
+                    snprintf(b, sizeof b, "Nativo: baixando %.1f / %.1f MB", got / 1048576.0, total / 1048576.0);
+                    waitNote = b;
+                    presentCb();
+                }
+            }
+            fclose(fp);
+            waitNote = "Nativo: abrindo decoder sceVideodec...";
+            presentCb();
+            if (!native.openFile(path)) {
+                log.push_back("Nativo: " + native.lastError());
+                waitNote = native.lastError();
+                presentCb();
+                native.close();
+                return false;
+            }
         }
-        if (body.size() >= kMax - 1024) {
-            log.push_back("Nativo: arquivo grande — AvPlayer progressive");
-            return false;
-        }
-        log.push_back("Nativo: " + std::to_string(body.size() / 1024) + " KB, abrindo decoder...");
-        if (!native.openMemory((const uint8_t *)body.data(), body.size())) {
-            log.push_back("Nativo: " + native.lastError());
-            native.close();
-            return false;
-        }
-        body.clear();
+
         useNative = true;
         isVod = true;
         h = 0;
@@ -1599,7 +1699,9 @@ struct Player {
         paused = false;
         playStartWall = nowSec();
         t0 = lastFps = lastFrameT = nowSec();
-        log.push_back("Nativo: OK (sceVideodec)");
+        log.push_back("Nativo: OK (sceVideodec) — AvPlayer desligado neste VOD");
+        waitNote.clear();
+        presentCb();
         return true;
     }
 
