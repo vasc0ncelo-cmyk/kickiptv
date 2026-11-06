@@ -5,8 +5,9 @@
 //   2) HTTP Range + seek
 //   3) live HLS / IPTV
 //
-// Se o módulo de hardware não carregar, open() retorna false e o app
-// deve continuar no AvPlayer (caminho atual).
+// Caminho NATIVO (sem AvPlayer) para H.264.
+// Integração: nativeplayer.hpp
+// Se o módulo de hardware não carregar, open() retorna false.
 #pragma once
 
 #include "videodec.hpp"
