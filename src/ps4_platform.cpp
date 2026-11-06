@@ -1564,6 +1564,7 @@ struct Player {
         useNative = false;
         failed = false;
         hwplayer::g_trace = trace;
+        mp4s::g_trace = trace;
         trace("nat-inicio");
         waitNote = "Nativo: preparando...";
         presentCb();
@@ -1606,20 +1607,20 @@ struct Player {
         trace("nat-probe-ok");
         { char tb[96]; snprintf(tb, sizeof tb, "   arquivo de %.0f MB (streaming, nada vai pro disco)", total / 1048576.0); log.back() = tb; }
 
-        // 2) leitor por blocos de 1 MB com Range, 2 conexoes, cache de 24 MB. Mesmo componente que o AvPlayer usava.
+        // 2) leitor por blocos de 1 MB com Range, cache de 24 MB. UMA conexao so (como o download do AvPlayer):
+        //    os pools de rede do PS4 sao pequenos e o app ja fechou com conexoes demais juntas. Cada bloco pede
+        //    vaga ao mesmo controle (g_coverGate) das capas, para nunca passar do limite.
         std::string u = url;
-        auto mkFetch = [u](std::shared_ptr<NetClient::Session> s) {
-            return [u, s](uint64_t from, uint64_t to, std::string &body) -> int {
-                int status = 0;
-                if (!g_net.getRange(*s, u, from, to, body, status)) return 0;
-                return status;
-            };
-        };
         auto s1 = std::make_shared<NetClient::Session>(); s1->recvSec = 25;
-        auto s2 = std::make_shared<NetClient::Session>(); s2->recvSec = 25;
-        auto rd = std::make_shared<httpfile::Reader>(mkFetch(s1), 24, 6);
+        auto fetch1 = [u, s1](uint64_t from, uint64_t to, std::string &body) -> int {
+            NetGate::Permit permit(g_coverGate, false, &g_quitting);
+            if (!permit.ok) return 0;
+            int status = 0;
+            if (!g_net.getRange(*s1, u, from, to, body, status)) return 0;
+            return status;
+        };
+        auto rd = std::make_shared<httpfile::Reader>(fetch1, 24, 6);
         rd->setOnExit([s1] { g_net.closeSession(*s1); });
-        rd->addWorker(mkFetch(s2), [s2] { g_net.closeSession(*s2); });
         rd->setProbe([total] { return total; });
         setHf(rd);
         rd->start();
@@ -1632,6 +1633,7 @@ struct Player {
         std::atomic<int> idxDone{0};
         bool idxOk = false;
         std::thread th([&] {
+            trace("nat-thread-inicio");
             try { idxOk = native.openStreamIndex(readAt, total, 60000); } catch (...) { idxOk = false; }
             idxDone = 1;
         });
@@ -3143,9 +3145,9 @@ int main() {
         std::string stageNote;
         {
             if (!g_prevTail.empty()) {
-                for (size_t i = g_prevTail.size() > 4 ? g_prevTail.size() - 4 : 0; i < g_prevTail.size(); i++) {
-                    if (!stageNote.empty()) stageNote += " | ";
-                    stageNote += g_prevTail[i];
+                for (size_t k = 0; k < g_prevTail.size() && k < 5; k++) {      // mais recente primeiro (o fim da linha pode ser cortado na tela)
+                    if (!stageNote.empty()) stageNote += " < ";
+                    stageNote += g_prevTail[g_prevTail.size() - 1 - k];
                 }
             } else if (g_prevRaw != "(nenhum)") stageNote = g_prevRaw;
             if (!stageNote.empty()) stageNote = "  [LOG: " + stageNote + "]";
