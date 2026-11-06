@@ -8,6 +8,9 @@
 
 namespace hwplayer {
 
+// Gancho de diagnostico: a plataforma aponta para trace() (grava em /data/kickiptv.log). O menu mostra o ultimo passo se o app cair.
+extern void (*traceHook)(const char *);
+
 struct Frame {
     const uint8_t *nv12 = nullptr;
     int width  = 0;
@@ -52,12 +55,12 @@ private:
     vdec::ResourceInfo res_{};
     std::vector<uint8_t> cpuMem_;
     std::vector<uint8_t> cpuGpuMem_;
-    std::vector<uint8_t> frameBuf_;
     uint64_t ptsTick_ = 0;
     bool created_ = false;
     uint8_t *fbAligned_ = nullptr;
     size_t fbSize_ = 0;
     uint32_t codecUsed_ = 0;
+    int decodes_ = 0;
 public:
     uint32_t codecUsed() const { return codecUsed_; }
 };
