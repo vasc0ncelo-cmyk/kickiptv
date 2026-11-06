@@ -43,6 +43,14 @@ public:
     // MP4/MKV ainda não: precisa demux (fase 2).
     bool openFile(const std::string &path, int maxW = 1920, int maxH = 1080);
 
+    // Modo STREAMING: abre so o decoder (sem arquivo). Quem chama entrega cada access unit com feedAu().
+    // Nao usa RAM para o arquivo — o demux (mp4stream.hpp) le sample por sample.
+    bool openStream(int maxW = 1920, int maxH = 1080);
+
+    // Decodifica UM access unit (Annex-B). Retorna true se saiu um quadro novo em 'out'.
+    // false sem erro = o decoder ainda guarda quadros (reordenacao de B-frames) — normal.
+    bool feedAu(const uint8_t *au, size_t n, uint64_t ptsMs, uint64_t dtsMs, Frame &out);
+
     // Alimenta o próximo access unit e, se houver quadro pronto, preenche 'out'.
     // Retorna true se 'out' tem frame novo.
     bool pump(Frame &out);
