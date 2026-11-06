@@ -16,7 +16,7 @@
 //   - HLS/fMP4 ao vivo (Kick) — precisa juntar segmentos TS/fMP4 e alimentar o decoder
 //   - Seek fino em arquivo enorme sem materializar Annex-B inteiro na RAM/disco
 //
-// AvPlayer continua no app so como fallback ate essas fases fecharem.
+// VOD: so este player (AvPlayer desligado no filme/serie). Live/HLS ainda usa pipeline antigo.
 // =============================================================================
 #include "hwplayer.hpp"
 #include "mp4annexb.hpp"
@@ -39,7 +39,7 @@ public:
         if (!in) { err_ = "nao abriu: " + path; return false; }
         in.seekg(0, std::ios::end);
         auto len = (std::streamoff)in.tellg();
-        if (len <= 32 || len > 400ll * 1024 * 1024) { err_ = "tamanho invalido"; return false; }
+        if (len <= 32 || len > 380ll * 1024 * 1024) { err_ = "tamanho invalido"; return false; }
         in.seekg(0, std::ios::beg);
         std::vector<uint8_t> data((size_t)len);
         in.read((char *)data.data(), len);
