@@ -54,6 +54,12 @@ private:
     std::vector<uint8_t> cpuGpuMem_;
     std::vector<uint8_t> frameBuf_;
     uint64_t ptsTick_ = 0;
+    bool created_ = false;
+    uint8_t *fbAligned_ = nullptr;
+    size_t fbSize_ = 0;
+    uint32_t codecUsed_ = 0;
+public:
+    uint32_t codecUsed() const { return codecUsed_; }
 };
 
 } // namespace hwplayer
