@@ -27,7 +27,6 @@
 #include <time.h>
 #include "hls.hpp"
 #include "nativeplayer.hpp"
-#include "mp4stream.hpp"
 #include "streambuf.hpp"
 #include "netstream.hpp"
 #include "httpfile.hpp"
@@ -86,7 +85,6 @@ unsigned int sceLibcHeapExtendedAlloc = 1;
 size_t sceLibcHeapSize = 0xFFFFFFFFFFFFFFFFULL;   // SCE_LIBC_HEAP_SIZE_EXTENDED_ALLOC_NO_LIMIT
 }
 static void trace(const char *stage);   // (definida mais abaixo)
-static std::atomic<int> g_grDbg{0};       // diagnostico: quantas chamadas de NetClient::getRange ainda vao pro log
 // Marcadores finos do download da lista M3U: se o app fechar, a proxima abertura mostra o ULTIMO passo que foi gravado.
 static bool g_traceHttp = false;                 // so durante o download da lista M3U
 static const char *g_m3uTag = "m3u-t-";          // "t" = thread de rede | "s" = modo seguro (mesma thread)
@@ -132,6 +130,7 @@ struct NetClient {
     // GET simples. Retorna true se conseguiu falar com o servidor (mesmo com status de erro).
     bool get(const std::string &url, std::string &body, int &status, size_t maxBytes = 1536 * 1024,
              const char *userAgent = nullptr, const char *referer = nullptr) {
+        std::lock_guard<std::recursive_mutex> httpLk(httpMx);
         status = 0; body.clear();
         if (!init()) return false;
         const char *ua = userAgent ? userAgent : "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
@@ -258,7 +257,8 @@ struct NetClient {
         size_t he = url.find('/', se + 3);
         return he == std::string::npos ? url : url.substr(0, he);
     }
-    std::recursive_mutex sessMx;              // abrir/fechar conexoes uma de cada vez (a transferencia dos dados continua em paralelo)
+    std::recursive_mutex sessMx;              // abrir/fechar conexoes uma de cada vez
+    std::recursive_mutex httpMx;              // TODA operacao sceHttp serializada (evita CE ao misturar capas/M3U/nativo)
     void closeSession(Session &s) {
         std::lock_guard<std::recursive_mutex> lk(sessMx);
         if (s.conn >= 0) sceHttpDeleteConnection(s.conn);
@@ -320,28 +320,20 @@ struct NetClient {
     // GET de um trecho [from, to] (inclusive) reaproveitando a conexao de 's' (so UMA thread por sessao). Devolve false em erro de rede.
     // 'status': 206 = ok | 416 = alem do fim | 200 = o servidor ignorou o Range (nao le o resto: derruba a conexao).
     bool getRange(Session &s, const std::string &url, uint64_t from, uint64_t to, std::string &body, int &status, uint64_t *total = nullptr) {
-        bool lg = g_grDbg.load() > 0;                  // diagnostico: so as primeiras chamadas vao pro log
-        if (lg) { g_grDbg--; trace("gr-ini"); }
+        std::lock_guard<std::recursive_mutex> httpLk(httpMx);
         for (int attempt = 0; attempt < 2; attempt++) {
             status = 0; body.clear();
             bool fresh = false;
-            if (s.conn < 0 || s.origin != originOf(url)) { if (lg) trace("gr-abrindo"); if (!openSession(s, url)) { if (lg) trace("gr-abrir-falhou"); return false; } fresh = true; if (lg) trace("gr-aberta"); }
+            if (s.conn < 0 || s.origin != originOf(url)) { if (!openSession(s, url)) return false; fresh = true; }
             int req = sceHttpCreateRequestWithURL(s.conn, 0 /*GET*/, url.c_str(), 0);
-            if (lg) trace("gr-req");
             bool ok = false, clean = false;
             size_t want = (size_t)(to - from + 1);
-            if (lg) trace("gr-reserve");
             body.reserve(want);
-            if (lg) trace("gr-reserve-ok");
             if (req >= 0) {
                 sceHttpAddRequestHeader(req, "Accept", "*/*", 0);
                 char rb[64]; snprintf(rb, sizeof rb, "bytes=%llu-%llu", (unsigned long long)from, (unsigned long long)to);
                 sceHttpAddRequestHeader(req, "Range", rb, 0);
-                if (lg) trace("gr-enviando");
-                int src = sceHttpSendRequest(req, NULL, 0);
-                if (lg) { char lb[64]; snprintf(lb, sizeof lb, "gr-enviado rc=%08X", (unsigned)src); trace(lb); }
-                if (src >= 0 && sceHttpGetStatusCode(req, &status) >= 0) {
-                    if (lg) { char lb[64]; snprintf(lb, sizeof lb, "gr-status=%d", status); trace(lb); }
+                if (sceHttpSendRequest(req, NULL, 0) >= 0 && sceHttpGetStatusCode(req, &status) >= 0) {
                     ok = true;
                     if (total) {                                          // "Content-Range: bytes 0-0/TOTAL": o tamanho vem numa requisicao so
                         char *hd = nullptr; size_t hn = 0;
@@ -358,11 +350,8 @@ struct NetClient {
                     if (status == 206 || status == 416 || (status == 200 && from == 0)) {
                         clean = true;
                         std::vector<char> buf(128 * 1024);
-                        bool firstRd = true;
                         for (;;) {
-                            if (lg && firstRd) trace("gr-lendo");
                             int n = sceHttpReadData(req, buf.data(), buf.size());
-                            if (lg && firstRd) { firstRd = false; char lb[64]; snprintf(lb, sizeof lb, "gr-leu n=%d", n); trace(lb); }
                             if (n < 0) { ok = clean = false; break; }
                             if (n == 0) break;
                             body.append(buf.data(), (size_t)n);
@@ -1574,146 +1563,155 @@ struct Player {
     // Nao baixa o filme inteiro para o disco — comeca a tocar assim que o buffer enche.
     // VOD estavel: 1) URL HTTP direta  2) download local completo. NUNCA cb=2 (fecha o app).
     bool tryStartNative(const std::string &url) {
+        // Episodios ~300–400 MB: NAO cabem em std::string na RAM do PS4.
+        // Baixa em blocos de 1 MB direto para /data (Range), HTTP serializado (httpMx).
         useNative = false;
         failed = false;
-        hwplayer::g_trace = trace;
-        mp4s::g_trace = trace;
-        trace("nat-inicio");
-        waitNote = "Nativo: preparando...";
+        cancelled = false;
+        waitNote = "Nativo: preparando episodio...";
         presentCb();
 
         if (!nativeplayer::boot()) {
-            log.push_back("Nativo: sceVideodec indisponivel neste firmware");
-            waitNote = "sceVideodec indisponivel";
+            log.push_back("Nativo: sceVideodec indisponivel");
+            waitNote = "sceVideodec indisponivel neste PS4";
             presentCb();
             return false;
         }
-        trace("nat-boot-ok");
-        releaseHfAsync();
-        releasePfAsync();
-        while (g_tearing.load() > 0) {
-            if (cancelCb && cancelCb()) { cancelled = true; failed = true; return false; }
-            presentCb(); sceKernelUsleep(30000);
-        }
-        trace("nat-probe");
 
-        // 1) tamanho do arquivo: UMA requisicao Range (igual ao caminho do AvPlayer)
-        log.push_back("   conectando ao servidor...");
+        try { g_covers.setPaused(true); } catch (...) {}
+
+        const char *path = "/data/kickiptv_native.bin";
+        const uint64_t kMax = 450ull * 1024ull * 1024ull;   // ~450 MB (ep ~330 MB ok)
+        const uint64_t kChunk = 1ull * 1024ull * 1024ull;    // 1 MB por Range
+        remove(path);
+
+        FILE *fp = fopen(path, "w+b");
+        if (!fp) {
+            log.push_back("Nativo: nao criou arquivo em /data");
+            waitNote = "Erro ao criar arquivo local";
+            presentCb();
+            try { g_covers.setPaused(false); } catch (...) {}
+            return false;
+        }
+
+        NetClient::Session sess;
+        sess.recvSec = 30;
+        if (!g_net.openSession(sess, url)) {
+            fclose(fp); remove(path);
+            log.push_back("Nativo: openSession falhou");
+            waitNote = "Sem conexao HTTP";
+            presentCb();
+            try { g_covers.setPaused(false); } catch (...) {}
+            return false;
+        }
+
+        // 1) tamanho via Range 0-15
+        std::string tip;
+        int st = 0;
+        uint64_t total = 0;
+        waitNote = "Nativo: lendo tamanho...";
         presentCb();
-        NetClient::Session probe; probe.recvSec = 20;
-        std::string tip; int st = 0; uint64_t total = 0;
         bool okProbe = false;
         for (int a = 0; a < 3 && !okProbe; a++) {
-            if (cancelCb && cancelCb()) { cancelled = true; g_net.closeSession(probe); return false; }
-            okProbe = g_net.getRange(probe, url, 0, 15, tip, st, &total) && st == 206 && total >= 1024;
-            if (!okProbe && st == 206 && total == 0) break;
+            if (cancelled) break;
+            tip.clear(); st = 0; total = 0;
+            okProbe = g_net.getRange(sess, url, 0, 15, tip, st, &total)
+                      && (st == 206 || st == 200) && total >= 1024;
             if (!okProbe && st >= 400 && st < 500) break;
         }
-        g_net.closeSession(probe);
-        if (!okProbe) {
-            failed = true;
-            if (st == 200) log.push_back("ERRO: o servidor nao aceita Range (nao da para tocar sem baixar tudo)");
-            else log.push_back("ERRO: sem resposta do servidor (HTTP " + std::to_string(st) + ")");
+        if (!okProbe || total < 1024) {
+            fclose(fp); remove(path);
+            g_net.closeSession(sess);
+            log.push_back("Nativo: probe falhou HTTP " + std::to_string(st));
+            waitNote = "Nao li o tamanho (HTTP " + std::to_string(st) + ")";
+            presentCb();
+            try { g_covers.setPaused(false); } catch (...) {}
             return false;
         }
-        vodContentLength = total;
-        trace("nat-probe-ok");
-        { char tb[96]; snprintf(tb, sizeof tb, "   arquivo de %.0f MB (streaming, nada vai pro disco)", total / 1048576.0); log.back() = tb; }
+        if (total > kMax) {
+            fclose(fp); remove(path);
+            g_net.closeSession(sess);
+            log.push_back("Nativo: " + std::to_string(total / 1048576) + " MB > limite 450 MB");
+            waitNote = "Episodio grande demais (" + std::to_string(total / 1048576) + " MB)";
+            presentCb();
+            try { g_covers.setPaused(false); } catch (...) {}
+            return false;
+        }
 
-        // 2) leitor por blocos de 1 MB com Range, cache de 24 MB. UMA conexao so (como o download do AvPlayer):
-        //    os pools de rede do PS4 sao pequenos e o app ja fechou com conexoes demais juntas. Cada bloco pede
-        //    vaga ao mesmo controle (g_coverGate) das capas, para nunca passar do limite.
-        std::string u = url;
-        auto s1 = std::make_shared<NetClient::Session>(); s1->recvSec = 25;
-        auto fetch1 = [u, s1](uint64_t from, uint64_t to, std::string &body) -> int {
-            static std::atomic<int> nf{0};
-            int k = nf++;
-            bool lg = k < 3;                                  // so as 3 primeiras chamadas vao pro log
-            char lb[96];
-            if (lg) { snprintf(lb, sizeof lb, "net-%d-ini from=%llu", k, (unsigned long long)from); trace(lb); }
-            NetGate::Permit permit(g_coverGate, false, &g_quitting);
-            if (!permit.ok) { if (lg) trace("net-permit-negado"); return 0; }
-            if (lg) trace("net-permit-ok");
-            int status = 0;
-            bool okNet = g_net.getRange(*s1, u, from, to, body, status);
-            if (lg) { snprintf(lb, sizeof lb, "net-%d-fim ok=%d st=%d n=%zu", k, (int)okNet, status, body.size()); trace(lb); }
-            if (!okNet) return 0;
-            return status;
-        };
-        auto rd = std::make_shared<httpfile::Reader>(fetch1, 24, 6);
-        rd->setOnExit([s1] { g_net.closeSession(*s1); });
-        rd->setProbe([total] { return total; });
-        setHf(rd);
-        g_grDbg = 2;                       // loga os passos das 2 primeiras chamadas de rede do leitor
-        rd->start();
-        trace("nat-reader-ok");
-
-        // 3) le o indice (moov) numa thread: a tela continua respondendo e o O cancela
-        waitNote = "Nativo: lendo o indice do filme...";
-        presentCb();
-        mp4s::ReadAt readAt = [rd](uint8_t *d, uint64_t pos, uint32_t len, int to) -> int {
-            static std::atomic<int> nr{0};
-            int k = nr++;
-            char lb[96];
-            if (k < 3) { snprintf(lb, sizeof lb, "rd-%d-ini pos=%llu len=%u", k, (unsigned long long)pos, (unsigned)len); trace(lb); }
-            int n = rd->read(d, pos, len, to);
-            if (k < 3) { snprintf(lb, sizeof lb, "rd-%d-fim n=%d", k, n); trace(lb); }
-            return n;
-        };
-        std::atomic<int> idxDone{0};
-        bool idxOk = false;
-        std::thread th([&] {
-            trace("nat-thread-inicio");
-            try { idxOk = native.openStreamIndex(readAt, total, 60000); } catch (...) { idxOk = false; }
-            idxDone = 1;
-        });
-        double tw = nowSec(), lastUi = 0;
-        while (!idxDone) {
-            if (cancelCb && cancelCb()) { cancelled = true; rd->abort(); }
-            if (nowSec() - lastUi > 0.2) {
-                lastUi = nowSec();
-                static int uiN = 0;
-                if (uiN < 4) { char ub[48]; snprintf(ub, sizeof ub, "nat-ui-%d t=%.1f", uiN++, nowSec() - tw); trace(ub); }
-                char b[96]; snprintf(b, sizeof b, "Nativo: lendo o indice... %.1f s  (O cancela)", nowSec() - tw);
-                waitNote = b; presentCb();
+        // 2) grava tip + resto em chunks (nunca segura o arquivo inteiro na RAM)
+        if (fwrite(tip.data(), 1, tip.size(), fp) != tip.size()) {
+            fclose(fp); remove(path);
+            g_net.closeSession(sess);
+            return false;
+        }
+        uint64_t got = tip.size();
+        while (got < total) {
+            if (cancelled) {
+                fclose(fp); remove(path);
+                g_net.closeSession(sess);
+                try { g_covers.setPaused(false); } catch (...) {}
+                return false;
             }
-            sceKernelUsleep(20000);
+            uint64_t to = got + kChunk - 1;
+            if (to >= total) to = total - 1;
+            std::string chunk;
+            st = 0;
+            bool rok = g_net.getRange(sess, url, got, to, chunk, st)
+                       && (st == 206 || st == 200) && !chunk.empty();
+            if (!rok) {
+                chunk.clear();
+                rok = g_net.getRange(sess, url, got, to, chunk, st)
+                      && !chunk.empty();
+            }
+            if (!rok) {
+                fclose(fp); remove(path);
+                g_net.closeSession(sess);
+                log.push_back("Nativo: Range falhou @" + std::to_string(got) + " HTTP " + std::to_string(st));
+                waitNote = "Falha no download @ " + std::to_string(got / 1048576) + " MB";
+                presentCb();
+                try { g_covers.setPaused(false); } catch (...) {}
+                return false;
+            }
+            if (fwrite(chunk.data(), 1, chunk.size(), fp) != chunk.size()) {
+                fclose(fp); remove(path);
+                g_net.closeSession(sess);
+                log.push_back("Nativo: disco cheio?");
+                waitNote = "Sem espaco em /data";
+                presentCb();
+                try { g_covers.setPaused(false); } catch (...) {}
+                return false;
+            }
+            got += chunk.size();
+            {
+                char b[96];
+                snprintf(b, sizeof b, "Nativo: baixando %.0f / %.0f MB", got / 1048576.0, total / 1048576.0);
+                waitNote = b;
+                presentCb();
+            }
         }
-        th.join();
-        trace(idxOk ? "nat-indice-ok" : "nat-indice-falhou");
-        if (cancelled) { failed = true; native.close(); releaseHfAsync(); return false; }
-        if (!idxOk) {
-            std::string why = native.lastError();
-            if (rd->state() == 2) why += " | rede: " + rd->error();
-            log.push_back("Nativo: " + why);
-            waitNote = why; presentCb();
-            native.close(); releaseHfAsync();
-            return false;
-        }
+        fclose(fp);
+        g_net.closeSession(sess);
 
-        // 4) decoder (thread principal)
-        waitNote = "Nativo: abrindo decoder sceVideodec...";
+        waitNote = "Nativo: abrindo sceVideodec...";
         presentCb();
-        trace("nat-decoder");
-        if (!native.openStreamDecoder()) {
+        if (!native.openFile(path)) {
             log.push_back("Nativo: " + native.lastError());
-            waitNote = native.lastError(); presentCb();
-            native.close(); releaseHfAsync();
+            waitNote = native.lastError().empty() ? "Decoder rejeitou o arquivo" : native.lastError();
+            presentCb();
+            native.close();
+            try { g_covers.setPaused(false); } catch (...) {}
             return false;
         }
-        { char b[96]; snprintf(b, sizeof b, "   video %ux%u, %.0f min", native.width(), native.height(), native.durationMs() / 60000.0); log.push_back(b); }
 
-        trace("nat-decoder-ok");
         useNative = true;
         isVod = true;
         h = 0;
         active = true;
         failed = false;
         paused = false;
-        durationMs = native.durationMs();
         playStartWall = nowSec();
         t0 = lastFps = lastFrameT = nowSec();
-        log.push_back("Nativo: OK (sceVideodec, streaming) — SEM AUDIO nesta fase");
+        log.push_back("Nativo: OK (" + std::to_string(total / 1048576) + " MB no disco)");
         waitNote.clear();
         presentCb();
         return true;
@@ -1933,7 +1931,6 @@ struct Player {
         if (useNative) {
             try { native.close(); } catch (...) {}
             useNative = false;
-            releaseHfAsync();
         }
         KAvHandle hh = h, hh2 = h2;
         h = 0; h2 = 0; active = false; chunkMode = false;
@@ -1975,16 +1972,7 @@ struct Player {
         if (useNative) {
             if (!native.isOpen()) return false;
             hwplayer::Frame fr;
-            static bool firstPump = true;
-            if (firstPump) { firstPump = false; trace("nat-pump-1"); }
-            bool got = native.pump(fr, nowSec());
-            static bool firstFrame = true;
-            if (got && firstFrame) { firstFrame = false; trace("nat-primeiro-quadro"); }
-            if (auto rdr = getHf()) {
-                if (rdr->state() == 2 && !failed) { failed = true; log.push_back("ERRO: " + rdr->error()); return false; }
-            }
-            waitNote = native.isBuffering() ? "Carregando..." : "";
-            if (!got || !fr.valid || !fr.nv12) return false;
+            if (!native.pump(fr) || !fr.valid || !fr.nv12) return false;
             int w = fr.width, hh = fr.height;
             if (w <= 0 || hh <= 0) return false;
             vw = (unsigned)w; vh = (unsigned)hh;
@@ -3173,21 +3161,8 @@ int main() {
             if (!wasSafe) { g_safeM3U = true; pf.saveSetting("safem3u", "1"); trace("modo-seguro-ligado"); }
             else skipAuto = true;
         }
-        // Ultimas linhas do log da vez anterior (onde o app parou). Aparece junto de qualquer aviso abaixo.
-        std::string stageNote;
-        {
-            if (!g_prevTail.empty()) {
-                for (size_t k = 0; k < g_prevTail.size() && k < 8; k++) {      // mais recente primeiro (o fim da linha pode ser cortado na tela)
-                    if (!stageNote.empty()) stageNote += "<";
-                    stageNote += g_prevTail[g_prevTail.size() - 1 - k];
-                }
-            } else if (g_prevRaw != "(nenhum)") stageNote = g_prevRaw;
-            if (!stageNote.empty()) stageNote = " [" + stageNote + "]";
-        }
         if (ui.hasSavedList() && skipAuto) {
-            app.say((stageNote.empty() ? std::string("A lista M3U fechou o app na ultima vez - abra LISTA M3U e aperte X.") : std::string("M3U: abra e aperte X.")) + stageNote);
-        } else if (ui.hasSavedList() && !stageNote.empty() && !g_prevStage.empty()) {
-            app.say("O app fechou na ultima vez." + stageNote);   // queda fora da lista M3U: mostra onde parou
+            app.say("A lista M3U fechou o app na ultima vez - abra LISTA M3U e aperte X.");
         } else if (ui.hasSavedList()) {
             // Abre o app e carrega a lista SALVA em segundo plano (le o arquivo guardado no console: nao baixa nada).
             // So baixa da rede se nao houver copia salva desta lista. Se o app cair nisso, a proxima abertura nao repete (protecao acima).
