@@ -1260,6 +1260,12 @@ struct Player {
     bool isVod = false;                    // true = arquivo (mp4/mkv/...), false = live/HLS
     bool useNative = false;                // true = sceVideodec (sem AvPlayer)
     nativeplayer::Session native;
+    // ---- seek por janela (ver progfile.hpp::want) e retomada da pausa ----
+    mp4s::Demuxer seekDm;                  // indice do arquivo LOCAL: tempo -> endereco do quadro-chave
+    bool seekDmTried = false, seekDmOk = false;
+    uint64_t pendWinA = 0, pendWinB = 0;   // janela de bytes que precisa estar no disco antes de pular
+    bool forceJump = false;                // seekTo no mesmo ponto (usado ao despausar)
+    int64_t pausePosMs = 0;                // onde o filme estava quando pausou
     bool quietWait = false;                // true = nao mostra o cartao de diagnostico ao conectar (qualidade/reconexao)
     uint64_t lastPtsMs = 0;                // posicao atual (ms) do ultimo quadro
     uint64_t maxPtsMs = 0;                 // maior pts visto (estima duracao minima)
@@ -1400,6 +1406,7 @@ struct Player {
         scrubMode = false; scrubMs = -1; seekSkip = false; seekTargetMs = 0;
         trigScrub = false; trigDir = 0; trigBlock = true;       // trigBlock: um L2/R2 ainda apertado do menu nao vira seek
         pendJumpMs = -1; pendJumpNeed = 0; jumpPct = 0; jumpTargetMs = -1; jumpSettleUntil = 0; jumpErrors = 0;
+        pendWinA = pendWinB = 0; seekDm = mp4s::Demuxer(); seekDmTried = seekDmOk = false; forceJump = false; pausePosMs = 0;
         if (jumpGuardOn) { remove(kJumpGuardFile); jumpGuardOn = false; }
         vodEstDurMs = 0; vodContentLength = 0; vodBytesAtStart = 0; vodTimeAtStart = 0;
         playStartWall = nowSec(); pauseAccum = 0; pauseStartedAt = 0; lastGoodPtsMs = 0; lastPtsWall = playStartWall; fileDurMs = 0; playedMs = 0; lastPaceWall = 0;
@@ -1439,12 +1446,19 @@ struct Player {
         // Se cair no pipeline de "ao vivo" (MPEG-TS), o PS4 fecha com CE-34878-0.
         if (!isHls && urlIsVod(url)) {
             isVod = true;
-            // SOMENTE player nativo (sem AvPlayer). Se falhar, mostra erro — nao cai no AvPlayer.
+            // Player nativo (sceVideodec) DESLIGADO: ainda e experimental e derruba o app no PS4.
+            // Padrao: o mesmo caminho que funcionava antes (baixa por HTTP Range e o AvPlayer do sistema toca).
+            // Para voltar a testar o nativo, troque para true.
+            const bool kNativeVod = false;
+            if (!kNativeVod) {
+                try { return startFile(url); }
+                catch (...) { failed = true; log.push_back("ERRO: sem memoria ao abrir o filme"); trace("vod-excecao"); releaseHfAsync(); releasePfAsync(); return false; }
+            }
             try {
                 if (tryStartNative(url)) return true;
                 failed = true;
                 if (log.empty() || log.back().find("Nativo:") == std::string::npos)
-                    log.push_back("Nativo: falhou ao abrir (sem fallback AvPlayer)");
+                    log.push_back("Nativo: falhou ao abrir");
                 return false;
             }
             catch (...) { failed = true; log.push_back("ERRO: sem memoria no player nativo"); trace("vod-excecao"); releaseHfAsync(); releasePfAsync(); return false; }
@@ -1570,6 +1584,7 @@ struct Player {
         waitNote = "Nativo: indice (sem baixar tudo)...";
         presentCb();
 
+        hwplayer::traceHook = [](const char *st) { trace(st); };    // passos do decoder em /data/kickiptv.log (se o app cair, o menu mostra onde)
         if (!nativeplayer::boot()) {
             log.push_back("Nativo: sceVideodec indisponivel");
             waitNote = "sceVideodec indisponivel";
@@ -1748,7 +1763,22 @@ struct Player {
         presentCb();
 
         // 3) toca o arquivo local (o resto ja esta baixando)
-        if (openSource(path, 0, 0, dl->warn().empty() ? 20000 : 8000, true)) {   // codec que o PS4 nao decodifica: nao espera 20 s
+        bool opened = openSource(path, 0, 0, dl->warn().empty() ? 20000 : 8000, true);   // codec que o PS4 nao decodifica: nao espera 20 s
+        if (!opened && !cancelled && dl->state() != 2 && dl->warn().empty()) {
+            // Abrir falha as vezes por o arquivo ainda estar curto demais: espera mais colchao e tenta UMA vez de novo.
+            log.push_back("   nao abriu de primeira, tentando de novo...");
+            presentCb();
+            uint64_t need2 = std::min<uint64_t>(total, std::max<uint64_t>(24u << 20, total / 120));
+            double pw = nowSec();
+            while (dl->state() == 1 && dl->frontier() < need2 && nowSec() - pw < 25) {
+                if (cancelCb && cancelCb()) { cancelled = true; break; }
+                char b[96]; snprintf(b, sizeof b, "Enchendo mais o buffer... %.0f / %.0f MB", dl->frontier() / 1048576.0, need2 / 1048576.0);
+                waitNote = b; presentCb();
+                sceKernelUsleep(50000);
+            }
+            if (!cancelled && dl->state() != 2) { sceKernelUsleep(400000); opened = openSource(path, 0, 0, 25000, true); }
+        }
+        if (opened) {
             audio.start(h); active = true; t0 = lastFps = lastFrameT = nowSec();
             isVod = true;
             // Duracao real do arquivo (mvhd) — barra e tempo total corretos
@@ -2187,9 +2217,17 @@ struct Player {
     // O loop principal para de buscar quadros e o audio fica mudo enquanto paused==true.
     void togglePause() {
         if (!h || failed) return;
+        const bool resuming = paused;
+        if (!resuming) pausePosMs = (int64_t)realPosMs();
+        const double pausedFor = resuming && pauseStartedAt > 0 ? nowSec() - pauseStartedAt : 0;
         setPausedSoft(!paused);
         audio.muted = paused || muted;
         hudUntil = nowSec() + 12;
+        // Enquanto pausado o app nao pega quadros, mas o AvPlayer segue com o relogio dele: ao despausar a imagem voltava atrasada, acelerada
+        // e bugada. Entao, depois de uma pausa de verdade, "pula" para o ponto exato onde parou (limpa a fila do player e do audio).
+        if (resuming && isVod && pausedFor > 0.6 && jumpUsable()) {
+            forceJump = true; seekTo(pausePosMs); forceJump = false;
+        }
     }
 
     // ---- Seek / barra de progresso ----
@@ -2249,6 +2287,35 @@ struct Player {
         return need >= (double)total ? total : (uint64_t)need;
     }
 
+    // Janela de bytes do arquivo LOCAL que o AvPlayer vai ler ao pular para 'ms': do quadro-chave anterior ate ~16 MB depois.
+    // Usa o indice (moov) do proprio arquivo em disco (mp4stream.hpp). false = nao sei (MKV etc.): cai no metodo antigo.
+    bool seekWindow(int64_t ms, uint64_t &a, uint64_t &b) {
+        if (vodPath.empty() || vodContentLength == 0 || !getPf()) return false;
+        if (!seekDmTried) {
+            seekDmTried = true;
+            const std::string lp = vodPath;
+            mp4s::ReadAt rd = [lp](uint8_t *dst, uint64_t pos, uint32_t len, int) -> int {
+                FILE *f = fopen(lp.c_str(), "rb");
+                if (!f) return 0;
+                int n = 0;
+                if (fseeko(f, (off_t)pos, SEEK_SET) == 0) n = (int)fread(dst, 1, len, f);
+                fclose(f);
+                return n;
+            };
+            std::string err;
+            seekDmOk = seekDm.open(rd, vodContentLength, err, 4000);
+            trace(seekDmOk ? "seek-indice-ok" : "seek-indice-indisponivel");
+        }
+        if (!seekDmOk || seekDm.count() == 0) return false;
+        size_t i = seekDm.syncBefore(ms);
+        uint64_t off = seekDm.at(i).off;
+        if (off == 0 || off >= vodContentLength) return false;
+        const uint64_t pre = 2u << 20, post = 16u << 20;
+        a = off > pre ? off - pre : 0;
+        b = std::min<uint64_t>(vodContentLength, off + post);
+        return b > a;
+    }
+
     void seekTo(int64_t targetMs) {
         if (!isVod || !active || failed) { hudUntil = nowSec() + 5; return; }
         clampTime(targetMs);
@@ -2257,9 +2324,14 @@ struct Player {
 
         if (jumpUsable()) {
             scrubMode = false; scrubMs = -1; seekSkip = false;
-            if (targetMs + 400 > cur && targetMs < cur + 400) { pendJumpMs = -1; return; }       // praticamente no mesmo ponto
+            if (!forceJump && targetMs + 400 > cur && targetMs < cur + 400) { pendJumpMs = -1; return; }   // praticamente no mesmo ponto
             pendJumpMs = targetMs;
-            pendJumpNeed = targetMs > cur ? jumpNeedBytes(targetMs) : 0;                          // para tras o arquivo ja esta no disco
+            pendJumpNeed = 0; pendWinA = pendWinB = 0;
+            uint64_t wa = 0, wb = 0;
+            if (seekWindow(targetMs, wa, wb)) {                                                   // sabe o endereco exato: baixa SO aquele trecho primeiro
+                pendWinA = wa; pendWinB = wb;
+                if (auto pf = getPf()) pf->want(wa, wb);
+            } else pendJumpNeed = targetMs > cur ? jumpNeedBytes(targetMs) : 0;                   // sem indice: espera o download chegar em ordem
             jumpPct = 0;
             serviceJump();                                                                        // pula agora se o download ja chegou la
             return;
@@ -2293,7 +2365,15 @@ struct Player {
         }
         if (pendJumpMs < 0) return;
         if (!isVod || !active || failed || !h || !jumpUsable()) { pendJumpMs = -1; return; }
-        if (pendJumpNeed > 0) {
+        if (pendWinB > pendWinA) {                                  // seek por janela: espera so o trecho do ponto pedido
+            auto pf = getPf();
+            if (pf && pf->state() == 2) { pendJumpMs = -1; pendWinA = pendWinB = 0; waitNote = "Download falhou: nao deu para pular"; return; }
+            if (pf && pf->state() != 3 && !pf->hasRange(pendWinA, pendWinB)) {
+                jumpPct = (int)(pf->haveIn(pendWinA, pendWinB) * 100 / (pendWinB - pendWinA));
+                if (hudUntil < t + 2) hudUntil = t + 2;
+                return;
+            }
+        } else if (pendJumpNeed > 0) {
             auto pf = getPf();
             if (pf && pf->state() == 2) { pendJumpMs = -1; waitNote = "Download falhou: nao deu para pular"; return; }
             uint64_t front = (!pf || pf->state() == 3) ? vodContentLength : pf->frontier();
@@ -2306,7 +2386,7 @@ struct Player {
         doJump();
     }
     void doJump() {
-        int64_t ms = pendJumpMs; pendJumpMs = -1;
+        int64_t ms = pendJumpMs; pendJumpMs = -1; pendWinA = pendWinB = 0;
         double t = nowSec();
         if (paused) { setPausedSoft(false); audio.muted = muted; }          // pausado: volta a tocar no novo ponto
         touchFile(kJumpGuardFile); jumpGuardOn = true; jumpGuardAt = t;
