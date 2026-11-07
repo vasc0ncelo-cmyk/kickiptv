@@ -1,4 +1,5 @@
 #include "../src/keyboard.hpp"
+#include "../src/defaultlist.hpp"
 #include "../src/clock.hpp"
 #include <cassert>
 #include <iostream>
@@ -81,6 +82,33 @@ int main() {
     // --- Remover lista: campo vazio ---
     ui.handle(Input::Back); ui.homeRow = 2; ui.handle(Input::Confirm); ui.onText("");
     assert(a.list.channels.empty() && f.store["m3u"].empty());
+    // --- Lista FIXA (padrao do app): sem "adicionar lista", so o botao ATUALIZAR ---
+    {
+        Fake fl; fl.store["m3u"] = "http://outra-lista.com/x.m3u";            // lista que uma versao antiga deixou guardada
+        App al(fl); UI ul(al);
+        ul.defaultUrl = "http://painel.com/lista.m3u?x=1";
+        ul.loadSaved();
+        assert(ul.listLocked() && ul.hasSavedList() && ul.m3uUrl == "http://painel.com/lista.m3u?x=1");     // vale a padrao, nao a guardada
+        { Rec r; ul.render(r); assert(r.has("LISTA IPTV") && r.has("X  ATUALIZAR") && !r.has("LISTA M3U")); }
+        ul.handle(Input::Down); assert(ul.homeRow == 2);
+        ul.handle(Input::Confirm);
+        assert(fl.asked.empty() && ul.textKind == 0 && ul.reloadRequested);                              // NAO abre teclado: ninguem digita outra lista
+        // a plataforma atende o pedido (mesmo caminho do download manual): baixa a lista de novo
+        ul.reloadRequested = false; ul.textKind = 2; ul.onText(ul.m3uUrl);
+        assert(fl.lastUrl == "http://painel.com/lista.m3u?x=1" && al.list.channels.size() == 1 && al.list.movies.size() == 1);
+        assert(fl.store["m3u"] == "http://painel.com/lista.m3u?x=1");
+        // reabrir o app: continua na lista padrao
+        { Fake f2; f2.store = fl.store; f2.store["m3u"] = "http://outra-lista.com/y.m3u"; App a2(f2); UI u2(a2); u2.defaultUrl = ul.defaultUrl; u2.loadSaved(); assert(u2.m3uUrl == ul.defaultUrl); }
+        // lista ainda nao carregou (sem rede): as telas avisam e mandam usar ATUALIZAR
+        { Fake f3; App a3(f3); UI u3(a3); u3.defaultUrl = "http://painel.com/x"; u3.loadSaved();
+          u3.screen = Screen::List; u3.tab = Tab::Movies; Rec r; u3.render(r);
+          assert(r.has("A lista ainda não carregou")); }
+        // sem nenhuma lista configurada: nao pede atualizacao
+        { Fake f4; App a4(f4); UI u4(a4); u4.defaultUrl = ""; u4.homeRow = 2; u4.handle(Input::Confirm); assert(!u4.reloadRequested && u4.textKind == 2); }   // (so builds de teste, sem lista padrao)
+        { Fake f5; App a5(f5); UI u5(a5); u5.defaultUrl = "x"; u5.m3uUrl.clear(); u5.homeRow = 2; u5.handle(Input::Confirm); assert(!u5.reloadRequested && a5.lastStatus.find("Nenhuma lista") == 0); }
+    }
+    // --- a lista padrao do app existe e e um endereco http(s) ---
+    { std::string u = defaultListUrl(); assert(u.compare(0, 7, "http://") == 0 || u.compare(0, 8, "https://") == 0); }
     // --- Teclado ---
     { Keyboard k; k.open("", true); assert(k.keyAt(0, 1) == "q");
       k.cx = 0; k.cy = 4; k.press(); assert(k.shift && k.keyAt(0, 1) == "Q");
