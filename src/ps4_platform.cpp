@@ -378,8 +378,10 @@ struct NetClient {
     }
 };
 
-static NetClient g_net;
-static ImgCache g_covers;
+// Objetos globais com threads/rede ficam "vazados" de proposito (nunca destruidos): se o PS4 encerrar o processo pelo caminho normal
+// (exit), os destrutores nao ficam esperando thread presa em rede (travava o fechamento) nem chamam std::terminate com thread ativa.
+static NetClient &g_net = *new NetClient;
+static ImgCache &g_covers = *new ImgCache;
 static NetGate g_coverGate(3, 2);                // no maximo 3 capas baixando juntas; o lote de fundo usa no maximo 2 (sempre sobra vaga para a tela)
 static std::atomic<bool> g_quitting{false};
 
@@ -1196,7 +1198,7 @@ struct HlsFeeder {
         }
     }
 };
-static HlsFeeder g_feed;
+static HlsFeeder &g_feed = *new HlsFeeder;
 static int feedOpen(void *, const char *) { g_feed.opens++; return 0; }
 static int feedClose(void *) { return 0; }
 static int feedRead(void *, uint8_t *dst, uint64_t pos, uint32_t len) { g_feed.reads++; return g_feed.sb.read(dst, pos, len); }
@@ -1212,7 +1214,7 @@ static void closeFeedFile() {                 // para o alimentador, fecha e apa
 // "AddSource = 806A0002 / Open file failed". Entao o app le o arquivo com o PROPRIO cliente HTTP (blocos de 1 MB via Range, httpfile.hpp)
 // e entrega ao player pelos callbacks de arquivo.
 static std::mutex g_hfM;
-static std::shared_ptr<httpfile::Reader> g_hf;
+static std::shared_ptr<httpfile::Reader> &g_hf = *new std::shared_ptr<httpfile::Reader>;
 static std::shared_ptr<httpfile::Reader> getHf() { std::lock_guard<std::mutex> l(g_hfM); return g_hf; }
 static void setHf(std::shared_ptr<httpfile::Reader> r) { std::lock_guard<std::mutex> l(g_hfM); g_hf = std::move(r); }
 static std::shared_ptr<httpfile::Reader> takeHf() { std::lock_guard<std::mutex> l(g_hfM); auto r = std::move(g_hf); g_hf.reset(); return r; }
@@ -1244,7 +1246,7 @@ static void releaseHfAsync() {                                                  
 
 // ---------- Filme/serie: download progressivo (progfile.hpp) ----------
 static std::mutex g_pfM;
-static std::shared_ptr<progfile::Downloader> g_pf;
+static std::shared_ptr<progfile::Downloader> &g_pf = *new std::shared_ptr<progfile::Downloader>;
 static void removeVodFiles() {                                                  // o arquivo local leva a extensao do container (mp4/mkv/avi/ts)
     static const char *e[] = {"mp4", "mkv", "avi", "ts"};
     for (const char *x : e) remove((std::string("/data/kickiptv_vod.") + x).c_str());
@@ -3387,7 +3389,10 @@ int main() {
                 if (bg && !wasBg) {
                     bgSince = nowSec();
                     keepBg = fileExists(kKeepBgFile);
-                    stopAllNow("sistema-background");
+                    // O menu do PS ja parou tudo (video, rede, capas). So para de novo se ainda tiver algo rodando: cada espera aqui
+                    // atrasava a saida e o sistema fechava o app antes (o log terminava logo apos "tudo-parado").
+                    if (mode == Mode::Play || player.h) stopAllNow("sistema-background");
+                    else trace("sistema-background");
                 }
                 if (!bg && wasBg) {
                     trace("sistema-foreground");
@@ -3400,11 +3405,10 @@ int main() {
                 if (bg) {
                     // Ficou no inicio do PS4 por mais de 1 s: encerra sozinho (nada de esperar o sistema matar o processo).
                     // Sem esperar threads de rede (_Exit); o estado (lista/ultimo streamer) ja fica salvo em disco.
-                    if (seenFg && !keepBg && nowSec() - bgSince > 1.0) {
+                    if (seenFg && !keepBg) {              // sai NA HORA (sem esperar 1 s): o sistema esta fechando/trocando o app
                         trace("bg-saindo");
                         g_quitting = true;
                         try { pf.saveSetting("bgload", ""); } catch (...) {}
-                        try { removeVodFiles(); } catch (...) {}
                         trace("fim-bg");
                         _Exit(0);
                     }
