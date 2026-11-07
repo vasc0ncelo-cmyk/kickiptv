@@ -3636,22 +3636,42 @@ int main() {
                 // religava o HUD (que usava o rascunho) e o video "voltava".
                 player.bufferGuard();                       // internet lenta: pausa sozinho e retoma quando houver colchao
                 FbRenderer r((hud || player.isVod) ? shadow : (uint32_t *)bufs[back], W, H);
+                // CORRECAO DAS "SOMBRAS PRETAS PISCANDO": o overlay (faixas escuras de cima/baixo, translucidas) era redesenhado varias vezes
+                // por cima do MESMO quadro (pausado, ou menu de opcoes aberto sem quadro novo) e escurecia cada vez mais, ate chegar um quadro
+                // novo e limpar. Agora guardamos uma copia do quadro puro e restauramos antes de cada redesenho do overlay.
+                static std::vector<uint32_t> cleanFrame; static bool cleanValid = false;
+                const bool useShadow = (hud || player.isVod);
+                auto saveClean = [&]() {
+                    if (!useShadow || !shadow) return;
+                    size_t n = (size_t)W * (size_t)H;
+                    if (cleanFrame.size() != n) cleanFrame.resize(n);
+                    memcpy(cleanFrame.data(), shadow, n * sizeof(uint32_t)); cleanValid = true;
+                };
+                auto prepClean = [&]() {                    // chamado antes de redesenhar o overlay SEM quadro novo
+                    if (!useShadow || !shadow || !gotFrame) return;
+                    size_t n = (size_t)W * (size_t)H;
+                    if (!cleanValid || cleanFrame.size() != n) saveClean();         // shadow ainda esta sem overlay: ele e o quadro puro
+                    else memcpy(shadow, cleanFrame.data(), n * sizeof(uint32_t));
+                };
                 if (player.paused) {
                     // pausado: so HUD (proporcao aplica no proximo quadro ao despausar)
+                    prepClean();
                     player.overlay(r); flip();
                     sceKernelUsleep(12000);
                     continue;
                 }
                 if (player.poll(r)) {
                     gotFrame = true;
-                    if (hud || player.showOpts || player.scrubMode) { player.overlay(r); flip(); }
+                    if (hud || player.showOpts || player.scrubMode) { saveClean(); player.overlay(r); flip(); }
                     else if (player.isVod) {
-                        // barra verde minima sempre (avanca com o filme)
-                        player.drawMiniProgress(r); flip();
+                        cleanValid = false;         // quadro puro no shadow, sem overlay
+                        flip();                     // sem barra verde: a barra (vermelha) so aparece ao mexer no analogico/apertar botoes
                     } else {
+                        cleanValid = false;
                         sceVideoOutSubmitFlip(vh, back, ORBIS_VIDEO_OUT_FLIP_VSYNC, 0); back = (back + 1) % 3;
                     }
                 } else if (player.showOpts || (hud && pressed)) {
+                    prepClean();
                     player.overlay(r); flip();
                 }
                 else if (!gotFrame && nowSec() - lastWaitDraw > 0.12) { lastWaitDraw = nowSec(); presentWait(); }
