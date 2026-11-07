@@ -117,13 +117,15 @@ inline std::string uiFit(const Renderer &r, std::string s, int size, int maxW) {
     return s + "...";
 }
 // Dicas de botoes (ex.: [X] Selecionar) alinhadas a direita em rightX. Retorna o x onde comecam.
+inline void uiGlyphTriangle(Renderer &r, int cx, int cy, int s, unsigned c);      // botao triangulo (a fonte nao tem o caractere)
 inline int uiHints(Renderer &r, int rightX, int cy, const std::vector<std::pair<std::string, std::string>> &h) {
     int x = rightX;
     for (int i = (int)h.size() - 1; i >= 0; i--) {
         int lw = r.textWidth(h[i].second, 20), kw = r.textWidth(h[i].first, 18) + 24;
         x -= lw; uiText(r, x, cy - 10, h[i].second, theme::MUTED, 20);
         x -= 10 + kw; r.roundRect(x, cy - 17, kw, 34, 11, theme::KEY);
-        uiCenter(r, x + kw / 2, cy, h[i].first, theme::TEXT, 18, true);
+        if (h[i].first == "△") uiGlyphTriangle(r, x + kw / 2, cy, 18, theme::TEXT);
+        else uiCenter(r, x + kw / 2, cy, h[i].first, theme::TEXT, 18, true);
         x -= 30;
     }
     return x + 30;
@@ -287,6 +289,35 @@ inline void uiIconWifi(Renderer &r, int cx, int cy, int s, unsigned c) {   // (c
         });
     }
     r.roundRect(cx - (int)(s * 0.08f), cy - (int)(s * 0.08f), (int)(s * 0.16f), (int)(s * 0.16f), (int)(s * 0.08f), c);
+}
+inline void uiGlyphTriangle(Renderer &r, int cx, int cy, int s, unsigned c) {      // contorno de triangulo (botao △ do controle)
+    const float ax = cx, ay = cy - s * 0.52f, bx = cx - s * 0.52f, by = cy + s * 0.40f, dx2 = cx + s * 0.52f, t = s * 0.14f;
+    auto seg = [](float px, float py, float x1, float y1, float x2, float y2) {
+        float vx = x2 - x1, vy = y2 - y1, wx = px - x1, wy = py - y1;
+        float h = (wx * vx + wy * vy) / (vx * vx + vy * vy); h = h < 0.f ? 0.f : (h > 1.f ? 1.f : h);
+        float qx = wx - vx * h, qy = wy - vy * h; return uiSqrt(qx * qx + qy * qy);
+    };
+    uiPaint(r, cx - s, cy - s, cx + s, cy + s, c, [&](float px, float py) {
+        float d = seg(px, py, ax, ay, bx, by);
+        float d2 = seg(px, py, bx, by, dx2, by); if (d2 < d) d = d2;
+        float d3 = seg(px, py, dx2, by, ax, ay); if (d3 < d) d = d3;
+        return uiClamp01(0.5f - (d - t * 0.5f));
+    });
+}
+inline void uiIconSearch(Renderer &r, int cx, int cy, int s, unsigned c) {   // lupa
+    const float t = s * 0.11f, R = s * 0.30f, ox = cx - s * 0.10f, oy = cy - s * 0.10f;
+    const float ax = ox + R * 0.7071f, ay = oy + R * 0.7071f, bx = cx + s * 0.40f, by = cy + s * 0.40f;
+    uiPaint(r, cx - s / 2 - 2, cy - s / 2 - 2, cx + s / 2 + 2, cy + s / 2 + 2, c, [&](float px, float py) {
+        float dx = px - ox, dy = py - oy;
+        float d = uiSqrt(dx * dx + dy * dy);
+        float cv = uiClamp01(0.5f - (uiAbs(d - R) - t * 0.5f));
+        float vx = bx - ax, vy = by - ay, wx = px - ax, wy = py - ay;
+        float h = (wx * vx + wy * vy) / (vx * vx + vy * vy);
+        h = h < 0.f ? 0.f : (h > 1.f ? 1.f : h);
+        float qx = wx - vx * h, qy = wy - vy * h;
+        float c2 = uiClamp01(0.5f - (uiSqrt(qx * qx + qy * qy) - t * 0.6f));
+        return c2 > cv ? c2 : cv;
+    });
 }
 inline void uiIconLink(Renderer &r, int cx, int cy, int s, unsigned c) {
     const float k = 0.7071f, t = s * 0.085f, hx = s * 0.30f, hy = s * 0.17f;
@@ -664,8 +695,7 @@ struct UI {
         int t = (int)tab; cursor[t] = scroll[t] = 0;
     }
     void startSearch() {
-        if (!browsable(tab)) { app.say("Abra Filmes, Series ou Canais para buscar"); return; }
-        textKind = 3;
+        textKind = 3;                                  // funciona de qualquer tela: no Inicio/Kick procura em Filmes, Series e Canais
         app.pf.requestText(searchQ.empty() ? "Buscar..." : searchQ);
     }
 
@@ -721,13 +751,37 @@ struct UI {
             size_t b = raw.find_last_not_of(" \t\r\n");
             searchQ = a == std::string::npos ? "" : raw.substr(a, b - a + 1);
             if (searchQ.empty()) { clearSearch(); app.say("Busca limpa"); return; }
-            rebuildSearch();
-            app.say(std::to_string(searchHits.size()) + " resultado(s) para \"" + searchQ + "\"" + (app.xt.active ? " (so nas categorias ja abertas)" : ""));
+            searchEverywhere();
             return;
         }
         kickLast = kickSlug(raw);
         if (kickLast.empty() && !raw.empty()) { app.say("@ invalido"); return; }
         if (!kickLast.empty()) { app.pf.saveSetting("kick", kickLast); app.watchKick(kickLast); }
+    }
+    // Conta os resultados em Filmes, Series e Canais; fica na aba atual se ela tem resultado (ou se ja estava numa lista), senao vai para a que tem mais.
+    void searchEverywhere() {
+        static const Tab ts[3] = {Tab::Movies, Tab::Series, Tab::Channels};
+        static const char *nm[3] = {"Filmes", "Séries", "Canais"};
+        size_t cnt[3] = {0, 0, 0};
+        Tab keep = tab;
+        for (int i = 0; i < 3; i++) { tab = ts[i]; rebuildSearch(); cnt[i] = searchHits.size(); }
+        int best = -1, cur = -1;
+        for (int i = 0; i < 3; i++) { if (ts[i] == keep) cur = i; if (cnt[i] > 0 && (best < 0 || cnt[i] > cnt[best])) best = i; }
+        int pick = (screen == Screen::List && cur >= 0) ? cur : (best >= 0 ? best : (cur >= 0 ? cur : 0));
+        tab = ts[pick]; screen = Screen::List; rebuildSearch();
+        std::string m = "Busca \"" + searchQ + "\": ";
+        for (int i = 0; i < 3; i++) m += std::string(i ? ", " : "") + nm[i] + " " + std::to_string(cnt[i]);
+        if (cnt[0] + cnt[1] + cnt[2] > 0) m += "  (L1/R1 troca de aba)";
+        else if (app.xt.active) m += "  (so nas categorias ja abertas)";
+        app.say(m);
+    }
+    // L1/R1 durante uma busca: muda de aba (Filmes/Series/Canais) mantendo o texto buscado
+    void switchTabKeepSearch(int dir) {
+        static const Tab ts[3] = {Tab::Movies, Tab::Series, Tab::Channels};
+        int cur = 0; for (int i = 0; i < 3; i++) if (ts[i] == tab) cur = i;
+        tab = ts[(cur + (dir > 0 ? 1 : 2)) % 3];
+        rebuildSearch();
+        app.say(std::to_string(searchHits.size()) + " resultado(s) para \"" + searchQ + "\"");
     }
     std::string textInitial() const {
         if (textKind == 2) return m3uUrl;
@@ -789,8 +843,8 @@ struct UI {
         if (screen == Screen::Home) { handleHome(in); return; }
         int t = (int)tab;
         switch (in) {
-        case Input::PrevTab: openTab(tileTab((tabTile(tab) + 3) % 4)); return;
-        case Input::NextTab: openTab(tileTab((tabTile(tab) + 1) % 4)); return;
+        case Input::PrevTab: if (searching()) { switchTabKeepSearch(-1); return; } openTab(tileTab((tabTile(tab) + 3) % 4)); return;
+        case Input::NextTab: if (searching()) { switchTabKeepSearch(1); return; } openTab(tileTab((tabTile(tab) + 1) % 4)); return;
         default: break;
         }
         if (!browsable(tab)) { handleItems(in); return; }
@@ -1377,10 +1431,21 @@ private:
         std::vector<std::pair<std::string, std::string>> hints;
         if (screen == Screen::Donate) hints = {{"O", "Voltar"}};
         else if (screen == Screen::Home) hints = {{"D-pad", "Navegar"}, {"X", "Selecionar"}};
-        else if (browsable(tab) && !inItems) hints = {{"L1/R1", "Abas"}, {"△", "Buscar"}, {"X", "Abrir"}, {"O", "Início"}};
-        else if (browsable(tab)) hints = {{"△", searching() ? "Nova busca" : "Buscar"}, {"X", "Selecionar"}, {"O", searching() ? "Limpar busca" : "Categorias"}};
+        else if (browsable(tab) && !inItems) hints = {{"L1/R1", "Abas"}, {"X", "Abrir"}, {"O", "Início"}};
+        else if (browsable(tab)) hints = {{"X", "Selecionar"}, {"O", searching() ? "Limpar busca" : "Categorias"}};
         else hints = {{"L1/R1", "Abas"}, {"X", "Selecionar"}, {"O", "Voltar"}};
-        int hx = uiHints(r, W - 73, cy, hints);
+        int hintsRight = W - 73;
+        if (screen != Screen::Donate && screen != Screen::Help) {         // botao da lupa (canto inferior direito): mesmo que apertar △ (ou clicar o touchpad)
+            const bool on = searching();
+            const int pw = on ? 250 : 214, ph = 48, px = W - 73 - pw, py = cy - ph / 2;
+            r.roundRect(px, py, pw, ph, 24, on ? GREEN : KEY);
+            uiIconSearch(r, px + 32, cy, 28, on ? BLACK : TEXT);
+            uiText(r, px + 58, cy - 11, on ? "Nova busca" : "Buscar", on ? BLACK : TEXT, 21, true);
+            r.roundRect(px + pw - 44, cy - 15, 34, 30, 10, on ? 0x40000000 : 0xFF3C424C);
+            uiGlyphTriangle(r, px + pw - 27, cy, 17, on ? BLACK : TEXT);
+            hintsRight = px - 26;
+        }
+        int hx = uiHints(r, hintsRight, cy, hints);
         const std::string &st = app.lastStatus;
         unsigned dot = AMBER;
         if (st.find("Falha") != std::string::npos || st.find("offline") != std::string::npos || st.find("invalido") != std::string::npos || st.find("Aviso") != std::string::npos) dot = RED;
@@ -1436,7 +1501,7 @@ private:
                 openMovieDetail(p.movies[hi], movieCategoryOf(hi));
             } else if (tab == Tab::Series) {
                 curSeries = seriesNameAt(hi);
-                if (!curSeries.empty()) { std::string nm = curSeries; if (!app.ensureSeries(nm)) return; clearSearch(); openSeriesDetail(nm, seriesCategoryOf(nm)); }
+                if (!curSeries.empty()) { std::string nm = curSeries; if (!app.ensureSeries(nm)) return; openSeriesDetail(nm, seriesCategoryOf(nm)); }      // a busca continua: O volta para os resultados
             }
             return;
         }
