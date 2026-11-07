@@ -4,6 +4,8 @@
 #include "app.hpp"
 #include "coverurl.hpp"
 #include "detailmeta.hpp"
+#include "donate.hpp"
+#include "qrcode.hpp"
 #include "sans.hpp"
 #include <algorithm>
 #include <functional>
@@ -17,7 +19,7 @@
 #endif
 
 enum class Input { Up, Down, Left, Right, PrevTab, NextTab, Confirm, Back, PageUp, PageDown, Extra };   // Extra = triangulo: buscar (lupa)
-enum class Screen { Home, Kick, List, Help, Detail };
+enum class Screen { Home, Kick, List, Help, Detail, Donate };
 
 struct Renderer {
     virtual ~Renderer() {}
@@ -374,6 +376,21 @@ inline void uiHeader(Renderer &r, const std::string &hhmm, const std::string &da
     uiTopRight(r, hhmm, date);
 }
 
+// coracao (apoiar): formula implicita (x^2+y^2-1)^3 - x^2*y^3 <= 0, desenhada em linhas horizontais
+inline void uiHeart(Renderer &r, int cx, int cy, int size, unsigned c) {
+    const float half = size / 2.0f;
+    for (int j = 0; j < size; j++) {
+        float y = (half - j - 0.5f) / half * 1.25f + 0.1f;          // topo = +, base = -
+        int x0 = -1, x1 = -1;
+        for (int i = 0; i < size; i++) {
+            float x = (i + 0.5f - half) / half * 1.25f;
+            float a = x * x + y * y - 1.0f;
+            if (a * a * a - x * x * y * y * y <= 0) { if (x0 < 0) x0 = i; x1 = i; }
+        }
+        if (x0 >= 0) r.fillRect(cx - size / 2 + x0, cy - size / 2 + j, x1 - x0 + 1, 1, c);
+    }
+}
+
 struct UI {
     App &app;
     std::function<void(const std::string &)> coverRequest;
@@ -387,7 +404,10 @@ struct UI {
     std::string lastBatchKey, lastBgKey;
     Screen screen = Screen::Home;
     Tab tab = Tab::Kick;
-    int homeRow = 1;          // 0 = banner, 1 = atalhos, 2 = lista M3U, 3 = comandos
+    int homeRow = 1;          // 0 = banner, 1 = atalhos, 2 = lista M3U, 3 = comandos / apoiar
+    int homeCol3 = 0;         // linha 3: 0 = comandos e ajuda, 1 = apoiar o app
+    std::string donateUrl = kDonateUrl, donatePix = kDonatePixKey;   // (testes podem trocar)
+    bool hasDonate() const { return !donateUrl.empty(); }
     int homeCol = 0;
     int helpScroll = 0;
     int cursor[4] = {0, 0, 0, 0};
@@ -758,6 +778,7 @@ struct UI {
 
     void handle(Input in) {
         if (screen == Screen::Detail) { handleDetail(in); return; }
+        if (screen == Screen::Donate) { if (in == Input::Back || in == Input::Confirm) screen = Screen::Home; return; }
         if (in == Input::Extra) { startSearch(); return; }
         if (screen == Screen::Help) {
             if (in == Input::Back || in == Input::Confirm) { screen = Screen::Home; return; }
@@ -824,7 +845,7 @@ struct UI {
         if (dbg) dbg("ui-capas-ok");
         uiHeader(r, timeText, dateText);
         if (dbg) dbg("ui-header-ok");
-        if (screen == Screen::Home) renderHome(r); else if (screen == Screen::Help) renderHelp(r); else if (screen == Screen::Detail) renderDetail(r); else renderList(r);
+        if (screen == Screen::Home) renderHome(r); else if (screen == Screen::Help) renderHelp(r); else if (screen == Screen::Donate) renderDonate(r); else if (screen == Screen::Detail) renderDetail(r); else renderList(r);
         if (dbg) dbg("ui-corpo-ok");
         if (screen != Screen::Detail) renderFooter(r);      // a pagina de detalhes desenha o proprio rodape
         if (dbg) dbg("ui-rodape-ok");
@@ -894,14 +915,15 @@ private:
         switch (in) {
         case Input::Up: homeRow = std::max(0, homeRow - 1); break;
         case Input::Down: homeRow = std::min(3, homeRow + 1); break;
-        case Input::Left: if (homeRow == 1) homeCol = std::max(0, homeCol - 1); break;
-        case Input::Right: if (homeRow == 1) homeCol = std::min(3, homeCol + 1); break;
+        case Input::Left: if (homeRow == 1) homeCol = std::max(0, homeCol - 1); else if (homeRow == 3) homeCol3 = 0; break;
+        case Input::Right: if (homeRow == 1) homeCol = std::min(3, homeCol + 1); else if (homeRow == 3 && hasDonate()) homeCol3 = 1; break;
         case Input::PrevTab: if (homeRow == 1) homeCol = std::max(0, homeCol - 1); break;
         case Input::NextTab: if (homeRow == 1) homeCol = std::min(3, homeCol + 1); break;
         case Input::Confirm:
             if (homeRow == 0) openTab(Tab::Kick);
             else if (homeRow == 1) openTab(tileTab(homeCol));
             else if (homeRow == 2) { if (listLocked()) requestReload(); else requestM3U(); }
+            else if (homeCol3 == 1 && hasDonate()) screen = Screen::Donate;
             else { screen = Screen::Help; helpScroll = 0; }
             break;
         default: break;
@@ -1074,14 +1096,65 @@ private:
                 r.fillRect(pcx - 15, pcy - 3, 30, 6, BLACK); r.fillRect(pcx - 3, pcy - 15, 6, 30, BLACK);
             }
         }
-        // ---- Comandos ----
+        // ---- Comandos e ajuda  |  Apoiar o app ----
         {
-            const int x = mx, y = 968, w = fw, h = 80, rad = 20;
-            bool sel = homeRow == 3;
-            if (sel) uiGlow(r, x, y, w, h, rad, GREEN, 14, 110, false);
-            uiFrame(r, x, y, w, h, rad, sel ? 3 : 2, sel ? GREEN : CARD_LINE, sel ? SEL : CARD);
-            uiHeavy(r, x + 40, y + 24, "COMANDOS E AJUDA", TEXT, 26);
-            uiText(r, x + 400, y + 28, "Botoes, player, teclado, Kick TV", MUTED, 20);
+            const int y = 956, h = 68, rad = 18;                          // termina em 1024: nao encosta no rodape (status e dicas ficam em y~1043)
+            const int cw = hasDonate() ? fw * 62 / 100 : fw;
+            bool sel = homeRow == 3 && homeCol3 == 0;
+            if (sel) uiGlow(r, mx, y, cw, h, rad, GREEN, 14, 110, false);
+            uiFrame(r, mx, y, cw, h, rad, sel ? 3 : 2, sel ? GREEN : CARD_LINE, sel ? SEL : CARD);
+            uiHeavy(r, mx + 40, y + 21, "COMANDOS E AJUDA", TEXT, 26);
+            if (cw > 900) uiText(r, mx + 400, y + 24, "Botoes, player, teclado, Kick TV", MUTED, 20);
+            if (hasDonate()) {
+                const int dx = mx + cw + 20, dw = fw - cw - 20;
+                bool ds = homeRow == 3 && homeCol3 == 1;
+                if (ds) uiGlow(r, dx, y, dw, h, rad, GREEN, 14, 110, false);
+                uiFrame(r, dx, y, dw, h, rad, ds ? 3 : 2, ds ? GREEN : CARD_LINE, ds ? SEL : CARD);
+                uiHeart(r, dx + 54, y + h / 2, 38, GREEN);
+                uiHeavy(r, dx + 100, y + 21, "APOIAR O APP", TEXT, 26);
+                uiText(r, dx + 100 + r.textWidth("APOIAR O APP", 26) + 24, y + 25, "QR Code Pix", MUTED, 20);
+            }
+        }
+    }
+
+    // Tela "Apoiar": QR Code do LivePix (ou da pagina de doacao) + explicacao
+    void renderDonate(Renderer &r) {
+        using namespace theme;
+        const int W = r.width();
+        uiKMark(r, 73, 146, 40, 41, GREEN);
+        uiHeavy(r, 130, 152, "APOIE O KICK IPTV", TEXT, 36);
+        r.fillRect(73, 196, W - 146, 2, 0xFF1C1C1C);
+        QrCode q;
+        const bool ok = qrEncode(donateUrl, q);
+        const int quiet = 4, box = 640, bx = 150, by = 260;
+        uiGlow(r, bx, by, box, box, 28, GREEN, 18, 110, false);
+        r.roundRect(bx, by, box, box, 28, 0xFFFFFFFF);
+        if (ok) {
+            int scale = box / (q.size + 2 * quiet);                // 4 modulos de margem branca (leitores pedem isso)
+            int qs = scale * q.size, ox = bx + (box - qs) / 2, oy = by + (box - qs) / 2;
+            for (int y = 0; y < q.size; y++)
+                for (int x = 0; x < q.size;) {                     // junta modulos escuros vizinhos: menos retangulos
+                    if (!q.dark(x, y)) { x++; continue; }
+                    int e = x; while (e < q.size && q.dark(e, y)) e++;
+                    r.fillRect(ox + x * scale, oy + y * scale, (e - x) * scale, scale, 0xFF000000);
+                    x = e;
+                }
+        } else uiCenterHeavy(r, bx + box / 2, by + box / 2 - 16, "QR indisponivel", 0xFF000000, 32);
+        const int tx = 880;
+        uiHeavy(r, tx, 268, "Gostou do app?", GREEN, 44);
+        uiText(r, tx, 330, "Ajude a manter e melhorar o Kick IPTV.", TEXT, 28);
+        uiText(r, tx, 372, "A contribuicao e opcional, mas ajuda muito. Obrigado!", SOFT, 24);
+        static const char *steps[3] = {"1.  Abra a camera do celular", "2.  Aponte para o QR Code ao lado", "3.  Escolha o valor e pague com Pix"};
+        for (int i = 0; i < 3; i++) {
+            r.roundRect(tx, 450 + i * 74, 56, 56, 28, GREEN);
+            uiCenterHeavy(r, tx + 28, 450 + i * 74 + 28, std::to_string(i + 1), BLACK, 28);
+            uiText(r, tx + 82, 450 + i * 74 + 14, steps[i] + 4, TEXT, 26, true);
+        }
+        uiText(r, tx, 692, "Ou acesse:", MUTED, 22);
+        uiText(r, tx, 726, uiFit(r, donateUrl, 28, W - tx - 100), GREEN, 28, true);
+        if (!donatePix.empty()) {
+            uiText(r, tx, 790, "Chave Pix:", MUTED, 22);
+            uiText(r, tx, 824, uiFit(r, donatePix, 28, W - tx - 100), TEXT, 28, true);
         }
     }
 
@@ -1302,7 +1375,8 @@ private:
         using namespace theme;
         const int W = r.width(), cy = 1043;
         std::vector<std::pair<std::string, std::string>> hints;
-        if (screen == Screen::Home) hints = {{"D-pad", "Navegar"}, {"X", "Selecionar"}};
+        if (screen == Screen::Donate) hints = {{"O", "Voltar"}};
+        else if (screen == Screen::Home) hints = {{"D-pad", "Navegar"}, {"X", "Selecionar"}};
         else if (browsable(tab) && !inItems) hints = {{"L1/R1", "Abas"}, {"△", "Buscar"}, {"X", "Abrir"}, {"O", "Início"}};
         else if (browsable(tab)) hints = {{"△", searching() ? "Nova busca" : "Buscar"}, {"X", "Selecionar"}, {"O", searching() ? "Limpar busca" : "Categorias"}};
         else hints = {{"L1/R1", "Abas"}, {"X", "Selecionar"}, {"O", "Voltar"}};
