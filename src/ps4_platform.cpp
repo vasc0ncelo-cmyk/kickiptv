@@ -1698,6 +1698,7 @@ struct Player {
 
     bool startFile(const std::string &url) {
         std::string ext = urlExtension(url);
+        trace("vod-inicio");
         log.push_back(std::string("Filme/serie") + (ext.empty() ? "" : " ." + ext));
         presentCb();
         releaseHfAsync();
@@ -1710,6 +1711,7 @@ struct Player {
         // 1) tamanho do arquivo (uma requisicao com Range). Sem tentar o AvPlayer direto na URL: o painel recusa e isso so atrasava ~10 s.
         log.push_back("   conectando ao servidor...");
         presentCb();
+        trace("vod-probe");
         NetClient::Session probe; probe.recvSec = 20;
         std::string tip; int st = 0; uint64_t total = 0;
         bool okProbe = false;
@@ -1744,6 +1746,7 @@ struct Player {
             return status;
         }, path, total);
         setPf(dl);
+        trace("vod-baixa-inicio");
         dl->start();
         log.push_back("   preparando o inicio do filme...");
         presentCb();
@@ -1768,6 +1771,7 @@ struct Player {
         if (!dl->warn().empty()) log.push_back("   AVISO: " + dl->warn());
         else if (!dl->audioWarn().empty()) log.push_back("   AVISO: " + dl->audioWarn());
         vodAudioExpected = dl->info().find("sem audio") == std::string::npos;
+        trace("vod-prebuffer");
         // 2b) pre-buffer: o AvPlayer le o arquivo local direto, sem esperar o download. Se ele ler alem do que ja chegou, enxerga zeros
         //     (imagem bugada). Arquivos grandes/de alto bitrate precisam de mais colchao antes de abrir: 0,4% do arquivo (8 a 48 MB).
         {
@@ -1793,6 +1797,7 @@ struct Player {
         presentCb();
 
         // 3) toca o arquivo local (o resto ja esta baixando)
+        trace("vod-abre-player");
         bool opened = openSource(path, 0, 0, dl->warn().empty() ? 20000 : 8000, true);   // codec que o PS4 nao decodifica: nao espera 20 s
         if (!opened && !cancelled && dl->state() != 2 && dl->warn().empty()) {
             // Abrir falha as vezes por o arquivo ainda estar curto demais: espera mais colchao e tenta UMA vez de novo.
@@ -1809,9 +1814,11 @@ struct Player {
             if (!cancelled && dl->state() != 2) { sceKernelUsleep(400000); opened = openSource(path, 0, 0, 25000, true); }
         }
         if (opened) {
+            trace("vod-player-aberto");
             audio.start(h); active = true; t0 = lastFps = lastFrameT = nowSec();
             isVod = true;
             // Duracao real do arquivo (mvhd) — barra e tempo total corretos
+            trace("vod-duracao");
             fileDurMs = mp4DurationMsFromFile(path);
             if (fileDurMs == 0) fileDurMs = dl->durationMs();      // MKV: duracao lida do cabecalho (Segment\Info)
             // mvhd parcial/errado: se o arquivo e grande e a duracao veio < 12 min, descarta
@@ -2763,33 +2770,20 @@ struct Player {
             uiText(r, trackX, trackY + trackH + 12, "AO VIVO", YT_RED, 16);
         }
 
-        // ---- CONTROLES centrais estilo YT ----
-        int cy = H - 58;
-        auto ctrl = [&](int i, int cx, const char *lab) {
-            bool hi = (focusCtrl == i);
-            r.roundRect(cx - 32, cy - 26, 64, 52, 26, hi ? 0xFFFFFFFF : 0xAA222222);
-            uiCenter(r, cx, cy, lab, hi ? 0xFF111111u : 0xFFFFFFFFu, 18, true);
-        };
-        ctrl(0, W / 2 - 200, "|<");
-        ctrl(1, W / 2 - 100, "-10");
-        ctrl(2, W / 2, paused ? ">" : "II");
-        ctrl(3, W / 2 + 100, "+10");
-        ctrl(4, W / 2 + 200, ">|");
-
+        // ---- rodape: som + dica dos botoes (filme/serie: so a barra de tempo; ao vivo: L1/R1 trocam de canal) ----
         {
             const char *vs = muted ? "Mudo" : "Som";
-            uiText(r, W - 160, cy - 8, vs, muted ? 0xFFFF6666u : 0xFFAAAAAAu, 18);
+            uiText(r, W - 160, H - 58 - 8, vs, muted ? 0xFFFF6666u : 0xFFAAAAAAu, 18);
         }
 
         uiText(r, 48, H - 22,
-               isVod
-                   ? "L2/R2 voltar/avancar (segure)   X pausa   UP seek   L1/R1 ep   △ Opcoes   O sair"
-                   : (hasEpisodes() ? "L1/R1 canal anterior/proximo   X pausa   □ mudo   △ Opcoes   O sair" : "X pausa   □ mudo   △ Opcoes   O sair"),
+               isVod ? "□ mudo   △ Opcoes   O sair"
+                     : (hasEpisodes() ? "L1/R1 canal anterior/proximo   □ mudo   △ Opcoes   O sair" : "□ mudo   △ Opcoes   O sair"),
                0xFF888888u, 15);
 
         // ---- MENU OPCOES (direita) ----
         if (showOpts) {
-            const int ox = W - 440, oy = 90, ow = 400, oh = 520;
+            const int ox = W - 440, oy = 90, ow = 400, oh = 400;
             r.roundRect(ox, oy, ow, oh, 16, 0xF00C0C0C);
             r.roundRect(ox, oy, 4, oh, 2, GREEN);
             uiHeavy(r, ox + 24, oy + 22, "Opcoes", TEXT, 26);
@@ -2797,13 +2791,11 @@ struct Player {
             const char *items[] = {
                 "Qualidade do video",
                 "Proporcao da tela",
-                "Legendas",
                 "Audio",
-                "Velocidade de reproducao",
                 "Informacoes",
                 "Voltar"
             };
-            const int nOpt = 7;
+            const int nOpt = 5;
             for (int i = 0; i < nOpt; i++) {
                 int iy = oy + 72 + i * 56;
                 bool sel = (i == optCur);
@@ -2816,10 +2808,8 @@ struct Player {
                 char tmp[32];
                 if (i == 0) val = kQualityName[g_quality.load() % 3];
                 else if (i == 1) val = aspectName(aspectMode);
-                else if (i == 2) val = "Desativadas";
-                else if (i == 3) val = muted ? "Mudo" : "Ativo";
-                else if (i == 4) val = "Normal";
-                else if (i == 5) val = showInfo ? "Abrir" : "";
+                else if (i == 2) val = muted ? "Mudo" : "Ativo";
+                else if (i == 3) val = showInfo ? "Abrir" : "";
                 if (val && val[0]) {
                     int vw2 = r.textWidth(val, 18);
                     uiText(r, ox + ow - 28 - vw2, iy + 12, val, MUTED, 18);
@@ -3496,8 +3486,8 @@ int main() {
 
             // ---- Menu de opcoes (△) ----
             if (player.showOpts) {
-                if (pressed & B_UP) { player.optCur = (player.optCur + 6) % 7; }
-                if (pressed & B_DOWN) { player.optCur = (player.optCur + 1) % 7; }
+                if (pressed & B_UP) { player.optCur = (player.optCur + 4) % 5; }
+                if (pressed & B_DOWN) { player.optCur = (player.optCur + 1) % 5; }
                 auto cycleOpt = [&](int dir) {
                     if (player.optCur == 0) g_quality = (g_quality.load() + (dir > 0 ? 1 : 2)) % 3;
                     if (player.optCur == 1) {
@@ -3505,7 +3495,7 @@ int main() {
                         // aplica na hora: sai da pausa visual forcando redraw
                         player.hudUntil = nowSec() + 30;
                     }
-                    if (player.optCur == 3) {
+                    if (player.optCur == 2) {
                         player.muted = !player.muted;
                         player.audio.muted = player.paused || player.muted;
                     }
@@ -3523,95 +3513,38 @@ int main() {
                         } else g_quality = (g_quality.load() + 1) % 3;
                     } else if (player.optCur == 1) {
                         player.aspectMode = (player.aspectMode + 1) % 3;
-                    } else if (player.optCur == 3) {
+                    } else if (player.optCur == 2) {
                         player.muted = !player.muted;
                         player.audio.muted = player.paused || player.muted;
-                    } else if (player.optCur == 5) {
+                    } else if (player.optCur == 3) {
                         player.showInfo = true; player.showOpts = false;
-                    } else if (player.optCur == 6) {
+                    } else if (player.optCur == 4) {
                         player.showOpts = false;
                     }
-                    // legendas / velocidade: sem API — so feedback
                 }
                 player.hudUntil = nowSec() + 30;
             } else if (player.showInfo) {
                 // so O fecha (ja tratado)
             } else {
-                // ---- Controles do player (HUD) ----
-                // Setas esquerda/direita: troca o botao em foco
-                if (pressed & B_LEFT)  { player.focusCtrl = (player.focusCtrl + 4) % 5; }
-                if (pressed & B_RIGHT) { player.focusCtrl = (player.focusCtrl + 1) % 5; }
-
-                // Barra de seek: UP entra no modo scrub | DOWN sai
-                if (player.isVod) {
-                    if (pressed & B_UP) {
-                        if (!player.scrubMode || player.scrubMs < 0) {
-                            player.scrubMs = player.pendJumpMs >= 0 ? player.pendJumpMs : (int64_t)player.realPosMs();
-                            player.scrubFromMs = player.scrubMs;
-                        }
-                        player.scrubMode = true;
-                        player.hudUntil = nowSec() + 15;
-                    }
-                    if ((pressed & B_DOWN) && player.scrubMode) player.cancelScrub();
-                    if (player.scrubMode) {
-                        // fino / grosso na barra (L2/R2 tem tratamento proprio logo abaixo)
-                        if (pressed & B_LEFT) player.scrubMove(-15000);
-                        if (pressed & B_RIGHT) player.scrubMove(+15000);
-                        if (pressed & B_L1) player.scrubMove(-60000);
-                        if (pressed & B_R1) player.scrubMove(+60000);
-                        if (pressed & B_CROSS) { player.scrubConfirm(); }
-                    }
-                    // L2/R2: toque = -10s/+10s | SEGURAR = a barra anda sozinha (acelerando) e o filme pula ao SOLTAR
-                    player.triggerScrub(((now & B_R2) ? 1 : 0) - ((now & B_L2) ? 1 : 0), nowSec());
-                }
-                // X = ativa o botao em foco (se nao confirmou scrub)
-                if ((pressed & B_CROSS) && !player.scrubMode) {
-                    int f = player.focusCtrl;
-                    if (f == 0) { // episodio anterior
-                        if (player.canPrevEp()) {
-                            player.epIndex--;
-                            pf.pendingPlayUrl = player.epUrls[player.epIndex];
-                            pf.pendingPlayTitle = player.epTitles[player.epIndex];
-                            pf.pendingEpIndex = player.epIndex;
-                            pf.pendingEpUrls = player.epUrls; pf.pendingEpTitles = player.epTitles;
-                            player.quietWait = true;
-                            player.stop(); mode = Mode::Menu; dirty = true; sceKernelUsleep(8000); continue;
-                        }
-                    } else if (f == 1) {
-                        if (player.isVod) player.seekBy(-10000);
-                    } else if (f == 2) {
-                        player.togglePause();
-                    } else if (f == 3) {
-                        if (player.isVod) player.seekBy(+10000);
-                    } else if (f == 4) {
-                        if (player.canNextEp()) {
-                            player.epIndex++;
-                            pf.pendingPlayUrl = player.epUrls[player.epIndex];
-                            pf.pendingPlayTitle = player.epTitles[player.epIndex];
-                            pf.pendingEpIndex = player.epIndex;
-                            pf.pendingEpUrls = player.epUrls; pf.pendingEpTitles = player.epTitles;
-                            player.quietWait = true;
-                            player.stop(); mode = Mode::Menu; dirty = true; sceKernelUsleep(8000); continue;
-                        }
-                    }
-                }
-                // L1/R1 tambem mudam episodio
-                if ((pressed & B_L1) && !player.scrubMode && player.canPrevEp()) {
+                // ---- Controles do player ----
+                // Filme/serie: sem pausa, sem avanco e sem troca de episodio (nao funcionavam); a barra de tempo aparece sozinha.
+                // Ao vivo (canais): L1/R1 trocam para o canal anterior/proximo da lista.
+                if (!player.isVod && (pressed & B_L1) && player.canPrevEp()) {
                     player.epIndex--;
                     pf.pendingPlayUrl = player.epUrls[player.epIndex];
                     pf.pendingPlayTitle = player.epTitles[player.epIndex];
                     pf.pendingEpIndex = player.epIndex;
                     pf.pendingEpUrls = player.epUrls; pf.pendingEpTitles = player.epTitles;
-                    player.focusCtrl = 0; player.quietWait = true;
+                    player.quietWait = true;
                     player.stop(); mode = Mode::Menu; dirty = true; sceKernelUsleep(8000); continue;
                 }
-                if ((pressed & B_R1) && !player.scrubMode && player.canNextEp()) {
+                if (!player.isVod && (pressed & B_R1) && player.canNextEp()) {
                     player.epIndex++;
                     pf.pendingPlayUrl = player.epUrls[player.epIndex];
                     pf.pendingPlayTitle = player.epTitles[player.epIndex];
                     pf.pendingEpIndex = player.epIndex;
                     pf.pendingEpUrls = player.epUrls; pf.pendingEpTitles = player.epTitles;
-                    player.focusCtrl = 4; player.quietWait = true;
+                    player.quietWait = true;
                     player.stop(); mode = Mode::Menu; dirty = true; sceKernelUsleep(8000); continue;
                 }
                 // SQUARE = mute rapido
@@ -3640,32 +3573,6 @@ int main() {
                     lastAudCheck = tn;
                 }
             }
-
-            // ---- Auto-avanca episodio ao terminar ----
-            if (player.isVod && player.canNextEp() && !player.paused) {
-                static double endHold = 0;
-                bool atEnd = player.nearEnd();
-                bool dead = (player.frames > 20 && (nowSec() - player.lastFrameT) > 3.5);
-                bool ended = (!player.active || player.failed) && player.frames > 20;
-                if (atEnd || (dead && player.displayPosMs() + 30000 >= player.displayDurMs()) || ended) {
-                    if (endHold < 1.0) endHold = nowSec();
-                    if (nowSec() - endHold > 1.2) {
-                        endHold = 0;
-                        player.epIndex++;
-                        if (player.epIndex < (int)player.epUrls.size()) {
-                            pf.pendingPlayUrl = player.epUrls[player.epIndex];
-                            pf.pendingPlayTitle = player.epTitles[player.epIndex];
-                            pf.pendingEpIndex = player.epIndex;
-                            pf.pendingEpUrls = player.epUrls; pf.pendingEpTitles = player.epTitles;
-                            player.quietWait = true;
-                            player.stop(); mode = Mode::Menu; dirty = true; sceKernelUsleep(8000); continue;
-                        }
-                    }
-                } else {
-                    endHold = 0;
-                }
-            }
-
 
             // ---- Live (Kick/IPTV): reconecta sozinho se congelar ----
             if (!player.isVod && player.active && !player.failed && !player.paused
