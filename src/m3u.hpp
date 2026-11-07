@@ -14,6 +14,7 @@ struct Entry {
     std::string logo;               // tvg-logo
     Kind kind = Kind::Channel;
     int season = 0, episode = 0;    // so para series
+    int mins = 0;                   // duracao em minutos (so quando o painel informa; episodios)
 };
 
 // Categoria (group-title da lista). Filmes/canais: indices em Playlist::movies / channels. Series: nomes (chave de seriesTree).
@@ -21,18 +22,27 @@ struct Category {
     std::string name;
     std::vector<uint32_t> items;     // so canais e filmes
     std::vector<std::string> series; // so series (ordenadas)
+    // Painel Xtream: a categoria so tem nome e id; os itens sao baixados quando ela abre (App::ensureCategory).
+    std::string id;
+    bool lazy = false, loaded = true;
+    bool unloaded() const { return lazy && !loaded; }
     size_t size() const { return items.empty() ? series.size() : items.size(); }
 };
+
+// Serie do painel Xtream: id para pedir os episodios (get_series_info) e capa vinda da lista.
+struct SeriesRef { std::string id, cover; };
 
 struct Playlist {
     std::vector<Entry> channels, movies;
     std::vector<Category> channelCats, movieCats, seriesCats;   // na ordem em que aparecem na lista
     size_t seriesEpisodes = 0;   // total de episodios (os episodios em si ficam em seriesTree)
+    bool xtream = false;         // veio da API do painel (categorias sob demanda), nao de uma lista M3U
+    std::unordered_map<std::string, SeriesRef> seriesInfo;   // so Xtream: nome da serie -> id/capa
     bool truncated = false;      // a lista tinha mais itens que o limite de memoria (os ultimos ficaram de fora)
     // serie -> temporada -> episodios
     // unordered_map: listas com dezenas de milhares de series nao podem usar std::map (log n por ep)
     std::unordered_map<std::string, std::map<int, std::vector<Entry>>> seriesTree;
-    bool empty() const { return channels.empty() && movies.empty() && seriesTree.empty(); }
+    bool empty() const { return channels.empty() && movies.empty() && seriesTree.empty() && !(xtream && (!channelCats.empty() || !movieCats.empty() || !seriesCats.empty())); }
 };
 
 // Le a lista M3U em PEDACOS (feed pode ser chamado com qualquer tamanho de bloco, inclusive cortando uma linha no meio).
