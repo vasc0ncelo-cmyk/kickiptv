@@ -57,6 +57,7 @@ inline void UI::openMovieDetail(const Entry &e, const std::string &category) {
     detailMeta = DetailMeta();
     detailMeta.year = y; detailMeta.quality = q;
     if (!category.empty() && category != "Sem categoria" && category.size() <= 28) detailMeta.genres.push_back(category);
+    app.movieMeta(e, detailMeta);                                  // sinopse/nota/generos/duracao do painel (se houver)
     if (metaLookup) metaLookup(detailTitle, false, detailMeta);
     lastBatchKey.clear();
     screen = Screen::Detail;
@@ -76,6 +77,7 @@ inline void UI::openSeriesDetail(const std::string &name, const std::string &cat
     detailMeta = DetailMeta();
     detailMeta.year = y; detailMeta.quality = q;
     if (!category.empty() && category != "Sem categoria" && category.size() <= 28) detailMeta.genres.push_back(category);
+    app.seriesMeta(name, detailMeta);
     if (metaLookup) metaLookup(detailTitle, true, detailMeta);
     detailFocus = detailEpisodes().empty() ? 0 : 2;          // como na imagem: foco no 1o episodio
     lastBatchKey.clear();
@@ -387,7 +389,7 @@ inline void UI::renderDetail(Renderer &r) {
             }
             std::string label = detailEpisodeLabel(curSeries, eps[i].name, eps[i].episode, i + 1);
             sansDraw(r, x + S(17), S(789), sansFit(label, F(16.5f), SansSemi, cw - S(17) - S(62)), TXT, F(16.5f), SansSemi);
-            int mins = i < (int)detailMeta.epMin.size() ? detailMeta.epMin[i] : 0;
+            int mins = i < (int)detailMeta.epMin.size() ? detailMeta.epMin[i] : eps[i].mins;
             if (mins > 0) sansDraw(r, x + S(17), S(815), detailMinutes(mins), TXT2, F(14.8f), SansRegular);
             dp::ring(r, (float)x + F(268), F(798), F(18.2f), F(2.2f), GREEN);
             dp::triRight(r, (float)x + F(262), F(789.5f), F(14), F(17), GREEN);
