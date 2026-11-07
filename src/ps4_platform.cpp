@@ -2968,14 +2968,16 @@ extern "C" int sceSystemServiceGetStatus(OrbisSystemServiceStatus *status);
 // reset() e chamado ao abrir video / voltar ao menu: so volta a valer depois de 1,5 s calmo.
 static const bool kPsStopLogic = true;
 struct SysWatch {
-    double calmSince = -1;
+    double calmSince = -1, lastOvlTrip = -1e9;     // lastOvlTrip: ultima vez que o menu do PS apareceu de verdade
     bool armed = false, tripped = false, ovl = false, bg = false;
     void reset() { calmSince = -1; armed = false; tripped = false; }
     // le o sistema; true = pedido VALIDO de parar (menu do PS aberto ou app indo para o inicio)
     bool poll() {
         if (!kPsStopLogic) return false;
-        OrbisSystemServiceStatus st{};
-        if (sceSystemServiceGetStatus(&st) != 0) return tripped;
+        // buffer folgado: se a estrutura real do sistema for maior que a nossa, nao estraga a pilha (e fecharia o app)
+        alignas(8) uint8_t raw[256]; memset(raw, 0, sizeof raw);
+        if (sceSystemServiceGetStatus((OrbisSystemServiceStatus *)raw) != 0) return tripped;
+        const OrbisSystemServiceStatus &st = *(const OrbisSystemServiceStatus *)raw;
         double t = nowSec();
         ovl = st.isSystemUiOverlaid != 0;
         bg = st.isInBackground != 0;
@@ -2986,6 +2988,7 @@ struct SysWatch {
         } else {
             calmSince = -1;
             if (armed) tripped = true;
+            if (tripped && ovl) lastOvlTrip = t;
             armed = false;
         }
         return tripped;
@@ -3371,7 +3374,7 @@ int main() {
             if (kPsStopLogic) {
                 bool trip = g_sys.poll();               // so conta apos o sistema ter ficado calmo (ver SysWatch)
                 bool ovl = trip && g_sys.ovl;
-                bool bgRaw = trip && g_sys.bg;
+                bool bgRaw = trip && g_sys.bg && (nowSec() - g_sys.lastOvlTrip < 20.0);   // sair sozinho: so apos o menu do PS ter aparecido (aviso de "segundo plano" sozinho ja deu falso positivo e fechava o app)
                 bool bg = bgRaw;
                 {   // diagnostico: 1 linha no log a cada mudanca (o log mostra o que o sistema informou)
                     static int lastSig = -1;
