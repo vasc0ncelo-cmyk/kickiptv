@@ -57,7 +57,9 @@ jobs:
           rm -f sce_sys/pic0.png sce_sys/pic1.png
           ls -la sce_sys
       - name: Compilar PKG
-        run: make TITLE="Kick IPTV ${{ github.run_number }}"
+        run: |
+          make TITLE="Kick IPTV"
+          mv build/*.pkg build/Kick-IPTV.pkg
       - name: Conferir o PKG
         run: |
           ls -l build/*.pkg
