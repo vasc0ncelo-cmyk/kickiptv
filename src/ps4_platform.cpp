@@ -817,9 +817,16 @@ static std::atomic<int> g_tearing{0};
 static bool avStopClose(KAvHandle h, int timeoutMs = 5000) {
     if (!h) return true;
     std::atomic<bool> *done = new std::atomic<bool>(false);
+    auto clk = [] { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec + ts.tv_nsec / 1e9; };
+    double t0 = clk();
     std::thread t([h, done] { sceAvPlayerStop(h); sceAvPlayerClose(h); done->store(true); });
     for (int i = 0; i < timeoutMs / 5 && !done->load(); i++) sceKernelUsleep(5000);
-    if (done->load()) { t.join(); delete done; return true; }
+    if (done->load()) {
+        t.join(); delete done;
+        char b[64]; snprintf(b, sizeof b, "av-close-ok %dms", (int)((clk() - t0) * 1000)); trace(b);
+        return true;
+    }
+    trace("av-close-TIMEOUT");                // o AvPlayer nao fechou: o decodificador fica preso e o PS4 pode dar erro ao sair
     t.detach();                               // vaza de proposito: a thread ainda usa 'done'
     return false;
 }
@@ -1961,6 +1968,7 @@ struct Player {
             remove("/data/live.ts");
             removeVodFiles();   // filme/serie baixado para disco
             nextReady = false; prepBusy = false;
+            trace("stop-thread-fim");
             g_tearing--;
         }).detach();
     }
