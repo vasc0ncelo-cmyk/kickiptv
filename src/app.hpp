@@ -2,6 +2,10 @@
 // Logica do app independente de plataforma (testavel no PC).
 #include "kick.hpp"
 #include "m3u.hpp"
+#include "xtload.hpp"
+#include "xtmeta.hpp"
+#include <algorithm>
+#include <unordered_map>
 #include <functional>
 #include <new>
 #include <cstdio>
@@ -39,12 +43,19 @@ struct Platform {
     virtual void cacheWrite(const char * /*d*/, size_t /*n*/) {}   // pedaco baixado, em ordem
     virtual void cacheEnd(const std::string & /*url*/, bool /*complete*/) {}   // complete=true: a copia vira a lista salva (senao descarta e mantem a antiga)
     virtual void cacheClear() {}                                   // apaga a copia salva
+    virtual void busy(const std::string & /*msg*/) {}              // vai fazer uma consulta de rede que bloqueia: desenhe "carregando" agora
 };
+
+// Painel Xtream ativo: so as categorias estao na memoria; os itens vem da API quando a categoria abre.
+struct XtState { bool active = false; XtreamAcct acct; };
 
 struct App {
     Platform &pf;
     Playlist list;
     std::string lastStatus = "Pronto";
+    XtState xt;
+    XtreamAcct metaAcct;                                   // conta do painel para sinopse/nota (tambem com lista M3U comum)
+    std::unordered_map<std::string, DetailMeta> metaCache; // "m:<id>" filmes, "s:<id>" series
     explicit App(Platform &p) : pf(p) {}
 
     void say(const std::string &m) { lastStatus = m; }
@@ -55,7 +66,27 @@ struct App {
 
     // useCache=true (abrir o app): usa a copia salva no console, se houver (sem baixar nada).
     // useCache=false (usuario confirmou o link): baixa de novo e atualiza a copia salva.
+    // Conexao com painel Xtream: guarda so as categorias (ver xtload.hpp).
+    void useXtream(const XtreamAcct &a, Playlist &&p) {
+        xt.active = true; xt.acct = a; metaAcct = a;
+        list = std::move(p);
+        say("Painel IPTV: " + std::to_string(list.channelCats.size()) + " categorias de canais | " + std::to_string(list.movieCats.size()) +
+            " de filmes | " + std::to_string(list.seriesCats.size()) + " de series");
+    }
+    void noteAccount(const std::string &url) { XtreamAcct a; if (xtreamParse(url, a)) metaAcct = a; else metaAcct = XtreamAcct(); }
+    void clearXtream() { xt = XtState(); metaCache.clear(); }
+
     bool loadM3U(const std::string &url, bool useCache = false) {
+        noteAccount(url);
+        {   // painel Xtream? (so quando o link tem usuario e senha) -> categorias pela API, sem baixar a lista gigante
+            XtreamAcct acct; Playlist xp; std::string msg;
+            say("Conectando ao painel IPTV...");
+            pf.busy("Conectando ao painel IPTV...");
+            int r = xtreamConnect([&](const std::string &u, std::string &b) { return pf.httpGet(u, b); }, url, acct, xp, msg);
+            if (r == 1) { clearXtream(); useXtream(acct, std::move(xp)); return true; }
+            if (r == 2) { say(msg); return false; }
+        }
+        clearXtream();
         if (useCache) {
             int r = loadCached(url);
             if (r == 1) return true;
@@ -119,6 +150,139 @@ struct App {
         list = b.take();
         say(summary() + "  |  lista salva" + truncNote());
         return 1;
+    }
+
+    // ---------- Xtream: itens por categoria ----------
+    static constexpr size_t kXtDropAt = 100000;   // acima disso (itens carregados) as categorias antigas sao descartadas ao abrir outra
+
+    void dropLoaded() {
+        std::vector<Entry>().swap(list.channels); std::vector<Entry>().swap(list.movies);
+        list.seriesTree.clear(); list.seriesInfo.clear(); list.seriesEpisodes = 0;
+        for (auto *cv : {&list.channelCats, &list.movieCats, &list.seriesCats})
+            for (auto &c : *cv) if (c.lazy && c.loaded) { std::vector<uint32_t>().swap(c.items); std::vector<std::string>().swap(c.series); c.loaded = false; }
+    }
+
+    // Baixa os itens da categoria (se ainda nao baixou). true = categoria pronta.
+    bool ensureCategory(Tab t, int idx) {
+        if (!xt.active || t == Tab::Kick) return true;
+        std::vector<Category> &cv = t == Tab::Channels ? list.channelCats : t == Tab::Movies ? list.movieCats : list.seriesCats;
+        if (idx < 0 || idx >= (int)cv.size()) return false;
+        if (!cv[idx].unloaded()) return true;
+        if (list.channels.size() + list.movies.size() + list.seriesInfo.size() > kXtDropAt) dropLoaded();
+        Category &c = cv[idx];
+        say("Carregando \"" + c.name + "\"...");
+        pf.busy("Carregando \"" + c.name + "\"...");
+        const char *action = t == Tab::Channels ? "get_live_streams" : t == Tab::Movies ? "get_vod_streams" : "get_series";
+        std::string body;
+        if (!pf.httpGet(xtreamApi(xt.acct, action, "category_id=" + c.id), body)) { say("Falha ao carregar a categoria (o painel nao respondeu)"); return false; }
+        size_t f = body.find_first_not_of(" \t\r\n\xEF\xBB\xBF");
+        if (f == std::string::npos || body[f] != '[') { say("Falha ao carregar a categoria (resposta invalida do painel)"); return false; }
+        std::vector<uint32_t> items; std::vector<std::string> names;
+        try {
+            jsonForEach(body, [&](const Json &it) {
+                std::string name = it.str("name");
+                if (name.empty()) return;
+                if (t == Tab::Series) {
+                    std::string id = it.str("series_id");
+                    if (id.empty() || list.seriesInfo.count(name)) return;
+                    list.seriesInfo[name] = SeriesRef{id, it.str("cover")};
+                    names.push_back(name);
+                    return;
+                }
+                std::string id = it.str("stream_id");
+                if (id.empty()) return;
+                Entry e; e.name = name; e.logo = it.str("stream_icon");
+                if (t == Tab::Channels) { e.kind = Kind::Channel; e.url = xtreamLiveUrl(xt.acct, id); list.channels.push_back(std::move(e)); items.push_back((uint32_t)list.channels.size() - 1); }
+                else { e.kind = Kind::Movie; e.url = xtreamMovieUrl(xt.acct, id, it.str("container_extension")); list.movies.push_back(std::move(e)); items.push_back((uint32_t)list.movies.size() - 1); }
+            });
+        } catch (const std::bad_alloc &) { say("Memoria insuficiente para esta categoria"); }
+        std::sort(names.begin(), names.end());
+        c.items = std::move(items); c.series = std::move(names); c.loaded = true;
+        say(c.name + ": " + std::to_string(c.size()) + " itens");
+        return true;
+    }
+
+    // Episodios de uma serie do painel (get_series_info). true = tem episodios na arvore.
+    bool ensureSeries(const std::string &name) {
+        if (!xt.active) return true;
+        auto it = list.seriesTree.find(name);
+        if (it != list.seriesTree.end() && !it->second.empty()) return true;
+        auto ri = list.seriesInfo.find(name);
+        if (ri == list.seriesInfo.end()) { say("Serie sem identificacao no painel"); return false; }
+        say("Carregando episodios...");
+        pf.busy("Carregando episodios...");
+        std::string body; Json j;
+        if (!pf.httpGet(xtreamApi(xt.acct, "get_series_info", "series_id=" + ri->second.id), body)) { say("Falha ao carregar os episodios (o painel nao respondeu)"); return false; }
+        if (!jsonParse(body, j) || !j.isObj()) { say("Falha ao carregar os episodios (resposta invalida do painel)"); return false; }
+        const Json *info = j.get("info");
+        std::string cover = info ? info->str("cover") : "";
+        if (cover.empty()) cover = ri->second.cover; else if (ri->second.cover.empty()) ri->second.cover = cover;
+        if (info && info->isObj()) { DetailMeta m; xtFillMeta(*info, m); metaCache["s:" + ri->second.id] = m; }
+        std::map<int, std::vector<Entry>> seasons;
+        auto addSeason = [&](int sn, const Json &arr) {
+            if (!arr.isArr()) return;
+            int pos = 0;
+            for (const Json &ep : arr.arr) {
+                pos++;
+                std::string id = ep.str("id");
+                if (id.empty()) continue;
+                Entry e; e.kind = Kind::Series; e.season = sn;
+                e.episode = (int)ep.num("episode_num", pos);
+                e.name = ep.str("title"); if (e.name.empty()) e.name = "Episodio " + std::to_string(e.episode);
+                e.url = xtreamEpisodeUrl(xt.acct, id, ep.str("container_extension"));
+                e.logo = cover;
+                if (const Json *ei = ep.get("info")) {
+                    std::string mi = ei->str("movie_image"); if (!mi.empty()) e.logo = mi;
+                    e.mins = xtDurationMin(*ei);
+                }
+                seasons[sn].push_back(std::move(e));
+            }
+        };
+        const Json *eps = j.get("episodes");
+        if (eps && eps->isObj()) for (const auto &kv : eps->obj) addSeason(atoi(kv.first.c_str()), kv.second);
+        else if (eps && eps->isArr()) { int sn = 0; for (const Json &arr : eps->arr) addSeason(++sn, arr); }
+        if (seasons.empty()) { say("A serie \"" + name + "\" esta sem episodios no painel"); return false; }
+        size_t n = 0; for (auto &kv : seasons) n += kv.second.size();
+        list.seriesEpisodes += n;
+        list.seriesTree[name] = std::move(seasons);
+        return true;
+    }
+
+    // ---------- Metadados do painel (sinopse, nota, generos, duracao) ----------
+    static void applyMeta(const DetailMeta &src, DetailMeta &dst) {
+        if (!src.plot.empty()) dst.plot = src.plot;
+        if (!src.rating.empty()) dst.rating = src.rating;
+        if (src.runtimeMin > 0) dst.runtimeMin = src.runtimeMin;
+        if (!src.genres.empty()) dst.genres = src.genres;
+        if (dst.year.empty()) dst.year = src.year;
+    }
+    const XtreamAcct &metaAccount() const { return xt.active ? xt.acct : metaAcct; }
+
+    bool movieMeta(const Entry &e, DetailMeta &m) {
+        std::string id = xtMovieIdFromUrl(e.url);
+        const XtreamAcct &a = metaAccount();
+        if (id.empty() || !a.valid()) return false;
+        const std::string key = "m:" + id;
+        auto c = metaCache.find(key);
+        if (c == metaCache.end()) {
+            pf.busy("Carregando detalhes...");
+            std::string body; Json j;
+            if (!pf.httpGet(xtreamApi(a, "get_vod_info", "vod_id=" + id), body) || !jsonParse(body, j)) return false;
+            DetailMeta d;
+            if (const Json *info = j.get("info")) xtFillMeta(*info, d);
+            c = metaCache.emplace(key, d).first;
+        }
+        applyMeta(c->second, m);
+        return true;
+    }
+    // Series (so painel Xtream): os dados vieram junto com os episodios (ensureSeries).
+    bool seriesMeta(const std::string &name, DetailMeta &m) {
+        auto ri = list.seriesInfo.find(name);
+        if (ri == list.seriesInfo.end()) return false;
+        auto c = metaCache.find("s:" + ri->second.id);
+        if (c == metaCache.end()) return false;
+        applyMeta(c->second, m);
+        return true;
     }
 
     // aviso quando a lista passou do limite de memoria e so os primeiros itens foram carregados
