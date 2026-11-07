@@ -814,16 +814,20 @@ static uint64_t mp4DurationMsFromFile(const char *path) {
 static std::atomic<int> g_tearing{0};
 
 // Stop+Close em outra thread com limite de tempo: se o player travar, abandona o handle e segue em frente
+static double g_avClosedAt = 0;               // quando o ultimo AvPlayer foi fechado (0 = nenhum nesta sessao)
 static bool avStopClose(KAvHandle h, int timeoutMs = 5000) {
     if (!h) return true;
     std::atomic<bool> *done = new std::atomic<bool>(false);
     auto clk = [] { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec + ts.tv_nsec / 1e9; };
     double t0 = clk();
-    std::thread t([h, done] { sceAvPlayerStop(h); sceAvPlayerClose(h); done->store(true); });
+    std::atomic<int> *rcs = new std::atomic<int>[2]{{0}, {0}};          // codigos de retorno (vaza se o player travar)
+    std::thread t([h, done, rcs] { rcs[0] = sceAvPlayerStop(h); rcs[1] = sceAvPlayerClose(h); done->store(true); });
     for (int i = 0; i < timeoutMs / 5 && !done->load(); i++) sceKernelUsleep(5000);
     if (done->load()) {
         t.join(); delete done;
-        char b[64]; snprintf(b, sizeof b, "av-close-ok %dms", (int)((clk() - t0) * 1000)); trace(b);
+        char b[96]; snprintf(b, sizeof b, "av-close-ok %dms stop=0x%x close=0x%x", (int)((clk() - t0) * 1000), (unsigned)rcs[0].load(), (unsigned)rcs[1].load()); trace(b);
+        delete[] rcs;
+        g_avClosedAt = clk();                  // o encerramento espera o AvPlayer "assentar" antes de matar o processo
         return true;
     }
     trace("av-close-TIMEOUT");                // o AvPlayer nao fechou: o decodificador fica preso e o PS4 pode dar erro ao sair
@@ -3913,7 +3917,7 @@ int main() {
     trace("saindo");
     g_quitting = true;
     // seguranca: se alguma thread nao largar a tempo, encerra de qualquer jeito em 2,5 s (o sistema nao espera mais que isso)
-    try { std::thread([] { sceKernelUsleep(2500000); trace("saida-forcada"); _Exit(0); }).detach(); } catch (...) {}
+    try { std::thread([] { sceKernelUsleep(3500000); trace("saida-forcada"); _Exit(0); }).detach(); } catch (...) {}
     try { pf.saveSetting("bgload", ""); } catch (...) {}
     try { if (mode == Mode::Play || player.h) player.stop(); } catch (...) {}
     try { g_covers.setPaused(true); } catch (...) {}
@@ -3921,6 +3925,11 @@ int main() {
     try { if (loader.stillAlive()) loader.cancel(0.4); } catch (...) {}
     try { g_feed.abort(); abortHf(); abortPf(); } catch (...) {}
     Player::waitTeardown(0.8);
+    if (g_avClosedAt > 0) {                   // depois de fechar o AvPlayer, da tempo das threads internas dele (decodificador/audio) terminarem
+        struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+        double since = ts.tv_sec + ts.tv_nsec / 1e9 - g_avClosedAt;
+        if (since < 1.2) { trace("espera-avplayer-assentar"); sceKernelUsleep((unsigned)((1.2 - since) * 1e6)); }
+    }
     try { if (!g_covers.shutdownFor(1.0)) trace("fim-capas-timeout"); } catch (...) {}
     try { g_feed.join(); } catch (...) {}
     try { auto r = takeHf(); if (r) r->join(); } catch (...) {}
