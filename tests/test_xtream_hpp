@@ -33,9 +33,10 @@ struct XtFake : Platform {
             body += "]"; return true;
         }
         if (url.find("get_series&category_id=20") != std::string::npos) { body = "[{\"name\":\"Zeta\",\"series_id\":98,\"cover\":\"http://i/z.jpg\"},{\"name\":\"4Ever\",\"series_id\":99,\"cover\":\"http://i/4.jpg\"},{\"name\":\"Vazia\",\"series_id\":97}]"; return true; }
+        if (url.find("get_vod_info&vod_id=7") != std::string::npos) { body = "{\"info\":{\"plot\":\"Um policial salva o predio.\",\"genre\":\"Acao, Suspense\",\"rating\":\"7.9\",\"releasedate\":\"1988-07-15\",\"duration_secs\":7920},\"movie_data\":{}}"; return true; }
         if (url.find("get_series_info&series_id=99") != std::string::npos) {
-            body = "{\"info\":{\"cover\":\"http://i/4.jpg\"},\"episodes\":{\"2\":[{\"id\":\"302\",\"episode_num\":1,\"title\":\"X\",\"container_extension\":\"mp4\"}],"
-                   "\"1\":[{\"id\":\"202\",\"episode_num\":2,\"title\":\"B\",\"container_extension\":\"mp4\"},{\"id\":\"201\",\"episode_num\":1,\"title\":\"A\",\"container_extension\":\"mp4\",\"info\":{\"movie_image\":\"http://i/e1.jpg\"}}]}}";
+            body = "{\"info\":{\"cover\":\"http://i/4.jpg\",\"plot\":\"Sinopse da serie\",\"genre\":\"Drama\",\"rating\":\"8.4\",\"episode_run_time\":\"45\"},\"episodes\":{\"2\":[{\"id\":\"302\",\"episode_num\":1,\"title\":\"X\",\"container_extension\":\"mp4\"}],"
+                   "\"1\":[{\"id\":\"202\",\"episode_num\":2,\"title\":\"B\",\"container_extension\":\"mp4\"},{\"id\":\"201\",\"episode_num\":1,\"title\":\"A\",\"container_extension\":\"mp4\",\"info\":{\"movie_image\":\"http://i/e1.jpg\",\"duration_secs\":2700}}]}}";
             return true;
         }
         if (url.find("get_series_info&series_id=97") != std::string::npos) { body = "{\"info\":{},\"episodes\":[]}"; return true; }
@@ -65,7 +66,13 @@ int main() {
     assert(ui.inItems && ui.itemCount() == 2 && ui.itemLabel(0) == "Duro de Matar" && x.count("get_vod_streams") == 1);
     assert(a.list.movies[0].url == "http://180381.sbs/movie/Dirce0273/Sar5438/7.mkv" && a.list.movies[0].logo == "http://i/dm.jpg");
     assert(a.list.movies[1].url == "http://180381.sbs/movie/Dirce0273/Sar5438/8.mp4");
-    ui.handle(Input::Confirm); assert(x.played == "http://180381.sbs/movie/Dirce0273/Sar5438/7.mkv");
+    ui.handle(Input::Confirm);                                                       // abre a pagina de detalhes do filme
+    assert(ui.screen == Screen::Detail && ui.detailUrl == "http://180381.sbs/movie/Dirce0273/Sar5438/7.mkv" && x.count("get_vod_info&vod_id=7") == 1);
+    assert(ui.detailMeta.plot == "Um policial salva o predio." && ui.detailMeta.rating == "7.9" && ui.detailMeta.runtimeMin == 132 && ui.detailMeta.year == "1988");
+    assert(ui.detailMeta.genres.size() == 2 && ui.detailMeta.genres[0] == "Acao" && ui.detailMeta.genres[1] == "Suspense");
+    ui.handle(Input::Back); assert(ui.screen == Screen::List);
+    ui.handle(Input::Confirm); assert(x.count("get_vod_info") == 1);                // reabrir: metadados em cache
+    ui.handle(Input::Back); ui.screen = Screen::List; ui.inItems = true;
     ui.handle(Input::Back); assert(!ui.inItems);                                     // volta para as categorias
     ui.handle(Input::Confirm); assert(x.count("get_vod_streams") == 1);             // reabrir: nao baixa de novo
     ui.handle(Input::Back); ui.handle(Input::Down); ui.handle(Input::Confirm);       // categoria "Drama"
@@ -82,14 +89,14 @@ int main() {
     ui.handle(Input::Confirm);                                                       // categoria "Drama"
     assert(ui.itemCount() == 3 && ui.itemLabel(0) == "4Ever" && ui.itemLabel(2) == "Zeta" && x.count("get_series_info") == 0);   // ordenadas
     assert(ui.itemLogo(0) == "http://i/4.jpg");                                      // capa vem da lista (antes de abrir a serie)
-    ui.handle(Input::Confirm);                                                       // abre "4Ever"
-    assert(x.count("get_series_info") == 1 && ui.level == 1 && ui.itemCount() == 2 && ui.itemLabel(0) == "Temporada 1" && ui.itemLabel(1) == "Temporada 2");
-    ui.handle(Input::Confirm); assert(ui.level == 2 && ui.itemCount() == 2 && ui.itemLabel(0) == "Ep 1 - A" && ui.itemLabel(1) == "Ep 2 - B");
-    assert(ui.itemLogo(0) == "http://i/e1.jpg" && ui.itemLogo(1) == "http://i/4.jpg");   // capa do episodio, senao a da serie
-    ui.handle(Input::Confirm); assert(x.played == "http://180381.sbs/series/Dirce0273/Sar5438/201.mp4");
-    ui.handle(Input::Back); ui.handle(Input::Back);                                  // volta para a lista de series
+    ui.handle(Input::Confirm);                                                       // abre "4Ever": baixa os episodios e mostra os detalhes
+    assert(x.count("get_series_info") == 1 && ui.screen == Screen::Detail && ui.detailSeasons.size() == 2);
+    assert(ui.detailMeta.plot == "Sinopse da serie" && ui.detailMeta.rating == "8.4" && ui.detailMeta.runtimeMin == 45 && ui.detailMeta.genres[0] == "Drama");
+    { auto eps = ui.detailEpisodes(); assert(eps.size() == 2 && eps[0].episode == 1 && eps[0].mins == 45 && eps[0].logo == "http://i/e1.jpg" && eps[1].logo == "http://i/4.jpg" && eps[1].name == "B"); }
+    ui.handle(Input::Confirm); assert(x.played == "http://180381.sbs/series/Dirce0273/Sar5438/201.mp4");   // foco no 1o episodio
+    ui.handle(Input::Back); assert(ui.screen == Screen::List);
     ui.handle(Input::Confirm); assert(x.count("get_series_info") == 1);              // mesma serie: nao baixa de novo
-    ui.handle(Input::Back);
+    ui.handle(Input::Back); ui.screen = Screen::List; ui.inItems = true;
     ui.handle(Input::Right); ui.handle(Input::Confirm);                               // "Vazia" (a grade anda com as setas): sem episodios -> fica na lista, avisa
     assert(ui.level == 0 && a.lastStatus.find("sem episodios") != std::string::npos);
 
@@ -126,5 +133,13 @@ int main() {
         while (!ld.take(r)) std::this_thread::sleep_for(std::chrono::milliseconds(2));
         assert(r.code == 0);
     }
+    // --- lista M3U comum com usuario/senha e links /movie/: sinopse tambem funciona (id vem da URL) ---
+    { XtFake y; y.api = false; App b(y); assert(b.loadM3U(url) && !b.xt.active);
+      y.api = true;
+      Entry e; e.url = "http://180381.sbs/movie/Dirce0273/Sar5438/7.mkv"; DetailMeta m;
+      assert(b.movieMeta(e, m) && m.plot == "Um policial salva o predio." && m.runtimeMin == 132);
+      Entry f; f.url = "http://h/qualquer.mp4"; DetailMeta m2; assert(!b.movieMeta(f, m2) && m2.plot.empty()); }
+    assert(xtMovieIdFromUrl("http://h/movie/u/p/123.mp4") == "123" && xtMovieIdFromUrl("http://h/live/u/p/123.ts").empty());
+    { Json j; jsonParse("{\"duration\":\"01:57:00\",\"rating_5based\":3.5}", j); DetailMeta m; xtFillMeta(j, m); assert(m.runtimeMin == 117 && m.rating == "7.0"); }
     std::cout << "OK\n";
 }
