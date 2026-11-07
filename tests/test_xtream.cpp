@@ -109,6 +109,16 @@ int main() {
       u.handle(Input::Back); u.catCur[2] = 2; u.handle(Input::Confirm); assert(u.itemCount() == 105000);     // e volta a carregar ao reabrir
     }
 
+    // --- abertura automatica: o cursor para na categoria e ela carrega sozinha, sem apertar X ---
+    { XtFake y; App b(y); UI u(b); assert(b.loadM3U(url));
+      u.screen = Screen::List; u.tab = Tab::Movies; u.inItems = false;
+      u.handle(Input::Down);                                                    // cursor em "Drama" (nao carrega ainda)
+      assert(y.count("get_vod_streams") == 0);
+      u.handle(Input::Up); u.handle(Input::Down);                              // mexer de novo recomeca a espera
+      int n = 0; while (!u.autoOpenTick() && n < 100) n++;
+      assert(n >= 10 && n < 40 && y.count("get_vod_streams&category_id=11") == 1 && b.list.movieCats[1].loaded && !u.inItems);
+      assert(!u.autoOpenTick() && y.count("get_vod_streams") == 1);          // so uma vez
+      u.handle(Input::Confirm); assert(u.inItems && u.itemLabel(0) == "Titanic" && y.count("get_vod_streams") == 1); }
     // --- painel recusa o login: avisa, nao baixa a lista gigante ---
     { XtFake y; y.authOk = false; App b(y); assert(!b.loadM3U(url) && b.lastStatus.find("recusou") != std::string::npos && !b.list.xtream && y.count("get.php") == 0); }
     // --- painel sem API / link M3U comum: usa a lista M3U ---
