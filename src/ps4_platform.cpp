@@ -2960,23 +2960,39 @@ struct OrbisSystemServiceStatus {
     int32_t reserved[8];
 };
 extern "C" int sceSystemServiceGetStatus(OrbisSystemServiceStatus *status);
-// true = o usuario apertou PS (inicio/menu rapido) ou o app foi para segundo plano: tudo que esta bloqueado (download da lista, abertura
-// de video) deve parar NA HORA, para o sistema poder fechar o app sem derrubar nada no meio.
-// true = o app reage ao botao PS / "Fechar aplicativo" / troca de app: para video, capas, download da lista e threads de rede
-// ANTES de o sistema matar o processo (se ele estiver com decodificador de video, audio e sockets em uso, o PS4 nao consegue
-// encerrar e mostra erro). Estava false so como TESTE DE ISOLAMENTO; as quedas que motivaram o teste eram do heap (ja corrigidas).
-// A deteccao de "segundo plano" so vale em reproducao se o menu do PS apareceu ha pouco (sem falso positivo ao abrir video).
+// Vigia do sistema (botao PS / "Fechar aplicativo" / troca de app).
+// O que ja deu problema: (1) com a deteccao desligada o PS4 nao conseguia fechar o app (video, audio e rede ainda em uso);
+// (2) ligada de forma simples, o sistema acendia o aviso por engano ao abrir um video e o app parava/fechava sozinho.
+// Solucao: so vale uma SUBIDA do aviso depois de o sistema ter ficado calmo (aviso apagado) por 1,5 s seguidos.
+// Aviso que ja nasce aceso, ou que pisca logo ao abrir o video, nunca dispara; apertar PS de verdade (apagado -> aceso) dispara.
+// reset() e chamado ao abrir video / voltar ao menu: so volta a valer depois de 1,5 s calmo.
 static const bool kPsStopLogic = true;
-static std::atomic<double> g_lastOvlT{-1e9};      // ultima vez que o menu do sistema (PS) apareceu por cima do app
-static bool sysWantsStop() {
-    if (!kPsStopLogic) return false;
-    OrbisSystemServiceStatus st{};
-    if (sceSystemServiceGetStatus(&st) != 0) return false;
-    double t = nowSec();
-    if (st.isSystemUiOverlaid) g_lastOvlT = t;
-    // "isInBackground" sozinho NAO basta: se o sistema avisar isso por engano (ex.: ao abrir o player de video), o app cancelava/fechava na hora.
-    return st.isSystemUiOverlaid != 0 || (st.isInBackground != 0 && t - g_lastOvlT.load() < 30.0);
-}
+struct SysWatch {
+    double calmSince = -1;
+    bool armed = false, tripped = false, ovl = false, bg = false;
+    void reset() { calmSince = -1; armed = false; tripped = false; }
+    // le o sistema; true = pedido VALIDO de parar (menu do PS aberto ou app indo para o inicio)
+    bool poll() {
+        if (!kPsStopLogic) return false;
+        OrbisSystemServiceStatus st{};
+        if (sceSystemServiceGetStatus(&st) != 0) return tripped;
+        double t = nowSec();
+        ovl = st.isSystemUiOverlaid != 0;
+        bg = st.isInBackground != 0;
+        if (!ovl && !bg) {
+            if (calmSince < 0) calmSince = t;
+            if (t - calmSince >= 1.5) armed = true;
+            tripped = false;
+        } else {
+            calmSince = -1;
+            if (armed) tripped = true;
+            armed = false;
+        }
+        return tripped;
+    }
+};
+static SysWatch g_sys;
+static bool sysWantsStop() { return g_sys.poll(); }
 
 using PadIn = PadInT<OrbisPadSrc>;
 
@@ -3352,17 +3368,15 @@ int main() {
                 trace("tudo-parado");
                 dirty = true;
             };
-            OrbisSystemServiceStatus st{};
-            if (kPsStopLogic && sceSystemServiceGetStatus(&st) == 0) {
-                bool ovl = (st.isSystemUiOverlaid != 0);
-                if (ovl) g_lastOvlT = nowSec();
-                bool bgRaw = (st.isInBackground != 0);
-                // Em reproducao, "segundo plano" so conta se o menu do PS apareceu ha pouco (evita falso positivo que fechava o app ao abrir video)
-                bool bg = bgRaw && (mode != Mode::Play || nowSec() - g_lastOvlT.load() < 30.0);
-                {   // diagnostico: 1 linha no log a cada mudanca (se voltar a fechar, o log mostra o que o sistema informou)
+            if (kPsStopLogic) {
+                bool trip = g_sys.poll();               // so conta apos o sistema ter ficado calmo (ver SysWatch)
+                bool ovl = trip && g_sys.ovl;
+                bool bgRaw = trip && g_sys.bg;
+                bool bg = bgRaw;
+                {   // diagnostico: 1 linha no log a cada mudanca (o log mostra o que o sistema informou)
                     static int lastSig = -1;
-                    int sig = (ovl ? 1 : 0) | (bgRaw ? 2 : 0) | (bg ? 4 : 0) | (mode == Mode::Play ? 8 : 0);
-                    if (sig != lastSig) { lastSig = sig; char b[64]; snprintf(b, sizeof b, "sys ovl=%d bgRaw=%d bgUsado=%d play=%d", ovl, bgRaw, bg, mode == Mode::Play); trace(b); }
+                    int sig = (g_sys.ovl ? 1 : 0) | (g_sys.bg ? 2 : 0) | (trip ? 4 : 0) | (mode == Mode::Play ? 8 : 0) | (g_sys.armed ? 16 : 0);
+                    if (sig != lastSig) { lastSig = sig; char b[80]; snprintf(b, sizeof b, "sys ovl=%d bg=%d valido=%d play=%d armado=%d", g_sys.ovl, g_sys.bg, trip, mode == Mode::Play, g_sys.armed); trace(b); }
                 }
                 if (!bg) seenFg = true;                // so conta como "foi para o inicio" depois de ter estado na frente uma vez
                 if (ovl && !wasUi && !bg) { wasUi = true; stopAllNow("sistema-menu-ps"); }       // PS apertado: para tudo, mas o app continua aberto
@@ -3845,6 +3859,7 @@ int main() {
                 player.epUrls.clear(); player.epTitles.clear(); player.epIndex = -1;
             }
             mode = Mode::Play; gotFrame = false; lastWaitDraw = 0;
+            g_sys.reset();                       // abrir video pode acender o aviso do sistema por engano: so vale depois de 1,5 s calmo
             presentWait();                       // mostra "Player" antes de bloquear
             player.presentCb = presentWait;
             player.cancelCb = [&]() -> bool {        // O cancela o carregamento; PS tambem (para tudo na hora)
