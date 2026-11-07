@@ -2842,8 +2842,8 @@ struct Player {
             r.roundRect(32, 100, r.textWidth(m, 20) + 48, 44, 22, 0xD0801520);
             uiText(r, 56, 112, m, TEXT, 20);
         }
-        if (vodDlFailed()) {
-            std::string m = uiFit(r, "Download interrompido: " + getPf()->error(), 20, W - 160);
+        if (auto pfd = getPf(); pfd && pfd->state() == 2) {
+            std::string m = uiFit(r, "Download interrompido: " + pfd->error(), 20, W - 160);
             r.roundRect(32, 100, r.textWidth(m, 20) + 48, 44, 22, 0xD0801520);
             uiText(r, 56, 112, m, TEXT, 20);
         }
@@ -2962,8 +2962,12 @@ struct OrbisSystemServiceStatus {
 extern "C" int sceSystemServiceGetStatus(OrbisSystemServiceStatus *status);
 // true = o usuario apertou PS (inicio/menu rapido) ou o app foi para segundo plano: tudo que esta bloqueado (download da lista, abertura
 // de video) deve parar NA HORA, para o sistema poder fechar o app sem derrubar nada no meio.
+// TESTE DE ISOLAMENTO: false = o app NAO reage ao botao PS/segundo plano (nada de parar tudo nem de sair sozinho).
+// Se com false o app parar de fechar ao abrir video, a causa era essa logica. Depois de confirmar, volto a ligar (true) com a correcao.
+static const bool kPsStopLogic = false;
 static std::atomic<double> g_lastOvlT{-1e9};      // ultima vez que o menu do sistema (PS) apareceu por cima do app
 static bool sysWantsStop() {
+    if (!kPsStopLogic) return false;
     OrbisSystemServiceStatus st{};
     if (sceSystemServiceGetStatus(&st) != 0) return false;
     double t = nowSec();
@@ -3347,7 +3351,7 @@ int main() {
                 dirty = true;
             };
             OrbisSystemServiceStatus st{};
-            if (sceSystemServiceGetStatus(&st) == 0) {
+            if (kPsStopLogic && sceSystemServiceGetStatus(&st) == 0) {
                 bool ovl = (st.isSystemUiOverlaid != 0);
                 if (ovl) g_lastOvlT = nowSec();
                 bool bgRaw = (st.isInBackground != 0);
