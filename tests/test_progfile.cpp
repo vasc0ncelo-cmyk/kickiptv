@@ -147,7 +147,35 @@ static void testRealIndex() {
     remove(P.c_str());
 }
 
+// SEEK: a janela pedida por want() chega antes do resto, e no fim o arquivo fica identico ao original
+static void testSeekWindow() {
+    const std::string P = "/tmp/pf_test_seek.bin";
+    Fake f; f.delayUs = 8000;
+    f.data = box("ftyp", 16) + box("moov", 50000) + box("mdat", 60u << 20);      // faststart: da para tocar assim que o comeco chega
+    progfile::Downloader d(f.fn(), P, f.data.size()); d.start();
+    waitState(d, 1); assert(d.state() == 1);
+    uint64_t a = 40u << 20, b = a + (6u << 20);
+    assert(!d.hasRange(a, b) && d.haveIn(a, b) == 0);
+    d.want(a, b);
+    for (int i = 0; i < 4000 && !d.hasRange(a, b); i++) usleep(5000);
+    assert(d.hasRange(a, b) && d.haveIn(a, b) == b - a);
+    assert(d.frontier() < a);                          // foi direto para a janela, sem baixar tudo antes dela
+    // outro pedido, para tras de onde o cursor esta: tambem atende
+    uint64_t a2 = 20u << 20, b2 = a2 + (3u << 20);
+    d.want(a2, b2);
+    for (int i = 0; i < 4000 && !d.hasRange(a2, b2); i++) usleep(5000);
+    assert(d.hasRange(a2, b2));
+    // pedido alem do fim do arquivo / vazio nao trava nada
+    d.want(f.data.size() + 100, f.data.size() + 200); d.want(5, 5);
+    f.delayUs = 0;
+    waitState(d, 3, 30000); assert(d.state() == 3);    // preencheu todos os buracos
+    d.join();
+    assert(readAll(P) == f.data);
+    assert(d.frontier() == f.data.size());
+}
+
 int main() {
+    testSeekWindow();
     testRealIndex();
     const std::string P = "/tmp/pf_test.bin";
     // 1) MP4 "faststart": ftyp, moov, mdat
