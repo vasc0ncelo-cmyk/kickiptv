@@ -36,6 +36,16 @@ jobs:
           g++ -std=c++17 -o dt tests/test_detail.cpp src/m3u.cpp && ./dt
           g++ -std=c++17 -pthread -o xt tests/test_xtream.cpp src/m3u.cpp && ./xt
           g++ -std=c++17 -o jt tests/test_json.cpp && ./jt
+      - name: Lista padrao do app (segredo LIST_URL, opcional)
+        env:
+          LIST_URL: ${{ secrets.LIST_URL }}
+        run: |
+          if [ -n "$LIST_URL" ]; then
+            printf 'static const char *kSecretListUrl = R"KICKURL(%s)KICKURL";\n' "$LIST_URL" > src/defaultlist_secret.hpp
+            echo "lista padrao: vem do segredo LIST_URL (nao fica no codigo do repositorio)"
+          else
+            echo "sem segredo LIST_URL: vale o endereco de src/defaultlist.hpp"
+          fi
       - name: Toolchain OpenOrbis
         run: bash scripts/get_toolchain.sh
       - name: Icone e fundo do app (nao quebra o build se falhar)
