@@ -2962,10 +2962,14 @@ struct OrbisSystemServiceStatus {
 extern "C" int sceSystemServiceGetStatus(OrbisSystemServiceStatus *status);
 // true = o usuario apertou PS (inicio/menu rapido) ou o app foi para segundo plano: tudo que esta bloqueado (download da lista, abertura
 // de video) deve parar NA HORA, para o sistema poder fechar o app sem derrubar nada no meio.
+static std::atomic<double> g_lastOvlT{-1e9};      // ultima vez que o menu do sistema (PS) apareceu por cima do app
 static bool sysWantsStop() {
     OrbisSystemServiceStatus st{};
     if (sceSystemServiceGetStatus(&st) != 0) return false;
-    return st.isInBackground != 0 || st.isSystemUiOverlaid != 0;
+    double t = nowSec();
+    if (st.isSystemUiOverlaid) g_lastOvlT = t;
+    // "isInBackground" sozinho NAO basta: se o sistema avisar isso por engano (ex.: ao abrir o player de video), o app cancelava/fechava na hora.
+    return st.isSystemUiOverlaid != 0 || (st.isInBackground != 0 && t - g_lastOvlT.load() < 30.0);
 }
 
 using PadIn = PadInT<OrbisPadSrc>;
@@ -3344,8 +3348,16 @@ int main() {
             };
             OrbisSystemServiceStatus st{};
             if (sceSystemServiceGetStatus(&st) == 0) {
-                bool bg = (st.isInBackground != 0);
                 bool ovl = (st.isSystemUiOverlaid != 0);
+                if (ovl) g_lastOvlT = nowSec();
+                bool bgRaw = (st.isInBackground != 0);
+                // Em reproducao, "segundo plano" so conta se o menu do PS apareceu ha pouco (evita falso positivo que fechava o app ao abrir video)
+                bool bg = bgRaw && (mode != Mode::Play || nowSec() - g_lastOvlT.load() < 30.0);
+                {   // diagnostico: 1 linha no log a cada mudanca (se voltar a fechar, o log mostra o que o sistema informou)
+                    static int lastSig = -1;
+                    int sig = (ovl ? 1 : 0) | (bgRaw ? 2 : 0) | (bg ? 4 : 0) | (mode == Mode::Play ? 8 : 0);
+                    if (sig != lastSig) { lastSig = sig; char b[64]; snprintf(b, sizeof b, "sys ovl=%d bgRaw=%d bgUsado=%d play=%d", ovl, bgRaw, bg, mode == Mode::Play); trace(b); }
+                }
                 if (!bg) seenFg = true;                // so conta como "foi para o inicio" depois de ter estado na frente uma vez
                 if (ovl && !wasUi && !bg) { wasUi = true; stopAllNow("sistema-menu-ps"); }       // PS apertado: para tudo, mas o app continua aberto
                 if (!ovl && wasUi) { wasUi = false; if (!bg) { g_quitting = false; g_covers.setPaused(false); dirty = true; } }
