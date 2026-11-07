@@ -1001,54 +1001,115 @@ private:
     }
 
 
+    // ---------- Tela "Comandos e ajuda": cartoes por assunto, cada botao do controle em um "chip" ----------
+    struct HelpItem { std::vector<std::string> keys; const char *desc; };
+    // chip de botao (retangulo arredondado com o nome); devolve a largura. △ e □ sao desenhados (a fonte nao tem esses caracteres)
+    static int helpChip(Renderer &r, int x, int cy, const std::string &k) {
+        using namespace theme;
+        int w = (k == "△" || k == "□") ? 56 : r.textWidth(k, 20) + 30;
+        if (w < 56) w = 56;
+        r.roundRect(x, cy - 20, w, 40, 12, KEY);
+        if (k == "△") uiGlyphTriangle(r, x + w / 2, cy, 20, TEXT);
+        else if (k == "□") { r.roundRect(x + w / 2 - 10, cy - 10, 20, 20, 4, TEXT); r.roundRect(x + w / 2 - 7, cy - 7, 14, 14, 2, KEY); }
+        else uiCenter(r, x + w / 2, cy, k, TEXT, 20, true);
+        return w;
+    }
+    static std::vector<std::string> helpWrap(const Renderer &r, const std::string &t, int size, int maxW) {
+        std::vector<std::string> out; std::string cur;
+        size_t i = 0;
+        while (i < t.size()) {
+            size_t j = t.find(' ', i); if (j == std::string::npos) j = t.size();
+            std::string w = t.substr(i, j - i);
+            std::string tryS = cur.empty() ? w : cur + " " + w;
+            if (!cur.empty() && r.textWidth(tryS, size) > maxW) { out.push_back(cur); cur = w; } else cur = tryS;
+            i = j + 1;
+        }
+        if (!cur.empty()) out.push_back(cur);
+        return out;
+    }
+    // uma linha: chips dos botoes a esquerda, explicacao (ate 2 linhas) a direita
+    static void helpRow(Renderer &r, int x, int cy, int keyCol, int descW, const HelpItem &it) {
+        using namespace theme;
+        int kx = x;
+        for (size_t k = 0; k < it.keys.size(); k++) {
+            if (k) { uiText(r, kx + 4, cy - 12, "/", DIM, 22); kx += 22; }
+            kx += helpChip(r, kx, cy, it.keys[k]);
+        }
+        auto ls = helpWrap(r, it.desc, 21, descW);
+        if (ls.size() > 2) ls.resize(2);
+        int ty = cy - (int)ls.size() * 13;
+        for (size_t i = 0; i < ls.size(); i++) uiText(r, x + keyCol, ty + (int)i * 26, ls[i], SOFT, 21);
+    }
+    static void helpCard(Renderer &r, int x, int y, int w, int h, const char *title, const std::vector<HelpItem> &items, const char *note) {
+        using namespace theme;
+        uiFrame(r, x, y, w, h, 24, 2, CARD_LINE, CARD);
+        r.roundRect(x + 30, y + 30, 6, 34, 3, GREEN);
+        uiHeavy(r, x + 52, y + 30, title, TEXT, 28);
+        const int keyCol = 196, descW = w - 30 - keyCol - 28;
+        int cy = y + 118;
+        for (const auto &it : items) { helpRow(r, x + 30, cy, keyCol, descW, it); cy += 76; }
+        if (note && note[0]) {
+            auto ls = helpWrap(r, note, 19, w - 60);
+            if (ls.size() > 3) ls.resize(3);
+            int ny = y + h - 26 - (int)ls.size() * 25;
+            r.fillRect(x + 30, ny - 14, w - 60, 2, 0xFF242424);
+            for (size_t i = 0; i < ls.size(); i++) uiText(r, x + 30, ny + (int)i * 25, ls[i], MUTED, 19);
+        }
+    }
+
     void renderHelp(Renderer &r) {
         using namespace theme;
         const int W = r.width(), H = r.height();
         uiBackground(r);
-        uiHeavy(r, 48, 40, "COMANDOS E FUNCOES", TEXT, 36);
-        uiText(r, 48, 90, "Tudo que o Kick IPTV faz — use O ou X para voltar", MUTED, 20);
-        struct Line { const char *a, *b; };
-        static const Line lines[] = {
-            {"MENU", ""},
-            {"D-pad / analogico", "Navegar"},
-            {"X", "Selecionar / abrir"},
-            {"O", "Voltar"},
-            {"Triangulo", "Buscar filmes, series e canais"},
-            {"OPTIONS", "No menu: busca | Na live: troca qualidade"},
-            {"X em LISTA IPTV", "Atualizar a lista (se nao carregou ou mudou)"},
-            {"", ""},
-            {"PLAYER - FILME / SERIE", ""},
-            {"X (foco pause)", "Pausar / continuar"},
-            {"L2 / R2", "-10 s  /  +10 s"},
-            {"Setas no seek (cima)", "Entrar na barra; L2/R2 fino, L1/R1 1 min, X confirma"},
-            {"L1 / R1", "Episodio anterior / proximo"},
-            {"Quadrado", "Mudo"},
-            {"Triangulo", "Menu de opcoes (proporcao, info...)"},
-            {"", ""},
-            {"PLAYER - LIVE KICK / CANAL", ""},
-            {"OPTIONS", "Ciclar qualidade (Fluido / 720 / 1080) e reconectar"},
-            {"O", "Sair do player"},
-            {"", ""},
-            {"TECLADO", ""},
-            {"X no botao #+ =", "Abre caracteres especiais"},
-            {"Triangulo", "Espaco"},
-            {"L1", "Maiusculas"},
-            {"Quadrado", "Apagar"},
-            {"R1", "Confirmar"},
-        };
-        const int n = (int)(sizeof(lines) / sizeof(lines[0]));
-        int y = 140 - helpScroll * 36;
-        for (int i = 0; i < n; i++) {
-            int yy = y + i * 36;
-            if (yy < 120 || yy > H - 80) continue;
-            if (!lines[i].b[0] && lines[i].a[0]) {
-                uiHeavy(r, 56, yy, lines[i].a, GREEN, 22);
-            } else if (lines[i].a[0]) {
-                uiText(r, 56, yy, lines[i].a, SOFT, 20);
-                uiText(r, 520, yy, lines[i].b, TEXT, 20);
+        uiKMark(r, 73, 52, 40, 41, GREEN);
+        uiHeavy(r, 130, 58, "COMANDOS E AJUDA", TEXT, 36);
+        uiText(r, 130, 104, "Todos os botões do app. Aperte O ou X para voltar.", MUTED, 20);
+        r.fillRect(73, 142, W - 146, 2, 0xFF1C1C1C);
+
+        const int gx = 73, gw = W - 146, gap = 24, cw = (gw - 2 * gap) / 3, cy0 = 168, ch = 560;
+        helpCard(r, gx, cy0, cw, ch, "NO MENU", {
+            {{"D-pad"}, "Navegar entre os itens"},
+            {{"X"}, "Selecionar ou abrir"},
+            {{"O"}, "Voltar"},
+            {{"△"}, "Buscar filmes, séries e canais"},
+            {{"L1", "R1"}, "Trocar de aba (ou de temporada numa série)"},
+            {{"L2", "R2"}, "Subir / descer uma página da lista"},
+        }, nullptr);
+        helpCard(r, gx + cw + gap, cy0, cw, ch, "FILME E SÉRIE", {
+            {{"OPTIONS"}, "Mostrar ou esconder a barra de tempo"},
+            {{"□"}, "Ligar ou desligar o som"},
+            {{"△"}, "Opções: proporção da tela, áudio e informações"},
+            {{"O"}, "Sair e voltar ao menu"},
+        }, "A barra de tempo aparece ao abrir, mostra o minuto atual e a duração, e some sozinha. Qualquer botão traz ela de volta.");
+        helpCard(r, gx + 2 * (cw + gap), cy0, cw, ch, "AO VIVO: KICK E CANAIS", {
+            {{"L1", "R1"}, "Canal anterior / próximo (nos canais)"},
+            {{"OPTIONS"}, "Trocar a qualidade: Fluido, 720p ou 1080p"},
+            {{"□"}, "Ligar ou desligar o som"},
+            {{"△"}, "Opções: qualidade, proporção e áudio"},
+            {{"O"}, "Sair da transmissão"},
+        }, nullptr);
+
+        // ---- teclado na tela ----
+        {
+            const int ky = cy0 + ch + 24, kh = 244;
+            uiFrame(r, gx, ky, gw, kh, 24, 2, CARD_LINE, CARD);
+            r.roundRect(gx + 30, ky + 30, 6, 34, 3, GREEN);
+            uiHeavy(r, gx + 52, ky + 30, "TECLADO NA TELA", TEXT, 28);
+            uiText(r, gx + 52 + r.textWidth("TECLADO NA TELA", 28) + 28, ky + 36, "usado para digitar @streamer, links e buscas", MUTED, 20);
+            static const HelpItem ks[6] = {
+                {{"X"}, "Digitar a tecla escolhida"},
+                {{"□"}, "Apagar (segure para apagar rápido)"},
+                {{"△"}, "Espaço"},
+                {{"L1"}, "Letras maiúsculas"},
+                {{"R1"}, "Confirmar o texto"},
+                {{"O"}, "Cancelar e voltar"},
+            };
+            const int colW = (gw - 60) / 3;
+            for (int i = 0; i < 6; i++) {
+                int col = i % 3, row = i / 3;
+                helpRow(r, gx + 30 + col * colW, ky + 118 + row * 72, 84, colW - 84 - 20, ks[i]);
             }
         }
-        uiText(r, 48, H - 48, "O / X voltar ao menu", DIM, 18);
     }
 
     void renderHome(Renderer &r) {
