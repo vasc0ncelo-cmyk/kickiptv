@@ -37,9 +37,9 @@ int main() {
     Fake f; App a(f); UI ui(a);
     // --- relogio: 11 Out 2026 23:47 (UTC-3) ---
     { std::string t, d; clockStrings(1791773220LL, t, d); assert(t == "23:47" && d == "11 Out 2026"); }
-    // --- Home: abre direto nos atalhos, KICK TV selecionado ---
-    assert(ui.screen == Screen::Home && ui.homeRow == 1 && ui.homeCol == 0);
-    { Rec r; ui.render(r); assert(r.has("KICK TV") && r.has("FILMES") && r.has("SÉRIES") && r.has("CANAIS") && r.has("LISTA M3U") && r.has("Acessar Agora")); }
+    // --- Home: abre direto nos atalhos, FILMES selecionado (o 1o atalho e APOIAR; a Kick abre pelo banner) ---
+    assert(ui.screen == Screen::Home && ui.homeRow == 1 && ui.homeCol == 1);
+    { Rec r; ui.render(r); assert(r.has("APOIAR") && !r.has("KICK TV") && r.has("FILMES") && r.has("SÉRIES") && r.has("CANAIS") && r.has("LISTA M3U") && r.has("Acessar Agora")); }
     // --- Lista M3U: pede o teclado, baixa e guarda ---
     ui.handle(Input::Down); assert(ui.homeRow == 2);
     ui.handle(Input::Confirm); assert(f.asked == "Endereço da lista M3U" && ui.textKind == 2);
@@ -73,7 +73,11 @@ int main() {
     ui.handle(Input::Back); assert(!ui.inItems && ui.screen == Screen::List);              // series -> categorias
     // --- Kick TV ---
     ui.handle(Input::NextTab); assert(ui.tab == Tab::Channels);
-    ui.handle(Input::NextTab); assert(ui.tab == Tab::Kick && ui.screen == Screen::Kick);
+    ui.handle(Input::NextTab); assert(ui.tab == Tab::Movies);                          // L1/R1 nao passa mais pela Kick
+    ui.handle(Input::PrevTab); assert(ui.tab == Tab::Channels);
+    ui.handle(Input::Back); assert(ui.screen == Screen::Home);                      // a Kick TV abre pelo banner
+    ui.handle(Input::Up); assert(ui.homeRow == 0);
+    ui.handle(Input::Confirm); assert(ui.tab == Tab::Kick && ui.screen == Screen::Kick);
     ui.handle(Input::Confirm); assert(f.asked == "@ do streamer" && ui.textKind == 1);
     ui.onText("@Streamer"); assert(f.played == "https://k/a.m3u8" && a.lastStatus == "Assistindo @streamer" && f.store["kick"] == "streamer");
     // o ultimo canal aparece como segundo item
@@ -261,22 +265,23 @@ int main() {
         for (size_t i = 0; i < u.size();) { unsigned char c = u[i]; size_t n = c < 0x80 ? 1 : (c >> 5) == 6 ? 2 : (c >> 4) == 14 ? 3 : 4; assert(i + n <= u.size()); i += n; }
         assert(uiFit(r, "curto", 28, 500) == "curto");
     }
-    // --- Apoiar o app: botao ao lado de COMANDOS, abre a tela com o QR Code ---
+    // --- Apoiar o app: 1o atalho da linha de cima (no lugar da KICK TV); abre a tela com o QR Code ---
     {
         Fake fd; App ad(fd); UI ud(ad);
-        ud.donateUrl = "";                                                        // sem link configurado: nada aparece
-        ud.handle(Input::Down); ud.handle(Input::Down); assert(ud.homeRow == 3);
-        { Rec r; ud.render(r); assert(r.has("COMANDOS E AJUDA") && !r.has("APOIAR O APP")); }
-        ud.handle(Input::Right); assert(ud.homeCol3 == 0);
-        ud.handle(Input::Confirm); assert(ud.screen == Screen::Help); ud.handle(Input::Back); assert(ud.screen == Screen::Home);
+        ud.donateUrl = "";                                                        // sem link configurado: volta o atalho KICK TV
+        { Rec r; ud.render(r); assert(r.has("KICK TV") && !r.has("APOIAR")); }
+        ud.handle(Input::Left); assert(ud.homeCol == 0);
+        ud.handle(Input::Confirm); assert(ud.screen == Screen::Kick); ud.handle(Input::Back); assert(ud.screen == Screen::Home);
         ud.donateUrl = "https://livepix.gg/exemplo"; ud.donatePix = "chave@exemplo.com";
-        { Rec r; ud.render(r); assert(r.has("COMANDOS E AJUDA") && r.has("APOIAR O APP")); }
-        ud.handle(Input::Right); assert(ud.homeCol3 == 1);
-        ud.handle(Input::Left); assert(ud.homeCol3 == 0); ud.handle(Input::Right);
+        { Rec r; ud.render(r); assert(r.has("APOIAR") && !r.has("KICK TV") && !r.has("APOIAR O APP") && r.has("COMANDOS E AJUDA")); }
+        assert(ud.homeRow == 1 && ud.homeCol == 0);
         ud.handle(Input::Confirm); assert(ud.screen == Screen::Donate);
         { Rec r; ud.render(r); assert(r.has("APOIE O KICK IPTV") && r.has("https://livepix.gg/exemplo") && r.has("chave@exemplo.com")); }
         ud.handle(Input::Extra); assert(ud.screen == Screen::Donate);              // triangulo (busca) nao sai da tela de apoio
-        ud.handle(Input::Back); assert(ud.screen == Screen::Home && ud.homeRow == 3);
+        ud.handle(Input::Back); assert(ud.screen == Screen::Home && ud.homeRow == 1 && ud.homeCol == 0);
+        ud.handle(Input::Down); ud.handle(Input::Down); assert(ud.homeRow == 3);   // linha de baixo: so COMANDOS E AJUDA
+        ud.handle(Input::Right); assert(ud.homeRow == 3);
+        ud.handle(Input::Confirm); assert(ud.screen == Screen::Help); ud.handle(Input::Back);
         ud.handle(Input::Up); ud.handle(Input::Up); assert(ud.homeRow == 1);        // sai da linha de baixo normalmente
     }
     std::cout << "OK\n";
