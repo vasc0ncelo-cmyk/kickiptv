@@ -3407,10 +3407,10 @@ int main() {
                     // Sem esperar threads de rede (_Exit); o estado (lista/ultimo streamer) ja fica salvo em disco.
                     if (seenFg && !keepBg) {              // sai NA HORA (sem esperar 1 s): o sistema esta fechando/trocando o app
                         { char b[96]; snprintf(b, sizeof b, "bg-saindo tearing=%d playerH=%d mode=%d", g_tearing.load(), (int)player.h, (int)mode); trace(b); }
+                        // Nao da _Exit seco: depois de assistir video ainda existem threads (download do filme, rede, decodificador, capas).
+                        // Matar o processo com elas rodando derruba o app (CE-34878-0). Vai para o encerramento limpo (junta todas as threads).
                         g_quitting = true;
-                        try { pf.saveSetting("bgload", ""); } catch (...) {}
-                        trace("fim-bg");
-                        _Exit(0);
+                        break;
                     }
                     sceKernelUsleep(30000);
                     continue;
@@ -3904,6 +3904,8 @@ int main() {
     // ---- encerramento limpo (OPTIONS, background ou saida normal) ----
     trace("saindo");
     g_quitting = true;
+    // seguranca: se alguma thread nao largar a tempo, encerra de qualquer jeito em 2,5 s (o sistema nao espera mais que isso)
+    try { std::thread([] { sceKernelUsleep(2500000); trace("saida-forcada"); _Exit(0); }).detach(); } catch (...) {}
     try { pf.saveSetting("bgload", ""); } catch (...) {}
     try { if (mode == Mode::Play || player.h) player.stop(); } catch (...) {}
     try { g_covers.setPaused(true); } catch (...) {}
