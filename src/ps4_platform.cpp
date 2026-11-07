@@ -1268,6 +1268,12 @@ struct Player {
     uint64_t pendWinA = 0, pendWinB = 0;   // janela de bytes que precisa estar no disco antes de pular
     bool forceJump = false;                // seekTo no mesmo ponto (usado ao despausar)
     int64_t pausePosMs = 0;                // onde o filme estava quando pausou
+    // Protecao de buffer: o AvPlayer le o arquivo local direto; se a internet for mais lenta que o filme e ele alcancar o que ja foi
+    // baixado, ele le zeros (imagem bugada). Entao o app pausa sozinho ("Carregando...") e retoma quando houver colchao.
+    bool bufPaused = false; double bufPausedAt = 0, bufHoldUntil = 0, bufChk = 0;
+    int bufPct = 0;                        // enchimento durante a pausa automatica (0-100)
+    uint64_t bufAheadMs = 0;               // quanto do filme ja esta baixado a frente do ponto atual (barra cinza clara)
+    bool bufKnown = false;
     bool quietWait = false;                // true = nao mostra o cartao de diagnostico ao conectar (qualidade/reconexao)
     uint64_t lastPtsMs = 0;                // posicao atual (ms) do ultimo quadro
     uint64_t maxPtsMs = 0;                 // maior pts visto (estima duracao minima)
@@ -1409,6 +1415,7 @@ struct Player {
         trigScrub = false; trigDir = 0; trigBlock = true;       // trigBlock: um L2/R2 ainda apertado do menu nao vira seek
         pendJumpMs = -1; pendJumpNeed = 0; jumpPct = 0; jumpTargetMs = -1; jumpSettleUntil = 0; jumpErrors = 0;
         pendWinA = pendWinB = 0; seekDm = mp4s::Demuxer(); seekDmTried = seekDmOk = false; forceJump = false; pausePosMs = 0;
+        bufPaused = false; bufHoldUntil = 0; bufChk = 0; bufPct = 0; bufAheadMs = 0; bufKnown = false;
         if (jumpGuardOn) { remove(kJumpGuardFile); jumpGuardOn = false; }
         vodEstDurMs = 0; vodContentLength = 0; vodBytesAtStart = 0; vodTimeAtStart = 0;
         playStartWall = nowSec(); pauseAccum = 0; pauseStartedAt = 0; lastGoodPtsMs = 0; lastPtsWall = playStartWall; fileDurMs = 0; playedMs = 0; lastPaceWall = 0;
@@ -2291,7 +2298,7 @@ struct Player {
 
     // Janela de bytes do arquivo LOCAL que o AvPlayer vai ler ao pular para 'ms': do quadro-chave anterior ate ~16 MB depois.
     // Usa o indice (moov) do proprio arquivo em disco (mp4stream.hpp). false = nao sei (MKV etc.): cai no metodo antigo.
-    bool seekWindow(int64_t ms, uint64_t &a, uint64_t &b) {
+    bool ensureSeekDm() {
         if (vodPath.empty() || vodContentLength == 0 || !getPf()) return false;
         if (!seekDmTried) {
             seekDmTried = true;
@@ -2308,7 +2315,10 @@ struct Player {
             seekDmOk = seekDm.open(rd, vodContentLength, err, 4000);
             trace(seekDmOk ? "seek-indice-ok" : "seek-indice-indisponivel");
         }
-        if (!seekDmOk || seekDm.count() == 0) return false;
+        return seekDmOk && seekDm.count() > 0;
+    }
+    bool seekWindow(int64_t ms, uint64_t &a, uint64_t &b) {
+        if (!ensureSeekDm()) return false;
         size_t i = seekDm.syncBefore(ms);
         uint64_t off = seekDm.at(i).off;
         if (off == 0 || off >= vodContentLength) return false;
@@ -2469,6 +2479,52 @@ struct Player {
         trigDir = 0;
     }
 
+
+    // Endereco (no arquivo local) onde o filme esta tocando agora: pelo indice do mp4/mkv; senao, proporcional.
+    bool playByte(int64_t ms, uint64_t &off) {
+        if (vodContentLength == 0) return false;
+        if (ensureSeekDm()) {
+            size_t i = seekDm.syncBefore(ms < 0 ? 0 : ms);
+            off = seekDm.at(i).off;
+            if (off > 0 && off < vodContentLength) return true;
+        }
+        uint64_t dur = displayDurMs();
+        double frac = dur > 0 ? (double)ms / (double)dur : 0;
+        if (frac < 0) frac = 0; if (frac > 1) frac = 1;
+        off = (uint64_t)(frac * (double)vodContentLength);
+        return true;
+    }
+    void bufferGuard() {
+        if (!isVod || !active || failed || !h) { bufPaused = false; bufKnown = false; return; }
+        const double now = nowSec();
+        if (bufPaused && !paused) { bufPaused = false; bufHoldUntil = now + 15; return; }     // o usuario apertou X: respeita
+        if (now - bufChk < 0.25) return;
+        bufChk = now;
+        auto pf = getPf();
+        if (!pf || pf->state() == 3) { if (bufPaused) { bufPaused = false; togglePause(); } bufKnown = false; return; }   // baixou tudo: sem risco
+        if (pf->state() != 1) { if (bufPaused) { bufPaused = false; togglePause(); } bufKnown = false; return; }          // falhou: o aviso de erro ja aparece
+        if (pendJumpMs >= 0 || scrubMode) return;
+        if (paused && !bufPaused) return;                                              // pausa do usuario
+        if (playedMs < 3000 && lastPtsMs < 3000) return;                               // so depois de alguns segundos tocando
+        uint64_t pos = realPosMs(), off = 0;
+        if (!playByte((int64_t)pos, off)) return;
+        const uint64_t total = vodContentLength, dur = displayDurMs();
+        double Bps = dur > 0 ? (double)total * 1000.0 / (double)dur : 250000.0;       // bytes por segundo do filme
+        if (Bps < 50000.0) Bps = 50000.0; if (Bps > 4000000.0) Bps = 4000000.0;
+        auto clampU = [](double v, double lo, double hi) { return (uint64_t)(v < lo ? lo : v > hi ? hi : v); };
+        const uint64_t low = clampU(Bps * 8, 6.0 * 1048576, 64.0 * 1048576), high = clampU(Bps * 20, 16.0 * 1048576, 160.0 * 1048576);
+        const uint64_t end = pf->contigEnd(off);
+        const uint64_t ahead = end > off ? end - off : 0;
+        const bool toEnd = end >= total;
+        bufAheadMs = (uint64_t)((double)ahead * 1000.0 / Bps); bufKnown = true;
+        if (!bufPaused) {
+            if (now >= bufHoldUntil && !toEnd && ahead < low) { bufPaused = true; bufPausedAt = now; bufPct = 0; trace("buffer-pausa"); togglePause(); }
+        } else {
+            bufPct = high ? (int)std::min<uint64_t>(100, ahead * 100 / high) : 100;
+            hudUntil = now + 2;
+            if (toEnd || ahead >= high || now - bufPausedAt > 180) { bufPaused = false; bufHoldUntil = now + 8; trace("buffer-retoma"); togglePause(); }
+        }
+    }
 
     void setPausedSoft(bool p) {
         if (p == paused) return;
@@ -2641,6 +2697,15 @@ struct Player {
             if (pos > dur) pos = dur;
             double frac = (double)pos / (double)dur;
             r.roundRect(trackX, trackY, trackW, trackH, 3, YT_GRAY);
+            {   // quanto do filme ja foi baixado a frente (cinza claro), como no YouTube
+                auto pfb = getPf();
+                double bf = frac;
+                if (pfb && pfb->state() == 3) bf = 1.0;
+                else if (bufKnown) bf = (double)(pos + bufAheadMs) / (double)dur;
+                if (bf > 1.0) bf = 1.0;
+                int bw = (int)(trackW * bf);
+                if (bw > 2 && bf > frac) r.roundRect(trackX, trackY, bw, trackH, 3, 0xFF9A9A9Au);
+            }
             int filled = (int)(trackW * frac);
             if (filled < 2 && pos > 0) filled = 2;
             r.roundRect(trackX, trackY, filled, trackH, 3, YT_RED);
@@ -2662,6 +2727,7 @@ struct Player {
                     char dtx[32]; fmtTime((uint64_t)(dl < 0 ? -dl : dl), dtx, sizeof dtx);
                     st = std::string(dl < 0 ? "<< -" : ">> +") + dtx + "   solte para ir";
                 } else if (scrubMode) st = "SEEK  L2/R2  L1/R1 1min  X ok";
+                else if (bufPaused) { st = "Carregando... " + std::to_string(bufPct) + "%  (internet mais lenta que o filme)"; col = 0xFFFFCC33u; }
                 else if (pendJumpMs >= 0) { st = "Baixando ate o ponto... " + std::to_string(jumpPct) + "%"; col = 0xFFFFCC33u; }
                 else if (seekSkip || (jumpTargetMs >= 0 && nowSec() < jumpSettleUntil)) { st = "Indo para o ponto..."; col = 0xFFFFCC33u; }
                 if (!st.empty()) {
@@ -3607,6 +3673,7 @@ int main() {
                 // Antes, com o HUD apagado, o quadro ia direto para a tela (bufs[back]) e logo em seguida o flip() copiava o
                 // rascunho (com a ultima imagem do HUD) POR CIMA dele = imagem parada com o som seguindo. Mexer no analogico
                 // religava o HUD (que usava o rascunho) e o video "voltava".
+                player.bufferGuard();                       // internet lenta: pausa sozinho e retoma quando houver colchao
                 FbRenderer r((hud || player.isVod) ? shadow : (uint32_t *)bufs[back], W, H);
                 if (player.paused) {
                     // pausado: so HUD (proporcao aplica no proximo quadro ao despausar)
