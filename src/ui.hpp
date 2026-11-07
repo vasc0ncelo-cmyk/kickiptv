@@ -399,6 +399,8 @@ struct UI {
     int curSeason = 0;
     std::string kickLast;     // ultimo @ pesquisado
     std::string m3uUrl;       // lista M3U atual
+    std::string defaultUrl;   // lista padrao do app (defaultlist.hpp). Preenchida = a lista e fixa: nao da para adicionar outra, so atualizar
+    bool reloadRequested = false;   // o botao ATUALIZAR foi apertado: a plataforma baixa a lista de novo (veja o laco principal)
     std::string timeText, dateText;   // relogio (a plataforma atualiza)
     int textKind = 0;         // 0 nada, 1 = @streamer, 2 = endereco M3U, 3 = busca
     std::string searchQ;
@@ -428,7 +430,9 @@ struct UI {
     void loadSaved() {
         kickLast = kickSlug(app.pf.loadSetting("kick"));
         m3uUrl = app.pf.loadSetting("m3u");
+        if (!defaultUrl.empty()) m3uUrl = defaultUrl;       // lista fixa: ignora qualquer outra que tenha ficado guardada
     }
+    bool listLocked() const { return !defaultUrl.empty(); }
     bool hasSavedList() const { return !m3uUrl.empty(); }
     void loadSavedList() { if (!m3uUrl.empty()) app.loadM3U(m3uUrl, true); }   // true = usa a copia salva (nao baixa de novo)
 
@@ -879,6 +883,12 @@ private:
         if (cursor[t] >= scroll[t] + kRows) scroll[t] = cursor[t] - kRows + 1;
     }
     void requestM3U() { textKind = 2; app.pf.requestText("Endereço da lista M3U"); }
+    // Botao ATUALIZAR: baixa a lista de novo (painel Xtream: reconecta e atualiza as categorias).
+    void requestReload() {
+        if (m3uUrl.empty()) { app.say("Nenhuma lista configurada neste app"); return; }
+        reloadRequested = true;
+        app.say("Atualizando a lista...");
+    }
 
     void handleHome(Input in) {
         switch (in) {
@@ -891,13 +901,15 @@ private:
         case Input::Confirm:
             if (homeRow == 0) openTab(Tab::Kick);
             else if (homeRow == 1) openTab(tileTab(homeCol));
-            else if (homeRow == 2) requestM3U();
+            else if (homeRow == 2) { if (listLocked()) requestReload(); else requestM3U(); }
             else { screen = Screen::Help; helpScroll = 0; }
             break;
         default: break;
         }
     }
 
+    std::string noListMsg() const { return listLocked() ? "A lista ainda não carregou" : "Nenhuma lista M3U adicionada"; }
+    std::string noListHint() const { return listLocked() ? "Volte ao início e aperte ATUALIZAR na lista" : "Volte ao início e use LISTA M3U para adicionar a sua"; }
     std::string emptyMsg() const {
         const Category *c = curCat();
         return c && c->unloaded() ? "Aperte X para abrir a categoria" : "Nada por aqui ainda";
@@ -905,7 +917,10 @@ private:
     std::string listSummary() const {
         const Playlist &p = app.list;
         if (p.xtream) return "Painel IPTV  |  " + std::to_string(p.channelCats.size()) + " categorias de canais  |  " + std::to_string(p.movieCats.size()) + " de filmes  |  " + std::to_string(p.seriesCats.size()) + " de séries";
-        if (p.channels.empty() && p.movies.empty() && p.seriesTree.empty()) return m3uUrl.empty() ? "Adicione sua lista de IPTV" : "Lista sem itens - X para trocar";
+        if (p.channels.empty() && p.movies.empty() && p.seriesTree.empty()) {
+            if (listLocked()) return "Lista ainda não carregada - aperte X para atualizar";
+            return m3uUrl.empty() ? "Adicione sua lista de IPTV" : "Lista sem itens - X para trocar";
+        }
         return std::to_string(p.channels.size()) + " canais  |  " + std::to_string(p.movies.size()) + " filmes  |  " + std::to_string(p.seriesTree.size()) + " séries";
     }
 
@@ -924,6 +939,7 @@ private:
             {"O", "Voltar"},
             {"Triangulo", "Buscar filmes, series e canais"},
             {"OPTIONS", "No menu: busca | Na live: troca qualidade"},
+            {"X em LISTA IPTV", "Atualizar a lista (se nao carregou ou mudou)"},
             {"", ""},
             {"PLAYER - FILME / SERIE", ""},
             {"X (foco pause)", "Pausar / continuar"},
@@ -1044,11 +1060,19 @@ private:
             uiFrame(r, x, y, w, h, rad, sel ? 4 : 2, sel ? GREEN : CARD_LINE, sel ? SEL : CARD);
             uiIconLink(r, x + 84, y + 70, 78, TEXT);
             r.fillRect(x + 170, y + 40, 3, 62, GREEN_DK);
-            uiHeavy(r, x + 222, y + 28, "LISTA M3U", TEXT, 40);
-            uiText(r, x + 222, y + 80, uiFit(r, listSummary(), 26, w - 222 - 140), SOFT, 26);
-            const int pcx = x + w - 90, pcy = y + h / 2;
-            r.roundRect(pcx - 36, pcy - 36, 72, 72, 36, GREEN);
-            r.fillRect(pcx - 15, pcy - 3, 30, 6, BLACK); r.fillRect(pcx - 3, pcy - 15, 6, 30, BLACK);
+            if (listLocked()) {          // lista fixa do app: so o botao ATUALIZAR
+                uiHeavy(r, x + 222, y + 28, "LISTA IPTV", TEXT, 40);
+                uiText(r, x + 222, y + 80, uiFit(r, listSummary(), 26, w - 222 - 330), SOFT, 26);
+                const int pcx = x + w - 150, pcy = y + h / 2;
+                r.roundRect(pcx - 118, pcy - 36, 236, 72, 36, GREEN);
+                uiCenterHeavy(r, pcx, pcy - 15, "X  ATUALIZAR", BLACK, 28);
+            } else {
+                uiHeavy(r, x + 222, y + 28, "LISTA M3U", TEXT, 40);
+                uiText(r, x + 222, y + 80, uiFit(r, listSummary(), 26, w - 222 - 140), SOFT, 26);
+                const int pcx = x + w - 90, pcy = y + h / 2;
+                r.roundRect(pcx - 36, pcy - 36, 72, 72, 36, GREEN);
+                r.fillRect(pcx - 15, pcy - 3, 30, 6, BLACK); r.fillRect(pcx - 3, pcy - 15, 6, 30, BLACK);
+            }
         }
         // ---- Comandos ----
         {
@@ -1153,7 +1177,7 @@ private:
             }
             if (n == 0) {
                 bool noList = app.list.empty();
-                uiCenterHeavy(r, W / 2 + 200, y0 + 150, noList ? "Nenhuma lista M3U adicionada" : emptyMsg(), MUTED, 32);
+                uiCenterHeavy(r, W / 2 + 200, y0 + 150, noList ? noListMsg() : emptyMsg(), MUTED, 32);
             }
             return;
         }
@@ -1197,8 +1221,8 @@ private:
         }
         if (nc == 0) {
             bool noList = app.list.empty();
-            uiCenterHeavy(r, W / 2, y0 + 150, noList ? "Nenhuma lista M3U adicionada" : emptyMsg(), MUTED, 32);
-            if (noList) uiCenter(r, W / 2, y0 + 200, "Volte ao início e use LISTA M3U para adicionar a sua", DIM, 24);
+            uiCenterHeavy(r, W / 2, y0 + 150, noList ? noListMsg() : emptyMsg(), MUTED, 32);
+            if (noList) uiCenter(r, W / 2, y0 + 200, noListHint(), DIM, 24);
         }
     }
 
@@ -1252,8 +1276,8 @@ private:
         }
         if (n == 0) {
             bool noList = app.list.empty();
-            uiCenterHeavy(r, W / 2, y0 + 150, noList ? "Nenhuma lista M3U adicionada" : emptyMsg(), MUTED, 32);
-            if (noList) uiCenter(r, W / 2, y0 + 200, "Volte ao início e use LISTA M3U para adicionar a sua", DIM, 24);
+            uiCenterHeavy(r, W / 2, y0 + 150, noList ? noListMsg() : emptyMsg(), MUTED, 32);
+            if (noList) uiCenter(r, W / 2, y0 + 200, noListHint(), DIM, 24);
         }
         // barra de rolagem
         if (n > kRows) {
