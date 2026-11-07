@@ -928,9 +928,12 @@ struct AudioPump {
     std::mutex hm;                       // protege 'h': a troca de pedaco muda o player SEM fechar a porta de audio
     int port = -1;
     static const int GRAIN = 1024;
+    std::mutex ctl;                      // start/stop podem vir de threads diferentes (a desmontagem roda em segundo plano): uma por vez
+    static double nowS() { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec + ts.tv_nsec / 1e9; }
 
     void start(KAvHandle handle) {
-        stop();
+        std::lock_guard<std::mutex> cl(ctl);
+        stopLocked();
         { std::lock_guard<std::mutex> l(hm); h = handle; }
         muted = false;
         run = true; state = 1; chunks = 0; rate = chans = 0; openRc = 0;
@@ -940,7 +943,8 @@ struct AudioPump {
     // do AudioOut: isso causa um "buraco" de audio e arrasta o video junto. Agora a porta continua aberta.
     // Ao retornar, a thread de audio nao esta mais dentro de uma chamada ao player antigo (so entao ele pode ser fechado).
     void retarget(KAvHandle handle) { std::lock_guard<std::mutex> l(hm); h = handle; }
-    void stop() {
+    void stop() { std::lock_guard<std::mutex> cl(ctl); stopLocked(); }
+    void stopLocked() {
         run = false;
         if (th.joinable()) th.join();
         if (port > 0) { sceAudioOutClose(port); port = -1; }
@@ -952,6 +956,7 @@ struct AudioPump {
         std::vector<int16_t> acc;
         std::vector<uint8_t> pcm;
         float prevL = 0, prevR = 0, phase = 0;
+        double nextOpen = 0;
         while (run) {
             if (flush.exchange(false)) { acc.clear(); prevL = prevR = 0; }
             if (muted.load()) { sceKernelUsleep(8000); continue; }
@@ -970,14 +975,21 @@ struct AudioPump {
             }
             if (!got) { sceKernelUsleep(3000); continue; }
             rate = sr; chans = ch;
-            if (port < 0 && state != -1) {
+            size_t frames = sz / (2 * ch);
+            if (port < 0 && nowS() >= nextOpen) {       // se a porta nao abrir, tenta de novo a cada 0,3 s (antes desistia para sempre: video sem som e acelerado)
                 int p = sceAudioOutOpen(0xFF /*usuario do sistema*/, ORBIS_AUDIO_OUT_PORT_TYPE_MAIN, 0, GRAIN, 48000, ORBIS_AUDIO_OUT_PARAM_FORMAT_S16_STEREO);
                 openRc = p;
-                if (p > 0) { port = p; state = 2; } else state = -1;      // se falhar, so descarta o audio (o relogio do player continua)
+                if (p > 0) { port = p; state = 2; } else { state = -1; nextOpen = nowS() + 0.3; }
             }
-            if (port <= 0) continue;
+            if (port <= 0) {
+                // Sem porta de audio: o AvPlayer regula o relogio pelo ritmo em que o audio e consumido. Descartar sem esperar fazia o
+                // video correr acelerado. Aqui o audio e consumido em tempo real (so sem som) e o video segue na velocidade certa.
+                double wait = (double)frames / (double)(sr ? sr : 48000);
+                double until = nowS() + (wait > 0.25 ? 0.25 : wait);
+                while (run && nowS() < until) sceKernelUsleep(2000);
+                continue;
+            }
             const int16_t *in = (const int16_t *)pcm.data();
-            size_t frames = sz / (2 * ch);
             float step = (float)sr / 48000.0f;
             for (size_t i = 0; i < frames; i++) {
                 const int16_t *f = in + i * ch;
@@ -2958,6 +2970,13 @@ struct OrbisSystemServiceStatus {
     int32_t reserved[8];
 };
 extern "C" int sceSystemServiceGetStatus(OrbisSystemServiceStatus *status);
+// true = o usuario apertou PS (inicio/menu rapido) ou o app foi para segundo plano: tudo que esta bloqueado (download da lista, abertura
+// de video) deve parar NA HORA, para o sistema poder fechar o app sem derrubar nada no meio.
+static bool sysWantsStop() {
+    OrbisSystemServiceStatus st{};
+    if (sceSystemServiceGetStatus(&st) != 0) return false;
+    return st.isInBackground != 0 || st.isSystemUiOverlaid != 0;
+}
 
 using PadIn = PadInT<OrbisPadSrc>;
 
@@ -3222,6 +3241,7 @@ int main() {
     }
     trace("intro-ok");
     pf.progressTick = [&]() -> bool {         // durante o download da lista: redesenha o status e deixa cancelar com O
+        if (sysWantsStop()) { g_quitting = true; return true; }      // PS: para o download da lista agora
         presentMenu();
         pin.poll();
         if (pin.pending & B_CIRCLE) { pin.pending &= ~B_CIRCLE; return true; }
@@ -3311,31 +3331,38 @@ int main() {
         // (se o usuario escolher "Fechar aplicativo", o sistema mata o processo;
         //  se ja liberamos AvPlayer/threads, nao da CE-34878-0).
         {
-            static bool wasBg = false, seenFg = false, keepBg = false;
+            static bool wasBg = false, seenFg = false, keepBg = false, wasUi = false;
             static double bgSince = 0;
+            // para TUDO de uma vez: video, capas, download da lista, alimentadores de rede
+            auto stopAllNow = [&](const char *why) {
+                trace(why);
+                g_quitting = true;                 // workers de rede/capas param
+                if (mode == Mode::Play || player.h) {
+                    try { player.stop(); } catch (...) {}
+                    mode = Mode::Menu;
+                }
+                g_covers.setPaused(true);
+                try { g_covers.cancelBackground(); } catch (...) {}
+                if (loader.stillAlive()) {
+                    try { loader.cancel(0.05); } catch (...) {}
+                }
+                try { g_feed.abort(); abortHf(); abortPf(); } catch (...) {}
+                // da um momento pro stop assincrono soltar o AvPlayer
+                Player::waitTeardown(0.35);
+                trace("tudo-parado");
+                dirty = true;
+            };
             OrbisSystemServiceStatus st{};
             if (sceSystemServiceGetStatus(&st) == 0) {
                 bool bg = (st.isInBackground != 0);
+                bool ovl = (st.isSystemUiOverlaid != 0);
                 if (!bg) seenFg = true;                // so conta como "foi para o inicio" depois de ter estado na frente uma vez
+                if (ovl && !wasUi && !bg) { wasUi = true; stopAllNow("sistema-menu-ps"); }       // PS apertado: para tudo, mas o app continua aberto
+                if (!ovl && wasUi) { wasUi = false; if (!bg) { g_quitting = false; g_covers.setPaused(false); dirty = true; } }
                 if (bg && !wasBg) {
                     bgSince = nowSec();
                     keepBg = fileExists(kKeepBgFile);
-                    trace("sistema-background");
-                    g_quitting = true;                 // workers de rede/capas param
-                    if (mode == Mode::Play || player.h) {
-                        try { player.stop(); } catch (...) {}
-                        mode = Mode::Menu;
-                    }
-                    g_covers.setPaused(true);
-                    try { g_covers.cancelBackground(); } catch (...) {}
-                    if (loader.stillAlive()) {
-                        try { loader.cancel(0.05); } catch (...) {}
-                    }
-                    try { g_feed.abort(); abortHf(); abortPf(); } catch (...) {}
-                    // da um momento pro stop assincrono soltar o AvPlayer
-                    Player::waitTeardown(0.35);
-                    trace("bg-parado");
-                    dirty = true;
+                    stopAllNow("sistema-background");
                 }
                 if (!bg && wasBg) {
                     trace("sistema-foreground");
@@ -3875,7 +3902,8 @@ int main() {
             mode = Mode::Play; gotFrame = false; lastWaitDraw = 0;
             presentWait();                       // mostra "Player" antes de bloquear
             player.presentCb = presentWait;
-            player.cancelCb = [&]() -> bool {        // O cancela o carregamento
+            player.cancelCb = [&]() -> bool {        // O cancela o carregamento; PS tambem (para tudo na hora)
+                if (sysWantsStop()) return true;
                 pin.poll();
                 if (pin.pending & B_CIRCLE) { pin.pending &= ~B_CIRCLE; return true; }
                 return false;
