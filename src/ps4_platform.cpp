@@ -2962,9 +2962,11 @@ struct OrbisSystemServiceStatus {
 extern "C" int sceSystemServiceGetStatus(OrbisSystemServiceStatus *status);
 // true = o usuario apertou PS (inicio/menu rapido) ou o app foi para segundo plano: tudo que esta bloqueado (download da lista, abertura
 // de video) deve parar NA HORA, para o sistema poder fechar o app sem derrubar nada no meio.
-// TESTE DE ISOLAMENTO: false = o app NAO reage ao botao PS/segundo plano (nada de parar tudo nem de sair sozinho).
-// Se com false o app parar de fechar ao abrir video, a causa era essa logica. Depois de confirmar, volto a ligar (true) com a correcao.
-static const bool kPsStopLogic = false;
+// true = o app reage ao botao PS / "Fechar aplicativo" / troca de app: para video, capas, download da lista e threads de rede
+// ANTES de o sistema matar o processo (se ele estiver com decodificador de video, audio e sockets em uso, o PS4 nao consegue
+// encerrar e mostra erro). Estava false so como TESTE DE ISOLAMENTO; as quedas que motivaram o teste eram do heap (ja corrigidas).
+// A deteccao de "segundo plano" so vale em reproducao se o menu do PS apareceu ha pouco (sem falso positivo ao abrir video).
+static const bool kPsStopLogic = true;
 static std::atomic<double> g_lastOvlT{-1e9};      // ultima vez que o menu do sistema (PS) apareceu por cima do app
 static bool sysWantsStop() {
     if (!kPsStopLogic) return false;
