@@ -3757,7 +3757,7 @@ int main() {
         if (pressed & B_R2)     { ui.handle(Input::PageDown); dirty = true; }
         if (pressed & B_CROSS)  { ui.handle(Input::Confirm);  dirty = true; }
         if (pressed & B_CIRCLE) { ui.handle(Input::Back);     dirty = true; }
-        if (pressed & B_TRIANGLE) { ui.handle(Input::Extra);  dirty = true; }       // lupa: buscar
+        if (pressed & (B_TRIANGLE | B_TOUCH)) { ui.handle(Input::Extra);  dirty = true; }       // lupa: buscar (triangulo ou clique no touchpad)
         if (updateClock()) dirty = true;
         {   // andamento do lote de capas (TRIANGULO)
             static bool wasBulk = false; static double nextSay = 0;
