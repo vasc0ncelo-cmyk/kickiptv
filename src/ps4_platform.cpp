@@ -3644,6 +3644,7 @@ int main() {
             for (int i = 0; i < nR; i++) ui.handle(Input::Right);
             if (nU + nD + nL + nR > 0) dirty = true;
         }
+        if (mode == Mode::Menu && ui.autoOpenTick()) dirty = true;      // painel Xtream: abre a categoria quando o cursor para nela
         if (pressed & B_L1)     { ui.handle(Input::PrevTab);  dirty = true; }
         if (pressed & B_R1)     { ui.handle(Input::NextTab);  dirty = true; }
         if (pressed & B_L2)     { ui.handle(Input::PageUp);   dirty = true; }
