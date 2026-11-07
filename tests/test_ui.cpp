@@ -230,6 +230,28 @@ int main() {
         ub2.handle(Input::Back);
         assert(!ub2.searching());
     }
+    // --- busca a partir do Inicio (lupa), troca de aba e resultado que continua ao voltar de um detalhe ---
+    {
+        Fake fb3; App ab3(fb3); UI ub3(ab3);
+        std::string m = "#EXTM3U\n#EXTINF:-1 group-title=\"A\",Canal Dark TV\nhttp://h/live/1.ts\n"
+                        "#EXTINF:-1 group-title=\"F\",Dark Filme\nhttp://h/movie/2.mp4\n"
+                        "#EXTINF:-1 group-title=\"S\",Dark S01E01\nhttp://h/series/3.mp4\n"
+                        "#EXTINF:-1 group-title=\"S\",Dark S01E02\nhttp://h/series/4.mp4\n"
+                        "#EXTINF:-1 group-title=\"S\",Dark Matter S01E01\nhttp://h/series/5.mp4\n";
+        ab3.list = buildPlaylist(m);
+        ub3.screen = Screen::Home;
+        ub3.handle(Input::Extra); assert(ub3.textKind == 3);                  // a busca abre do Inicio
+        ub3.onText("dark");
+        assert(ub3.screen == Screen::List && ub3.searching());
+        assert(ab3.lastStatus.find("Filmes 1") != std::string::npos && ab3.lastStatus.find("Séries 2") != std::string::npos && ab3.lastStatus.find("Canais 1") != std::string::npos);
+        assert(ub3.tab == Tab::Series && ub3.itemCount() == 2);               // foi para a aba com mais resultados
+        ub3.handle(Input::Confirm); assert(ub3.screen == Screen::Detail);     // abre a serie
+        ub3.handle(Input::Back);
+        assert(ub3.screen == Screen::List && ub3.searching() && ub3.itemCount() == 2);   // o resultado continua ali
+        ub3.handle(Input::NextTab); assert(ub3.tab == Tab::Channels && ub3.searching() && ub3.itemCount() == 1);   // L1/R1 troca de aba mantendo a busca
+        ub3.handle(Input::PrevTab); ub3.handle(Input::PrevTab); assert(ub3.tab == Tab::Movies && ub3.itemCount() == 1);
+        ub3.handle(Input::Back); assert(!ub3.searching());                    // O limpa a busca
+    }
     // --- uiFit: corta com "..." sem estourar a largura e sem quebrar UTF-8 ---
     {
         Rec r; std::string longo(200, 'a');
