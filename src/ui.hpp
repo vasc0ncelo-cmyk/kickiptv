@@ -1302,6 +1302,23 @@ public:
     void wantDetailCovers(const std::string &poster, const std::vector<std::string> &front, const std::vector<std::string> &back);
 private:
 
+    // Toca o canal e entrega a lista da categoria (ou da busca) ao player: L1/R1 durante o video troca para o canal anterior/proximo.
+    void playChannelFrom(const std::vector<uint32_t> &idx, int pos) {
+        const Playlist &p = app.list;
+        if (pos < 0 || pos >= (int)idx.size() || idx[pos] >= p.channels.size()) return;
+        const Entry &e = p.channels[idx[pos]];
+        if (e.url.empty()) { app.say("Canal sem link"); return; }
+        app.pf.play(e.url, e.name);
+        const int a = std::max(0, pos - 1000), b = std::min((int)idx.size(), pos + 1001);     // janela: categorias enormes nao viram uma lista gigante
+        std::vector<std::string> urls, titles; int cur = 0;
+        for (int i = a; i < b; i++) {
+            if (idx[i] >= p.channels.size() || p.channels[idx[i]].url.empty()) continue;
+            if (i == pos) cur = (int)urls.size();
+            urls.push_back(p.channels[idx[i]].url); titles.push_back(p.channels[idx[i]].name);
+        }
+        app.pf.setEpisodeList(urls, titles, cur);
+    }
+
     void confirm(int n) {
         int t = (int)tab, c = cursor[t];
         const Playlist &p = app.list;
@@ -1316,9 +1333,7 @@ private:
             if (c < 0 || c >= (int)searchHits.size()) return;
             uint32_t hi = searchHits[c];
             if (tab == Tab::Channels && hi < p.channels.size()) {
-                const Entry &e = p.channels[hi];
-                if (e.url.empty()) app.say("Canal sem link");
-                else app.pf.play(e.url, e.name);
+                playChannelFrom(searchHits, c);
             } else if (tab == Tab::Movies && hi < p.movies.size()) {
                 openMovieDetail(p.movies[hi], movieCategoryOf(hi));
             } else if (tab == Tab::Series) {
@@ -1330,9 +1345,7 @@ private:
         const Category *cat = curCat();
         if (!cat || c >= n) return;
         if (tab == Tab::Channels) {
-            const Entry &e = p.channels[cat->items[c]];
-            if (e.url.empty()) app.say("Canal sem link");
-            else app.pf.play(e.url, e.name);
+            playChannelFrom(cat->items, c);
         } else if (tab == Tab::Movies) {
             openMovieDetail(p.movies[cat->items[c]], cat->name);
         } else if (level == 0) {
