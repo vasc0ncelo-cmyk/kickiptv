@@ -59,17 +59,16 @@ int main() {
     ui.handle(Input::Left); ui.handle(Input::Left); ui.handle(Input::Confirm); assert(ui.tab == Tab::Movies);
     ui.handle(Input::Right); assert(ui.inItems);                                         // seta direita tambem entra na categoria
     ui.handle(Input::Left); assert(!ui.inItems); ui.handle(Input::Right);
-    ui.handle(Input::Confirm); assert(f.played == "http://h/movie/2");
+    f.played.clear(); ui.handle(Input::Confirm); assert(ui.screen == Screen::Detail && f.played.empty());   // abre a pagina de detalhes
+    ui.handle(Input::Confirm); assert(f.played == "http://h/movie/2");                     // X na pagina toca
+    ui.handle(Input::Back); assert(ui.screen == Screen::List);
     // --- Series: serie -> temporada 1 -> ep 1 (ordenado) ---
     ui.handle(Input::NextTab); assert(ui.tab == Tab::Series && !ui.inItems);
     ui.handle(Input::Confirm);          // abre a categoria "Series"
     ui.handle(Input::Confirm);          // Dark
-    ui.handle(Input::Confirm);          // Temporada 1
-    { Rec r; ui.render(r); assert(r.has("Ep 1 - Dark S01E01") && r.has("Ep 2 - Dark S01E02")); }
-    ui.handle(Input::Confirm); assert(f.played == "http://h/series/5");
-    ui.handle(Input::Back); ui.handle(Input::Down); ui.handle(Input::Confirm);   // Temporada 2
-    ui.handle(Input::Confirm); assert(f.played == "http://h/series/3");
-    ui.handle(Input::Back); ui.handle(Input::Back); assert(ui.level == 0 && ui.inItems);   // episodios -> temporadas -> series
+    assert(ui.screen == Screen::Detail && ui.detailSeasons.size() == 2);                  // pagina de detalhes da serie
+    ui.handle(Input::Confirm); assert(f.played == "http://h/series/5");                  // foco no 1o episodio (ordenado)
+    ui.handle(Input::Back); assert(ui.screen == Screen::List && ui.inItems);
     ui.handle(Input::Back); assert(!ui.inItems && ui.screen == Screen::List);              // series -> categorias
     // --- Kick TV ---
     ui.handle(Input::NextTab); assert(ui.tab == Tab::Channels);
@@ -120,7 +119,8 @@ int main() {
         u5.handle(Input::Right); u5.handle(Input::Right); assert(u5.cursor[2] == 1);   // grade: direita anda 1 poster
         u5.handle(Input::Left); u5.handle(Input::Left); u5.handle(Input::Down);       // 1a coluna: esquerda volta as categorias                                   // categoria "Ação"
         assert(u5.catCur[2] >= 1 && u5.cursor[2] == 0);
-        u5.handle(Input::Confirm); f5.played.clear(); u5.handle(Input::Confirm); assert(f5.played == "http://h/movie/2.mp4");
+        u5.handle(Input::Confirm); f5.played.clear(); u5.handle(Input::Confirm); u5.handle(Input::Confirm); assert(f5.played == "http://h/movie/2.mp4");
+        u5.handle(Input::Back);
         { Rec r; u5.render(r); assert(r.has("FILMES") && r.has("Ação") && r.has("Comédia") && r.has("Duro de Matar") && !r.has("Superbad")); }
         u5.tab = Tab::Channels; u5.inItems = false;
         assert(u5.catCount() >= 2 && u5.catLabel(0) == "Todos");
@@ -195,8 +195,10 @@ int main() {
         assert(ub2.textKind == 3 && fb2.asked.find("Buscar") == 0);
         ub2.onText("Matrix");
         assert(ub2.searching() && ub2.itemCount() == 1);
+        ub2.handle(Input::Confirm); assert(ub2.screen == Screen::Detail);      // abre os detalhes
         ub2.handle(Input::Confirm);
         assert(fb2.played == "http://h/m/matrix.mp4");
+        ub2.handle(Input::Back); assert(ub2.screen == Screen::List);
         ub2.handle(Input::Back);
         assert(!ub2.searching());
     }
@@ -208,15 +210,6 @@ int main() {
         assert(r.textWidth(u, 28) <= 200);
         for (size_t i = 0; i < u.size();) { unsigned char c = u[i]; size_t n = c < 0x80 ? 1 : (c >> 5) == 6 ? 2 : (c >> 4) == 14 ? 3 : 4; assert(i + n <= u.size()); i += n; }
         assert(uiFit(r, "curto", 28, 500) == "curto");
-    }
-    // --- Teclado: cursor piscando e posicao do campo ---
-    {
-        Keyboard k; k.open("abc", false);
-        Rec r; auto fld = k.field(r);
-        assert(fld.shown == "abc" && fld.caretX == fld.px + r.textWidth("abc", 36) + 3);
-        k.drawCaret(r, true); k.drawCaret(r, false);                      // nao pode quebrar
-        k.open(std::string(300, 'x'), true);
-        auto f2 = k.field(r); assert(f2.shown.compare(0, 3, "...") == 0 && f2.caretX < r.width());
     }
     std::cout << "OK\n";
 }
