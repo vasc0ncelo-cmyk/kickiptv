@@ -3019,6 +3019,7 @@ int main() {
     Ps4Platform pf;
     trace("pf-ok");
     App app(pf);
+    app.prefetch = true;                       // painel Xtream: baixa o catalogo todo em segundo plano ao conectar
     pf.app = &app;
     UI ui(app);
     trace("ui-ok");
@@ -3719,6 +3720,7 @@ int main() {
             for (int i = 0; i < nR; i++) ui.handle(Input::Right);
             if (nU + nD + nL + nR > 0) dirty = true;
         }
+        if (mode == Mode::Menu && app.prefetchTick()) dirty = true;      // catalogo do painel chegando (um pedaco por quadro, so no menu)
         if (mode == Mode::Menu && ui.autoOpenTick()) dirty = true;      // painel Xtream: abre a categoria quando o cursor para nela
         if (pressed & B_L1)     { ui.handle(Input::PrevTab);  dirty = true; }
         if (pressed & B_R1)     { ui.handle(Input::NextTab);  dirty = true; }
