@@ -3406,7 +3406,7 @@ int main() {
                     // Ficou no inicio do PS4 por mais de 1 s: encerra sozinho (nada de esperar o sistema matar o processo).
                     // Sem esperar threads de rede (_Exit); o estado (lista/ultimo streamer) ja fica salvo em disco.
                     if (seenFg && !keepBg) {              // sai NA HORA (sem esperar 1 s): o sistema esta fechando/trocando o app
-                        trace("bg-saindo");
+                        { char b[96]; snprintf(b, sizeof b, "bg-saindo tearing=%d playerH=%d mode=%d", g_tearing.load(), (int)player.h, (int)mode); trace(b); }
                         g_quitting = true;
                         try { pf.saveSetting("bgload", ""); } catch (...) {}
                         trace("fim-bg");
