@@ -458,10 +458,7 @@ struct UI {
         if (tab == Tab::Channels && c && i < (int)c->items.size())
             return p.channels[c->items[i]].logo;
         if (tab == Tab::Series && level == 0 && c && i < (int)c->series.size()) {
-            auto it = p.seriesTree.find(c->series[i]);
-            if (it == p.seriesTree.end() || it->second.empty()) return "";
-            const auto &eps = it->second.begin()->second;
-            return eps.empty() ? "" : eps[0].logo;
+            return seriesLogo(c->series[i]);
         }
         if (tab == Tab::Series && level == 2) {
             auto it = p.seriesTree.find(curSeries);
@@ -495,9 +492,12 @@ struct UI {
     bool gridMode() const { return browsable(tab) && !(tab == Tab::Series && level > 0); }   // temporadas/episodios continuam em lista
     std::string seriesLogo(const std::string &name) const {
         auto it = app.list.seriesTree.find(name);
-        if (it == app.list.seriesTree.end() || it->second.empty()) return "";
-        const auto &eps = it->second.begin()->second;
-        return eps.empty() ? "" : eps[0].logo;
+        if (it != app.list.seriesTree.end() && !it->second.empty()) {
+            const auto &eps = it->second.begin()->second;
+            if (!eps.empty() && !eps[0].logo.empty()) return eps[0].logo;
+        }
+        auto ri = app.list.seriesInfo.find(name);      // painel Xtream: a capa vem na lista de series
+        return ri == app.list.seriesInfo.end() ? "" : ri->second.cover;
     }
     // pede as capas da tela atual (so quando algo mudou) e das proximas paginas, para ja estarem prontas
     void wantCovers(int firstVisible, int visibleCount) {
@@ -585,6 +585,10 @@ struct UI {
     bool searching() const { return !searchQ.empty() && browsable(tab); }
     std::string seriesNameAt(uint32_t flatIdx) const {
         uint32_t idx = 0;
+        if (app.list.xtream) {                              // painel: busca nas series das categorias ja abertas
+            for (const auto &kv : app.list.seriesInfo) { if (idx == flatIdx) return kv.first; idx++; }
+            return "";
+        }
         for (const auto &kv : app.list.seriesTree) {
             if (idx == flatIdx) return kv.first;
             idx++;
@@ -626,7 +630,8 @@ struct UI {
                 if (nameMatch(p.channels[i].name, searchQ)) searchHits.push_back(i);
         } else if (tab == Tab::Series) {
             uint32_t idx = 0;
-            for (const auto &kv : p.seriesTree) {
+            if (p.xtream) { for (const auto &kv : p.seriesInfo) { if (nameMatch(kv.first, searchQ)) searchHits.push_back(idx); idx++; } }
+            else for (const auto &kv : p.seriesTree) {
                 if (nameMatch(kv.first, searchQ)) searchHits.push_back(idx);
                 idx++;
             }
@@ -693,7 +698,7 @@ struct UI {
             searchQ = a == std::string::npos ? "" : raw.substr(a, b - a + 1);
             if (searchQ.empty()) { clearSearch(); app.say("Busca limpa"); return; }
             rebuildSearch();
-            app.say(std::to_string(searchHits.size()) + " resultado(s) para \"" + searchQ + "\"");
+            app.say(std::to_string(searchHits.size()) + " resultado(s) para \"" + searchQ + "\"" + (app.xt.active ? " (so nas categorias ja abertas)" : ""));
             return;
         }
         kickLast = kickSlug(raw);
@@ -710,7 +715,7 @@ struct UI {
         size_t a = url.find_first_not_of(" \t\r\n"), b = url.find_last_not_of(" \t\r\n");
         url = a == std::string::npos ? "" : url.substr(a, b - a + 1);
         if (url.empty()) {                       // campo vazio = remover a lista
-            m3uUrl.clear(); app.list = Playlist(); app.pf.saveSetting("m3u", ""); app.pf.cacheClear();
+            m3uUrl.clear(); app.list = Playlist(); app.clearXtream(); app.pf.saveSetting("m3u", ""); app.pf.cacheClear();
             resetBrowse();
             app.say("Lista M3U removida");
             return;
@@ -776,7 +781,13 @@ struct UI {
         case Input::Down: catCur[t] = std::min(std::max(0, n - 1), catCur[t] + 1); break;
         case Input::PageUp: catCur[t] = std::max(0, catCur[t] - kRows); break;
         case Input::PageDown: catCur[t] = std::min(std::max(0, n - 1), catCur[t] + kRows); break;
-        case Input::Right: case Input::Confirm: if (itemCount() > 0) inItems = true; return;
+        case Input::Right: case Input::Confirm:
+            if (curCat() && curCat()->unloaded()) {                       // painel Xtream: baixa so os itens desta categoria
+                if (!app.ensureCategory(tab, catCur[t])) return;
+                cursor[t] = scroll[t] = 0;
+            }
+            if (itemCount() > 0) inItems = true;
+            return;
         case Input::Back: screen = Screen::Home; return;
         default: return;
         }
@@ -870,8 +881,13 @@ private:
         }
     }
 
+    std::string emptyMsg() const {
+        const Category *c = curCat();
+        return c && c->unloaded() ? "Aperte X para abrir a categoria" : "Nada por aqui ainda";
+    }
     std::string listSummary() const {
         const Playlist &p = app.list;
+        if (p.xtream) return "Painel IPTV  |  " + std::to_string(p.channelCats.size()) + " categorias de canais  |  " + std::to_string(p.movieCats.size()) + " de filmes  |  " + std::to_string(p.seriesCats.size()) + " de séries";
         if (p.channels.empty() && p.movies.empty() && p.seriesTree.empty()) return m3uUrl.empty() ? "Adicione sua lista de IPTV" : "Lista sem itens - X para trocar";
         return std::to_string(p.channels.size()) + " canais  |  " + std::to_string(p.movies.size()) + " filmes  |  " + std::to_string(p.seriesTree.size()) + " séries";
     }
@@ -1067,7 +1083,7 @@ private:
             if (sel) uiGlow(r, cx, y, cw, rh, 18, GREEN, 10, 110, false);
             uiFrame(r, cx, y, cw, rh, 18, sel ? 3 : 2, sel ? GREEN : CARD_LINE, sel ? SEL : CARD);
             if (cur && !sel) r.roundRect(cx + 10, y + 14, 5, rh - 28, 2, GREEN);        // categoria aberta (foco nos itens)
-            std::string cnt = std::to_string(catSize(idx));
+            std::string cnt = cats(tab)[idx].unloaded() ? std::string() : std::to_string(catSize(idx));
             int cwid = r.textWidth(cnt, 20);
             uiText(r, cx + cw - 22 - cwid, y + (rh - 20) / 2, cnt, sel ? SOFT : MUTED, 20);
             unsigned tc = cur ? (sel ? TEXT : GREEN) : SOFT;
@@ -1119,8 +1135,8 @@ private:
                 r.roundRect(W - 52, y0 + (th - kh) * scroll[t] / std::max(1, rows - kGridRows), 8, kh, 4, GREEN_DK);
             }
             if (n == 0) {
-                bool noList = app.list.channels.empty() && app.list.movies.empty() && app.list.seriesTree.empty();
-                uiCenterHeavy(r, W / 2 + 200, y0 + 150, noList ? "Nenhuma lista M3U adicionada" : "Nada por aqui ainda", MUTED, 32);
+                bool noList = app.list.empty();
+                uiCenterHeavy(r, W / 2 + 200, y0 + 150, noList ? "Nenhuma lista M3U adicionada" : emptyMsg(), MUTED, 32);
             }
             return;
         }
@@ -1164,7 +1180,7 @@ private:
         }
         if (nc == 0) {
             bool noList = app.list.empty();
-            uiCenterHeavy(r, W / 2, y0 + 150, noList ? "Nenhuma lista M3U adicionada" : "Nada por aqui ainda", MUTED, 32);
+            uiCenterHeavy(r, W / 2, y0 + 150, noList ? "Nenhuma lista M3U adicionada" : emptyMsg(), MUTED, 32);
             if (noList) uiCenter(r, W / 2, y0 + 200, "Volte ao início e use LISTA M3U para adicionar a sua", DIM, 24);
         }
     }
@@ -1218,8 +1234,8 @@ private:
             if (sel) { r.roundRect(x + rw - 84, y + rh / 2 - 19, 56, 38, 12, KEY); uiCenter(r, x + rw - 56, y + rh / 2, "X", TEXT, 22, true); }
         }
         if (n == 0) {
-            bool noList = app.list.channels.empty() && app.list.movies.empty() && app.list.seriesTree.empty();
-            uiCenterHeavy(r, W / 2, y0 + 150, noList ? "Nenhuma lista M3U adicionada" : "Nada por aqui ainda", MUTED, 32);
+            bool noList = app.list.empty();
+            uiCenterHeavy(r, W / 2, y0 + 150, noList ? "Nenhuma lista M3U adicionada" : emptyMsg(), MUTED, 32);
             if (noList) uiCenter(r, W / 2, y0 + 200, "Volte ao início e use LISTA M3U para adicionar a sua", DIM, 24);
         }
         // barra de rolagem
@@ -1290,7 +1306,7 @@ private:
                 openMovieDetail(p.movies[hi], movieCategoryOf(hi));
             } else if (tab == Tab::Series) {
                 curSeries = seriesNameAt(hi);
-                if (!curSeries.empty()) { std::string nm = curSeries; clearSearch(); openSeriesDetail(nm, seriesCategoryOf(nm)); }
+                if (!curSeries.empty()) { std::string nm = curSeries; if (!app.ensureSeries(nm)) return; clearSearch(); openSeriesDetail(nm, seriesCategoryOf(nm)); }
             }
             return;
         }
@@ -1303,7 +1319,9 @@ private:
         } else if (tab == Tab::Movies) {
             openMovieDetail(p.movies[cat->items[c]], cat->name);
         } else if (level == 0) {
-            openSeriesDetail(cat->series[c], cat->name);
+            std::string nm = cat->series[c];
+            if (!app.ensureSeries(nm)) return;                 // painel: baixa os episodios agora (sem episodios: fica na lista e avisa)
+            openSeriesDetail(nm, cat->name);
         } else if (level == 1) {
             auto &m = p.seriesTree.at(curSeries);
             auto it = m.begin(); std::advance(it, c);
