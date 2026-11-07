@@ -3352,6 +3352,7 @@ int main() {
     }
     trace("loop-inicio");
     double hbNext = monoSec() + 60, hbT0 = monoSec();
+    bool sysExit = false;                       // true = saindo porque o sistema (menu do PS) esta fechando/trocando o app
     for (;;) {
         if (monoSec() >= hbNext) {                       // 1 linha por minuto no log (/data/kickiptv.log): ate quando o app estava vivo
             hbNext += 60;
@@ -3449,6 +3450,7 @@ int main() {
                         // Nao da _Exit seco: depois de assistir video ainda existem threads (download do filme, rede, decodificador, capas).
                         // Matar o processo com elas rodando derruba o app (CE-34878-0). Vai para o encerramento limpo (junta todas as threads).
                         g_quitting = true;
+                        sysExit = true;
                         break;
                     }
                     sceKernelUsleep(30000);
@@ -3965,8 +3967,11 @@ int main() {
     try { removeVodFiles(); } catch (...) {}
     try { blit::pool().shutdown(); } catch (...) {}
     // fecha pad / video se ainda abertos
-    try { if (pin.h >= 0) scePadClose(pin.h); } catch (...) {}
-    try { if (vh >= 0) sceVideoOutClose(vh); } catch (...) {}
+    // Fechado pelo menu do PS: NAO fecha controle nem saida de video (o sistema ja tomou a tela; fechar agora pode derrubar o app)
+    if (!sysExit) {
+        try { if (pin.h >= 0) scePadClose(pin.h); } catch (...) {}
+        try { if (vh >= 0) sceVideoOutClose(vh); } catch (...) {}
+    }
     trace("fim");
     // _Exit: nao roda destrutores C++ de threads destacadas (evita std::terminate)
     _Exit(0);
