@@ -272,6 +272,23 @@ public:
     bool relocated() const { return remap_.load(); }                              // o indice estava no fim e foi movido para o comeco
     uint64_t durationMs() const { return mkvDur_.load(); }                        // MKV: duracao lida do cabecalho (0 = desconhecida)
 
+    // ---- SEEK: pedido de prioridade ----
+    // Pular para o minuto 10 de um filme: em vez de esperar o download chegar la em ordem, o app pede a janela [a, b) (enderecos do
+    // ARQUIVO LOCAL) e o baixador vai direto para ela; depois continua dali para frente e, no fim, preenche o buraco que ficou.
+    void want(uint64_t a, uint64_t b) {
+        std::lock_guard<std::mutex> l(m_);
+        if (b > total_) b = total_;
+        if (a >= b) { wantA_ = wantB_ = 0; return; }
+        wantA_ = a; wantB_ = b;
+    }
+    bool hasRange(uint64_t a, uint64_t b) { if (b > total_) b = total_; return a >= b || hasAll(a, b); }
+    uint64_t haveIn(uint64_t a, uint64_t b) {         // bytes ja gravados dentro de [a, b)
+        std::lock_guard<std::mutex> l(m_);
+        uint64_t n = 0;
+        for (auto &r : have_) { uint64_t x = std::max(a, r.a), y = std::min(b, r.b); if (y > x) n += y - x; }
+        return n;
+    }
+
 private:
     void fail(const std::string &e) { { std::lock_guard<std::mutex> l(m_); if (state_ != 2) err_ = e; } state_ = 2; }
     bool sleepMs(int ms) { for (int i = 0; i < ms / 20 && !stop_; i++) std::this_thread::sleep_for(std::chrono::milliseconds(20)); return !stop_; }
@@ -329,6 +346,11 @@ private:
         for (auto &r : have_) { if (!m.empty() && r.a <= m.back().b) m.back().b = std::max(m.back().b, r.b); else m.push_back(r); }
         have_.swap(m);
         frontier_ = (!have_.empty() && have_[0].a == 0) ? have_[0].b : 0;
+    }
+    uint64_t firstMissing(uint64_t x) {                // primeiro endereco >= x que ainda nao foi gravado (total_ se nao ha)
+        std::lock_guard<std::mutex> l(m_);
+        for (auto &r : have_) if (r.a <= x && x < r.b) x = r.b;
+        return x > total_ ? total_ : x;
     }
     bool hasAll(uint64_t a, uint64_t b) {
         std::lock_guard<std::mutex> l(m_);
@@ -423,16 +445,25 @@ private:
         }
         state_ = 1;                                                  // pode tocar
 
-        // 3) resto do arquivo, em ordem
-        for (uint64_t off = headEndNew; off < total_ && !stop_;) {
-            uint64_t end = std::min<uint64_t>(total_, off + 2 * kBlock);
-            if (hasAll(off, end)) { off = end; continue; }
-            // pula o que ja existe (indice/final): baixa so o trecho que falta
-            uint64_t a = off;
-            { std::lock_guard<std::mutex> l(m_); for (auto &r : have_) if (r.a <= a && r.b > a) a = r.b; }
-            if (a >= end) { off = a; continue; }
+        // 3) resto do arquivo: em ordem, MAS com prioridade para a janela pedida por want() (seek). Terminado o pedido, continua dali
+        //    para frente; quando chega ao fim volta ao comeco e preenche os buracos que ficaram.
+        uint64_t cursor = headEndNew;
+        for (;;) {
+            if (stop_) break;
+            uint64_t wa = 0, wb = 0;
+            { std::lock_guard<std::mutex> l(m_); wa = wantA_; wb = wantB_; }
+            if (wb > wa) {
+                uint64_t a = firstMissing(wa);
+                if (a >= wb) { std::lock_guard<std::mutex> l(m_); if (wantA_ == wa && wantB_ == wb) wantA_ = wantB_ = 0; cursor = wb; continue; }
+                uint64_t end = std::min<uint64_t>(wb, a + 2 * kBlock);
+                if (!getInto(a, end)) return;
+                continue;
+            }
+            uint64_t a = firstMissing(cursor);
+            if (a >= total_) { a = firstMissing(headEndNew); if (a >= total_) break; }       // chegou ao fim: volta e preenche os buracos
+            uint64_t end = std::min<uint64_t>(total_, a + 2 * kBlock);
             if (!getInto(a, end)) return;
-            off = end;
+            cursor = end;
         }
         if (!stop_) state_ = 3;
     }
@@ -451,6 +482,7 @@ private:
     std::atomic<bool> remap_{false};
     std::atomic<uint64_t> prep_{0};
     std::atomic<uint64_t> mkvDur_{0};
+    uint64_t wantA_ = 0, wantB_ = 0;                         // janela de prioridade (seek); protegida por m_
     uint64_t ftypEnd_ = 0, moovOff_ = 0, moovSize_ = 0;      // so valem com remap_ (definidos antes de remap_ ficar true)
 };
 
