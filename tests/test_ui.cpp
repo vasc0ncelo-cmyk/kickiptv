@@ -239,5 +239,23 @@ int main() {
         for (size_t i = 0; i < u.size();) { unsigned char c = u[i]; size_t n = c < 0x80 ? 1 : (c >> 5) == 6 ? 2 : (c >> 4) == 14 ? 3 : 4; assert(i + n <= u.size()); i += n; }
         assert(uiFit(r, "curto", 28, 500) == "curto");
     }
+    // --- Apoiar o app: botao ao lado de COMANDOS, abre a tela com o QR Code ---
+    {
+        Fake fd; App ad(fd); UI ud(ad);
+        ud.donateUrl = "";                                                        // sem link configurado: nada aparece
+        ud.handle(Input::Down); ud.handle(Input::Down); assert(ud.homeRow == 3);
+        { Rec r; ud.render(r); assert(r.has("COMANDOS E AJUDA") && !r.has("APOIAR O APP")); }
+        ud.handle(Input::Right); assert(ud.homeCol3 == 0);
+        ud.handle(Input::Confirm); assert(ud.screen == Screen::Help); ud.handle(Input::Back); assert(ud.screen == Screen::Home);
+        ud.donateUrl = "https://livepix.gg/exemplo"; ud.donatePix = "chave@exemplo.com";
+        { Rec r; ud.render(r); assert(r.has("COMANDOS E AJUDA") && r.has("APOIAR O APP")); }
+        ud.handle(Input::Right); assert(ud.homeCol3 == 1);
+        ud.handle(Input::Left); assert(ud.homeCol3 == 0); ud.handle(Input::Right);
+        ud.handle(Input::Confirm); assert(ud.screen == Screen::Donate);
+        { Rec r; ud.render(r); assert(r.has("APOIE O KICK IPTV") && r.has("https://livepix.gg/exemplo") && r.has("chave@exemplo.com")); }
+        ud.handle(Input::Extra); assert(ud.screen == Screen::Donate);              // triangulo (busca) nao sai da tela de apoio
+        ud.handle(Input::Back); assert(ud.screen == Screen::Home && ud.homeRow == 3);
+        ud.handle(Input::Up); ud.handle(Input::Up); assert(ud.homeRow == 1);        // sai da linha de baixo normalmente
+    }
     std::cout << "OK\n";
 }
