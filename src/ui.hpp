@@ -791,9 +791,24 @@ struct UI {
         case Input::Back: screen = Screen::Home; return;
         default: return;
         }
-        if (catCur[t] != before) { cursor[t] = scroll[t] = 0; level = 0; }   // outra categoria: itens desde o comeco
+        if (catCur[t] != before) { cursor[t] = scroll[t] = 0; level = 0; wantAutoOpen(); }   // outra categoria: itens desde o comeco
         if (catCur[t] < catScroll[t]) catScroll[t] = catCur[t];
         if (catCur[t] >= catScroll[t] + kRows) catScroll[t] = catCur[t] - kRows + 1;
+    }
+
+    // Painel Xtream: a categoria sob o cursor abre sozinha depois que o cursor para nela (~0,3 s), sem apertar X.
+    // Chamar uma vez por quadro (laco principal). true = carregou algo: redesenhar.
+    bool autoOpenTick() {
+        if (!autoWant) return false;
+        if (screen != Screen::List || inItems || searching() || !browsable(tab) || !app.xt.active) { autoWant = false; return false; }
+        if (++autoFrames < 18) return false;
+        autoWant = false;
+        const Category *c = curCat();
+        if (!c || !c->unloaded()) return false;
+        int t = (int)tab;
+        app.ensureCategory(tab, catCur[t]);
+        cursor[t] = scroll[t] = 0;
+        return true;
     }
 
     // ---------- Desenho ----------
@@ -813,7 +828,9 @@ struct UI {
 
 private:
 
-    void openTab(Tab t) { tab = t; screen = t == Tab::Kick ? Screen::Kick : Screen::List; level = 0; inItems = false; searchQ.clear(); searchHits.clear(); }
+    bool autoWant = false; int autoFrames = 0;
+    void wantAutoOpen() { autoFrames = 0; autoWant = app.xt.active && browsable(tab) && curCat() && curCat()->unloaded(); }
+    void openTab(Tab t) { tab = t; screen = t == Tab::Kick ? Screen::Kick : Screen::List; level = 0; inItems = false; searchQ.clear(); searchHits.clear(); wantAutoOpen(); }
     void resetBrowse() {
         for (int i = 0; i < 4; i++) cursor[i] = scroll[i] = catCur[i] = catScroll[i] = 0;
         level = 0; inItems = false;
