@@ -46,6 +46,7 @@
 #include <orbis/Pad.h>
 #include <orbis/AudioOut.h>
 #include "ui.hpp"
+#include "defaultlist.hpp"
 
 #include "fbrender.hpp"
 #include "keyboard.hpp"
@@ -3062,6 +3063,7 @@ int main() {
         } catch (...) { return false; }
     };
 
+    ui.defaultUrl = defaultListUrl();         // a lista do app e fixa (defaultlist.hpp): sem "adicionar lista", so ATUALIZAR
     ui.loadSaved();                           // ultimo streamer e lista M3U guardados
     if (!g_prevStage.empty()) app.say("Aviso: da ultima vez o app parou no passo: " + g_prevStage);
     trace("estado-criado");
@@ -3798,6 +3800,14 @@ int main() {
             dirty = true;
         }
 
+        if (ui.reloadRequested) {                 // botao ATUALIZAR (menu): baixa a lista de novo, pelo mesmo caminho do download manual
+            ui.reloadRequested = false;
+            if (mode == Mode::Menu && !ui.m3uUrl.empty()) {
+                autoLoadList = false;             // se o carregamento automatico do inicio ainda nao rodou, este o substitui
+                pf.pendingText = ui.m3uUrl; pf.hasPendingText = true; ui.textKind = 2;
+                trace("lista-atualizar");
+            }
+        }
         if (pf.kbdRequested) {                    // X em "Digitar @streamer": abre o teclado na tela
             pf.kbdRequested = false;
             kbd.open(ui.textInitial(), ui.textKind == 2, ui.textKind == 3 ? 2 : (ui.textKind == 2 ? 1 : 0));
