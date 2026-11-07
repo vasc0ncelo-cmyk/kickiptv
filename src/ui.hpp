@@ -407,18 +407,24 @@ inline void uiHeader(Renderer &r, const std::string &hhmm, const std::string &da
     uiTopRight(r, hhmm, date);
 }
 
-// coracao (apoiar): formula implicita (x^2+y^2-1)^3 - x^2*y^3 <= 0, desenhada em linhas horizontais
+// coracao (apoiar): dois circulos no alto + um triangulo embaixo (o entalhe do meio fica bem marcado), em linhas horizontais
 inline void uiHeart(Renderer &r, int cx, int cy, int size, unsigned c) {
     const float half = size / 2.0f;
     for (int j = 0; j < size; j++) {
-        float y = (half - j - 0.5f) / half * 1.25f + 0.1f;          // topo = +, base = -
-        int x0 = -1, x1 = -1;
-        for (int i = 0; i < size; i++) {
-            float x = (i + 0.5f - half) / half * 1.25f;
-            float a = x * x + y * y - 1.0f;
-            if (a * a * a - x * x * y * y * y <= 0) { if (x0 < 0) x0 = i; x1 = i; }
+        float v = (half - j - 0.5f) / half;                          // topo = +1, base = -1
+        int run = -1;                                                  // inicio do trecho preenchido (o entalhe do meio fica de fora)
+        for (int i = 0; i <= size; i++) {
+            bool in = false;
+            if (i < size) {
+                float u = (i + 0.5f - half) / half;
+                float au = u < 0 ? -u : u;
+                float dx = au - 0.5f, dy = v - 0.3f;                  // circulos de raio 0.5 centrados em (+-0.5, 0.3)
+                in = dx * dx + dy * dy <= 0.25f;
+                if (!in && v <= 0.3f && v >= -0.98f && au <= (v + 0.98f) * 0.78f) in = true;   // ponta de baixo
+            }
+            if (in && run < 0) run = i;
+            else if (!in && run >= 0) { r.fillRect(cx - size / 2 + run, cy - size / 2 + j, i - run, 1, c); run = -1; }
         }
-        if (x0 >= 0) r.fillRect(cx - size / 2 + x0, cy - size / 2 + j, x1 - x0 + 1, 1, c);
     }
 }
 
@@ -439,7 +445,7 @@ struct UI {
     int homeCol3 = 0;         // linha 3: 0 = comandos e ajuda, 1 = apoiar o app
     std::string donateUrl = kDonateUrl, donatePix = kDonatePixKey;   // (testes podem trocar)
     bool hasDonate() const { return !donateUrl.empty(); }
-    int homeCol = 0;
+    int homeCol = 1;          // atalhos: 0 = apoiar (ou KICK TV se nao houver link), 1 = filmes, 2 = series, 3 = canais
     int helpScroll = 0;
     int cursor[4] = {0, 0, 0, 0};
     int scroll[4] = {0, 0, 0, 0};
@@ -475,6 +481,13 @@ struct UI {
     explicit UI(App &a) : app(a) {}
 
     static Tab tileTab(int col) { static const Tab m[4] = {Tab::Kick, Tab::Movies, Tab::Series, Tab::Channels}; return m[col & 3]; }
+    // L1/R1 entre as listas: Filmes -> Series -> Canais (a Kick TV abre so pelo banner)
+    static Tab cycleTab(Tab t, int dir) {
+        static const Tab m[3] = {Tab::Movies, Tab::Series, Tab::Channels};
+        int cur = -1; for (int i = 0; i < 3; i++) if (m[i] == t) cur = i;
+        if (cur < 0) return dir > 0 ? Tab::Movies : Tab::Channels;
+        return m[(cur + (dir > 0 ? 1 : 2)) % 3];
+    }
     static int tabTile(Tab t) { for (int i = 0; i < 4; i++) if (tileTab(i) == t) return i; return 0; }
 
     // Dados guardados da ultima vez
@@ -843,8 +856,8 @@ struct UI {
         if (screen == Screen::Home) { handleHome(in); return; }
         int t = (int)tab;
         switch (in) {
-        case Input::PrevTab: if (searching()) { switchTabKeepSearch(-1); return; } openTab(tileTab((tabTile(tab) + 3) % 4)); return;
-        case Input::NextTab: if (searching()) { switchTabKeepSearch(1); return; } openTab(tileTab((tabTile(tab) + 1) % 4)); return;
+        case Input::PrevTab: if (searching()) { switchTabKeepSearch(-1); return; } openTab(cycleTab(tab, -1)); return;
+        case Input::NextTab: if (searching()) { switchTabKeepSearch(1); return; } openTab(cycleTab(tab, 1)); return;
         default: break;
         }
         if (!browsable(tab)) { handleItems(in); return; }
@@ -970,14 +983,13 @@ private:
         case Input::Up: homeRow = std::max(0, homeRow - 1); break;
         case Input::Down: homeRow = std::min(3, homeRow + 1); break;
         case Input::Left: if (homeRow == 1) homeCol = std::max(0, homeCol - 1); else if (homeRow == 3) homeCol3 = 0; break;
-        case Input::Right: if (homeRow == 1) homeCol = std::min(3, homeCol + 1); else if (homeRow == 3 && hasDonate()) homeCol3 = 1; break;
+        case Input::Right: if (homeRow == 1) homeCol = std::min(3, homeCol + 1); break;
         case Input::PrevTab: if (homeRow == 1) homeCol = std::max(0, homeCol - 1); break;
         case Input::NextTab: if (homeRow == 1) homeCol = std::min(3, homeCol + 1); break;
         case Input::Confirm:
             if (homeRow == 0) openTab(Tab::Kick);
-            else if (homeRow == 1) openTab(tileTab(homeCol));
+            else if (homeRow == 1) { if (homeCol == 0 && hasDonate()) screen = Screen::Donate; else openTab(tileTab(homeCol)); }
             else if (homeRow == 2) { if (listLocked()) requestReload(); else requestM3U(); }
-            else if (homeCol3 == 1 && hasDonate()) screen = Screen::Donate;
             else { screen = Screen::Help; helpScroll = 0; }
             break;
         default: break;
@@ -1163,7 +1175,8 @@ private:
         }
         // ---- Atalhos ----
         {
-            static const char *names[4] = {"KICK TV", "FILMES", "SÉRIES", "CANAIS"};
+            const bool donateTile = hasDonate();
+            const char *names[4] = {donateTile ? "APOIAR" : "KICK TV", "FILMES", "SÉRIES", "CANAIS"};
             const int gap = 19, tw = (fw - 3 * gap) / 4, ty = 560, th = 251, rad = 24;
             for (int i = 0; i < 4; i++) {
                 const int x = mx + i * (tw + gap);
@@ -1178,7 +1191,8 @@ private:
                 uiBand(r, K0 - 74, K0 + 10, T, B, sel ? 0x6653FC18 : 0x4053FC18, &clip);
                 const int cx = x + tw / 2;
                 unsigned ic = TEXT;
-                if (i == 0) uiKMark(r, cx - 47, ty + 36, 94, 96, GREEN);
+                if (i == 0 && donateTile) uiHeart(r, cx, ty + 84, 100, GREEN);
+                else if (i == 0) uiKMark(r, cx - 47, ty + 36, 94, 96, GREEN);
                 else if (i == 1) uiIconClapper(r, cx - 54, ty + 33, 108, ic, fill);
                 else if (i == 2) uiIconTvPlay(r, cx - 54, ty + 33, 108, ic, fill);
                 else uiIconTvRetro(r, cx - 54, ty + 33, 108, ic, fill);
@@ -1214,21 +1228,12 @@ private:
         // ---- Comandos e ajuda  |  Apoiar o app ----
         {
             const int y = 956, h = 68, rad = 18;                          // termina em 1024: nao encosta no rodape (status e dicas ficam em y~1043)
-            const int cw = hasDonate() ? fw * 62 / 100 : fw;
-            bool sel = homeRow == 3 && homeCol3 == 0;
+            const int cw = fw;
+            bool sel = homeRow == 3;
             if (sel) uiGlow(r, mx, y, cw, h, rad, GREEN, 14, 110, false);
             uiFrame(r, mx, y, cw, h, rad, sel ? 3 : 2, sel ? GREEN : CARD_LINE, sel ? SEL : CARD);
             uiHeavy(r, mx + 40, y + 21, "COMANDOS E AJUDA", TEXT, 26);
             if (cw > 900) uiText(r, mx + 400, y + 24, "Botoes, player, teclado, Kick TV", MUTED, 20);
-            if (hasDonate()) {
-                const int dx = mx + cw + 20, dw = fw - cw - 20;
-                bool ds = homeRow == 3 && homeCol3 == 1;
-                if (ds) uiGlow(r, dx, y, dw, h, rad, GREEN, 14, 110, false);
-                uiFrame(r, dx, y, dw, h, rad, ds ? 3 : 2, ds ? GREEN : CARD_LINE, ds ? SEL : CARD);
-                uiHeart(r, dx + 54, y + h / 2, 38, GREEN);
-                uiHeavy(r, dx + 100, y + 21, "APOIAR O APP", TEXT, 26);
-                uiText(r, dx + 100 + r.textWidth("APOIAR O APP", 26) + 24, y + 25, "QR Code Pix", MUTED, 20);
-            }
         }
     }
 
