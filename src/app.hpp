@@ -5,6 +5,12 @@
 #include "xtload.hpp"
 #include "xtmeta.hpp"
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <functional>
 #include <new>
@@ -56,7 +62,11 @@ struct App {
     XtState xt;
     XtreamAcct metaAcct;                                   // conta do painel para sinopse/nota (tambem com lista M3U comum)
     std::unordered_map<std::string, DetailMeta> metaCache; // "m:<id>" filmes, "s:<id>" series
+    bool prefetch = false;                                 // painel Xtream: baixa as categorias todas em segundo plano ao conectar
     explicit App(Platform &p) : pf(p) {}
+    ~App() { stopPrefetch(0.3); }
+    App(const App &) = delete;
+    App &operator=(const App &) = delete;
 
     void say(const std::string &m) { lastStatus = m; }
 
@@ -69,12 +79,14 @@ struct App {
     // Conexao com painel Xtream: guarda so as categorias (ver xtload.hpp).
     void useXtream(const XtreamAcct &a, Playlist &&p) {
         xt.active = true; xt.acct = a; metaAcct = a;
+        stopPrefetch(0.5);
         list = std::move(p);
+        startPrefetch();
         say("Painel IPTV: " + std::to_string(list.channelCats.size()) + " categorias de canais | " + std::to_string(list.movieCats.size()) +
             " de filmes | " + std::to_string(list.seriesCats.size()) + " de series");
     }
     void noteAccount(const std::string &url) { XtreamAcct a; if (xtreamParse(url, a)) metaAcct = a; else metaAcct = XtreamAcct(); }
-    void clearXtream() { xt = XtState(); metaCache.clear(); }
+    void clearXtream() { stopPrefetch(0.5); xt = XtState(); metaCache.clear(); }
 
     bool loadM3U(const std::string &url, bool useCache = false) {
         noteAccount(url);
@@ -156,6 +168,7 @@ struct App {
     static constexpr size_t kXtDropAt = 100000;   // acima disso (itens carregados) as categorias antigas sao descartadas ao abrir outra
 
     void dropLoaded() {
+        stopPrefetch(0.3);                                  // indices mudam: o catalogo em segundo plano para
         std::vector<Entry>().swap(list.channels); std::vector<Entry>().swap(list.movies);
         list.seriesTree.clear(); list.seriesInfo.clear(); list.seriesEpisodes = 0;
         for (auto *cv : {&list.channelCats, &list.movieCats, &list.seriesCats})
@@ -175,8 +188,15 @@ struct App {
         const char *action = t == Tab::Channels ? "get_live_streams" : t == Tab::Movies ? "get_vod_streams" : "get_series";
         std::string body;
         if (!pf.httpGet(xtreamApi(xt.acct, action, "category_id=" + c.id), body)) { say("Falha ao carregar a categoria (o painel nao respondeu)"); return false; }
+        if (!applyCategoryBody(t, c, body)) { say("Falha ao carregar a categoria (resposta invalida do painel)"); return false; }
+        say(c.name + ": " + std::to_string(c.size()) + " itens");
+        return true;
+    }
+
+    // Le o JSON da categoria e preenche a lista (so a thread principal mexe em 'list'). false = resposta que nao e uma lista.
+    bool applyCategoryBody(Tab t, Category &c, const std::string &body) {
         size_t f = body.find_first_not_of(" \t\r\n\xEF\xBB\xBF");
-        if (f == std::string::npos || body[f] != '[') { say("Falha ao carregar a categoria (resposta invalida do painel)"); return false; }
+        if (f == std::string::npos || body[f] != '[') return false;
         std::vector<uint32_t> items; std::vector<std::string> names;
         try {
             jsonForEach(body, [&](const Json &it) {
@@ -198,8 +218,89 @@ struct App {
         } catch (const std::bad_alloc &) { say("Memoria insuficiente para esta categoria"); }
         std::sort(names.begin(), names.end());
         c.items = std::move(items); c.series = std::move(names); c.loaded = true;
-        say(c.name + ": " + std::to_string(c.size()) + " itens");
         return true;
+    }
+
+    // ---------- Xtream: carrega o catalogo todo em segundo plano ----------
+    // Uma thread so baixa o JSON de cada categoria (rede); a thread principal e que le e preenche a lista (prefetchTick), um por vez e
+    // so no menu (nunca durante o video). Passou do limite de memoria: para e o resto abre por categoria, como antes.
+    static constexpr size_t kXtPrefetchCap = 80000;
+    struct PfItem { Tab t; int idx; std::string body; bool ok; };
+    struct PfShared { std::atomic<bool> stop{false}, finished{false}; std::mutex m; std::deque<PfItem> q; size_t total = 0, done = 0; };
+    std::shared_ptr<PfShared> pfs_;
+    std::thread pfTh_;
+
+    void startPrefetch() {
+        if (!prefetch || !xt.active) return;
+        struct Job { Tab t; int idx; std::string id; };
+        std::vector<Job> jobs;
+        size_t n[3] = {list.channelCats.size(), list.movieCats.size(), list.seriesCats.size()};
+        size_t mx = std::max(n[0], std::max(n[1], n[2]));
+        for (size_t i = 0; i < mx; i++) {                      // intercala as abas: a 1a categoria de cada uma chega logo
+            if (i < n[1]) jobs.push_back({Tab::Movies, (int)i, list.movieCats[i].id});
+            if (i < n[2]) jobs.push_back({Tab::Series, (int)i, list.seriesCats[i].id});
+            if (i < n[0]) jobs.push_back({Tab::Channels, (int)i, list.channelCats[i].id});
+        }
+        if (jobs.empty()) return;
+        auto sh = std::make_shared<PfShared>(); sh->total = jobs.size();
+        pfs_ = sh;
+        XtreamAcct acct = xt.acct; Platform *plat = &pf;
+        pfTh_ = std::thread([sh, jobs, acct, plat] {
+            for (const Job &j : jobs) {
+                while (!sh->stop) {                                // a thread principal e mais lenta que a rede: espera ela esvaziar a fila
+                    { std::lock_guard<std::mutex> l(sh->m); if (sh->q.size() < 3) break; }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                }
+                if (sh->stop) break;
+                const char *action = j.t == Tab::Channels ? "get_live_streams" : j.t == Tab::Movies ? "get_vod_streams" : "get_series";
+                PfItem it{j.t, j.idx, std::string(), false};
+                try { it.ok = plat->httpGet(xtreamApi(acct, action, "category_id=" + j.id), it.body); } catch (...) { it.ok = false; }
+                std::lock_guard<std::mutex> l(sh->m);
+                sh->q.push_back(std::move(it));
+            }
+            sh->finished = true;
+        });
+    }
+    void stopPrefetch(double waitSec = 0.3) {
+        if (!pfs_) return;
+        pfs_->stop = true;
+        auto until = std::chrono::steady_clock::now() + std::chrono::duration<double>(waitSec);
+        while (!pfs_->finished && std::chrono::steady_clock::now() < until) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        if (pfTh_.joinable()) { if (pfs_->finished) pfTh_.join(); else pfTh_.detach(); }
+        pfs_.reset();
+    }
+    bool prefetching() const { return pfs_ && !(pfs_->finished && pfs_->done >= pfs_->total); }
+    size_t loadedCount() const { return list.channels.size() + list.movies.size() + list.seriesInfo.size(); }
+    // Thread principal, uma vez por quadro no menu. true = algo novo na lista (redesenhar).
+    bool prefetchTick() {
+        if (!pfs_ || !xt.active) return false;
+        PfItem it; bool got = false;
+        { std::lock_guard<std::mutex> l(pfs_->m); if (!pfs_->q.empty()) { it = std::move(pfs_->q.front()); pfs_->q.pop_front(); got = true; } }
+        if (!got) {
+            if (pfs_->finished) {
+                bool empty; { std::lock_guard<std::mutex> l(pfs_->m); empty = pfs_->q.empty(); }      // (o lock tem que soltar ANTES do reset abaixo)
+                if (empty) { if (pfTh_.joinable()) pfTh_.join(); if (loadedCount() > 0) say("Catalogo carregado: " + summaryXt()); pfs_.reset(); return true; }
+            }
+            return false;
+        }
+        pfs_->done++;
+        std::vector<Category> &cv = it.t == Tab::Channels ? list.channelCats : it.t == Tab::Movies ? list.movieCats : list.seriesCats;
+        if (it.idx < 0 || it.idx >= (int)cv.size()) return false;
+        if (loadedCount() >= kXtPrefetchCap) {                  // memoria: o resto continua por categoria
+            pfs_->stop = true;
+            if (pfTh_.joinable()) pfTh_.detach();
+            say("Catalogo grande: " + summaryXt() + "  |  o resto abre por categoria");
+            pfs_.reset();
+            return true;
+        }
+        Category &c = cv[it.idx];
+        if (!c.unloaded()) return false;                        // o usuario ja abriu esta
+        if (!it.ok || !applyCategoryBody(it.t, c, it.body)) return false;   // falhou: continua lazy (abre ao apertar X)
+        say("Carregando catalogo... " + std::to_string(pfs_->done) + "/" + std::to_string(pfs_->total) + " categorias");
+        return true;
+    }
+    std::string summaryXt() const {
+        return std::to_string(list.channels.size()) + " canais | " + std::to_string(list.movies.size()) + " filmes | " + std::to_string(list.seriesInfo.size()) + " series";
     }
 
     // Episodios de uma serie do painel (get_series_info). true = tem episodios na arvore.
