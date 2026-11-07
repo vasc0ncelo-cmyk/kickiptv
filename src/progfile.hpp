@@ -282,6 +282,7 @@ public:
         wantA_ = a; wantB_ = b;
     }
     bool hasRange(uint64_t a, uint64_t b) { if (b > total_) b = total_; return a >= b || hasAll(a, b); }
+    uint64_t contigEnd(uint64_t x) { return firstMissing(x); }   // ate onde, a partir de x, o arquivo ja esta todo no disco
     uint64_t haveIn(uint64_t a, uint64_t b) {         // bytes ja gravados dentro de [a, b)
         std::lock_guard<std::mutex> l(m_);
         uint64_t n = 0;
