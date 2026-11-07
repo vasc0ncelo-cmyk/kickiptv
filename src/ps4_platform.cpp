@@ -704,6 +704,9 @@ struct KAvFrameInfo {
 typedef unsigned long KAvHandle;          // 64 bits (LP64); nao usa uintptr_t
 extern "C" {
 int sceSysmoduleLoadModule(uint16_t id);
+// "weak": se o stub do toolchain nao tiver o simbolo, o link NAO quebra (a chamada e pulada)
+int sceSysmoduleUnloadModule(uint16_t id) __attribute__((weak));
+int sceSysmoduleUnloadModuleInternal(uint32_t id) __attribute__((weak));
 KAvHandle sceAvPlayerInit(KAvInitData *init);
 int sceAvPlayerAddSource(KAvHandle h, const char *url);
 bool sceAvPlayerIsActive(KAvHandle h);
@@ -814,6 +817,7 @@ static uint64_t mp4DurationMsFromFile(const char *path) {
 static std::atomic<int> g_tearing{0};
 
 // Stop+Close em outra thread com limite de tempo: se o player travar, abandona o handle e segue em frente
+static bool g_avModLoaded = false, g_avLeaked = false;      // modulos do AvPlayer carregados / algum player ficou preso
 static double g_avClosedAt = 0;               // quando o ultimo AvPlayer foi fechado (0 = nenhum nesta sessao)
 static bool avStopClose(KAvHandle h, int timeoutMs = 5000) {
     if (!h) return true;
@@ -830,9 +834,30 @@ static bool avStopClose(KAvHandle h, int timeoutMs = 5000) {
         g_avClosedAt = clk();                  // o encerramento espera o AvPlayer "assentar" antes de matar o processo
         return true;
     }
+    g_avLeaked = true;                        // player preso: nao descarrega os modulos dele
     trace("av-close-TIMEOUT");                // o AvPlayer nao fechou: o decodificador fica preso e o PS4 pode dar erro ao sair
     t.detach();                               // vaza de proposito: a thread ainda usa 'done'
     return false;
+}
+
+// Descarrega os modulos do AvPlayer quando nao ha nenhum player aberto. Com eles carregados o PS4 nao consegue suspender/fechar o app
+// ao apertar PS (so dava erro CE-34878-0 DEPOIS de assistir algo; no menu sem video fechava normal). Sao recarregados no proximo video.
+static void unloadAvModules() {
+    if (!g_avModLoaded || g_avLeaked) return;
+    std::atomic<bool> *done = new std::atomic<bool>(false);
+    std::atomic<int> *rc = new std::atomic<int>[2]{{-1}, {-1}};
+    std::thread t([done, rc] {
+        if (sceSysmoduleUnloadModuleInternal) rc[0] = sceSysmoduleUnloadModuleInternal(0x80000050);
+        if (sceSysmoduleUnloadModule) rc[1] = sceSysmoduleUnloadModule(0x00A5);
+        done->store(true);
+    });
+    for (int i = 0; i < 300 && !done->load(); i++) sceKernelUsleep(5000);     // ate 1,5 s
+    if (done->load()) {
+        t.join();
+        char b[96]; snprintf(b, sizeof b, "avmod-descarregado str=0x%x av=0x%x", (unsigned)rc[0].load(), (unsigned)rc[1].load()); trace(b);
+        g_avModLoaded = false;
+        delete done; delete[] rc;
+    } else { trace("avmod-descarregar-TIMEOUT"); t.detach(); g_avLeaked = true; }
 }
 
 // Log interno do AvPlayer (capturado para o diagnostico) e contadores dos alocadores
@@ -1483,6 +1508,7 @@ struct Player {
         g_net.init();
         log.push_back("modulo AvPlayer (0xA5): " + hx8(sceSysmoduleLoadModule(0x00A5)));
         log.push_back("modulo AvPlayerStreaming: " + hx8(sceSysmoduleLoadModuleInternal(0x80000050)));
+        g_avModLoaded = true;
         bool isHls = url.find(".m3u8") != std::string::npos;
         useFeed = false; lastFeedSegs = 0; lastFeedSegWall = 0;
         // Filmes/series: URL com extensao (.mp4...) OU caminho /movie/ /series/ do painel (muitas vezes SEM extensao).
@@ -3382,6 +3408,7 @@ int main() {
                 try { g_feed.abort(); abortHf(); abortPf(); } catch (...) {}
                 // da um momento pro stop assincrono soltar o AvPlayer
                 Player::waitTeardown(0.35);
+                if (g_tearing.load() == 0) unloadAvModules();      // sem player aberto: solta os modulos do AvPlayer para o PS4 poder fechar o app
                 trace("tudo-parado");
                 dirty = true;
             };
@@ -3930,6 +3957,7 @@ int main() {
         double since = ts.tv_sec + ts.tv_nsec / 1e9 - g_avClosedAt;
         if (since < 1.2) { trace("espera-avplayer-assentar"); sceKernelUsleep((unsigned)((1.2 - since) * 1e6)); }
     }
+    if (g_tearing.load() == 0) unloadAvModules();
     try { if (!g_covers.shutdownFor(1.0)) trace("fim-capas-timeout"); } catch (...) {}
     try { g_feed.join(); } catch (...) {}
     try { auto r = takeHf(); if (r) r->join(); } catch (...) {}
