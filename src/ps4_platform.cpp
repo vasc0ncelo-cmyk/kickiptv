@@ -99,6 +99,14 @@ static void netErr(const char *what, int rc) {
 }
 static double monoSec() { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec + ts.tv_nsec / 1e9; }
 
+// User-Agent dos fluxos de video. Paineis IPTV recusam (ou nao entregam o video para) User-Agent de navegador; o do VLC e aceito por todos.
+// Kick (CDN propria) continua com o de navegador, que e o que ja funcionava la.
+static const char *streamUserAgent(const std::string &url) {
+    if (url.find("kick.com") != std::string::npos || url.find("live-video.net") != std::string::npos || url.find("kick-") != std::string::npos)
+        return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
+    return "VLC/3.0.20 LibVLC/3.0.20";
+}
+
 struct NetClient {
     std::vector<std::string> *log = nullptr;
     bool ready = false, failed = false;
@@ -188,7 +196,7 @@ struct NetClient {
         status = 0;
         if (!init()) return -1;
         uint64_t offset = useRange ? pos : 0;
-        const char *ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
+        const char *ua = streamUserAgent(url);
         traceHttp("tmpl");
         int tmpl = sceHttpCreateTemplate(httpCtx, ua, 1 /*HTTP/1.1*/, 1);
         if (tmpl < 0) return 0;
@@ -270,7 +278,7 @@ struct NetClient {
         std::lock_guard<std::recursive_mutex> lk(sessMx);
         closeSession(s);
         if (!init()) return false;
-        const char *ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
+        const char *ua = streamUserAgent(url);
         s.tmpl = sceHttpCreateTemplate(httpCtx, ua, 1 /*HTTP/1.1*/, 1);
         if (s.tmpl < 0) { netErr("template", s.tmpl); s.tmpl = -1; return false; }
         sceHttpsDisableOption(s.tmpl, 0x1F);
@@ -1072,7 +1080,7 @@ struct HlsFeeder {
             else if (okSince > 0 && nowSecF() - okSince > 20) errs = 0;
             if (r == 1 && segs.load() == 0 && ck.vPid < 0 && pos < 200000) { fail("o canal terminou sem video (HTTP " + std::to_string(st) + ")"); return; }
             if (++errs > 6) { fail("a transmissao parou (rede)"); return; }
-            setStatus("reconectando ao canal");
+            setStatus("reconectando ao canal (HTTP " + std::to_string(st) + ")");
             okSince = 0;
             sleepMs(1000, run);
         }
@@ -1146,7 +1154,7 @@ struct HlsFeeder {
                 if (!g_net.getKA(sess, hlsResolve(mediaUrl, sg.uri), seg, ss, 12u << 20) || ss < 200 || ss >= 300 || seg.empty()) {
                     g_net.closeSession(sess);
                     if (++errs > 25) { fail("segmento HTTP " + std::to_string(ss)); return; }
-                    setStatus("segmento falhou, renovando...");
+                    setStatus("segmento falhou (HTTP " + std::to_string(ss) + "), renovando...");
                     sleepMs(350, run);
                     break;
                 }
@@ -2763,7 +2771,7 @@ struct Player {
         uiText(r, 48, H - 22,
                isVod
                    ? "L2/R2 voltar/avancar (segure)   X pausa   UP seek   L1/R1 ep   △ Opcoes   O sair"
-                   : "X pausa   □ mudo   △ Opcoes   O sair",
+                   : (hasEpisodes() ? "L1/R1 canal anterior/proximo   X pausa   □ mudo   △ Opcoes   O sair" : "X pausa   □ mudo   △ Opcoes   O sair"),
                0xFF888888u, 15);
 
         // ---- MENU OPCOES (direita) ----
