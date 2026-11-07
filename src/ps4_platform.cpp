@@ -388,10 +388,12 @@ struct Ps4Platform : Platform {
     std::atomic<int> lastStatus_{0};
     bool httpGet(const std::string &url, std::string &body) override {
         int st = 0;
-        bool ok = g_net.get(url, body, st);
+        bool ok = g_net.get(url, body, st, 48u * 1024 * 1024);      // categorias de paineis grandes passam de 1,5 MB de JSON
         lastStatus_ = ok ? st : 0;
         return ok && st >= 200 && st < 300;
     }
+    std::function<void(const std::string &)> busyFn;             // desenha um quadro antes de uma consulta que bloqueia (categoria, detalhes)
+    void busy(const std::string &m) override { if (busyFn) busyFn(m); }
     int lastHttpStatus() override { return lastStatus_.load(); }
     // Kick: o Cloudflare da Kick recusa (403) clientes cujo "User-Agent" nao combina com o jeito de conectar. O PS4 conecta como o
     // navegador do proprio PS4, entao primeiro tentamos com o User-Agent dele (e Referer da Kick); depois com o do Chrome.
@@ -3102,6 +3104,7 @@ int main() {
         if (firstDraw) { firstDraw = false; trace("menu-flip-ok"); ui.dbg = nullptr; }
     };
     auto presentWait = [&]() { FbRenderer r(shadow, W, H); player.renderWaiting(r); flip(); };
+    pf.busyFn = [&](const std::string &) { presentMenu(); };
     auto presentKbd = [&]() { FbRenderer r(shadow, W, H); kbd.render(r, ((int)(nowSec() * 2)) % 2 == 0, ui.timeText, ui.dateText); flip(); };
     auto updateClock = [&]() -> bool {         // true se o minuto mudou
         struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
