@@ -42,6 +42,8 @@ struct XtFake : Platform {
         if (url.find("get_series_info&series_id=97") != std::string::npos) { body = "{\"info\":{},\"episodes\":[]}"; return true; }
         body = "[]"; return true;
     }
+    std::vector<std::string> epu; int epi = -1;
+    void setEpisodeList(const std::vector<std::string> &u, const std::vector<std::string> &, int i) override { epu = u; epi = i; }
     void play(const std::string &url, const std::string &) override { played = url; }
     void requestText(const std::string &) override {}
     std::string loadSetting(const std::string &k) override { return store[k]; }
@@ -83,6 +85,7 @@ int main() {
     ui.tab = Tab::Channels; ui.inItems = false; ui.catCur[1] = 1; ui.handle(Input::Confirm);
     assert(ui.itemCount() == 2 && a.list.channels[0].url == "http://180381.sbs/live/Dirce0273/Sar5438/501.ts" && a.list.channels[1].url.find("/502.ts") != std::string::npos);
     ui.handle(Input::Confirm); assert(x.played.find("/live/") != std::string::npos);
+    assert(x.epu.size() == 2 && x.epi == 0 && x.epu[0].find("/501.ts") != std::string::npos);   // L1/R1 no player: canal anterior/proximo
 
     // --- SERIES: serie -> (baixa episodios so agora) -> temporadas -> episodios ordenados ---
     ui.tab = Tab::Series; ui.inItems = false; ui.level = 0; ui.catCur[3] = 0;
@@ -119,6 +122,18 @@ int main() {
       assert(n >= 10 && n < 40 && y.count("get_vod_streams&category_id=11") == 1 && b.list.movieCats[1].loaded && !u.inItems);
       assert(!u.autoOpenTick() && y.count("get_vod_streams") == 1);          // so uma vez
       u.handle(Input::Confirm); assert(u.inItems && u.itemLabel(0) == "Titanic" && y.count("get_vod_streams") == 1); }
+    // --- catalogo todo em segundo plano: entra no app e as categorias ja estao carregadas ---
+    { XtFake y; App b(y); b.prefetch = true; UI u(b); assert(b.loadM3U(url));
+      int n = 0; while (b.prefetching() && n++ < 3000) { b.prefetchTick(); std::this_thread::sleep_for(std::chrono::milliseconds(2)); }
+      while (b.prefetchTick()) {}
+      assert(!b.prefetching() && b.list.movies.size() == 3 && b.list.channels.size() == 2 && b.list.seriesInfo.size() == 3);
+      for (auto &c : b.list.movieCats) assert(c.loaded && !c.unloaded());
+      u.screen = Screen::List; u.tab = Tab::Movies; u.handle(Input::Confirm);          // ja esta carregada: abre sem consultar o painel
+      assert(u.inItems && u.itemLabel(0) == "Duro de Matar" && y.count("get_vod_streams&category_id=10") == 1); }
+    // --- catalogo gigante: para no limite de memoria e o resto fica por categoria ---
+    { XtFake y; y.bigItems = 90000; App b(y); b.prefetch = true; assert(b.loadM3U(url));
+      int n = 0; while (b.prefetching() && n++ < 6000) { b.prefetchTick(); std::this_thread::sleep_for(std::chrono::milliseconds(2)); }
+      assert(b.list.movies.size() >= 90000 && b.list.movies.size() < 90010 + 5 && !b.prefetching()); }
     // --- painel recusa o login: avisa, nao baixa a lista gigante ---
     { XtFake y; y.authOk = false; App b(y); assert(!b.loadM3U(url) && b.lastStatus.find("recusou") != std::string::npos && !b.list.xtream && y.count("get.php") == 0); }
     // --- painel sem API / link M3U comum: usa a lista M3U ---
