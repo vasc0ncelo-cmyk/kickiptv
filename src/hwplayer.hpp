@@ -11,6 +11,9 @@ namespace hwplayer {
 // Gancho de diagnostico: a plataforma aponta para trace() (grava em /data/kickiptv.log). O menu mostra o ultimo passo se o app cair.
 extern void (*traceHook)(const char *);
 
+// Descarrega os modulos do AvPlayer via libSceSysmodule (resolvida em tempo de execucao). rc = retorno do sistema ou -1.
+void unloadSysmodules(int *rcInternal, int *rcAv);
+
 struct Frame {
     const uint8_t *nv12 = nullptr;
     int width  = 0;
