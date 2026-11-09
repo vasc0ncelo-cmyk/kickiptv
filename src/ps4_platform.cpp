@@ -847,8 +847,14 @@ static void unloadAvModules() {
     std::atomic<bool> *done = new std::atomic<bool>(false);
     std::atomic<int> *rc = new std::atomic<int>[2]{{-1}, {-1}};
     std::thread t([done, rc] {
-        if (sceSysmoduleUnloadModuleInternal) rc[0] = sceSysmoduleUnloadModuleInternal(0x80000050);
-        if (sceSysmoduleUnloadModule) rc[1] = sceSysmoduleUnloadModule(0x00A5);
+        if (sceSysmoduleUnloadModuleInternal || sceSysmoduleUnloadModule) {
+            if (sceSysmoduleUnloadModuleInternal) rc[0] = sceSysmoduleUnloadModuleInternal(0x80000050);
+            if (sceSysmoduleUnloadModule) rc[1] = sceSysmoduleUnloadModule(0x00A5);
+        } else {                                  // o stub nao tem as funcoes: acha em libSceSysmodule em tempo de execucao
+            int a = -1, b = -1;
+            hwplayer::unloadSysmodules(&a, &b);
+            rc[0] = a; rc[1] = b;
+        }
         done->store(true);
     });
     for (int i = 0; i < 300 && !done->load(); i++) sceKernelUsleep(5000);     // ate 1,5 s
