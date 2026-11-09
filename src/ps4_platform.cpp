@@ -959,6 +959,9 @@ static void blitNV12(const uint8_t *src, int sw, int sh, int pitch, int yRows, u
 
 // ---------- Audio: thread propria (sceAudioOutOutput bloqueia ate o buffer tocar) ----------
 // O AvPlayer entrega PCM S16 intercalado (1, 2 ou 6+ canais, 44.1k/48k). Aqui vira estereo 48k.
+// TESTE DE ISOLAMENTO (temporario): true = o video toca SEM abrir a porta de audio do PS4 (fica mudo, mas segue na velocidade certa).
+// Serve para descobrir se o erro CE-34878-0 ao fechar depois de assistir vem da porta de audio. Volte para false depois do teste.
+static const bool kTestNoAudioOut = true;
 struct AudioPump {
     std::thread th;
     std::atomic<bool> run{false};
@@ -1020,7 +1023,7 @@ struct AudioPump {
             if (!got) { sceKernelUsleep(3000); continue; }
             rate = sr; chans = ch;
             size_t frames = sz / (2 * ch);
-            if (port < 0 && nowS() >= nextOpen) {       // se a porta nao abrir, tenta de novo a cada 0,3 s (antes desistia para sempre: video sem som e acelerado)
+            if (!kTestNoAudioOut && port < 0 && nowS() >= nextOpen) {       // se a porta nao abrir, tenta de novo a cada 0,3 s (antes desistia para sempre: video sem som e acelerado)
                 int p = sceAudioOutOpen(0xFF /*usuario do sistema*/, ORBIS_AUDIO_OUT_PORT_TYPE_MAIN, 0, GRAIN, 48000, ORBIS_AUDIO_OUT_PARAM_FORMAT_S16_STEREO);
                 openRc = p;
                 if (p > 0) { port = p; state = 2; } else { state = -1; nextOpen = nowS() + 0.3; }
