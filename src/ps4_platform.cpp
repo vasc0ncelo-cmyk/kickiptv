@@ -3116,8 +3116,15 @@ int main() {
     boot.line("[1] video aberto");
 
     traceInit();
-    g_expFreeTex = fileExists("/data/kickiptv_x_free");
-    g_expNoUnload = fileExists("/data/kickiptv_x_nounload");
+    // aceita o nome com ou sem ".txt" (alguns gerenciadores de arquivo do celular colocam .txt sem mostrar)
+    auto expFlag = [](const char *name) {
+        char p[128];
+        static const char *ext[] = {"", ".txt", ".TXT", ".txt.txt"};
+        for (const char *e : ext) { snprintf(p, sizeof p, "/data/%s%s", name, e); if (fileExists(p)) return true; }
+        return false;
+    };
+    g_expFreeTex = expFlag("kickiptv_x_free");
+    g_expNoUnload = expFlag("kickiptv_x_nounload");
     { char b[96]; snprintf(b, sizeof b, "exp livra-textura=%d nao-descarrega=%d", (int)g_expFreeTex.load(), (int)g_expNoUnload.load()); trace(b); }
     trace("video-ok");
     PlaylistBuilder::maxBytes() = 1024u * 1024 * 1024;     // lista inteira (antes cortava em 90 MB); o heap do app e sem limite
