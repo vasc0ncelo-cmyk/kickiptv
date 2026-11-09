@@ -932,6 +932,10 @@ static void *avAllocTex(void *, uint32_t align, uint32_t size) {
 // O AvPlayer fecha em ~1 ms; se o hardware de video ainda estiver escrevendo nessa memoria quando ela e devolvida, o PS4 acusa queda.
 // Agora e escolhido SEM recompilar: crie o arquivo vazio /data/kickiptv_x_free no PS4 para devolver a memoria (false = vaza, como antes).
 static std::atomic<bool> g_expFreeTex{false};
+// Teste: crie o arquivo vazio /data/kickiptv_x_unmap para tirar a textura do espaco de enderecos (munmap) ANTES de devolver a memoria.
+// Hoje o app mapeia a memoria do decoder (sceKernelMapDirectMemory) mas nunca desfaz o mapeamento: ele fica preso no processo ate o PS4 suspende-lo.
+static std::atomic<bool> g_expUnmapTex{false};
+extern "C" int sceKernelMunmap(void *addr, size_t len);
 static void avFreeTex(void *, void *p) {
     TexMem tm;
     {
@@ -940,8 +944,9 @@ static void avFreeTex(void *, void *p) {
         if (it == g_tex.end()) return;
         tm = it->second; g_tex.erase(it);
     }
+    if (g_expUnmapTex.load()) sceKernelMunmap(p, tm.size);          // 1o desfaz o mapeamento...
     if (!g_expFreeTex.load()) return;
-    sceKernelReleaseDirectMemory(tm.phys, tm.size);
+    sceKernelReleaseDirectMemory(tm.phys, tm.size);                  // ...2o devolve a memoria fisica
 }
 
 // ---------- Copia rapida de memoria "write-combined" (a memoria de textura do decoder e type 3 = WC/GARLIC) ----------
@@ -3125,7 +3130,8 @@ int main() {
     };
     g_expFreeTex = expFlag("kickiptv_x_free");
     g_expNoUnload = expFlag("kickiptv_x_nounload");
-    { char b[96]; snprintf(b, sizeof b, "exp livra-textura=%d nao-descarrega=%d", (int)g_expFreeTex.load(), (int)g_expNoUnload.load()); trace(b); }
+    g_expUnmapTex = expFlag("kickiptv_x_unmap");
+    { char b[112]; snprintf(b, sizeof b, "exp livra-textura=%d nao-descarrega=%d desmapeia=%d", (int)g_expFreeTex.load(), (int)g_expNoUnload.load(), (int)g_expUnmapTex.load()); trace(b); }
     trace("video-ok");
     PlaylistBuilder::maxBytes() = 1024u * 1024 * 1024;     // lista inteira (antes cortava em 90 MB); o heap do app e sem limite
     Ps4Platform pf;
