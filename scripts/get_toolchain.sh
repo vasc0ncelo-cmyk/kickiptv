@@ -2,7 +2,14 @@
 # Baixa a ultima release do OpenOrbis e prepara sce_sys/sce_module a partir do sample hello_world.
 set -euo pipefail
 mkdir -p tc && cd tc
-gh release download --repo OpenOrbis/OpenOrbis-PS4-Toolchain --pattern '*' || { echo "Falha ao baixar release"; exit 1; }
+# O GitHub as vezes responde HTTP 500/502 por alguns segundos: tenta de novo (ate 5 vezes) antes de desistir.
+ok=0
+for i in 1 2 3 4 5; do
+  if gh release download --repo OpenOrbis/OpenOrbis-PS4-Toolchain --pattern '*' --clobber; then ok=1; break; fi
+  echo "Falha ao baixar release (tentativa $i de 5)"
+  [ "$i" -lt 5 ] && sleep $((i * 15))
+done
+[ "$ok" = 1 ] || { echo "Falha ao baixar release depois de 5 tentativas"; exit 1; }
 ls -la
 for f in *.tar.gz *.tgz; do [ -f "$f" ] && tar xzf "$f"; done
 for f in *.zip; do [ -f "$f" ] && unzip -q "$f"; done
