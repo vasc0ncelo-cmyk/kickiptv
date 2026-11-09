@@ -3007,6 +3007,9 @@ extern "C" int sceSystemServiceGetStatus(OrbisSystemServiceStatus *status);
 // Aviso que ja nasce aceso, ou que pisca logo ao abrir o video, nunca dispara; apertar PS de verdade (apagado -> aceso) dispara.
 // reset() e chamado ao abrir video / voltar ao menu: so volta a valer depois de 1,5 s calmo.
 static const bool kPsStopLogic = true;
+// false = ao ir para o inicio/fechar pelo menu do PS o app SO para video/rede/capas e espera o proprio sistema encerrar o processo
+// (como um app normal). true = o app tambem se encerra sozinho (_Exit). Nos testes, sair sozinho gerou CE-34878-0 ate no menu, sem video.
+static const bool kSelfExitOnBg = false;
 struct SysWatch {
     double calmSince = -1, lastOvlTrip = -1e9;     // lastOvlTrip: ultima vez que o menu do PS apareceu de verdade
     bool armed = false, tripped = false, ovl = false, bg = false;
@@ -3445,7 +3448,7 @@ int main() {
                 if (bg) {
                     // Ficou no inicio do PS4 por mais de 1 s: encerra sozinho (nada de esperar o sistema matar o processo).
                     // Sem esperar threads de rede (_Exit); o estado (lista/ultimo streamer) ja fica salvo em disco.
-                    if (seenFg && !keepBg) {              // sai NA HORA (sem esperar 1 s): o sistema esta fechando/trocando o app
+                    if (kSelfExitOnBg && seenFg && !keepBg) {              // sai NA HORA (sem esperar 1 s): o sistema esta fechando/trocando o app
                         { char b[96]; snprintf(b, sizeof b, "bg-saindo tearing=%d playerH=%d mode=%d", g_tearing.load(), (int)player.h, (int)mode); trace(b); }
                         // Nao da _Exit seco: depois de assistir video ainda existem threads (download do filme, rede, decodificador, capas).
                         // Matar o processo com elas rodando derruba o app (CE-34878-0). Vai para o encerramento limpo (junta todas as threads).
@@ -3453,6 +3456,7 @@ int main() {
                         sysExit = true;
                         break;
                     }
+                    { static bool said = false; if (!said) { said = true; trace("bg-aguardando-sistema"); } }
                     sceKernelUsleep(30000);
                     continue;
                 }
