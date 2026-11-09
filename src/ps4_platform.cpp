@@ -922,6 +922,9 @@ static void *avAllocTex(void *, uint32_t align, uint32_t size) {
     { std::lock_guard<std::mutex> l(g_texM); g_tex[addr] = {phys, sz}; }
     return addr;
 }
+// TESTE DE ISOLAMENTO (temporario): true = NAO devolve a memoria dos quadros de video ao sistema (vaza alguns MB por video).
+// O AvPlayer fecha em ~1 ms; se o hardware de video ainda estiver escrevendo nessa memoria quando ela e devolvida, o PS4 acusa queda.
+static const bool kTestLeakTex = true;
 static void avFreeTex(void *, void *p) {
     TexMem tm;
     {
@@ -930,6 +933,7 @@ static void avFreeTex(void *, void *p) {
         if (it == g_tex.end()) return;
         tm = it->second; g_tex.erase(it);
     }
+    if (kTestLeakTex) return;
     sceKernelReleaseDirectMemory(tm.phys, tm.size);
 }
 
@@ -961,7 +965,7 @@ static void blitNV12(const uint8_t *src, int sw, int sh, int pitch, int yRows, u
 // O AvPlayer entrega PCM S16 intercalado (1, 2 ou 6+ canais, 44.1k/48k). Aqui vira estereo 48k.
 // TESTE DE ISOLAMENTO (temporario): true = o video toca SEM abrir a porta de audio do PS4 (fica mudo, mas segue na velocidade certa).
 // Serve para descobrir se o erro CE-34878-0 ao fechar depois de assistir vem da porta de audio. Volte para false depois do teste.
-static const bool kTestNoAudioOut = true;
+static const bool kTestNoAudioOut = false;      // teste do audio: NAO era a causa (o erro continuou). Desligado.
 struct AudioPump {
     std::thread th;
     std::atomic<bool> run{false};
