@@ -845,8 +845,11 @@ static bool avStopClose(KAvHandle h, int timeoutMs = 5000) {
 
 // Descarrega os modulos do AvPlayer quando nao ha nenhum player aberto. Com eles carregados o PS4 nao consegue suspender/fechar o app
 // ao apertar PS (so dava erro CE-34878-0 DEPOIS de assistir algo; no menu sem video fechava normal). Sao recarregados no proximo video.
+// Teste: crie o arquivo vazio /data/kickiptv_x_nounload para NAO descarregar os modulos do AvPlayer ao parar tudo.
+static std::atomic<bool> g_expNoUnload{false};
 static void unloadAvModules() {
     if (!g_avModLoaded || g_avLeaked) return;
+    if (g_expNoUnload.load()) { trace("avmod-NAO-descarregado(teste)"); return; }
     std::atomic<bool> *done = new std::atomic<bool>(false);
     std::atomic<int> *rc = new std::atomic<int>[2]{{-1}, {-1}};
     std::thread t([done, rc] {
@@ -927,7 +930,8 @@ static void *avAllocTex(void *, uint32_t align, uint32_t size) {
 }
 // TESTE DE ISOLAMENTO (temporario): true = NAO devolve a memoria dos quadros de video ao sistema (vaza alguns MB por video).
 // O AvPlayer fecha em ~1 ms; se o hardware de video ainda estiver escrevendo nessa memoria quando ela e devolvida, o PS4 acusa queda.
-static const bool kTestLeakTex = true;
+// Agora e escolhido SEM recompilar: crie o arquivo vazio /data/kickiptv_x_free no PS4 para devolver a memoria (false = vaza, como antes).
+static std::atomic<bool> g_expFreeTex{false};
 static void avFreeTex(void *, void *p) {
     TexMem tm;
     {
@@ -936,7 +940,7 @@ static void avFreeTex(void *, void *p) {
         if (it == g_tex.end()) return;
         tm = it->second; g_tex.erase(it);
     }
-    if (kTestLeakTex) return;
+    if (!g_expFreeTex.load()) return;
     sceKernelReleaseDirectMemory(tm.phys, tm.size);
 }
 
@@ -3112,6 +3116,9 @@ int main() {
     boot.line("[1] video aberto");
 
     traceInit();
+    g_expFreeTex = fileExists("/data/kickiptv_x_free");
+    g_expNoUnload = fileExists("/data/kickiptv_x_nounload");
+    { char b[96]; snprintf(b, sizeof b, "exp livra-textura=%d nao-descarrega=%d", (int)g_expFreeTex.load(), (int)g_expNoUnload.load()); trace(b); }
     trace("video-ok");
     PlaylistBuilder::maxBytes() = 1024u * 1024 * 1024;     // lista inteira (antes cortava em 90 MB); o heap do app e sem limite
     Ps4Platform pf;
