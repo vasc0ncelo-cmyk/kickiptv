@@ -398,6 +398,24 @@ bool Player::pump(Frame &out) {
     return true;
 }
 
+// Descarrega os modulos do AvPlayer (AvPlayer 0xA5 e AvPlayerStreaming 0x80000050) procurando as funcoes de libSceSysmodule em tempo
+// de execucao (o stub do toolchain nao as exporta). -1 = nao achou/nao chamou; senao o retorno da funcao do sistema.
+void unloadSysmodules(int *rcInternal, int *rcAv) {
+    *rcInternal = -1; *rcAv = -1;
+    static const char *paths[] = {"/system/common/lib/libSceSysmodule.sprx", "libSceSysmodule.sprx", nullptr};
+    for (int i = 0; paths[i]; i++) {
+        int res = 0;
+        int mod = sceKernelLoadStartModule(paths[i], 0, nullptr, 0, nullptr, &res);
+        { char b[120]; snprintf(b, sizeof b, "hw-sysmodule %s mod=%d", paths[i], mod); T(b); }
+        if (mod < 0) continue;
+        void *p = nullptr;
+        if (resolveOne(mod, "sceSysmoduleUnloadModuleInternal", &p)) *rcInternal = ((int (*)(uint32_t))p)(0x80000050u);
+        p = nullptr;
+        if (resolveOne(mod, "sceSysmoduleUnloadModule", &p)) *rcAv = ((int (*)(uint16_t))p)((uint16_t)0x00A5);
+        return;
+    }
+}
+
 void Player::close() {
     if (created_ && g_api.loaded && g_api.deleteDecoder) g_api.deleteDecoder(&ctrl_);   // nao depende do layout do campo "handle"
     created_ = false; fbAligned_ = nullptr; fbSize_ = 0; decodes_ = 0;
