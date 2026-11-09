@@ -675,6 +675,9 @@ static void trace(const char *stage) {
     std::lock_guard<std::mutex> lk(g_traceMu);
     FILE *f = fopen("/data/kickiptv.log", "ab");
     if (f) { fwrite(stage, 1, strlen(stage), f); fwrite("\n", 1, 1, f); fclose(f); }
+    // Tambem sai no log do sistema (klog): a mesma captura que mostra "Suspend App"/"App Crash" passa a mostrar, na ordem certa,
+    // o que o app estava fazendo antes (menu-ps, av-close, avmod-descarregado...). Prefixo [kickiptv] para dar grep.
+    fprintf(stderr, "[kickiptv] %s\n", stage);
 }
 
 // ---------- AvPlayer (libSceAvPlayer) - structs proprias para nao depender do header ----------
