@@ -25,6 +25,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <signal.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include "hls.hpp"
 #include "nativeplayer.hpp"
 #include "streambuf.hpp"
@@ -671,8 +674,10 @@ static void traceInit() {
     if (f) { fwrite("inicio\n", 1, 7, f); fclose(f); }
 }
 static std::mutex g_traceMu;
+static char g_lastTrace[96];                        // ultimo passo gravado (o registrador de falha mostra qual era)
 static void trace(const char *stage) {
     std::lock_guard<std::mutex> lk(g_traceMu);
+    strncpy(g_lastTrace, stage, sizeof g_lastTrace - 1); g_lastTrace[sizeof g_lastTrace - 1] = 0;
     FILE *f = fopen("/data/kickiptv.log", "ab");
     if (f) { fwrite(stage, 1, strlen(stage), f); fwrite("\n", 1, 1, f); fclose(f); }
     // Tambem sai no log do sistema (klog): a mesma captura que mostra "Suspend App"/"App Crash" passa a mostrar, na ordem certa,
@@ -738,6 +743,55 @@ static const char *kKeepBgFile = "/data/kickiptv_keepbg";
 static std::atomic<int> g_jumpMode{0};                 // 1 = usa JumpToTime | 0 = desligado (definido na abertura do app)
 static bool fileExists(const char *p) { FILE *f = fopen(p, "rb"); if (!f) return false; fclose(f); return true; }
 static void touchFile(const char *p) { FILE *f = fopen(p, "wb"); if (f) { fwrite("1", 1, 1, f); fclose(f); } }
+
+// ---------- Registrador de falha ----------
+// Quando o app cai com SIGBUS/SIGSEGV (o erro 0xa0d0c00a do PS4 e SIGBUS), grava em /data/kickiptv_crash.log (e no klog) o ENDERECO onde caiu
+// (rip), os registradores e um trecho da pilha, mais o ultimo passo do log. Depois devolve a falha ao PS4 (relatorio normal de erro).
+// So usa write() com texto montado a mao (nada de malloc/stdio dentro do tratador). Offsets do ucontext/siginfo sao os do FreeBSD/amd64.
+static volatile int g_inCrash = 0;
+static int g_crashFd = -1;
+static void cwrite(const char *s) {
+    size_t n = 0; while (s[n]) n++;
+    if (g_crashFd >= 0) write(g_crashFd, s, n);
+    write(2, s, n);
+}
+static void chex(const char *label, unsigned long v) {
+    char b[56]; int p = 0;
+    while (label[p] && p < 16) { b[p] = label[p]; p++; }
+    if (p) b[p++] = '=';
+    b[p++] = '0'; b[p++] = 'x';
+    for (int i = 60; i >= 0; i -= 4) b[p++] = "0123456789abcdef"[(v >> i) & 15];
+    b[p++] = ' '; b[p] = 0; cwrite(b);
+}
+static void crashHandler(int sig, siginfo_t *si, void *uc) {
+    if (g_inCrash) _exit(1);                // falha dentro do proprio tratador: nao tenta de novo
+    g_inCrash = 1;
+    cwrite("[kickiptv] CRASH ");
+    chex("sig", (unsigned long)sig);
+    const unsigned char *s = (const unsigned char *)si, *u = (const unsigned char *)uc;
+    if (s) { chex("code", (unsigned long)*(const int *)(s + 8)); chex("addr", *(const unsigned long *)(s + 24)); }
+    if (u) {
+        chex("rip", *(const unsigned long *)(u + 176)); chex("rsp", *(const unsigned long *)(u + 200)); chex("rbp", *(const unsigned long *)(u + 88));
+        chex("rax", *(const unsigned long *)(u + 72)); chex("rdi", *(const unsigned long *)(u + 24)); chex("rsi", *(const unsigned long *)(u + 32));
+        chex("rdx", *(const unsigned long *)(u + 40)); chex("rcx", *(const unsigned long *)(u + 48));
+        chex("trap", (unsigned long)*(const int *)(u + 144)); chex("err", *(const unsigned long *)(u + 168));
+        unsigned long rsp = *(const unsigned long *)(u + 200);
+        if (rsp > 0x10000 && (rsp & 7) == 0) { cwrite("\n[kickiptv] STACK "); for (int i = 0; i < 24; i++) chex("", *(const unsigned long *)(rsp + (unsigned long)i * 8)); }
+    }
+    cwrite("\n[kickiptv] ultimo-passo: "); cwrite(g_lastTrace); cwrite("\n");
+    struct sigaction dfl; memset(&dfl, 0, sizeof dfl); dfl.sa_handler = SIG_DFL; sigemptyset(&dfl.sa_mask);
+    sigaction(sig, &dfl, NULL);             // volta ao padrao: a instrucao e reexecutada e o PS4 trata a queda como sempre
+    g_inCrash = 0;
+}
+static void installCrashLog() {
+    g_crashFd = open("/data/kickiptv_crash.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
+    struct sigaction sa; memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = crashHandler; sa.sa_flags = SA_SIGINFO; sigemptyset(&sa.sa_mask);
+    const int sigs[] = {SIGBUS, SIGSEGV, SIGILL, SIGFPE, SIGABRT};
+    int ok = 0; for (int sg : sigs) if (sigaction(sg, &sa, NULL) == 0) ok++;
+    char b[96]; snprintf(b, sizeof b, "crashlog fd=%d sigaction-ok=%d/5", g_crashFd, ok); trace(b);
+    if (g_crashFd >= 0) { cwrite("[kickiptv] --- app iniciado ---\n"); }
+}
 
 
 // Duracao do MP4 a partir do atomo mvhd (ms). 0 = nao achou.
@@ -3154,6 +3208,9 @@ int main() {
     // A leitura da Garlic e rapida (copyFromWC), so um pouco mais lenta no total.
     if (expFlag("kickiptv_x_garlic")) g_texType = 3;
     { char b[128]; snprintf(b, sizeof b, "exp livra-textura=%d nao-descarrega=%d desmapeia=%d garlic=%d", (int)g_expFreeTex.load(), (int)g_expNoUnload.load(), (int)g_expUnmapTex.load(), g_texType.load() == 3 ? 1 : 0); trace(b); }
+    installCrashLog();
+    // Teste do registrador: crie o arquivo vazio /data/kickiptv_x_crashtest. O app cai de proposito ao abrir (apague o arquivo depois!).
+    if (expFlag("kickiptv_x_crashtest")) { trace("crashtest-disparando"); *(volatile int *)16 = 1; }
     trace("video-ok");
     PlaylistBuilder::maxBytes() = 1024u * 1024 * 1024;     // lista inteira (antes cortava em 90 MB); o heap do app e sem limite
     Ps4Platform pf;
