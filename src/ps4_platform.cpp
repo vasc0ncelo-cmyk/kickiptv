@@ -822,6 +822,7 @@ static std::atomic<int> g_tearing{0};
 // Stop+Close em outra thread com limite de tempo: se o player travar, abandona o handle e segue em frente
 static bool g_avModLoaded = false, g_avLeaked = false;      // modulos do AvPlayer carregados / algum player ficou preso
 static double g_avClosedAt = 0;               // quando o ultimo AvPlayer foi fechado (0 = nenhum nesta sessao)
+static void texAfterClose();                 // definida mais abaixo (depende do alocador de texturas)
 static bool avStopClose(KAvHandle h, int timeoutMs = 5000) {
     if (!h) return true;
     std::atomic<bool> *done = new std::atomic<bool>(false);
@@ -834,6 +835,7 @@ static bool avStopClose(KAvHandle h, int timeoutMs = 5000) {
         t.join(); delete done;
         char b[96]; snprintf(b, sizeof b, "av-close-ok %dms stop=0x%x close=0x%x", (int)((clk() - t0) * 1000), (unsigned)rcs[0].load(), (unsigned)rcs[1].load()); trace(b);
         delete[] rcs;
+        texAfterClose();                       // registra quantas texturas o AvPlayer deixou vivas e (se pedido) limpa o resto
         g_avClosedAt = clk();                  // o encerramento espera o AvPlayer "assentar" antes de matar o processo
         return true;
     }
@@ -947,6 +949,22 @@ static void avFreeTex(void *, void *p) {
     if (g_expUnmapTex.load()) sceKernelMunmap(p, tm.size);          // 1o desfaz o mapeamento...
     if (!g_expFreeTex.load()) return;
     sceKernelReleaseDirectMemory(tm.phys, tm.size);                  // ...2o devolve a memoria fisica
+}
+// Chamado logo depois do sceAvPlayerClose. Os testes "free"/"unmap" so valem se o AvPlayer realmente chama avFreeTex ao fechar:
+// se sobrarem blocos vivos aqui, ele NAO chamou, e a limpeza abaixo e que faz o trabalho (com as mesmas flags).
+static void texAfterClose() {
+    std::vector<std::pair<void *, TexMem>> rest;
+    size_t live;
+    {
+        std::lock_guard<std::mutex> l(g_texM);
+        live = g_tex.size();
+        if (g_expFreeTex.load() || g_expUnmapTex.load()) { for (auto &kv : g_tex) rest.push_back(kv); g_tex.clear(); }
+    }
+    char b[128]; snprintf(b, sizeof b, "av-tex vivas=%zu alocadas=%d limpa=%zu", live, g_texN.load(), rest.size()); trace(b);
+    for (auto &kv : rest) {
+        if (g_expUnmapTex.load()) sceKernelMunmap(kv.first, kv.second.size);
+        if (g_expFreeTex.load()) sceKernelReleaseDirectMemory(kv.second.phys, kv.second.size);
+    }
 }
 
 // ---------- Copia rapida de memoria "write-combined" (a memoria de textura do decoder e type 3 = WC/GARLIC) ----------
