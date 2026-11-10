@@ -773,8 +773,11 @@ static void crashHandler(int sig, CrashSigInfo *si, void *uc) {
     g_inCrash = 1;
     cwrite("[kickiptv] CRASH ");
     chex("sig", (unsigned long)sig);
+    chex("si", (unsigned long)si); chex("uc", (unsigned long)uc);    // os ponteiros recebidos (se forem lixo, da para ver aqui)
     const unsigned char *s = (const unsigned char *)si, *u = (const unsigned char *)uc;
-    if (s) { chex("code", (unsigned long)*(const int *)(s + 8)); chex("addr", *(const unsigned long *)(s + 24)); }
+    // O log anterior parava logo depois de "sig=": o tratador caia lendo o siginfo (ponteiro invalido neste sistema) e nada mais era gravado.
+    // Agora cada campo e gravado NA HORA (write) e na ordem do mais util para o menos seguro: rip e registradores, pilha, ultimo passo
+    // e so por ultimo o siginfo. Se ele ainda derrubar o tratador, o que importa ja esta no arquivo.
     if (u) {
         chex("rip", *(const unsigned long *)(u + 176)); chex("rsp", *(const unsigned long *)(u + 200)); chex("rbp", *(const unsigned long *)(u + 88));
         chex("rax", *(const unsigned long *)(u + 72)); chex("rdi", *(const unsigned long *)(u + 24)); chex("rsi", *(const unsigned long *)(u + 32));
@@ -784,6 +787,7 @@ static void crashHandler(int sig, CrashSigInfo *si, void *uc) {
         if (rsp > 0x10000 && (rsp & 7) == 0) { cwrite("\n[kickiptv] STACK "); for (int i = 0; i < 24; i++) chex("", *(const unsigned long *)(rsp + (unsigned long)i * 8)); }
     }
     cwrite("\n[kickiptv] ultimo-passo: "); cwrite(g_lastTrace); cwrite("\n");
+    if (s) { chex("code", (unsigned long)*(const int *)(s + 8)); chex("addr", *(const unsigned long *)(s + 24)); cwrite("\n"); }
     struct sigaction dfl; memset(&dfl, 0, sizeof dfl); dfl.sa_handler = SIG_DFL; sigemptyset(&dfl.sa_mask);
     sigaction(sig, &dfl, NULL);             // volta ao padrao: a instrucao e reexecutada e o PS4 trata a queda como sempre
     g_inCrash = 0;
