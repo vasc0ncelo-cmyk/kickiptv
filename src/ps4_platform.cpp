@@ -3534,20 +3534,35 @@ int main() {
             static double bgSince = 0;
             // para TUDO de uma vez: video, capas, download da lista, alimentadores de rede
             auto stopAllNow = [&](const char *why) {
-                // Botao PS / suspender: PARA video+rede+AvPlayer e fica vivo.
-                // Quando o usuario der "Fechar aplicativo", o sistema mata o processo
-                // — se o AvPlayer ja estiver fechado, nao da CE-34878-0.
+                // Botao PS: PARAR TUDO de forma o mais SINCRONA possivel.
+                // O CE-34878-0 no "Fechar aplicativo" acontece quando o sistema mata o processo
+                // ainda com sceAvPlayer / audio / threads de rede vivos.
                 trace(why);
-                g_quitting = true;   // workers de rede/capas param enquanto suspenso
+                g_quitting = true;
                 try { g_feed.abort(); abortHf(); abortPf(); } catch (...) {}
                 try { g_covers.setPaused(true); } catch (...) {}
                 try { g_covers.cancelBackground(); } catch (...) {}
                 try { if (loader.stillAlive()) loader.cancel(0.05); } catch (...) {}
-                if (mode == Mode::Play || player.h || player.useNative) {
-                    try { player.stop(); } catch (...) {}
-                    mode = Mode::Menu;
-                }
-                Player::waitTeardown(0.45);   // um pouco mais: garante AvPlayer Close antes do usuario ir em Fechar
+
+                // Copia handles e zera ANTES do close (evita poll/uso paralelo)
+                KAvHandle hh = player.h, hh2 = player.h2;
+                player.h = 0; player.h2 = 0;
+                player.active = false;
+                player.chunkMode = false;
+                try { if (player.useNative) { player.native.close(); player.useNative = false; } } catch (...) {}
+                try { player.audio.retarget(0); } catch (...) {}
+                try { player.audio.stop(); } catch (...) {}   // fecha porta sceAudioOut JA
+
+                // Close AvPlayer NESTA thread (nao so detach): sistema pode matar antes da outra thread terminar
+                if (hh) { try { avStopClose(hh, 900); } catch (...) {} }
+                if (hh2) { try { avStopClose(hh2, 600); } catch (...) {} }
+                try { player.stop(); } catch (...) {}  // limpa resto (feeds/arquivos) em background
+                mode = Mode::Menu;
+
+                Player::waitTeardown(0.5);
+                // capas: corta workers
+                try { g_covers.shutdownFor(0.25); } catch (...) {}
+                // modulos AvPlayer: so se close ok
                 if (!g_avLeaked && g_avModLoaded) {
                     try { unloadAvModules(); } catch (...) {}
                 }
@@ -3571,8 +3586,26 @@ int main() {
                 // continua valendo so para a variavel 'bg' acima (que e o que podia fechar o app sozinho).
                 bool bgAny = trip && g_sys.bg;
                 bool stopReq = ovl || bgAny;
-                if (stopReq && !wasUi && !bg) { wasUi = true; stopAllNow(ovl ? "sistema-menu-ps" : "sistema-bg-parar"); }       // para tudo, mas o app continua aberto
-                if (!stopReq && wasUi) { wasUi = false; if (!bg) { g_quitting = false; g_covers.setPaused(false); dirty = true; } }
+                if (stopReq && !wasUi) {
+                    wasUi = true;
+                    stopAllNow(ovl ? "sistema-menu-ps" : "sistema-bg-parar");
+                }
+                // Enquanto menu PS ou background: NAO desenha, NAO le pad pesado — so espera
+                if (stopReq || bg || g_sys.ovl) {
+                    if (!bg && !g_sys.ovl && !g_sys.bg) { /* calm */ }
+                    else {
+                        sceKernelUsleep(30000);
+                        continue;   // nao chama present/flip com UI do sistema por cima (evita CE)
+                    }
+                }
+                if (!stopReq && wasUi) {
+                    wasUi = false;
+                    if (!bg) {
+                        g_quitting = false;
+                        try { /* capas podem voltar depois */ } catch (...) {}
+                        dirty = true;
+                    }
+                }
                 if (bg && !wasBg) {
                     bgSince = nowSec();
                     keepBg = fileExists(kKeepBgFile);
@@ -3590,14 +3623,10 @@ int main() {
                 wasBg = bg;
                 // Enquanto estiver em background: nao toca video nem redesenha menu pesado
                 if (bg) {
-                    // Botao PS / tela inicial: o app fica SUSPENSO (nao fecha sozinho).
-                    // Ja paramos video/rede no stopAllNow. Ficamos em loop leve ate:
-                    //  - usuario voltar pro app, ou
-                    //  - usuario dar Options > Fechar aplicativo (o SISTEMA mata o processo).
-                    // NAO chamar _Exit aqui: senão o app "fecha" so de apertar PS.
+                    // Suspenso na tela inicial. Recursos ja liberados no stopAllNow.
+                    // Options > Fechar aplicativo: o sistema mata o processo (sem AvPlayer = sem CE).
                     { static bool said = false; if (!said) { said = true; trace("bg-suspenso-ok"); } }
-                    // reforça parada se ainda sobrou player (ex.: abriu video e apertou PS na hora)
-                    if (player.h || player.useNative || mode == Mode::Play) {
+                    if (player.h || player.h2 || player.useNative) {
                         try { stopAllNow("sistema-bg-reforco"); } catch (...) {}
                     }
                     sceKernelUsleep(50000);
