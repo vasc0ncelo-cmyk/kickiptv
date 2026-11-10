@@ -43,6 +43,7 @@
 #include "tsmux.hpp"
 #include "blit.hpp"
 #include "padin.hpp"
+#include "stalldetect.hpp"
 #include <orbis/libkernel.h>
 #include <orbis/VideoOut.h>
 #include <orbis/UserService.h>
@@ -89,6 +90,20 @@ unsigned int sceLibcHeapExtendedAlloc = 1;
 size_t sceLibcHeapSize = 0xFFFFFFFFFFFFFFFFULL;   // SCE_LIBC_HEAP_SIZE_EXTENDED_ALLOC_NO_LIMIT
 }
 static void trace(const char *stage);   // (definida mais abaixo)
+
+// ===== SAIR DO APP: sempre PELO SISTEMA =====
+// Terminar com `return` do main, exit() ou _Exit() da CE-34878-0: essas rotinas acabam no syscall "exit" cru, que o sandbox do app recusa
+// (o klog mostra SIGSYS na thread principal logo depois do ultimo log do app). Os apps da Sony e os homebrews que fecham sem erro pedem
+// ao sistema: sceSystemServiceLoadExec("exit", NULL). (Fontes: PRs do sse-97/ps4-bt-audio e do FPKGi-OpenOrbis, que acharam o mesmo erro.)
+extern "C" int sceSystemServiceLoadExec(const char *path, char *const argv[]);
+static std::atomic<uint64_t> g_mainTick{0};      // sobe a cada volta do loop principal / quadro / passo do log (o vigia le isto)
+[[noreturn]] static void ps4Exit(const char *why) {
+    trace(why);
+    int rc = sceSystemServiceLoadExec("exit", NULL);
+    char b[64]; snprintf(b, sizeof b, "exit-pelo-sistema rc=%08X", (unsigned)rc); trace(b);
+    // O sistema recusou: NAO volta ao main nem usa _Exit (os dois dariam CE-34878-0). Fica parado; o menu do PS4 ainda consegue fechar o app.
+    for (;;) sceKernelUsleep(1000000);
+}
 // Marcadores finos do download da lista M3U: se o app fechar, a proxima abertura mostra o ULTIMO passo que foi gravado.
 static bool g_traceHttp = false;                 // so durante o download da lista M3U
 static const char *g_m3uTag = "m3u-t-";          // "t" = thread de rede | "s" = modo seguro (mesma thread)
@@ -676,6 +691,7 @@ static void traceInit() {
 static std::mutex g_traceMu;
 static char g_lastTrace[96];                        // ultimo passo gravado (o registrador de falha mostra qual era)
 static void trace(const char *stage) {
+    g_mainTick++;
     std::lock_guard<std::mutex> lk(g_traceMu);
     strncpy(g_lastTrace, stage, sizeof g_lastTrace - 1); g_lastTrace[sizeof g_lastTrace - 1] = 0;
     FILE *f = fopen("/data/kickiptv.log", "ab");
@@ -683,6 +699,24 @@ static void trace(const char *stage) {
     // Tambem sai no log do sistema (klog): a mesma captura que mostra "Suspend App"/"App Crash" passa a mostrar, na ordem certa,
     // o que o app estava fazendo antes (menu-ps, av-close, avmod-descarregado...). Prefixo [kickiptv] para dar grep.
     fprintf(stderr, "[kickiptv] %s\n", stage);
+}
+
+// ===== VIGIA: se a thread principal parar de andar (travada), registra onde e fecha o app PELO SISTEMA em vez de deixar o PS4 mostrar erro =====
+// Conta em segundos do proprio vigia; se o console dormiu/suspendeu (volta de repouso, menu do PS) o intervalo fica grande e nao conta.
+static void startWatchdog() {
+    static std::atomic<bool> started{false};
+    if (started.exchange(true)) return;
+    try {
+        std::thread([] {
+            StallDetector det;                                                      // (testado em tests/test_stalldetect.cpp)
+            for (;;) {
+                sceKernelUsleep(1000000);
+                int stale = det.step(g_mainTick.load(), monoSec());
+                if (stale == 30 || stale == 60 || stale == 90) { char b[96]; snprintf(b, sizeof b, "watchdog-main-parado-%ds ultimo=%s", stale, g_lastTrace); trace(b); g_mainTick--; }
+                if (stale >= 120) { char b[96]; snprintf(b, sizeof b, "watchdog-fechando ultimo=%s", g_lastTrace); ps4Exit(b); }
+            }
+        }).detach();
+    } catch (...) {}
 }
 
 // ---------- AvPlayer (libSceAvPlayer) - structs proprias para nao depender do header ----------
@@ -898,22 +932,18 @@ static bool avStopClose(KAvHandle h, int timeoutMs = 5000) {
     double t0 = clk();
     std::atomic<int> *rcs = new std::atomic<int>[2]{{0}, {0}};          // codigos de retorno (vaza se o player travar)
     std::thread t([h, done, rcs] { rcs[0] = sceAvPlayerStop(h); rcs[1] = sceAvPlayerClose(h); done->store(true); });
-    int limit = timeoutMs;
-    if (g_quitting.load()) limit = std::min(limit, 800);   // fechando app: nao espera 5s
-    for (int i = 0; i < limit / 5 && !done->load(); i++) sceKernelUsleep(5000);
+    for (int i = 0; i < timeoutMs / 5 && !done->load(); i++) sceKernelUsleep(5000);
     if (done->load()) {
         t.join(); delete done;
         char b[96]; snprintf(b, sizeof b, "av-close-ok %dms stop=0x%x close=0x%x", (int)((clk() - t0) * 1000), (unsigned)rcs[0].load(), (unsigned)rcs[1].load()); trace(b);
         delete[] rcs;
-        texAfterClose();
-        g_avClosedAt = clk();
+        texAfterClose();                       // registra quantas texturas o AvPlayer deixou vivas e (se pedido) limpa o resto
+        g_avClosedAt = clk();                  // o encerramento espera o AvPlayer "assentar" antes de matar o processo
         return true;
     }
-    // TIMEOUT: ainda assim marca closedAt para o fluxo de saida nao esperar 1.2s extra
-    g_avLeaked = true;
-    g_avClosedAt = clk();
-    trace("av-close-TIMEOUT");
-    t.detach();
+    g_avLeaked = true;                        // player preso: nao descarrega os modulos dele
+    trace("av-close-TIMEOUT");                // o AvPlayer nao fechou: o decodificador fica preso e o PS4 pode dar erro ao sair
+    t.detach();                               // vaza de proposito: a thread ainda usa 'done'
     return false;
 }
 
@@ -922,9 +952,7 @@ static bool avStopClose(KAvHandle h, int timeoutMs = 5000) {
 // Teste: crie o arquivo vazio /data/kickiptv_x_nounload para NAO descarregar os modulos do AvPlayer ao parar tudo.
 static std::atomic<bool> g_expNoUnload{false};
 static void unloadAvModules() {
-    if (!g_avModLoaded) return;
-    // se g_avLeaked e NAO estamos saindo, nao mexe (handle preso). Ao sair, tenta mesmo assim.
-    if (g_avLeaked && !g_quitting.load()) return;
+    if (!g_avModLoaded || g_avLeaked) return;
     if (g_expNoUnload.load()) { trace("avmod-NAO-descarregado(teste)"); return; }
     std::atomic<bool> *done = new std::atomic<bool>(false);
     std::atomic<int> *rc = new std::atomic<int>[2]{{-1}, {-1}};
@@ -939,8 +967,7 @@ static void unloadAvModules() {
         }
         done->store(true);
     });
-    int ulim = g_quitting.load() ? 80 : 300;   // saindo: max ~0,4 s
-    for (int i = 0; i < ulim && !done->load(); i++) sceKernelUsleep(5000);
+    for (int i = 0; i < 300 && !done->load(); i++) sceKernelUsleep(5000);     // ate 1,5 s
     if (done->load()) {
         t.join();
         char b[96]; snprintf(b, sizeof b, "avmod-descarregado str=0x%x av=0x%x", (unsigned)rc[0].load(), (unsigned)rc[1].load()); trace(b);
@@ -1008,10 +1035,10 @@ static void *avAllocTex(void *, uint32_t align, uint32_t size) {
 // TESTE DE ISOLAMENTO (temporario): true = NAO devolve a memoria dos quadros de video ao sistema (vaza alguns MB por video).
 // O AvPlayer fecha em ~1 ms; se o hardware de video ainda estiver escrevendo nessa memoria quando ela e devolvida, o PS4 acusa queda.
 // Agora e escolhido SEM recompilar: crie o arquivo vazio /data/kickiptv_x_free no PS4 para devolver a memoria (false = vaza, como antes).
-static std::atomic<bool> g_expFreeTex{true};   // true: libera DirectMemory das texturas do AvPlayer (evita CE ao fechar apos video)
+static std::atomic<bool> g_expFreeTex{false};
 // Teste: crie o arquivo vazio /data/kickiptv_x_unmap para tirar a textura do espaco de enderecos (munmap) ANTES de devolver a memoria.
 // Hoje o app mapeia a memoria do decoder (sceKernelMapDirectMemory) mas nunca desfaz o mapeamento: ele fica preso no processo ate o PS4 suspende-lo.
-static std::atomic<bool> g_expUnmapTex{true};  // true: munmap antes de ReleaseDirectMemory
+static std::atomic<bool> g_expUnmapTex{false};
 extern "C" int sceKernelMunmap(void *addr, size_t len);
 static void avFreeTex(void *, void *p) {
     TexMem tm;
@@ -3126,8 +3153,9 @@ extern "C" int sceSystemServiceGetStatus(OrbisSystemServiceStatus *status);
 // reset() e chamado ao abrir video / voltar ao menu: so volta a valer depois de 1,5 s calmo.
 static const bool kPsStopLogic = true;
 // false = ao ir para o inicio/fechar pelo menu do PS o app SO para video/rede/capas e espera o proprio sistema encerrar o processo
-// (como um app normal). true = o app tambem se encerra sozinho (_Exit). Nos testes, sair sozinho gerou CE-34878-0 ate no menu, sem video.
-static const bool kSelfExitOnBg = false;  // false = botao PS so suspende (como app normal). Fechar aplicativo = o SISTEMA mata o processo
+// (como um app normal). true = o app tambem se encerra sozinho, PELO SISTEMA (ps4Exit). Os testes antigos davam CE-34878-0 porque saiam por _Exit (syscall cru recusado).
+static const bool kSelfExitOnBg = true;                 // agora sai PELO SISTEMA (ps4Exit); antes usava _Exit, que dava CE-34878-0
+static const double kBgExitDelay = 1.5;                 // segundos estavel em segundo plano antes de sair (descarta aviso falso)
 struct SysWatch {
     double calmSince = -1, lastOvlTrip = -1e9;     // lastOvlTrip: ultima vez que o menu do PS apareceu de verdade
     bool armed = false, tripped = false, ovl = false, bg = false;
@@ -3198,16 +3226,16 @@ int main() {
 
     const int W = 1920, H = 1080;
     int vh = sceVideoOutOpen(ORBIS_VIDEO_USER_MAIN, 0, 0, NULL);
-    if (vh < 0) return 1;
+    if (vh < 0) ps4Exit("falha-videoout-open");
     const size_t bufSize = 0x800000, total = bufSize * 3;      // 3 telas em anel: nunca desenha na tela que esta aparecendo/aguardando o flip
     off_t phys = 0;
     void *mem = NULL;
-    if (sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), total, 0x200000, 3, &phys) < 0) return 2;
-    if (sceKernelMapDirectMemory(&mem, total, 0x33, 0, phys, 0x200000) < 0) return 3;
+    if (sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), total, 0x200000, 3, &phys) < 0) ps4Exit("falha-memoria-video");
+    if (sceKernelMapDirectMemory(&mem, total, 0x33, 0, phys, 0x200000) < 0) ps4Exit("falha-mapear-video");
     void *bufs[3] = {mem, (char *)mem + bufSize, (char *)mem + bufSize * 2};
     OrbisVideoOutBufferAttribute attr;
     sceVideoOutSetBufferAttribute(&attr, 0x80000000, ORBIS_VIDEO_OUT_TILING_MODE_LINEAR, ORBIS_VIDEO_OUT_ASPECT_RATIO_16_9, W, H, W);
-    if (sceVideoOutRegisterBuffers(vh, 0, bufs, 3, &attr) < 0) return 4;
+    if (sceVideoOutRegisterBuffers(vh, 0, bufs, 3, &attr) < 0) ps4Exit("falha-registrar-video");
     BootScreen boot;
     boot.init(bufs[0], W, H);                                       // so escrita: igual ao codigo original
     sceVideoOutSubmitFlip(vh, 0, ORBIS_VIDEO_OUT_FLIP_VSYNC, 0);
@@ -3221,11 +3249,9 @@ int main() {
         for (const char *e : ext) { snprintf(p, sizeof p, "/data/%s%s", name, e); if (fileExists(p)) return true; }
         return false;
     };
-    // Padrao: LIVRAR texturas (evita CE-34878-0 ao Fechar apos video).
-    // Arquivo /data/kickiptv_x_nofreetex desliga a limpeza (so pra teste).
-    g_expFreeTex = !expFlag("kickiptv_x_nofreetex");
-    g_expUnmapTex = !expFlag("kickiptv_x_nounmaptex");
+    g_expFreeTex = expFlag("kickiptv_x_free");
     g_expNoUnload = expFlag("kickiptv_x_nounload");
+    g_expUnmapTex = expFlag("kickiptv_x_unmap");
     // Teste: crie o arquivo vazio /data/kickiptv_x_garlic para o decoder escrever os quadros em memoria Garlic (GPU, tipo 3) em vez de Onion (tipo 0).
     // O erro do PS4 (0xa0d0c00a = SIGBUS) e acesso a memoria mapeada sem conteudo; a Onion mapeada com acesso de GPU (0x33) e a suspeita.
     // A leitura da Garlic e rapida (copyFromWC), so um pouco mais lenta no total.
@@ -3386,6 +3412,7 @@ int main() {
     trace("rascunho-ok");
     boot.line(shadow == shadowFallback.data() ? "[3] rascunho de tela: heap" : "[3] rascunho de tela: memoria direta");
     auto flip = [&]() {
+        g_mainTick++;
         memcpy(bufs[back], shadow, (size_t)W * H * 4);          // copia sequencial (rapida)
         sceVideoOutSubmitFlip(vh, back, ORBIS_VIDEO_OUT_FLIP_VSYNC, 0); back = (back + 1) % 3;
     };
@@ -3492,9 +3519,11 @@ int main() {
         trace(pb);
     }
     trace("loop-inicio");
+    startWatchdog();
     double hbNext = monoSec() + 60, hbT0 = monoSec();
     bool sysExit = false;                       // true = saindo porque o sistema (menu do PS) esta fechando/trocando o app
     for (;;) {
+        g_mainTick++;
         if (monoSec() >= hbNext) {                       // 1 linha por minuto no log (/data/kickiptv.log): ate quando o app estava vivo
             hbNext += 60;
             char hb[64]; snprintf(hb, sizeof hb, "vivo-%dmin", (int)((monoSec() - hbT0) / 60.0 + 0.5));
@@ -3536,69 +3565,22 @@ int main() {
             static double bgSince = 0;
             // para TUDO de uma vez: video, capas, download da lista, alimentadores de rede
             auto stopAllNow = [&](const char *why) {
-                // Apos VIDEO o CE-34878-0 vinha de: 2o AvPlayer (bHandle/h2), texturas DirectMemory
-                // nao liberadas, e stop so em thread detach. Aqui fecha TUDO na thread principal.
                 trace(why);
-                g_quitting = true;
-                // obriga limpar texturas do AvPlayer ao fechar (padrao era vazar = CE no kill)
-                g_expFreeTex = true;
-                g_expUnmapTex = true;
-
-                try { g_feed.abort(); abortHf(); abortPf(); } catch (...) {}
-                try { g_covers.setPaused(true); } catch (...) {}
+                g_quitting = true;                 // workers de rede/capas param
+                if (mode == Mode::Play || player.h) {
+                    try { player.stop(); } catch (...) {}
+                    mode = Mode::Menu;
+                }
+                g_covers.setPaused(true);
                 try { g_covers.cancelBackground(); } catch (...) {}
-                try { if (loader.stillAlive()) loader.cancel(0.05); } catch (...) {}
-
-                KAvHandle hh = player.h, hh2 = player.h2, hb = player.bHandle;
-                player.h = 0; player.h2 = 0; player.bHandle = 0;
-                player.bState = 0;
-                player.active = false;
-                player.chunkMode = false;
-                player.nextReady = false;
-                player.prepBusy = false;
-
-                try { if (player.useNative) { player.native.close(); player.useNative = false; } } catch (...) {}
-                try { player.audio.retarget(0); } catch (...) {}
-                try { player.audio.stop(); } catch (...) {}
-
-                // threads de prep/open do gapless: pede pra parar e espera um pouco
-                try {
-                    if (player.openTh.joinable()) {
-                        // nao da pra cancelar facil; se ainda estiver abrindo, espera no max 0.4s
-                        for (int i = 0; i < 20 && player.openTh.joinable() && player.bState == 1; i++)
-                            sceKernelUsleep(20000);
-                    }
-                } catch (...) {}
-
-                if (hh)  { try { avStopClose(hh,  1200); } catch (...) {} }
-                if (hh2) { try { avStopClose(hh2,  800); } catch (...) {} }
-                if (hb)  { try { avStopClose(hb,   800); } catch (...) {} }
-
-                // forca limpeza de texturas restantes (avFreeTex as vezes nao e chamado)
-                try { texAfterClose(); } catch (...) {}
-
-                try { player.stop(); } catch (...) {}
-                mode = Mode::Menu;
-
-                Player::waitTeardown(0.6);
-                try { g_covers.shutdownFor(0.3); } catch (...) {}
-
-                // espera minima pos-close do AvPlayer
-                if (g_avClosedAt > 0) {
-                    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-                    double since = ts.tv_sec + ts.tv_nsec / 1e9 - g_avClosedAt;
-                    if (since >= 0 && since < 0.35)
-                        sceKernelUsleep((unsigned)((0.35 - since) * 1e6));
+                if (loader.stillAlive()) {
+                    try { loader.cancel(0.05); } catch (...) {}
                 }
-
-                if (!g_avLeaked && g_avModLoaded) {
-                    try { unloadAvModules(); } catch (...) {}
-                }
-                // segunda passagem de texturas apos unload
-                try { texAfterClose(); } catch (...) {}
-
-                { char b[96]; snprintf(b, sizeof b, "tudo-parado leaked=%d mod=%d tex=%d",
-                    (int)g_avLeaked, (int)g_avModLoaded, (int)g_texN.load()); trace(b); }
+                try { g_feed.abort(); abortHf(); abortPf(); } catch (...) {}
+                // da um momento pro stop assincrono soltar o AvPlayer
+                Player::waitTeardown(0.35);
+                if (g_tearing.load() == 0) unloadAvModules();      // sem player aberto: solta os modulos do AvPlayer para o PS4 poder fechar o app
+                trace("tudo-parado");
                 dirty = true;
             };
             if (kPsStopLogic) {
@@ -3618,24 +3600,14 @@ int main() {
                 // continua valendo so para a variavel 'bg' acima (que e o que podia fechar o app sozinho).
                 bool bgAny = trip && g_sys.bg;
                 bool stopReq = ovl || bgAny;
-                if (stopReq && !wasUi) {
-                    wasUi = true;
-                    stopAllNow(ovl ? "sistema-menu-ps" : "sistema-bg-parar");
-                }
-                // Enquanto menu PS ou background: NAO desenha, NAO le pad pesado — so espera
-                if (stopReq || bg || g_sys.ovl) {
-                    if (!bg && !g_sys.ovl && !g_sys.bg) { /* calm */ }
-                    else {
-                        sceKernelUsleep(30000);
-                        continue;   // nao chama present/flip com UI do sistema por cima (evita CE)
-                    }
-                }
-                if (!stopReq && wasUi) {
-                    wasUi = false;
-                    if (!bg) {
-                        g_quitting = false;
-                        try { /* capas podem voltar depois */ } catch (...) {}
-                        dirty = true;
+                if (stopReq && !wasUi && !bg) { wasUi = true; stopAllNow(ovl ? "sistema-menu-ps" : "sistema-bg-parar"); }       // para tudo, mas o app continua aberto
+                if (!stopReq && wasUi) { wasUi = false; if (!bg) { g_quitting = false; g_covers.setPaused(false); dirty = true; } }
+                {   // "Fechar aplicativo" do PS4 manda o app ao segundo plano SEM passar pelo menu do PS (ovl=0): estavel por 1,5 s = sai PELO SISTEMA
+                    static double bgAnySince = -1; static bool keepAny = false;
+                    if (bgAny) { if (bgAnySince < 0) { bgAnySince = nowSec(); keepAny = fileExists(kKeepBgFile); } } else bgAnySince = -1;
+                    if (kSelfExitOnBg && bgAny && seenFg && !keepAny && bgAnySince > 0 && nowSec() - bgAnySince >= kBgExitDelay) {
+                        trace("bg-estavel-saindo");
+                        g_quitting = true; sysExit = true; break;
                     }
                 }
                 if (bg && !wasBg) {
@@ -3655,13 +3627,18 @@ int main() {
                 wasBg = bg;
                 // Enquanto estiver em background: nao toca video nem redesenha menu pesado
                 if (bg) {
-                    // Suspenso na tela inicial. Recursos ja liberados no stopAllNow.
-                    // Options > Fechar aplicativo: o sistema mata o processo (sem AvPlayer = sem CE).
-                    { static bool said = false; if (!said) { said = true; trace("bg-suspenso-ok"); } }
-                    if (player.h || player.h2 || player.useNative) {
-                        try { stopAllNow("sistema-bg-reforco"); } catch (...) {}
+                    // Ficou no inicio do PS4 por mais de 1 s: encerra sozinho (nada de esperar o sistema matar o processo).
+                    // Sem esperar threads de rede (_Exit); o estado (lista/ultimo streamer) ja fica salvo em disco.
+                    if (kSelfExitOnBg && seenFg && !keepBg && nowSec() - bgSince >= kBgExitDelay) {   // segundo plano estavel: o sistema esta fechando/trocando o app
+                        { char b[96]; snprintf(b, sizeof b, "bg-saindo tearing=%d playerH=%d mode=%d", g_tearing.load(), (int)player.h, (int)mode); trace(b); }
+                        // Nao da _Exit seco: depois de assistir video ainda existem threads (download do filme, rede, decodificador, capas).
+                        // Matar o processo com elas rodando derruba o app (CE-34878-0). Vai para o encerramento limpo (junta todas as threads).
+                        g_quitting = true;
+                        sysExit = true;
+                        break;
                     }
-                    sceKernelUsleep(50000);
+                    { static bool said = false; if (!said) { said = true; trace("bg-aguardando-sistema"); } }
+                    sceKernelUsleep(30000);
                     continue;
                 }
             }
@@ -4150,51 +4127,36 @@ int main() {
         if (dirty) { presentMenu(); dirty = false; static bool once = false; if (!once) { once = true; trace("menu-ok"); } }
         sceKernelUsleep(4000);                     // 4 ms: o controle e lido ~200x por segundo (antes 16 ms)
     }
-    // ---- encerramento (Fechar aplicativo / background / saida) ----
-    // CE-34878-0 ao "Fechar aplicativo":
-    //  (1) processo nao morre e sistema tenta matar com AvPlayer/threads vivos
-    //  (2) unload de modulo / close de VideoOut com handle ainda em uso
-    // Estrategia: corta rede, para player, espera pouco, _Exit. Sem join infinito.
-    trace(sysExit ? "saindo-sistema" : "saindo");
+    // ---- encerramento limpo (OPTIONS, background ou saida normal) ----
+    trace("saindo");
     g_quitting = true;
-
-    // Se travar em qualquer join/unload, some em 1.2s sem CE de hang
-    try { std::thread([] { sceKernelUsleep(1200000); _Exit(0); }).detach(); } catch (...) {}
-
+    // seguranca: se alguma thread nao largar a tempo, encerra de qualquer jeito em 2,5 s (o sistema nao espera mais que isso)
+    try { std::thread([] { sceKernelUsleep(3500000); ps4Exit("saida-forcada"); }).detach(); } catch (...) {}
+    try { pf.saveSetting("bgload", ""); } catch (...) {}
+    try { if (mode == Mode::Play || player.h) player.stop(); } catch (...) {}
     try { g_covers.setPaused(true); } catch (...) {}
     try { g_covers.cancelBackground(); } catch (...) {}
-    try { if (loader.stillAlive()) loader.cancel(0.05); } catch (...) {}
+    try { if (loader.stillAlive()) loader.cancel(0.4); } catch (...) {}
     try { g_feed.abort(); abortHf(); abortPf(); } catch (...) {}
-    try {
-        if (mode == Mode::Play || player.h || player.useNative)
-            player.stop();
-    } catch (...) {}
-
-    if (sysExit) {
-        // Fechar aplicativo: sistema ja tem a tela. Nao fecha pad/VideoOut.
-        Player::waitTeardown(0.35);
-        if (!g_avLeaked && g_avModLoaded) {
-            try { unloadAvModules(); } catch (...) {}
-        } else {
-            trace("saida-skip-unload-av");
-        }
-        try { pf.saveSetting("bgload", ""); } catch (...) {}
-        trace("fim-sistema");
-        _Exit(0);
+    Player::waitTeardown(0.8);
+    if (g_avClosedAt > 0) {                   // depois de fechar o AvPlayer, da tempo das threads internas dele (decodificador/audio) terminarem
+        struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+        double since = ts.tv_sec + ts.tv_nsec / 1e9 - g_avClosedAt;
+        if (since < 1.2) { trace("espera-avplayer-assentar"); sceKernelUsleep((unsigned)((1.2 - since) * 1e6)); }
     }
-
-    // Saida normal (dentro do app)
-    Player::waitTeardown(0.5);
-    if (!g_avLeaked && g_avModLoaded) {
-        try { unloadAvModules(); } catch (...) {}
-    }
-    try { g_covers.shutdownFor(0.2); } catch (...) {}
+    if (g_tearing.load() == 0) unloadAvModules();
+    try { if (!g_covers.shutdownFor(1.0)) trace("fim-capas-timeout"); } catch (...) {}
+    try { g_feed.join(); } catch (...) {}
+    try { auto r = takeHf(); if (r) r->join(); } catch (...) {}
+    try { auto r = takePf(); if (r) { r->join(); r.reset(); } } catch (...) {}
     try { removeVodFiles(); } catch (...) {}
     try { blit::pool().shutdown(); } catch (...) {}
-    try { if (pin.h >= 0) scePadClose(pin.h); } catch (...) {}
-    try { if (vh >= 0) sceVideoOutClose(vh); } catch (...) {}
-    try { pf.saveSetting("bgload", ""); } catch (...) {}
-    trace("fim");
-    _Exit(0);
-    return 0;
+    // fecha pad / video se ainda abertos
+    // Fechado pelo menu do PS: NAO fecha controle nem saida de video (o sistema ja tomou a tela; fechar agora pode derrubar o app)
+    if (!sysExit) {
+        try { if (pin.h >= 0) scePadClose(pin.h); } catch (...) {}
+        try { if (vh >= 0) sceVideoOutClose(vh); } catch (...) {}
+    }
+    // Sai PELO SISTEMA (nunca return/_Exit: CE-34878-0). Nao roda destrutores C++ de threads soltas (evita std::terminate).
+    ps4Exit("fim");
 }
