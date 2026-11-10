@@ -763,7 +763,12 @@ static void chex(const char *label, unsigned long v) {
     for (int i = 60; i >= 0; i -= 4) b[p++] = "0123456789abcdef"[(v >> i) & 15];
     b[p++] = ' '; b[p] = 0; cwrite(b);
 }
-static void crashHandler(int sig, siginfo_t *si, void *uc) {
+#if defined(__FreeBSD__)
+typedef struct __siginfo CrashSigInfo;      // o signal.h do toolchain do PS4 (estilo FreeBSD) declara o tratador assim
+#else
+typedef siginfo_t CrashSigInfo;
+#endif
+static void crashHandler(int sig, CrashSigInfo *si, void *uc) {
     if (g_inCrash) _exit(1);                // falha dentro do proprio tratador: nao tenta de novo
     g_inCrash = 1;
     cwrite("[kickiptv] CRASH ");
