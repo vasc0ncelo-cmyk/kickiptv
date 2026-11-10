@@ -1008,10 +1008,10 @@ static void *avAllocTex(void *, uint32_t align, uint32_t size) {
 // TESTE DE ISOLAMENTO (temporario): true = NAO devolve a memoria dos quadros de video ao sistema (vaza alguns MB por video).
 // O AvPlayer fecha em ~1 ms; se o hardware de video ainda estiver escrevendo nessa memoria quando ela e devolvida, o PS4 acusa queda.
 // Agora e escolhido SEM recompilar: crie o arquivo vazio /data/kickiptv_x_free no PS4 para devolver a memoria (false = vaza, como antes).
-static std::atomic<bool> g_expFreeTex{false};
+static std::atomic<bool> g_expFreeTex{true};   // true: libera DirectMemory das texturas do AvPlayer (evita CE ao fechar apos video)
 // Teste: crie o arquivo vazio /data/kickiptv_x_unmap para tirar a textura do espaco de enderecos (munmap) ANTES de devolver a memoria.
 // Hoje o app mapeia a memoria do decoder (sceKernelMapDirectMemory) mas nunca desfaz o mapeamento: ele fica preso no processo ate o PS4 suspende-lo.
-static std::atomic<bool> g_expUnmapTex{false};
+static std::atomic<bool> g_expUnmapTex{true};  // true: munmap antes de ReleaseDirectMemory
 extern "C" int sceKernelMunmap(void *addr, size_t len);
 static void avFreeTex(void *, void *p) {
     TexMem tm;
@@ -3221,9 +3221,11 @@ int main() {
         for (const char *e : ext) { snprintf(p, sizeof p, "/data/%s%s", name, e); if (fileExists(p)) return true; }
         return false;
     };
-    g_expFreeTex = expFlag("kickiptv_x_free");
+    // Padrao: LIVRAR texturas (evita CE-34878-0 ao Fechar apos video).
+    // Arquivo /data/kickiptv_x_nofreetex desliga a limpeza (so pra teste).
+    g_expFreeTex = !expFlag("kickiptv_x_nofreetex");
+    g_expUnmapTex = !expFlag("kickiptv_x_nounmaptex");
     g_expNoUnload = expFlag("kickiptv_x_nounload");
-    g_expUnmapTex = expFlag("kickiptv_x_unmap");
     // Teste: crie o arquivo vazio /data/kickiptv_x_garlic para o decoder escrever os quadros em memoria Garlic (GPU, tipo 3) em vez de Onion (tipo 0).
     // O erro do PS4 (0xa0d0c00a = SIGBUS) e acesso a memoria mapeada sem conteudo; a Onion mapeada com acesso de GPU (0x33) e a suspeita.
     // A leitura da Garlic e rapida (copyFromWC), so um pouco mais lenta no total.
@@ -3534,39 +3536,69 @@ int main() {
             static double bgSince = 0;
             // para TUDO de uma vez: video, capas, download da lista, alimentadores de rede
             auto stopAllNow = [&](const char *why) {
-                // Botao PS: PARAR TUDO de forma o mais SINCRONA possivel.
-                // O CE-34878-0 no "Fechar aplicativo" acontece quando o sistema mata o processo
-                // ainda com sceAvPlayer / audio / threads de rede vivos.
+                // Apos VIDEO o CE-34878-0 vinha de: 2o AvPlayer (bHandle/h2), texturas DirectMemory
+                // nao liberadas, e stop so em thread detach. Aqui fecha TUDO na thread principal.
                 trace(why);
                 g_quitting = true;
+                // obriga limpar texturas do AvPlayer ao fechar (padrao era vazar = CE no kill)
+                g_expFreeTex = true;
+                g_expUnmapTex = true;
+
                 try { g_feed.abort(); abortHf(); abortPf(); } catch (...) {}
                 try { g_covers.setPaused(true); } catch (...) {}
                 try { g_covers.cancelBackground(); } catch (...) {}
                 try { if (loader.stillAlive()) loader.cancel(0.05); } catch (...) {}
 
-                // Copia handles e zera ANTES do close (evita poll/uso paralelo)
-                KAvHandle hh = player.h, hh2 = player.h2;
-                player.h = 0; player.h2 = 0;
+                KAvHandle hh = player.h, hh2 = player.h2, hb = player.bHandle;
+                player.h = 0; player.h2 = 0; player.bHandle = 0;
+                player.bState = 0;
                 player.active = false;
                 player.chunkMode = false;
+                player.nextReady = false;
+                player.prepBusy = false;
+
                 try { if (player.useNative) { player.native.close(); player.useNative = false; } } catch (...) {}
                 try { player.audio.retarget(0); } catch (...) {}
-                try { player.audio.stop(); } catch (...) {}   // fecha porta sceAudioOut JA
+                try { player.audio.stop(); } catch (...) {}
 
-                // Close AvPlayer NESTA thread (nao so detach): sistema pode matar antes da outra thread terminar
-                if (hh) { try { avStopClose(hh, 900); } catch (...) {} }
-                if (hh2) { try { avStopClose(hh2, 600); } catch (...) {} }
-                try { player.stop(); } catch (...) {}  // limpa resto (feeds/arquivos) em background
+                // threads de prep/open do gapless: pede pra parar e espera um pouco
+                try {
+                    if (player.openTh.joinable()) {
+                        // nao da pra cancelar facil; se ainda estiver abrindo, espera no max 0.4s
+                        for (int i = 0; i < 20 && player.openTh.joinable() && player.bState == 1; i++)
+                            sceKernelUsleep(20000);
+                    }
+                } catch (...) {}
+
+                if (hh)  { try { avStopClose(hh,  1200); } catch (...) {} }
+                if (hh2) { try { avStopClose(hh2,  800); } catch (...) {} }
+                if (hb)  { try { avStopClose(hb,   800); } catch (...) {} }
+
+                // forca limpeza de texturas restantes (avFreeTex as vezes nao e chamado)
+                try { texAfterClose(); } catch (...) {}
+
+                try { player.stop(); } catch (...) {}
                 mode = Mode::Menu;
 
-                Player::waitTeardown(0.5);
-                // capas: corta workers
-                try { g_covers.shutdownFor(0.25); } catch (...) {}
-                // modulos AvPlayer: so se close ok
+                Player::waitTeardown(0.6);
+                try { g_covers.shutdownFor(0.3); } catch (...) {}
+
+                // espera minima pos-close do AvPlayer
+                if (g_avClosedAt > 0) {
+                    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+                    double since = ts.tv_sec + ts.tv_nsec / 1e9 - g_avClosedAt;
+                    if (since >= 0 && since < 0.35)
+                        sceKernelUsleep((unsigned)((0.35 - since) * 1e6));
+                }
+
                 if (!g_avLeaked && g_avModLoaded) {
                     try { unloadAvModules(); } catch (...) {}
                 }
-                trace("tudo-parado");
+                // segunda passagem de texturas apos unload
+                try { texAfterClose(); } catch (...) {}
+
+                { char b[96]; snprintf(b, sizeof b, "tudo-parado leaked=%d mod=%d tex=%d",
+                    (int)g_avLeaked, (int)g_avModLoaded, (int)g_texN.load()); trace(b); }
                 dirty = true;
             };
             if (kPsStopLogic) {
