@@ -3552,8 +3552,14 @@ int main() {
                     if (sig != lastSig) { lastSig = sig; char b[80]; snprintf(b, sizeof b, "sys ovl=%d bg=%d valido=%d play=%d armado=%d", g_sys.ovl, g_sys.bg, trip, mode == Mode::Play, g_sys.armed); trace(b); }
                 }
                 if (!bg) seenFg = true;                // so conta como "foi para o inicio" depois de ter estado na frente uma vez
-                if (ovl && !wasUi && !bg) { wasUi = true; stopAllNow("sistema-menu-ps"); }       // PS apertado: para tudo, mas o app continua aberto
-                if (!ovl && wasUi) { wasUi = false; if (!bg) { g_quitting = false; g_covers.setPaused(false); dirty = true; } }
+                // "Fechar aplicativo" manda o app para o segundo plano SEM passar pelo menu do PS (ovl=0): o log mostrava
+                // "sys ovl=0 bg=1 valido=1" e nada mais, o app seguia rodando video/rede/capas e o sistema matava o processo no meio (CE-34878-0).
+                // Para PARAR tudo basta o sistema dizer que foi pro segundo plano (parar e inofensivo: ao voltar, retoma). A guarda dos 20 s
+                // continua valendo so para a variavel 'bg' acima (que e o que podia fechar o app sozinho).
+                bool bgAny = trip && g_sys.bg;
+                bool stopReq = ovl || bgAny;
+                if (stopReq && !wasUi && !bg) { wasUi = true; stopAllNow(ovl ? "sistema-menu-ps" : "sistema-bg-parar"); }       // para tudo, mas o app continua aberto
+                if (!stopReq && wasUi) { wasUi = false; if (!bg) { g_quitting = false; g_covers.setPaused(false); dirty = true; } }
                 if (bg && !wasBg) {
                     bgSince = nowSec();
                     keepBg = fileExists(kKeepBgFile);
