@@ -3127,7 +3127,7 @@ extern "C" int sceSystemServiceGetStatus(OrbisSystemServiceStatus *status);
 static const bool kPsStopLogic = true;
 // false = ao ir para o inicio/fechar pelo menu do PS o app SO para video/rede/capas e espera o proprio sistema encerrar o processo
 // (como um app normal). true = o app tambem se encerra sozinho (_Exit). Nos testes, sair sozinho gerou CE-34878-0 ate no menu, sem video.
-static const bool kSelfExitOnBg = true;   // true = ao ir pro background (Fechar aplicativo) o app encerra limpo com _Exit
+static const bool kSelfExitOnBg = false;  // false = botao PS so suspende (como app normal). Fechar aplicativo = o SISTEMA mata o processo
 struct SysWatch {
     double calmSince = -1, lastOvlTrip = -1e9;     // lastOvlTrip: ultima vez que o menu do PS apareceu de verdade
     bool armed = false, tripped = false, ovl = false, bg = false;
@@ -3534,10 +3534,11 @@ int main() {
             static double bgSince = 0;
             // para TUDO de uma vez: video, capas, download da lista, alimentadores de rede
             auto stopAllNow = [&](const char *why) {
-                // Menu PS / background: corta tudo ja (quando o usuario confirmar Fechar, o AvPlayer
-                // ja esta em teardown — reduz CE-34878-0).
+                // Botao PS / suspender: PARA video+rede+AvPlayer e fica vivo.
+                // Quando o usuario der "Fechar aplicativo", o sistema mata o processo
+                // — se o AvPlayer ja estiver fechado, nao da CE-34878-0.
                 trace(why);
-                g_quitting = true;
+                g_quitting = true;   // workers de rede/capas param enquanto suspenso
                 try { g_feed.abort(); abortHf(); abortPf(); } catch (...) {}
                 try { g_covers.setPaused(true); } catch (...) {}
                 try { g_covers.cancelBackground(); } catch (...) {}
@@ -3546,8 +3547,7 @@ int main() {
                     try { player.stop(); } catch (...) {}
                     mode = Mode::Menu;
                 }
-                Player::waitTeardown(0.25);
-                // so descarrega se o close do AvPlayer terminou limpo
+                Player::waitTeardown(0.45);   // um pouco mais: garante AvPlayer Close antes do usuario ir em Fechar
                 if (!g_avLeaked && g_avModLoaded) {
                     try { unloadAvModules(); } catch (...) {}
                 }
@@ -3590,17 +3590,17 @@ int main() {
                 wasBg = bg;
                 // Enquanto estiver em background: nao toca video nem redesenha menu pesado
                 if (bg) {
-                    // Fechar aplicativo / troca de app: o sistema manda o processo pro background.
-                    // Se a gente NAO sair sozinho, o PS4 tenta matar o processo com AvPlayer/threads/rede
-                    // ainda vivos e estoura CE-34878-0 (nao fecha). Por isso: para tudo e _Exit limpo.
-                    if (seenFg && !keepBg) {
-                        { char b[96]; snprintf(b, sizeof b, "bg-saindo tearing=%d playerH=%d mode=%d", g_tearing.load(), (int)player.h, (int)mode); trace(b); }
-                        g_quitting = true;
-                        sysExit = true;
-                        break;   // vai pro bloco de encerramento limpo no fim do main
+                    // Botao PS / tela inicial: o app fica SUSPENSO (nao fecha sozinho).
+                    // Ja paramos video/rede no stopAllNow. Ficamos em loop leve ate:
+                    //  - usuario voltar pro app, ou
+                    //  - usuario dar Options > Fechar aplicativo (o SISTEMA mata o processo).
+                    // NAO chamar _Exit aqui: senão o app "fecha" so de apertar PS.
+                    { static bool said = false; if (!said) { said = true; trace("bg-suspenso-ok"); } }
+                    // reforça parada se ainda sobrou player (ex.: abriu video e apertou PS na hora)
+                    if (player.h || player.useNative || mode == Mode::Play) {
+                        try { stopAllNow("sistema-bg-reforco"); } catch (...) {}
                     }
-                    { static bool said = false; if (!said) { said = true; trace("bg-aguardando-sistema"); } }
-                    sceKernelUsleep(20000);
+                    sceKernelUsleep(50000);
                     continue;
                 }
             }
