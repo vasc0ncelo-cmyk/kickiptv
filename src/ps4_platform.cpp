@@ -3131,7 +3131,11 @@ int main() {
     g_expFreeTex = expFlag("kickiptv_x_free");
     g_expNoUnload = expFlag("kickiptv_x_nounload");
     g_expUnmapTex = expFlag("kickiptv_x_unmap");
-    { char b[112]; snprintf(b, sizeof b, "exp livra-textura=%d nao-descarrega=%d desmapeia=%d", (int)g_expFreeTex.load(), (int)g_expNoUnload.load(), (int)g_expUnmapTex.load()); trace(b); }
+    // Teste: crie o arquivo vazio /data/kickiptv_x_garlic para o decoder escrever os quadros em memoria Garlic (GPU, tipo 3) em vez de Onion (tipo 0).
+    // O erro do PS4 (0xa0d0c00a = SIGBUS) e acesso a memoria mapeada sem conteudo; a Onion mapeada com acesso de GPU (0x33) e a suspeita.
+    // A leitura da Garlic e rapida (copyFromWC), so um pouco mais lenta no total.
+    if (expFlag("kickiptv_x_garlic")) g_texType = 3;
+    { char b[128]; snprintf(b, sizeof b, "exp livra-textura=%d nao-descarrega=%d desmapeia=%d garlic=%d", (int)g_expFreeTex.load(), (int)g_expNoUnload.load(), (int)g_expUnmapTex.load(), g_texType.load() == 3 ? 1 : 0); trace(b); }
     trace("video-ok");
     PlaylistBuilder::maxBytes() = 1024u * 1024 * 1024;     // lista inteira (antes cortava em 90 MB); o heap do app e sem limite
     Ps4Platform pf;
