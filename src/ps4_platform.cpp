@@ -3534,21 +3534,23 @@ int main() {
             static double bgSince = 0;
             // para TUDO de uma vez: video, capas, download da lista, alimentadores de rede
             auto stopAllNow = [&](const char *why) {
+                // Menu PS / background: corta tudo ja (quando o usuario confirmar Fechar, o AvPlayer
+                // ja esta em teardown — reduz CE-34878-0).
                 trace(why);
-                g_quitting = true;                 // workers de rede/capas param
-                if (mode == Mode::Play || player.h) {
+                g_quitting = true;
+                try { g_feed.abort(); abortHf(); abortPf(); } catch (...) {}
+                try { g_covers.setPaused(true); } catch (...) {}
+                try { g_covers.cancelBackground(); } catch (...) {}
+                try { if (loader.stillAlive()) loader.cancel(0.05); } catch (...) {}
+                if (mode == Mode::Play || player.h || player.useNative) {
                     try { player.stop(); } catch (...) {}
                     mode = Mode::Menu;
                 }
-                g_covers.setPaused(true);
-                try { g_covers.cancelBackground(); } catch (...) {}
-                if (loader.stillAlive()) {
-                    try { loader.cancel(0.05); } catch (...) {}
+                Player::waitTeardown(0.25);
+                // so descarrega se o close do AvPlayer terminou limpo
+                if (!g_avLeaked && g_avModLoaded) {
+                    try { unloadAvModules(); } catch (...) {}
                 }
-                try { g_feed.abort(); abortHf(); abortPf(); } catch (...) {}
-                // da um momento pro stop assincrono soltar o AvPlayer
-                Player::waitTeardown(0.35);
-                try { unloadAvModules(); } catch (...) {}          // tenta sempre: modulos presos impedem Fechar aplicativo (CE-34878-0)
                 trace("tudo-parado");
                 dirty = true;
             };
@@ -4087,43 +4089,51 @@ int main() {
         if (dirty) { presentMenu(); dirty = false; static bool once = false; if (!once) { once = true; trace("menu-ok"); } }
         sceKernelUsleep(4000);                     // 4 ms: o controle e lido ~200x por segundo (antes 16 ms)
     }
-    // ---- encerramento limpo (Fechar aplicativo / background / saida) ----
-    // Critico: o menu "Fechar aplicativo" do PS4 so funciona se o processo MORRER sozinho
-    // depois de soltar AvPlayer/audio/rede. Se travar em join, o sistema da CE e nao fecha.
-    trace("saindo");
+    // ---- encerramento (Fechar aplicativo / background / saida) ----
+    // CE-34878-0 ao "Fechar aplicativo":
+    //  (1) processo nao morre e sistema tenta matar com AvPlayer/threads vivos
+    //  (2) unload de modulo / close de VideoOut com handle ainda em uso
+    // Estrategia: corta rede, para player, espera pouco, _Exit. Sem join infinito.
+    trace(sysExit ? "saindo-sistema" : "saindo");
     g_quitting = true;
-    // watchdog curto: 1.8s e mata o processo de qualquer jeito (sistema nao espera muito)
-    try { std::thread([] { sceKernelUsleep(1800000); trace("saida-forcada"); _Exit(0); }).detach(); } catch (...) {}
-    try { pf.saveSetting("bgload", ""); } catch (...) {}
-    // para player / rede o mais rapido possivel
+
+    // Se travar em qualquer join/unload, some em 1.2s sem CE de hang
+    try { std::thread([] { sceKernelUsleep(1200000); _Exit(0); }).detach(); } catch (...) {}
+
     try { g_covers.setPaused(true); } catch (...) {}
     try { g_covers.cancelBackground(); } catch (...) {}
-    try { if (loader.stillAlive()) loader.cancel(0.2); } catch (...) {}
+    try { if (loader.stillAlive()) loader.cancel(0.05); } catch (...) {}
     try { g_feed.abort(); abortHf(); abortPf(); } catch (...) {}
-    try { if (mode == Mode::Play || player.h || player.useNative) player.stop(); } catch (...) {}
-    // espera no maximo 0.6s as threads de stop (nao ficar preso em HTTP)
-    Player::waitTeardown(0.6);
-    // AvPlayer: espera minima so se fechou de verdade
-    if (g_avClosedAt > 0) {
-        struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-        double since = ts.tv_sec + ts.tv_nsec / 1e9 - g_avClosedAt;
-        if (since >= 0 && since < 0.4)
-            sceKernelUsleep((unsigned)((0.4 - since) * 1e6));
+    try {
+        if (mode == Mode::Play || player.h || player.useNative)
+            player.stop();
+    } catch (...) {}
+
+    if (sysExit) {
+        // Fechar aplicativo: sistema ja tem a tela. Nao fecha pad/VideoOut.
+        Player::waitTeardown(0.35);
+        if (!g_avLeaked && g_avModLoaded) {
+            try { unloadAvModules(); } catch (...) {}
+        } else {
+            trace("saida-skip-unload-av");
+        }
+        try { pf.saveSetting("bgload", ""); } catch (...) {}
+        trace("fim-sistema");
+        _Exit(0);
     }
-    // SEMPRE tenta descarregar modulos do AvPlayer (mesmo com tearing residual)
-    try { unloadAvModules(); } catch (...) {}
-    try { g_covers.shutdownFor(0.3); } catch (...) {}
-    // joins curtos — se travar, o watchdog _Exit mata
-    try { g_feed.abort(); } catch (...) {}
-    try { abortHf(); abortPf(); } catch (...) {}
+
+    // Saida normal (dentro do app)
+    Player::waitTeardown(0.5);
+    if (!g_avLeaked && g_avModLoaded) {
+        try { unloadAvModules(); } catch (...) {}
+    }
+    try { g_covers.shutdownFor(0.2); } catch (...) {}
     try { removeVodFiles(); } catch (...) {}
     try { blit::pool().shutdown(); } catch (...) {}
-    // Fechado pelo menu do PS: NAO mexe em pad/VideoOut (sistema ja tomou a tela)
-    if (!sysExit) {
-        try { if (pin.h >= 0) scePadClose(pin.h); } catch (...) {}
-        try { if (vh >= 0) sceVideoOutClose(vh); } catch (...) {}
-    }
+    try { if (pin.h >= 0) scePadClose(pin.h); } catch (...) {}
+    try { if (vh >= 0) sceVideoOutClose(vh); } catch (...) {}
+    try { pf.saveSetting("bgload", ""); } catch (...) {}
     trace("fim");
-    _Exit(0);   // sem destrutores C++ de threads destacadas
+    _Exit(0);
     return 0;
 }
