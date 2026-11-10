@@ -791,10 +791,15 @@ static void crashHandler(int sig, CrashSigInfo *si, void *uc) {
 static void installCrashLog() {
     g_crashFd = open("/data/kickiptv_crash.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
     struct sigaction sa; memset(&sa, 0, sizeof sa);
-    sa.sa_sigaction = crashHandler; sa.sa_flags = SA_SIGINFO; sigemptyset(&sa.sa_mask);
+    // O signal.h do toolchain define a macro 'sa_sigaction' quebrada (expande para um membro que nao existe) e nao compila.
+    // O tratador fica no PRIMEIRO campo da struct (union sa_handler/sa_sigaction, igual no FreeBSD/amd64): grava o ponteiro la direto.
+    static_assert(sizeof(void *) == 8, "amd64");
+    { void (*fp)(int, CrashSigInfo *, void *) = crashHandler; memcpy(&sa, &fp, sizeof fp); }
+    sa.sa_flags = SA_SIGINFO; sigemptyset(&sa.sa_mask);
     const int sigs[] = {SIGBUS, SIGSEGV, SIGILL, SIGFPE, SIGABRT};
     int ok = 0; for (int sg : sigs) if (sigaction(sg, &sa, NULL) == 0) ok++;
-    char b[96]; snprintf(b, sizeof b, "crashlog fd=%d sigaction-ok=%d/5", g_crashFd, ok); trace(b);
+    // hnd=1: o ponteiro gravado esta mesmo no campo sa_handler (confirma o layout da struct neste toolchain)
+    char b[96]; snprintf(b, sizeof b, "crashlog fd=%d sigaction-ok=%d/5 hnd=%d", g_crashFd, ok, (int)((void *)sa.sa_handler == (void *)crashHandler)); trace(b);
     if (g_crashFd >= 0) { cwrite("[kickiptv] --- app iniciado ---\n"); }
 }
 
