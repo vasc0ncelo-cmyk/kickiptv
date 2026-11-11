@@ -37,6 +37,7 @@ jobs:
           g++ -std=c++17 -pthread -o xt tests/test_xtream.cpp src/m3u.cpp && ./xt
           g++ -std=c++17 -o jt tests/test_json.cpp && ./jt
           g++ -std=c++17 -o qr tests/test_qrcode.cpp && ./qr
+          g++ -std=c++17 -o lb tests/test_livebuf.cpp && ./lb
       - name: Lista padrao do app (segredo LIST_URL, opcional)
         env:
           LIST_URL: ${{ secrets.LIST_URL }}
