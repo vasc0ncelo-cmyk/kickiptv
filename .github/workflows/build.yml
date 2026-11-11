@@ -14,7 +14,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Dependencias
-        run: sudo apt-get update && sudo apt-get install -y clang lld unzip
+        # O espelho de pacotes do Ubuntu as vezes some do DNS por alguns minutos ("Temporary failure resolving azure.archive.ubuntu.com").
+        # Entao: so instala o que falta e tenta de novo (ate 5 vezes) antes de desistir.
+        run: |
+          need=""
+          command -v clang++ >/dev/null || need="$need clang"
+          command -v ld.lld  >/dev/null || need="$need lld"
+          command -v unzip   >/dev/null || need="$need unzip"
+          if [ -z "$need" ]; then
+            echo "clang, lld e unzip ja estao no runner: nada para instalar"
+          else
+            ok=0
+            for i in 1 2 3 4 5; do
+              if sudo apt-get update -o Acquire::Retries=3 && sudo apt-get install -y -o Acquire::Retries=3 $need; then ok=1; break; fi
+              echo "apt falhou (tentativa $i de 5); esperando para tentar de novo"
+              sleep $((i * 20))
+            done
+            [ "$ok" = 1 ] || { echo "nao consegui instalar:$need"; exit 1; }
+          fi
+          clang++ --version | head -1; ld.lld --version | head -1
       - name: Testes da logica (PC)
         run: |
           g++ -std=c++17 -o t tests/test_app.cpp src/m3u.cpp && ./t
