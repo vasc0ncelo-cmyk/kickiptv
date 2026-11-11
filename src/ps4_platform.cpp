@@ -44,6 +44,7 @@
 #include "blit.hpp"
 #include "padin.hpp"
 #include "stalldetect.hpp"
+#include "livebuf.hpp"
 #include <orbis/libkernel.h>
 #include <orbis/VideoOut.h>
 #include <orbis/UserService.h>
@@ -1215,6 +1216,7 @@ struct HlsFeeder {
     std::thread th;
     std::atomic<bool> run{false};
     std::atomic<int> segs{0}, opens{0}, reads{0}, failed{0};
+    std::atomic<int> wantSegs{3};                // segmentos/pedacos do buffer inicial (o player espera juntar isso antes de tocar)
     std::atomic<bool> streamEnded{false};       // a playlist trouxe EXT-X-ENDLIST (a live acabou)
     unsigned long long localId = 0;             // numero PROPRIO de cada segmento baixado (so cresce). O numero da playlist pode voltar atras
                                                 // (streamer reconectou); antes o player ignorava para sempre os segmentos novos e a imagem congelava.
@@ -1241,6 +1243,7 @@ struct HlsFeeder {
         { std::lock_guard<std::mutex> l(rm); recent.clear(); }
         raw = rawTs;
         url = u; segs = opens = reads = failed = 0; localId = 0; streamEnded = false; run = true; discardBuf = false; dlMs = dlMsMax = 0; setStatus("iniciando");
+        wantSegs = rawTs ? livebuf::startSegs(2.0, livebuf::kStartSecsRaw) : 3;
         th = std::thread([this] { loop(); g_net.closeSession(sess); });
     }
     void abort() { run = false; sb.abort(); }                // libera leituras bloqueadas do player
@@ -1256,7 +1259,7 @@ struct HlsFeeder {
         ck.emit = [this](std::string &&c) {
             size_t sz = c.size();
             if (!discardBuf.load()) sb.append((const uint8_t *)c.data(), c.size());
-            { std::lock_guard<std::mutex> l(rm); recent.push_back({++localId, std::move(c)}); while (recent.size() > 8) recent.pop_front(); }
+            { std::lock_guard<std::mutex> l(rm); recent.push_back({++localId, std::move(c)}); while ((int)recent.size() > livebuf::kWindowRaw) recent.pop_front(); }
             segs++;
             setStatus("ao vivo: pedaco " + std::to_string(segs.load()) + " (" + std::to_string(sz / 1024) + " KB)");
         };
@@ -1323,7 +1326,10 @@ struct HlsFeeder {
             if (md.hasMap) { fail("fMP4 (EXT-X-MAP) ainda nao suportado"); return; }
             if (md.segs.empty()) { sleepMs(800, run); continue; }
             if (first) {
-                size_t k = md.segs.size() > 3 ? md.segs.size() - 3 : 0;
+                double sd = md.segs.back().dur > 0 ? md.segs.back().dur : md.target;
+                int want = livebuf::startSegs(sd, livebuf::kStartSecsHls, (int)md.segs.size());
+                wantSegs = want;
+                size_t k = md.segs.size() > (size_t)want ? md.segs.size() - want : 0;
                 next = md.segs[k].seq; first = false;
             } else if (md.segs.back().seq + 1 < next) {
                 size_t k = md.segs.size() > 2 ? md.segs.size() - 2 : 0;
@@ -1363,7 +1369,7 @@ struct HlsFeeder {
                 } else if (!discardBuf.load()) sb.append((const uint8_t *)seg.data(), seg.size());
                 { double dm = (nowSecF() - d0) * 1000.0; dlMs = dm; if (dm > dlMsMax.load()) dlMsMax = dm; }
                 lastSegDur = sg.dur;
-                { std::lock_guard<std::mutex> l(rm); recent.push_back({++localId, seg}); while (recent.size() > 6) recent.pop_front(); }
+                { std::lock_guard<std::mutex> l(rm); recent.push_back({++localId, seg}); while ((int)recent.size() > livebuf::kWindowHls) recent.pop_front(); }
                 next = sg.seq + 1; segs++; got = true; downloaded++;
                 setStatus("ao vivo: segmento " + std::to_string(sg.seq) + " (" + std::to_string(seg.size() / 1024) + " KB)");
             }
@@ -1549,7 +1555,7 @@ struct Player {
     int gatherChunk(bool first, std::string &out, unsigned long long &lastOut) {
         std::lock_guard<std::mutex> l(g_feed.rm);
         size_t from = 0;
-        if (first) from = g_feed.recent.size() > 3 ? g_feed.recent.size() - 3 : 0;
+        if (first) { size_t want = (size_t)std::max(3, g_feed.wantSegs.load()); from = g_feed.recent.size() > want ? g_feed.recent.size() - want : 0; }
         int n = 0; out.clear();
         for (size_t i = from; i < g_feed.recent.size(); i++) {
             if (!first && g_feed.recent[i].first <= lastSeq) continue;
@@ -1696,12 +1702,13 @@ struct Player {
             g_feed.start(tries[ti].first, tries[ti].second);
             const bool isKick = !kickSlug.empty();
             const int needSegs = isKick ? 3 : (tries[ti].second ? 1 : 2);
-            const int maxWait = (tries[ti].second && ti + 1 < tries.size()) ? 160 : (isKick ? 500 : 400);
-            for (int i = 0; i < maxWait && (int)g_feed.segs.load() < needSegs && !g_feed.failed.load(); i++) {
+            const int maxWait = isKick ? 500 : 400;
+            for (int i = 0; i < maxWait && (int)g_feed.segs.load() < std::max(needSegs, g_feed.wantSegs.load()) && !g_feed.failed.load(); i++) {
+                if (tries[ti].second && ti + 1 < tries.size() && i >= 160 && g_feed.segs.load() == 0) break;     // TS direto sem nenhum dado em 8 s: cai no HLS do painel
                 sceKernelUsleep(50000);
                 if (cancelCb && cancelCb()) { cancelled = true; break; }
                 if (i % 2 == 0) {
-                    waitNote = "Pre-buffer " + std::to_string(g_feed.segs.load()) + "/" + std::to_string(needSegs) + " segmentos...";
+                    waitNote = "Pre-buffer " + std::to_string(g_feed.segs.load()) + "/" + std::to_string(std::max(needSegs, g_feed.wantSegs.load())) + " segmentos...";
                     presentCb();
                 }
             }
@@ -2100,8 +2107,8 @@ struct Player {
         if (!inactive) inactiveSince = 0;
         int fresh = 0;
         { std::lock_guard<std::mutex> l(g_feed.rm); for (auto &sg : g_feed.recent) if (sg.first > lastSeq) fresh++; }
-        if (!prepBusy.load() && !nextReady.load() && fresh >= 2) startPrep();
         double el = chunkT0 > 0 ? t - chunkT0 : 0;
+        if (!prepBusy.load() && !nextReady.load() && livebuf::shouldPrep(fresh, curDur, el, convMs)) startPrep();
         bool ended = inactive && inactiveSince > 0 && (t - inactiveSince) > 0.35;
         bool overdue = curDur > 0 && chunkT0 > 0 && el > curDur + 0.8;
         bool stalled = lastFrameT > 0 && (t - lastFrameT) > 3.5;
