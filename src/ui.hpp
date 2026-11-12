@@ -203,6 +203,13 @@ inline float uiSdBox(float px, float py, float hx, float hy, float rad) {   // d
     return uiSqrt(mx * mx + my * my) + in - rad;
 }
 inline float uiClamp01(float v) { return v < 0 ? 0 : v > 1 ? 1 : v; }
+inline float uiSin(float a) {                    // seno por polinomio (o app nao usa libm)
+    const float PI = 3.14159265f, TP = 6.2831853f;
+    while (a > PI) a -= TP;
+    while (a < -PI) a += TP;
+    float a2 = a * a;
+    return a * (1.f - a2 / 6.f * (1.f - a2 / 20.f * (1.f - a2 / 42.f * (1.f - a2 / 72.f * (1.f - a2 / 110.f)))));
+}
 
 // brilho suave em volta de um retangulo arredondado
 // inside=false: o chamador desenha uma moldura/cor opaca por cima do retangulo logo em seguida, entao o miolo nao precisa do brilho.
@@ -447,6 +454,30 @@ struct UI {
     bool hasDonate() const { return !donateUrl.empty(); }
     int homeCol = 1;          // atalhos: 0 = apoiar (ou KICK TV se nao houver link), 1 = filmes, 2 = series, 3 = canais
     int helpScroll = 0;
+    // ---- animacao e sons ----
+    std::function<void(int)> sound;          // a plataforma toca: 0 navegar, 1 confirmar, 2 voltar, 3 erro, 4 trocar de aba
+    double animT = 0, fadeAt = -10;          // relogio da animacao e quando a tela mudou (fade-in)
+    int fadeSig = -1;
+    // Chamar antes de cada desenho. true = tem animacao rodando (o laco principal redesenha em ~25 quadros/s)
+    bool tick(double t) {
+        animT = t;
+        int sig = (int)screen * 64 + (int)tab * 8 + (inItems ? 1 : 0) + (detailSeries ? 2 : 0);
+        if (sig != fadeSig) { fadeSig = sig; fadeAt = t; }
+        return wantsFrames();
+    }
+    bool wantsFrames() const { return screen != Screen::Help && screen != Screen::Donate; }     // as telas de texto/QR ficam paradas
+    float pulse() const { return 0.78f + 0.22f * uiSin((float)animT * 4.4f); }                   // brilho do foco "respirando"
+    int pk(int base) const { return (int)(base * pulse()); }
+    unsigned navSig() const {                // muda sempre que o foco/tela muda (para saber se a tecla "andou")
+        unsigned h = (unsigned)screen * 131u + (unsigned)tab * 31u + (inItems ? 7u : 0u) + (unsigned)level * 3u;
+        for (int i = 0; i < 4; i++) h = h * 1315423911u + (unsigned)cursor[i] * 17u + (unsigned)catCur[i] * 5u;
+        h += (unsigned)homeRow * 977u + (unsigned)homeCol * 89u + (unsigned)homeCol3 * 13u + (unsigned)detailFocus * 271u + (unsigned)detailEpCur * 53u + (unsigned)detailSeasonIdx * 29u;
+        return h;
+    }
+    static bool looksLikeError(const std::string &m) {
+        return m.find("Falha") != std::string::npos || m.find("offline") != std::string::npos || m.find("inválido") != std::string::npos ||
+               m.find("não parece") != std::string::npos || m.find("Erro") != std::string::npos || m.find("erro") != std::string::npos;
+    }
     int cursor[4] = {0, 0, 0, 0};
     int scroll[4] = {0, 0, 0, 0};
     int level = 0;            // so Series: 0 series, 1 temporadas, 2 episodios
@@ -844,6 +875,18 @@ struct UI {
     }
 
     void handle(Input in) {
+        if (!sound) { handleImpl(in); return; }
+        const unsigned before = navSig();
+        const std::string st0 = app.lastStatus;
+        handleImpl(in);
+        const bool moved = navSig() != before;
+        if ((in == Input::PrevTab || in == Input::NextTab) && moved) sound(4);
+        else if (in == Input::Confirm) sound(1);
+        else if (in == Input::Back) { if (moved) sound(2); }
+        else if (moved) sound(0);
+        if (app.lastStatus != st0 && looksLikeError(app.lastStatus)) sound(3);
+    }
+    void handleImpl(Input in) {
         if (screen == Screen::Detail) { handleDetail(in); return; }
         if (screen == Screen::Donate) { if (in == Input::Back || in == Input::Confirm) screen = Screen::Home; return; }
         if (in == Input::Extra) { startSearch(); return; }
@@ -906,6 +949,27 @@ struct UI {
     // ---------- Desenho ----------
     std::function<void(const char *)> dbg;         // diagnostico: o PS4 grava cada etapa do 1o desenho (para achar onde cai)
 
+    // Efeitos "tecnologicos": linha de varredura, cantos de mira (HUD) e fade-in ao trocar de tela. Tudo leve (retangulos com alfa).
+    void drawFx(Renderer &r) const {
+        using namespace theme;
+        const int W = r.width(), H = r.height();
+        if (screen != Screen::Help && screen != Screen::Donate) {
+            float ph = (float)animT / 6.5f; ph -= (float)(int)ph;
+            int y = 130 + (int)(ph * (float)(H - 210));
+            for (int i = 0; i < 6; i++) r.fillRect(0, y - i * 3, W, 3, uiAlpha(GREEN, 24 - i * 4));
+            r.fillRect(0, y, W, 2, uiAlpha(GREEN, 40));
+            const int m = 20, L = 44, T = 3; const unsigned c = uiAlpha(GREEN, 95);
+            r.fillRect(m, m, L, T, c);               r.fillRect(m, m, T, L, c);
+            r.fillRect(W - m - L, m, L, T, c);       r.fillRect(W - m - T, m, T, L, c);
+            r.fillRect(m, H - m - T, L, T, c);       r.fillRect(m, H - m - L, T, L, c);
+            r.fillRect(W - m - L, H - m - T, L, T, c); r.fillRect(W - m - T, H - m - L, T, L, c);
+        }
+        const float age = (float)(animT - fadeAt);
+        if (age >= 0.f && age < 0.30f) {                                           // fade-in da tela nova
+            float k = 1.f - age / 0.30f; k *= k;
+            r.fillRect(0, 128, W, H - 128, ((unsigned)(int)(235.f * k) << 24) | 0x040707u);
+        }
+    }
     void render(Renderer &r) {
         if (dbg) dbg("ui-render-ini");
         backgroundCovers();
@@ -915,6 +979,7 @@ struct UI {
         if (screen == Screen::Home) renderHome(r); else if (screen == Screen::Help) renderHelp(r); else if (screen == Screen::Donate) renderDonate(r); else if (screen == Screen::Detail) renderDetail(r); else renderList(r);
         if (dbg) dbg("ui-corpo-ok");
         if (screen != Screen::Detail) renderFooter(r);      // a pagina de detalhes desenha o proprio rodape
+        drawFx(r);
         if (dbg) dbg("ui-rodape-ok");
     }
 
@@ -1086,6 +1151,7 @@ private:
             {{"△"}, "Buscar filmes, séries e canais"},
             {{"L1", "R1"}, "Trocar de aba (ou de temporada numa série)"},
             {{"L2", "R2"}, "Subir / descer uma página da lista"},
+            {{"R3"}, "Ligar ou desligar os sons do app"},
         }, nullptr);
         helpCard(r, gx + cw + gap, cy0, cw, ch, "FILME E SÉRIE", {
             {{"OPTIONS"}, "Mostrar ou esconder a barra de tempo"},
@@ -1133,7 +1199,7 @@ private:
         {
             const int x = mx, y = 169, w = fw, h = 337, rad = 28;
             bool on = homeRow == 0;
-            uiGlow(r, x, y, w, h, rad, GREEN, on ? 22 : 12, on ? 120 : 70, false);
+            uiGlow(r, x, y, w, h, rad, GREEN, on ? 22 : 12, pk(on ? 120 : 70), false);
             uiFrame(r, x, y, w, h, rad, 3, GREEN, 0xFF020302);
             UiClip clip{x + 3, y + 3, w - 6, h - 6, rad - 3};
             // KICK desfocado ao fundo
@@ -1182,7 +1248,7 @@ private:
                 const int x = mx + i * (tw + gap);
                 bool sel = homeRow == 1 && homeCol == i;
                 unsigned fill = sel ? SEL : CARD;
-                if (sel) uiGlow(r, x, ty, tw, th, rad, GREEN, 18, 130, false);
+                if (sel) uiGlow(r, x, ty, tw, th, rad, GREEN, 18, pk(130), false);
                 uiFrame(r, x, ty, tw, th, rad, sel ? 4 : 2, sel ? GREEN : CARD_LINE, fill);
                 UiClip clip{x + 2, ty + 2, tw - 4, th - 4, rad - 2};
                 const float K0 = (float)(x + tw + ty + th), T = (float)ty, B = (float)(ty + th);
@@ -1207,7 +1273,7 @@ private:
         {
             const int x = mx, y = 820, w = fw, h = 120, rad = 26;
             bool sel = homeRow == 2;
-            if (sel) uiGlow(r, x, y, w, h, rad, GREEN, 18, 130, false);
+            if (sel) uiGlow(r, x, y, w, h, rad, GREEN, 18, pk(130), false);
             uiFrame(r, x, y, w, h, rad, sel ? 4 : 2, sel ? GREEN : CARD_LINE, sel ? SEL : CARD);
             uiIconLink(r, x + 84, y + 70, 78, TEXT);
             r.fillRect(x + 170, y + 40, 3, 62, GREEN_DK);
@@ -1230,7 +1296,7 @@ private:
             const int y = 956, h = 68, rad = 18;                          // termina em 1024: nao encosta no rodape (status e dicas ficam em y~1043)
             const int cw = fw;
             bool sel = homeRow == 3;
-            if (sel) uiGlow(r, mx, y, cw, h, rad, GREEN, 14, 110, false);
+            if (sel) uiGlow(r, mx, y, cw, h, rad, GREEN, 14, pk(110), false);
             uiFrame(r, mx, y, cw, h, rad, sel ? 3 : 2, sel ? GREEN : CARD_LINE, sel ? SEL : CARD);
             uiHeavy(r, mx + 40, y + 21, "COMANDOS E AJUDA", TEXT, 26);
             if (cw > 900) uiText(r, mx + 400, y + 24, "Botoes, player, teclado, Kick TV", MUTED, 20);
@@ -1247,7 +1313,7 @@ private:
         QrCode q;
         const bool ok = qrEncode(donateUrl, q);
         const int quiet = 4, box = 640, bx = 150, by = 260;
-        uiGlow(r, bx, by, box, box, 28, GREEN, 18, 110, false);
+        uiGlow(r, bx, by, box, box, 28, GREEN, 18, pk(110), false);
         r.roundRect(bx, by, box, box, 28, 0xFFFFFFFF);
         if (ok) {
             int scale = box / (q.size + 2 * quiet);                // 4 modulos de margem branca (leitores pedem isso)
@@ -1314,7 +1380,7 @@ private:
             if (idx >= nc) break;
             int y = y0 + row * pitch;
             bool cur = idx == catCur[t], sel = cur && !inItems;
-            if (sel) uiGlow(r, cx, y, cw, rh, 18, GREEN, 10, 110, false);
+            if (sel) uiGlow(r, cx, y, cw, rh, 18, GREEN, 10, pk(110), false);
             uiFrame(r, cx, y, cw, rh, 18, sel ? 3 : 2, sel ? GREEN : CARD_LINE, sel ? SEL : CARD);
             if (cur && !sel) r.roundRect(cx + 10, y + 14, 5, rh - 28, 2, GREEN);        // categoria aberta (foco nos itens)
             std::string cnt = cats(tab)[idx].unloaded() ? std::string() : std::to_string(catSize(idx));
@@ -1341,7 +1407,7 @@ private:
                     int px = gx0 + col * (pw + gap), py = y0 + row * pitchY;
                     bool sel = inItems && idx == cursor[t];
                     const std::string label = itemLabel(idx);
-                    if (sel) uiGlow(r, px - 4, py - 4, pw + 8, ph + 8, 14, GREEN, 12, 120, false);
+                    if (sel) uiGlow(r, px - 4, py - 4, pw + 8, ph + 8, 14, GREEN, 12, pk(120), false);
                     if (sel) r.roundRect(px - 4, py - 4, pw + 8, ph + 8, 14, GREEN);      // moldura verde (fica atras do poster)
                     r.roundRect(px, py, pw, ph, 10, CHIP);
                     bool drew = false;
@@ -1382,7 +1448,7 @@ private:
             if (idx >= n) break;
             int y = y0 + row * pitch;
             bool sel = inItems && idx == cursor[t];
-            if (sel) uiGlow(r, x, y, rw, rh, 18, GREEN, 10, 110, false);
+            if (sel) uiGlow(r, x, y, rw, rh, 18, GREEN, 10, pk(110), false);
             uiFrame(r, x, y, rw, rh, 18, sel ? 3 : 2, sel ? GREEN : CARD_LINE, sel ? SEL : CARD);
             const std::string label = itemLabel(idx);
             std::string ic = "#";
@@ -1448,7 +1514,7 @@ private:
             if (idx >= n) break;
             int y = y0 + row * pitch;
             bool sel = idx == cursor[t];
-            if (sel) uiGlow(r, x, y, rw, rh, 18, GREEN, 10, 110, false);
+            if (sel) uiGlow(r, x, y, rw, rh, 18, GREEN, 10, pk(110), false);
             uiFrame(r, x, y, rw, rh, 18, sel ? 3 : 2, sel ? GREEN : CARD_LINE, sel ? SEL : CARD);
             const std::string label = itemLabel(idx);
             std::string ic = "#";
