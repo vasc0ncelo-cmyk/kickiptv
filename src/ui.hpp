@@ -8,6 +8,7 @@
 #include "qrcode.hpp"
 #include "sans.hpp"
 #include <algorithm>
+#include <map>
 #include <functional>
 #include <cctype>
 #include <cstdint>
@@ -226,6 +227,53 @@ inline void uiFrame(Renderer &r, int x, int y, int w, int h, int rad, int bw, un
     r.roundRect(x + bw, y + bw, w - 2 * bw, h - 2 * bw, rad > bw ? rad - bw : 0, fill);
 }
 
+// ---------- Animacao: curvas de suavizacao e camada com deslocamento/transparencia ----------
+inline float uiEaseOut(float t) { t = uiClamp01(t); float u = 1.f - t; return 1.f - u * u * u; }                    // desacelera no fim
+inline float uiEaseInOut(float t) { t = uiClamp01(t); return t < 0.5f ? 4.f * t * t * t : 1.f - (1.f - t) * (1.f - t) * (1.f - t) * 4.f; }
+inline float uiEaseBack(float t) {                                                                                   // passa um pouco do alvo e volta (efeito "pop")
+    t = uiClamp01(t); const float c1 = 1.70158f, c3 = c1 + 1.f, u = t - 1.f;
+    return 1.f + c3 * u * u * u + c1 * u * u;
+}
+inline float uiLerp(float a, float b, float t) { return a + (b - a) * t; }
+inline float uiFrac(float v) { return v - (float)(int)v; }
+
+// Desenha o que vier por cima de outro Renderer deslocado (dx, dy) e com opacidade 'a' (0..1). Usado nas transicoes de tela e na entrada
+// dos blocos do Inicio. Imagens nao tem alfa no Renderer: escurecem na direcao do preto (o fundo do app).
+struct UiFx : Renderer {
+    Renderer &r; int dx, dy; float a;
+    UiFx(Renderer &base, int x, int y, float alpha) : r(base), dx(x), dy(y), a(alpha < 0.f ? 0.f : alpha > 1.f ? 1.f : alpha) {}
+    unsigned mul(unsigned c) const { return a >= 0.998f ? c : uiAlpha(c, (int)(a * 255.f + 0.5f)); }
+    void dim(int x, int y, int w, int h) { if (a < 0.998f) r.fillRect(x + dx, y + dy, w, h, ((unsigned)((1.f - a) * 255.f) << 24) | 0x000000u); }
+    int width() const override { return r.width(); }
+    int height() const override { return r.height(); }
+    void fillRect(int x, int y, int w, int h, unsigned c) override { r.fillRect(x + dx, y + dy, w, h, mul(c)); }
+    void drawText(int x, int y, const std::string &t, unsigned c, int size) override { r.drawText(x + dx, y + dy, t, mul(c), size); }
+    void roundRect(int x, int y, int w, int h, int rad, unsigned c) override { r.roundRect(x + dx, y + dy, w, h, rad, mul(c)); }
+    void gradient(int x, int y, int w, int h, unsigned top, unsigned bot) override { r.gradient(x + dx, y + dy, w, h, mul(top), mul(bot)); }
+    void pixel(int x, int y, unsigned c) override { r.pixel(x + dx, y + dy, mul(c)); }
+    int textWidth(const std::string &t, int size) const override { return r.textWidth(t, size); }
+    bool blitBackground() override { return false; }
+    bool glow(int x, int y, int w, int h, int rad, unsigned color, int spread, int peak, bool inside) override {
+        return r.glow(x + dx, y + dy, w, h, rad, color, spread, (int)(peak * a), inside);
+    }
+    void blitImage(int x, int y, int dw, int dh, const uint32_t *px, int sw, int sh) override { r.blitImage(x + dx, y + dy, dw, dh, px, sw, sh); dim(x, y, dw, dh); }
+    void blitImageRound(int x, int y, int dw, int dh, const uint32_t *px, int sw, int sh, int rt, int rb) override {
+        r.blitImageRound(x + dx, y + dy, dw, dh, px, sw, sh, rt, rb); dim(x, y, dw, dh);
+    }
+    void drawMask(int x, int y, int w, int h, const uint8_t *m, unsigned c) override { r.drawMask(x + dx, y + dy, w, h, m, mul(c)); }
+};
+
+// Texto proporcional (Inter) posicionado pelo CENTRO vertical das maiusculas (cy) e nao pela linha de base.
+inline int uiSansL(Renderer &r, int x, int cy, const std::string &t, unsigned c, float size, int weight) {
+    return sansDraw(r, x, cy + (int)(size * 0.3635f + 0.5f), t, c, size, weight);
+}
+inline void uiSansC(Renderer &r, int cx, int cy, const std::string &t, unsigned c, float size, int weight) {
+    sansDraw(r, cx - sansWidth(t, size, weight) / 2, cy + (int)(size * 0.3635f + 0.5f), t, c, size, weight);
+}
+inline void uiSansR(Renderer &r, int rx, int cy, const std::string &t, unsigned c, float size, int weight) {
+    sansDraw(r, rx - sansWidth(t, size, weight), cy + (int)(size * 0.3635f + 0.5f), t, c, size, weight);
+}
+
 // ---------- Marca Kick (estilo pixel) ----------
 // "K" em blocos, caixa w x h
 inline void uiKMark(Renderer &r, int x, int y, int w, int h, unsigned c) {
@@ -392,6 +440,11 @@ inline void uiBackground(Renderer &r) {
     // faixa diagonal discreta no topo
     UiPt p[4] = {{1330, 0}, {1470, 0}, {1230, 190}, {1090, 190}};
     uiPoly(r, p, 4, 0x12FFFFFF);
+    // riscos de neon nos cantos de cima (como na referencia): halo largo + nucleo fino
+    static const struct { float k0, k1; unsigned c; } L[] = {
+        {95, 255, 0x0A53FC18}, {150, 200, 0x2253FC18}, {160, 178, 0xB053FC18}, {222, 232, 0x6053FC18}, {262, 266, 0x3053FC18}};
+    for (const auto &q : L) uiBand(r, q.k0, q.k1, 0, 300, q.c, nullptr);
+    for (const auto &q : L) uiBand(r, (float)W + 40 + (q.k0 - 95), (float)W + 40 + (q.k1 - 95), 0, 300, q.c, nullptr);
 }
 inline int uiLogoWidth(int h) { return uiWordWidth("KICK", h) + h * 3 / 8 + uiWordWidth("IPTV", h); }
 inline void uiLogo(Renderer &r, int x, int y, int h) {      // "KICK IPTV"
@@ -404,8 +457,8 @@ inline void uiTopRight(Renderer &r, const std::string &hhmm, const std::string &
     r.fillRect(W - 230, 46, 2, 69, 0xFF6A6A6A);
     if (!hhmm.empty()) {
         const int rx = W - 72;
-        uiHeavy(r, rx - r.textWidth(hhmm, 46), 44, hhmm, theme::TEXT, 46);
-        uiText(r, rx - r.textWidth(date, 22), 94, date, theme::SOFT, 22);
+        uiSansR(r, rx, 68, hhmm, theme::TEXT, 49.f, SansBold);
+        uiSansR(r, rx, 105, date, theme::SOFT, 22.f, SansMedium);
     }
 }
 inline void uiHeader(Renderer &r, const std::string &hhmm, const std::string &date) {
@@ -452,28 +505,51 @@ struct UI {
     int homeCol3 = 0;         // linha 3: 0 = comandos e ajuda, 1 = apoiar o app
     std::string donateUrl = kDonateUrl, donatePix = kDonatePixKey;   // (testes podem trocar)
     bool hasDonate() const { return !donateUrl.empty(); }
+    // carrossel do Inicio: slide 0 = Kick TV, os demais = filmes / series do catalogo (capas reais)
+    struct HeroItem { int kind = 0; std::string title, sub, logo, cat; uint32_t idx = 0; };   // kind: 0 Kick, 1 filme, 2 serie
+    std::vector<HeroItem> hero;
+    std::string heroSig, lastHeroKey_;
+    int heroCur = 0, heroFrom = 0;
+    double heroT0 = -10, heroAuto = 0;
     int homeCol = 1;          // atalhos: 0 = apoiar (ou KICK TV se nao houver link), 1 = filmes, 2 = series, 3 = canais
     int helpScroll = 0;
-    // ---- animacao e sons ----
-    std::function<void(int)> sound;          // a plataforma toca: 0 navegar, 1 confirmar, 2 voltar, 3 erro, 4 trocar de aba
-    double animT = 0, fadeAt = -10;          // relogio da animacao e quando a tela mudou (fade-in)
-    int fadeSig = -1;
-    // Chamar antes de cada desenho. true = tem animacao rodando (o laco principal redesenha em ~25 quadros/s)
+    // ---- animacao ----
+    // tick(t) roda uma vez por quadro; as telas leem animT/animDt e os valores suavizados (sm). Nenhum som: a interface e silenciosa.
+    double animT = 0, fadeAt = -10, lastTickT = 0;     // relogio, quando a tela mudou
+    float animDt = 0.033f;                              // duracao do ultimo quadro (s)
+    int fadeSig = -1, trDir = 1;                        // trDir: de que lado a tela nova entra (+1 direita, -1 esquerda)
+    int prevScreenDepth = 0, prevTabSig = 0;
+    std::map<int, float> smv_;                          // valores que "deslizam" ate o alvo (foco, brilho, escala)
+    static int screenDepth(Screen s) { return s == Screen::Home ? 0 : s == Screen::Detail ? 2 : 1; }
     bool tick(double t) {
-        animT = t;
-        int sig = (int)screen * 64 + (int)tab * 8 + (inItems ? 1 : 0) + (detailSeries ? 2 : 0);
-        if (sig != fadeSig) { fadeSig = sig; fadeAt = t; }
+        animDt = lastTickT > 0 ? (float)(t - lastTickT) : 0.033f;
+        if (animDt < 0.001f) animDt = 0.001f;
+        if (animDt > 0.1f) animDt = 0.1f;
+        lastTickT = t; animT = t;
+        int sig = (int)screen * 64 + (int)tab * 8 + (detailSeries ? 2 : 0);
+        if (sig != fadeSig) {
+            fadeSig = sig; fadeAt = t;
+            int d = screenDepth(screen), tb = (int)tab;
+            if (d != prevScreenDepth) trDir = d > prevScreenDepth ? 1 : -1;
+            else trDir = tb >= prevTabSig ? 1 : -1;
+            prevScreenDepth = d; prevTabSig = tb;
+            smv_.clear();                               // cada tela comeca com o foco ja no lugar (sem "voar" de outra tela)
+        }
+        heroTick(t);
         return wantsFrames();
     }
     bool wantsFrames() const { return screen != Screen::Help && screen != Screen::Donate; }     // as telas de texto/QR ficam paradas
-    float pulse() const { return 0.78f + 0.22f * uiSin((float)animT * 4.4f); }                   // brilho do foco "respirando"
-    int pk(int base) const { return (int)(base * pulse()); }
-    unsigned navSig() const {                // muda sempre que o foco/tela muda (para saber se a tecla "andou")
-        unsigned h = (unsigned)screen * 131u + (unsigned)tab * 31u + (inItems ? 7u : 0u) + (unsigned)level * 3u;
-        for (int i = 0; i < 4; i++) h = h * 1315423911u + (unsigned)cursor[i] * 17u + (unsigned)catCur[i] * 5u;
-        h += (unsigned)homeRow * 977u + (unsigned)homeCol * 89u + (unsigned)homeCol3 * 13u + (unsigned)detailFocus * 271u + (unsigned)detailEpCur * 53u + (unsigned)detailSeasonIdx * 29u;
-        return h;
+    // valor que desliza ate 'target' (velocidade em 1/s). Na 1a vez ja nasce no alvo.
+    float sm(int id, float target, float speed = 14.f) {
+        auto it = smv_.find(id);
+        if (it == smv_.end()) { smv_[id] = target; return target; }
+        float x = speed * animDt, k = x / (1.f + x + 0.5f * x * x);                             // ~ 1 - e^-x
+        it->second += (target - it->second) * k;
+        if (uiAbs(target - it->second) < 0.003f) it->second = target;
+        return it->second;
     }
+    float pulse() const { return 0.80f + 0.20f * uiSin((float)animT * 3.2f); }                   // brilho do foco "respirando" (suave)
+    int pk(int base) const { return (int)(base * pulse()); }
     static bool looksLikeError(const std::string &m) {
         return m.find("Falha") != std::string::npos || m.find("offline") != std::string::npos || m.find("inválido") != std::string::npos ||
                m.find("não parece") != std::string::npos || m.find("Erro") != std::string::npos || m.find("erro") != std::string::npos;
@@ -874,18 +950,7 @@ struct UI {
         return "";
     }
 
-    void handle(Input in) {
-        if (!sound) { handleImpl(in); return; }
-        const unsigned before = navSig();
-        const std::string st0 = app.lastStatus;
-        handleImpl(in);
-        const bool moved = navSig() != before;
-        if ((in == Input::PrevTab || in == Input::NextTab) && moved) sound(4);
-        else if (in == Input::Confirm) sound(1);
-        else if (in == Input::Back) { if (moved) sound(2); }
-        else if (moved) sound(0);
-        if (app.lastStatus != st0 && looksLikeError(app.lastStatus)) sound(3);
-    }
+    void handle(Input in) { handleImpl(in); }
     void handleImpl(Input in) {
         if (screen == Screen::Detail) { handleDetail(in); return; }
         if (screen == Screen::Donate) { if (in == Input::Back || in == Input::Confirm) screen = Screen::Home; return; }
@@ -949,37 +1014,25 @@ struct UI {
     // ---------- Desenho ----------
     std::function<void(const char *)> dbg;         // diagnostico: o PS4 grava cada etapa do 1o desenho (para achar onde cai)
 
-    // Efeitos "tecnologicos": linha de varredura, cantos de mira (HUD) e fade-in ao trocar de tela. Tudo leve (retangulos com alfa).
-    void drawFx(Renderer &r) const {
-        using namespace theme;
-        const int W = r.width(), H = r.height();
-        if (screen != Screen::Help && screen != Screen::Donate) {
-            float ph = (float)animT / 6.5f; ph -= (float)(int)ph;
-            int y = 130 + (int)(ph * (float)(H - 210));
-            for (int i = 0; i < 6; i++) r.fillRect(0, y - i * 3, W, 3, uiAlpha(GREEN, 24 - i * 4));
-            r.fillRect(0, y, W, 2, uiAlpha(GREEN, 40));
-            const int m = 20, L = 44, T = 3; const unsigned c = uiAlpha(GREEN, 95);
-            r.fillRect(m, m, L, T, c);               r.fillRect(m, m, T, L, c);
-            r.fillRect(W - m - L, m, L, T, c);       r.fillRect(W - m - T, m, T, L, c);
-            r.fillRect(m, H - m - T, L, T, c);       r.fillRect(m, H - m - L, T, L, c);
-            r.fillRect(W - m - L, H - m - T, L, T, c); r.fillRect(W - m - T, H - m - L, T, L, c);
-        }
-        const float age = (float)(animT - fadeAt);
-        if (age >= 0.f && age < 0.30f) {                                           // fade-in da tela nova
-            float k = 1.f - age / 0.30f; k *= k;
-            r.fillRect(0, 128, W, H - 128, ((unsigned)(int)(235.f * k) << 24) | 0x040707u);
-        }
-    }
     void render(Renderer &r) {
         if (dbg) dbg("ui-render-ini");
         backgroundCovers();
         if (dbg) dbg("ui-capas-ok");
         uiHeader(r, timeText, dateText);
+        drawAmbient(r);                                     // particulas e brilho dos riscos de neon (atras do conteudo)
         if (dbg) dbg("ui-header-ok");
-        if (screen == Screen::Home) renderHome(r); else if (screen == Screen::Help) renderHelp(r); else if (screen == Screen::Donate) renderDonate(r); else if (screen == Screen::Detail) renderDetail(r); else renderList(r);
+        if (screen == Screen::Home) renderHome(r);          // o Inicio anima a propria entrada, bloco por bloco
+        else {
+            const float age = (float)(animT - fadeAt), e = uiEaseOut(age / 0.34f);
+            auto body = [&](Renderer &q) {
+                if (screen == Screen::Help) renderHelp(q); else if (screen == Screen::Donate) renderDonate(q);
+                else if (screen == Screen::Detail) renderDetail(q); else renderList(q);
+            };
+            if (e < 1.f) { UiFx fx(r, (int)((1.f - e) * 56.f * (float)trDir), 0, e); body(fx); }     // desliza e aparece
+            else body(r);
+        }
         if (dbg) dbg("ui-corpo-ok");
         if (screen != Screen::Detail) renderFooter(r);      // a pagina de detalhes desenha o proprio rodape
-        drawFx(r);
         if (dbg) dbg("ui-rodape-ok");
     }
 
@@ -1047,18 +1100,28 @@ private:
         switch (in) {
         case Input::Up: homeRow = std::max(0, homeRow - 1); break;
         case Input::Down: homeRow = std::min(3, homeRow + 1); break;
-        case Input::Left: if (homeRow == 1) homeCol = std::max(0, homeCol - 1); else if (homeRow == 3) homeCol3 = 0; break;
-        case Input::Right: if (homeRow == 1) homeCol = std::min(3, homeCol + 1); break;
-        case Input::PrevTab: if (homeRow == 1) homeCol = std::max(0, homeCol - 1); break;
-        case Input::NextTab: if (homeRow == 1) homeCol = std::min(3, homeCol + 1); break;
+        case Input::Left:
+            if (homeRow == 0) heroMove(-1);
+            else if (homeRow == 1) homeCol = std::max(0, homeCol - 1);
+            else if (homeRow == 3) homeCol3 = 0;
+            break;
+        case Input::Right:
+            if (homeRow == 0) heroMove(1);
+            else if (homeRow == 1) homeCol = std::min(3, homeCol + 1);
+            else if (homeRow == 3 && hasDonate()) homeCol3 = 1;
+            break;
+        case Input::PrevTab: if (homeRow == 0) heroMove(-1); else if (homeRow == 1) homeCol = std::max(0, homeCol - 1); break;
+        case Input::NextTab: if (homeRow == 0) heroMove(1); else if (homeRow == 1) homeCol = std::min(3, homeCol + 1); break;
         case Input::Confirm:
-            if (homeRow == 0) openTab(Tab::Kick);
-            else if (homeRow == 1) { if (homeCol == 0 && hasDonate()) screen = Screen::Donate; else openTab(tileTab(homeCol)); }
+            if (homeRow == 0) heroOpen();
+            else if (homeRow == 1) openTab(tileTab(homeCol));
             else if (homeRow == 2) { if (listLocked()) requestReload(); else requestM3U(); }
+            else if (homeCol3 == 1 && hasDonate()) screen = Screen::Donate;
             else { screen = Screen::Help; helpScroll = 0; }
             break;
         default: break;
         }
+        if (homeRow != 3 || !hasDonate()) homeCol3 = 0;
     }
 
     std::string noListMsg() const { return listLocked() ? "A lista ainda não carregou" : "Nenhuma lista M3U adicionada"; }
@@ -1151,7 +1214,6 @@ private:
             {{"△"}, "Buscar filmes, séries e canais"},
             {{"L1", "R1"}, "Trocar de aba (ou de temporada numa série)"},
             {{"L2", "R2"}, "Subir / descer uma página da lista"},
-            {{"R3"}, "Ligar ou desligar os sons do app"},
         }, nullptr);
         helpCard(r, gx + cw + gap, cy0, cw, ch, "FILME E SÉRIE", {
             {{"OPTIONS"}, "Mostrar ou esconder a barra de tempo"},
@@ -1190,118 +1252,16 @@ private:
         }
     }
 
-    void renderHome(Renderer &r) {
-        wantHomeCovers();
-        using namespace theme;
-        const int W = r.width();
-        const int mx = 37, fw = W - 2 * mx;
-        // ---- Banner ----
-        {
-            const int x = mx, y = 169, w = fw, h = 337, rad = 28;
-            bool on = homeRow == 0;
-            uiGlow(r, x, y, w, h, rad, GREEN, on ? 22 : 12, pk(on ? 120 : 70), false);
-            uiFrame(r, x, y, w, h, rad, 3, GREEN, 0xFF020302);
-            UiClip clip{x + 3, y + 3, w - 6, h - 6, rad - 3};
-            // KICK desfocado ao fundo
-            {
-                const char *s = "KICK"; int bh = 232, bx = 1096, by = 205;
-                for (int i = 0; i < 4; i++) {
-                    static const int ox[4] = {-5, 5, -5, 5}, oy[4] = {-5, -5, 5, 5};
-                    uiWord(r, s, bx + ox[i], by + oy[i], bh, 0x1853FC18, 64);
-                }
-                uiWord(r, s, bx, by, bh, 0x3A53FC18, 64);
-            }
-            // faixas diagonais do canto
-            const float K0 = (float)(x + w + y + h);
-            const float T = (float)y, B = (float)(y + h);
-            uiBand(r, K0 - 600, K0 - 470, T, B, 0x2253FC18, &clip);
-            uiBand(r, K0 - 440, K0 - 408, T, B, 0xE053FC18, &clip);
-            uiBand(r, K0 - 372, K0 - 215, T, B, 0xE653FC18, &clip);
-            uiBand(r, K0 - 205, K0 - 170, T, B, 0x2253FC18, &clip);
-            uiBand(r, K0 - 160, K0 - 120, T, B, 0xF053FC18, &clip);
-            uiBand(r, K0 - 112, K0 + 20, T, B, 0x6653FC18, &clip);
-            // conteudo
-            uiKMark(r, 180, 234, 207, 211, GREEN);
-            r.fillRect(476, 234, 3, 211, GREEN_DK);
-            int gw = uiWord(r, "KICK", 535, 234, 74, GREEN);
-            uiWord(r, "TV", 535 + gw + 28, 234, 74, TEXT);
-            uiText(r, 535, 334, "Assista suas lives favoritas", TEXT, 31);
-            r.drawText(535, 372, "da Kick em ", TEXT, 31);
-            int aw = r.textWidth("da Kick em ", 31);
-            uiText(r, 535 + aw, 372, "tempo real", GREEN, 31, true);
-            r.drawText(535 + aw + r.textWidth("tempo real", 31), 372, "!", TEXT, 31);
-            // botao
-            const int bx = 535, by = 423, bw = 305, bh = 61;
-            if (on) { r.roundRect(bx, by, bw, bh, 14, GREEN); }
-            else uiFrame(r, bx, by, bw, bh, 14, 3, GREEN, 0xFF020302);
-            unsigned bc = on ? BLACK : GREEN;
-            UiPt tri[3] = {{(float)bx + 24, (float)by + 17}, {(float)bx + 24, (float)by + 44}, {(float)bx + 50, (float)by + 30.5f}};
-            uiPoly(r, tri, 3, bc);
-            uiText(r, bx + 71, by + 15, "Acessar Agora", bc, 31, true);
-        }
-        // ---- Atalhos ----
-        {
-            const bool donateTile = hasDonate();
-            const char *names[4] = {donateTile ? "APOIAR" : "KICK TV", "FILMES", "SÉRIES", "CANAIS"};
-            const int gap = 19, tw = (fw - 3 * gap) / 4, ty = 560, th = 251, rad = 24;
-            for (int i = 0; i < 4; i++) {
-                const int x = mx + i * (tw + gap);
-                bool sel = homeRow == 1 && homeCol == i;
-                unsigned fill = sel ? SEL : CARD;
-                if (sel) uiGlow(r, x, ty, tw, th, rad, GREEN, 18, pk(130), false);
-                uiFrame(r, x, ty, tw, th, rad, sel ? 4 : 2, sel ? GREEN : CARD_LINE, fill);
-                UiClip clip{x + 2, ty + 2, tw - 4, th - 4, rad - 2};
-                const float K0 = (float)(x + tw + ty + th), T = (float)ty, B = (float)(ty + th);
-                uiBand(r, K0 - 215, K0 - 185, T, B, sel ? 0x4053FC18 : 0x2653FC18, &clip);
-                uiBand(r, K0 - 160, K0 - 88, T, B, sel ? 0xDD53FC18 : 0xB053FC18, &clip);
-                uiBand(r, K0 - 74, K0 + 10, T, B, sel ? 0x6653FC18 : 0x4053FC18, &clip);
-                const int cx = x + tw / 2;
-                unsigned ic = TEXT;
-                if (i == 0 && donateTile) uiHeart(r, cx, ty + 84, 100, GREEN);
-                else if (i == 0) uiKMark(r, cx - 47, ty + 36, 94, 96, GREEN);
-                else if (i == 1) uiIconClapper(r, cx - 54, ty + 33, 108, ic, fill);
-                else if (i == 2) uiIconTvPlay(r, cx - 54, ty + 33, 108, ic, fill);
-                else uiIconTvRetro(r, cx - 54, ty + 33, 108, ic, fill);
-                int fs = i == 0 ? 52 : 50;
-                uiCenterHeavy(r, cx, ty + 187, names[i], TEXT, fs);
-                int lw = sel ? r.textWidth(names[i], fs) : 120;
-                if (sel) r.fillRect(cx - lw / 2, ty + 222, lw, 4, GREEN);
-                else { r.roundRect(cx - 60, ty + 222, 120, 4, 2, 0xFF1E7A0C); r.roundRect(cx - 30, ty + 222, 60, 4, 2, GREEN_DK); }
-            }
-        }
-        // ---- Lista M3U ----
-        {
-            const int x = mx, y = 820, w = fw, h = 120, rad = 26;
-            bool sel = homeRow == 2;
-            if (sel) uiGlow(r, x, y, w, h, rad, GREEN, 18, pk(130), false);
-            uiFrame(r, x, y, w, h, rad, sel ? 4 : 2, sel ? GREEN : CARD_LINE, sel ? SEL : CARD);
-            uiIconLink(r, x + 84, y + 70, 78, TEXT);
-            r.fillRect(x + 170, y + 40, 3, 62, GREEN_DK);
-            if (listLocked()) {          // lista fixa do app: so o botao ATUALIZAR
-                uiHeavy(r, x + 222, y + 28, "LISTA IPTV", TEXT, 40);
-                uiText(r, x + 222, y + 80, uiFit(r, listSummary(), 26, w - 222 - 330), SOFT, 26);
-                const int pcx = x + w - 150, pcy = y + h / 2;
-                r.roundRect(pcx - 118, pcy - 36, 236, 72, 36, GREEN);
-                uiCenterHeavy(r, pcx, pcy - 15, "X  ATUALIZAR", BLACK, 28);
-            } else {
-                uiHeavy(r, x + 222, y + 28, "LISTA M3U", TEXT, 40);
-                uiText(r, x + 222, y + 80, uiFit(r, listSummary(), 26, w - 222 - 140), SOFT, 26);
-                const int pcx = x + w - 90, pcy = y + h / 2;
-                r.roundRect(pcx - 36, pcy - 36, 72, 72, 36, GREEN);
-                r.fillRect(pcx - 15, pcy - 3, 30, 6, BLACK); r.fillRect(pcx - 3, pcy - 15, 6, 30, BLACK);
-            }
-        }
-        // ---- Comandos e ajuda  |  Apoiar o app ----
-        {
-            const int y = 956, h = 68, rad = 18;                          // termina em 1024: nao encosta no rodape (status e dicas ficam em y~1043)
-            const int cw = fw;
-            bool sel = homeRow == 3;
-            if (sel) uiGlow(r, mx, y, cw, h, rad, GREEN, 14, pk(110), false);
-            uiFrame(r, mx, y, cw, h, rad, sel ? 3 : 2, sel ? GREEN : CARD_LINE, sel ? SEL : CARD);
-            uiHeavy(r, mx + 40, y + 21, "COMANDOS E AJUDA", TEXT, 26);
-            if (cw > 900) uiText(r, mx + 400, y + 24, "Botoes, player, teclado, Kick TV", MUTED, 20);
-        }
-    }
+    // Inicio (homeview.hpp): carrossel, atalhos, lista e rodape de comandos/apoiar
+    void renderHome(Renderer &r);
+    void heroTick(double t);
+    void heroMove(int d);
+    void heroOpen();
+    void heroRebuild();
+    void drawAmbient(Renderer &r);
+    void drawHeroCard(Renderer &r, int slide, int x, int y, int w, int h, float center, bool focus);
+    void drawPeek(Renderer &r, int slide, int x, int y, int w, int h, float dimA);
+    void heroArt(Renderer &r, const std::string &logo, int x, int y, int w, int h, int rt, int rb);
 
     // Tela "Apoiar": QR Code do LivePix (ou da pagina de doacao) + explicacao
     void renderDonate(Renderer &r) {
@@ -1658,3 +1618,4 @@ private:
 };
 
 #include "detailpage.hpp"
+#include "homeview.hpp"
