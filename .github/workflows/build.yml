@@ -13,6 +13,27 @@ jobs:
       DOTNET_SYSTEM_GLOBALIZATION_INVARIANT: "1"
     steps:
       - uses: actions/checkout@v4
+      - name: Corrigir nome de pasta com caractere invisivel (src)
+        run: |
+          # Pelo celular e facil criar a pasta com um caractere INVISIVEL na frente do nome (ex.: U+2060): na tela parece "src",
+          # mas para o computador e outra pasta e o build nao acha nenhum arquivo. Aqui renomeia para o nome certo e grava a correcao.
+          fixed=0
+          for d in */; do
+            d="${d%/}"
+            clean=$(printf '%s' "$d" | LC_ALL=C tr -cd '\040-\176')
+            if [ "$clean" != "$d" ] && [ -n "$clean" ]; then
+              echo "Pasta com caractere invisivel no nome: '$clean' (bytes: $(printf '%s' "$d" | od -An -tx1 | head -1))"
+              if [ -e "$clean" ]; then cp -rf "$d"/. "$clean"/ && rm -rf "$d"; else mv "$d" "$clean"; fi
+              fixed=1
+            fi
+          done
+          if [ "$fixed" = 1 ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add -A
+            git commit -m "Corrige o nome da pasta (tinha um caractere invisivel) [skip ci]" || true
+            git push origin "HEAD:${GITHUB_REF_NAME}" || echo "AVISO: nao consegui gravar a correcao no repositorio; o build segue com a pasta corrigida so nesta execucao"
+          fi
       - name: Dependencias
         # O espelho de pacotes do Ubuntu as vezes some do DNS por alguns minutos ("Temporary failure resolving azure.archive.ubuntu.com").
         # Entao: so instala o que falta e tenta de novo (ate 5 vezes) antes de desistir.
