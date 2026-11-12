@@ -316,9 +316,11 @@ struct NetClient {
     }
     // GET reaproveitando a conexao de 's' (so use de UMA thread por sessao). Se a conexao antiga caiu, refaz uma vez.
     // Leitura interrompida no meio (erro de rede) conta como falha: antes devolvia o segmento cortado como se fosse bom.
-    bool getKA(Session &s, const std::string &url, std::string &body, int &status, size_t maxBytes = 1536 * 1024) {
+    // maxSecs > 0: prazo TOTAL da resposta. O timeout do sceHttp vale por leitura; uma conexao que entrega bytes devagar nunca estourava.
+    bool getKA(Session &s, const std::string &url, std::string &body, int &status, size_t maxBytes = 1536 * 1024, double maxSecs = 0) {
         for (int attempt = 0; attempt < 2; attempt++) {
             status = 0; body.clear();
+            struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
             bool fresh = false;
             if (s.conn < 0 || s.origin != originOf(url)) { if (!openSession(s, url)) return false; fresh = true; }
             int req = sceHttpCreateRequestWithURL(s.conn, 0 /*GET*/, url.c_str(), 0);
@@ -335,6 +337,10 @@ struct NetClient {
                         if (n == 0) break;
                         body.append(buf.data(), n);
                         if (body.size() > maxBytes) { clean = false; break; }   // resposta nao lida ate o fim: nao reaproveita
+                        if (maxSecs > 0) {
+                            struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
+                            if ((t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9 > maxSecs) { ok = clean = false; break; }   // lento demais: conta como falha
+                        }
                     }
                 }
                 sceHttpDeleteRequest(req);
@@ -1248,6 +1254,10 @@ static const char *kQualityName[3] = {"Fluido 30fps", "Maxima 720p60", "Ultra 10
 // Reconexao automatica: se a live congelar ou a rede/pipeline quebrar, o app reabre a transmissao sozinho (ver Player::wantReconnect).
 static std::string g_reconnectNote;          // motivo da ultima reconexao (mostrado na tela "Conectando...")
 static int g_autoRestarts = 0;               // quantas reconexoes automaticas ja houve (HUD)
+static double g_stallT[8] = {};              // instantes (relogio monotonico) dos ultimos congelamentos: a proxima abertura fica mais conservadora (livebuf.hpp)
+static unsigned g_stallI = 0;
+static double monoNow() { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec + ts.tv_nsec / 1e9; }
+static int liveRecentStalls() { return livebuf::recentStalls(g_stallT, 8, monoNow()); }
 
 // ---------- Alimentador HLS -> AvPlayer ----------
 // O AvPlayer do PS4 nao abre https/HLS direto (AddSource=806A0002). Entao o app baixa o HLS (playlist + segmentos .ts)
@@ -1334,11 +1344,13 @@ struct HlsFeeder {
         std::string mediaUrl = url;
         if (hlsIsMaster(body)) {
             auto v = hlsParseMaster(body);
-            int i = hlsPickVariant(v, g_quality.load() == 2 ? 1080 : 720, g_quality.load() == 0 ? 30 : 0);
+            const int stalls = liveRecentStalls();                                     // congelamentos nos ultimos 5 min
+            const int maxH = livebuf::capHeight(g_quality.load() == 2 ? 1080 : 720, stalls);
+            int i = hlsPickVariant(v, maxH, g_quality.load() == 0 ? 30 : 0);
             if (i < 0) { fail("playlist mestre sem variantes"); return; }
             mediaUrl = hlsResolve(url, v[i].uri);
             setStatus("variante " + std::to_string(v[i].width) + "x" + std::to_string(v[i].height) + " " + std::to_string((int)(v[i].fps + 0.5)) +
-                      "fps bw=" + std::to_string(v[i].bandwidth));
+                      "fps bw=" + std::to_string(v[i].bandwidth) + (stalls > 0 ? "  (ajuste automatico: " + std::to_string(stalls) + " congelamento(s) recente(s))" : ""));
             variantFps = (int)(v[i].fps + 0.5); variantH = v[i].height;
         }
         unsigned long long next = 0; bool first = true; int errs = 0;
@@ -1361,14 +1373,16 @@ struct HlsFeeder {
                 g_net.closeSession(sess);
                 if (++errs > 40) { fail("playlist de midia HTTP " + std::to_string(st)); return; }
                 setStatus("playlist: tentando de novo (" + std::to_string(st) + ")");
-                sleepMs(400, run); continue;
+                sleepMs(livebuf::backoffMs(errs), run); continue;
             }
             HlsMedia md = hlsParseMedia(body);
             if (md.hasMap) { fail("fMP4 (EXT-X-MAP) ainda nao suportado"); return; }
             if (md.segs.empty()) { sleepMs(800, run); continue; }
             if (first) {
                 double sd = md.segs.back().dur > 0 ? md.segs.back().dur : md.target;
-                int want = livebuf::startSegs(sd, livebuf::kStartSecsHls, (int)md.segs.size());
+                const int stl = liveRecentStalls();
+                int want = livebuf::startSegs(sd, livebuf::kStartSecsHls + livebuf::extraStartSecs(stl), (int)md.segs.size(),
+                                              stl > 0 ? livebuf::kExtraMaxSegs : livebuf::kMaxStartSegs);
                 wantSegs = want;
                 size_t k = md.segs.size() > (size_t)want ? md.segs.size() - want : 0;
                 next = md.segs[k].seq; first = false;
@@ -1394,7 +1408,7 @@ struct HlsFeeder {
                 if (downloaded >= 4) break;
                 std::string seg; int ss = 0;
                 double d0 = nowSecF();
-                if (!g_net.getKA(sess, hlsResolve(mediaUrl, sg.uri), seg, ss, 12u << 20) || ss < 200 || ss >= 300 || seg.empty()) {
+                if (!g_net.getKA(sess, hlsResolve(mediaUrl, sg.uri), seg, ss, 12u << 20, livebuf::segDeadlineSecs(sg.dur > 0 ? sg.dur : md.target)) || ss < 200 || ss >= 300 || seg.empty()) {
                     g_net.closeSession(sess);
                     if (++errs > 25) { fail("segmento HTTP " + std::to_string(ss)); return; }
                     setStatus("segmento falhou (HTTP " + std::to_string(ss) + "), renovando...");
@@ -3916,6 +3930,7 @@ int main() {
                     if (!allowAuto())
                         app.say("Live instavel — reconectando...");
                     g_autoRestarts++;
+                    g_stallT[g_stallI++ % 8] = monoNow();                 // alimenta o ajuste automatico da proxima abertura
                     g_reconnectNote = why;
                     safeRestartLive(why);
                     sceKernelUsleep(50000);
