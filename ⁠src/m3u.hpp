@@ -1,0 +1,85 @@
+#pragma once
+#include <cstddef>
+#include <cstdint>
+#include <map>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
+enum class Kind { Channel, Movie, Series };
+
+struct Entry {
+    std::string name, url, group;   // (group so existe durante o parse; a Playlist final nao guarda, para poupar memoria)
+    std::string logo;               // tvg-logo
+    Kind kind = Kind::Channel;
+    int season = 0, episode = 0;    // so para series
+    int mins = 0;                   // duracao em minutos (so quando o painel informa; episodios)
+};
+
+// Categoria (group-title da lista). Filmes/canais: indices em Playlist::movies / channels. Series: nomes (chave de seriesTree).
+struct Category {
+    std::string name;
+    std::vector<uint32_t> items;     // so canais e filmes
+    std::vector<std::string> series; // so series (ordenadas)
+    // Painel Xtream: a categoria so tem nome e id; os itens sao baixados quando ela abre (App::ensureCategory).
+    std::string id;
+    bool lazy = false, loaded = true;
+    bool unloaded() const { return lazy && !loaded; }
+    size_t size() const { return items.empty() ? series.size() : items.size(); }
+};
+
+// Serie do painel Xtream: id para pedir os episodios (get_series_info) e capa vinda da lista.
+struct SeriesRef { std::string id, cover; };
+
+struct Playlist {
+    std::vector<Entry> channels, movies;
+    std::vector<Category> channelCats, movieCats, seriesCats;   // na ordem em que aparecem na lista
+    size_t seriesEpisodes = 0;   // total de episodios (os episodios em si ficam em seriesTree)
+    bool xtream = false;         // veio da API do painel (categorias sob demanda), nao de uma lista M3U
+    std::unordered_map<std::string, SeriesRef> seriesInfo;   // so Xtream: nome da serie -> id/capa
+    bool truncated = false;      // a lista tinha mais itens que o limite de memoria (os ultimos ficaram de fora)
+    // serie -> temporada -> episodios
+    // unordered_map: listas com dezenas de milhares de series nao podem usar std::map (log n por ep)
+    std::unordered_map<std::string, std::map<int, std::vector<Entry>>> seriesTree;
+    bool empty() const { return channels.empty() && movies.empty() && seriesTree.empty() && !(xtream && (!channelCats.empty() || !movieCats.empty() || !seriesCats.empty())); }
+};
+
+// Le a lista M3U em PEDACOS (feed pode ser chamado com qualquer tamanho de bloco, inclusive cortando uma linha no meio).
+// Nao precisa guardar o arquivo inteiro na memoria: listas de IPTV com 10-15 mil itens tem varios MB.
+class PlaylistBuilder {
+public:
+    PlaylistBuilder();
+    void feed(const char *data, size_t n);
+    void finish();                 // processa a ultima linha e ordena os episodios
+    Playlist take();               // entrega o resultado (use depois de finish)
+    size_t count() const { return count_; }   // itens lidos ate agora
+    bool full() const { return full_; }       // atingiu o orcamento de memoria: o resto da lista e ignorado (Playlist::truncated)
+    // Orcamento de memoria da lista (estimado). Listas de IPTV chegam a 350 mil+ itens (~330 bytes cada = 115 MB+); no PS4 isso,
+    // somado ao resto do app, faz o sistema fechar o app. Medido: 90 MB ~ 250 mil itens (a lista que ja carregou 200 mil sem problemas).
+    // Orcamento de memoria da lista (bytes estimados). Padrao 90 MB (testes); o PS4 sobe isso no inicio (heap sem limite),
+    // porque lista cortada nao e aceitavel. Se a memoria acabar de verdade, App::loadM3U trata o bad_alloc e aproveita o que leu.
+    static size_t &maxBytes() { static size_t v = 512u * 1024 * 1024; return v; }
+
+private:
+    void line(std::string &l);
+    std::string cur_, extinf_;
+    bool skipRest_ = false, first_ = true;
+    Playlist p_;
+    size_t count_ = 0, memBytes_ = 0;
+    bool full_ = false;
+    std::unordered_map<std::string, int> chanIdx_, movieIdx_, seriesIdx_;   // nome limpo da categoria -> posicao
+    std::unordered_set<std::string> seenUrl_;   // evita duplicata por URL
+    std::unordered_set<std::string> seenName_;  // evita mesmo titulo (capa 2-3x)
+    std::unordered_map<std::string, std::string> seriesNorm_; // normTitle -> nome na arvore (O(1))
+    std::unordered_map<std::string, uint32_t> movieNorm_; // base name -> index em movies (preferir PT)
+    static int catFor(std::vector<Category> &cats, std::unordered_map<std::string, int> &idx, const std::string &group);
+};
+
+// Nome de categoria para mostrar: tira o prefixo do tipo ("FILMES | Acao" -> "Acao"); vazio vira "Sem categoria".
+std::string cleanCategory(const std::string &group);
+
+// Versoes "tudo de uma vez" (testes e compatibilidade).
+std::vector<Entry> parseM3U(const std::string &text);
+Playlist buildPlaylist(const std::string &text);
+bool parseEpisode(const std::string &name, std::string &series, int &season, int &episode);
