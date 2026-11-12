@@ -2,12 +2,18 @@
 // Parser HLS minimo (independente de plataforma, testavel no PC).
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <sstream>
 #include <string>
 #include <vector>
 
 struct HlsVariant { std::string uri; int bandwidth = 0, width = 0, height = 0; double fps = 0; };
-struct HlsSegment { std::string uri; double dur = 0; unsigned long long seq = 0; };
+struct HlsSegment {
+    std::string uri; double dur = 0; unsigned long long seq = 0;
+    std::string keyMethod;                 // "" = sem criptografia | "AES-128" | outro (ex.: SAMPLE-AES: nao suportado)
+    std::string keyUri;                    // URI da chave (relativa ou absoluta)
+    bool hasIv = false; unsigned char iv[16] = {0};   // IV explicito (se nao tiver, usa o numero de sequencia do segmento)
+};
 struct HlsMedia {
     std::vector<HlsSegment> segs;
     double target = 2;
@@ -98,15 +104,45 @@ inline HlsMedia hlsParseMedia(const std::string &text) {
     HlsMedia m;
     std::istringstream in(text);
     std::string line; unsigned long long seq = 0; double dur = 0;
+    std::string keyMethod, keyUri; bool hasIv = false; unsigned char iv[16] = {0};
     while (std::getline(in, line)) {
         line = hlsTrim(line);
         if (line.empty()) continue;
+        if (line.compare(0, 14, "#EXT-X-KEY:") == 0 || line.compare(0, 11, "#EXT-X-KEY:") == 0) {
+            keyMethod = hlsAttr(line, "METHOD");
+            if (keyMethod == "NONE") keyMethod.clear();
+            keyUri = hlsAttr(line, "URI");
+            std::string ivs = hlsAttr(line, "IV");
+            hasIv = false;
+            if (ivs.size() > 2 && ivs[0] == '0' && (ivs[1] == 'x' || ivs[1] == 'X')) {   // 0x + 32 digitos hex
+                std::string hx = ivs.substr(2);
+                while (hx.size() < 32) hx = "0" + hx;
+                if (hx.size() == 32) {
+                    bool ok = true;
+                    for (int i = 0; i < 16 && ok; i++) {
+                        unsigned v = 0;
+                        for (int j = 0; j < 2; j++) {
+                            char c = hx[i * 2 + j]; v <<= 4;
+                            if (c >= '0' && c <= '9') v |= (unsigned)(c - '0'); else if (c >= 'a' && c <= 'f') v |= (unsigned)(c - 'a' + 10);
+                            else if (c >= 'A' && c <= 'F') v |= (unsigned)(c - 'A' + 10); else ok = false;
+                        }
+                        iv[i] = (unsigned char)v;
+                    }
+                    hasIv = ok;
+                }
+            }
+            continue;
+        }
         if (line.compare(0, 22, "#EXT-X-MEDIA-SEQUENCE:") == 0) seq = strtoull(line.c_str() + 22, nullptr, 10);
         else if (line.compare(0, 22, "#EXT-X-TARGETDURATION:") == 0) m.target = atof(line.c_str() + 22);
         else if (line.compare(0, 8, "#EXTINF:") == 0) dur = atof(line.c_str() + 8);
         else if (line.compare(0, 11, "#EXT-X-MAP:") == 0) m.hasMap = true;
         else if (line.compare(0, 14, "#EXT-X-ENDLIST") == 0) m.endList = true;
-        else if (line[0] != '#') { HlsSegment s; s.uri = line; s.dur = dur; s.seq = seq++; m.segs.push_back(s); dur = 0; }
+        else if (line[0] != '#') {
+            HlsSegment s; s.uri = line; s.dur = dur; s.seq = seq++;
+            s.keyMethod = keyMethod; s.keyUri = keyUri; s.hasIv = hasIv; memcpy(s.iv, iv, 16);
+            m.segs.push_back(s); dur = 0;
+        }
     }
     return m;
 }
