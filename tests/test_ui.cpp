@@ -256,6 +256,30 @@ int main() {
         ub3.handle(Input::PrevTab); ub3.handle(Input::PrevTab); assert(ub3.tab == Tab::Movies && ub3.itemCount() == 1);
         ub3.handle(Input::Back); assert(!ub3.searching());                    // O limpa a busca
     }
+    // --- sons e animacao ---
+    {
+        Fake fs; App as(fs); UI us(as);
+        std::vector<int> snd; us.sound = [&](int k) { snd.push_back(k); };
+        std::string m = "#EXTM3U\n#EXTINF:-1 group-title=\"A\",Canal 1\nhttp://h/live/1.ts\n#EXTINF:-1 group-title=\"A\",Canal 2\nhttp://h/live/2.ts\n";
+        as.list = buildPlaylist(m);
+        us.screen = Screen::Home;
+        us.handle(Input::Right);                                      // anda entre os atalhos: som de navegacao
+        assert(!snd.empty() && snd.back() == 0);
+        snd.clear();
+        for (int i = 0; i < 6; i++) us.handle(Input::Right);          // chega no fim: nao anda mais, sem som
+        size_t atEdge = snd.size(); snd.clear();
+        us.handle(Input::Right); assert(snd.empty() && atEdge <= 3);
+        snd.clear(); us.handle(Input::Confirm); assert(!snd.empty() && snd[0] == 1);   // confirmar
+        snd.clear(); us.handle(Input::NextTab); assert(!snd.empty() && snd.back() == 4);   // trocar de aba
+        snd.clear(); us.handle(Input::Back); assert(!snd.empty());     // voltar
+        // animacao: o fade comeca quando a tela muda e termina em 0,3 s; o brilho do foco respira entre 0,56 e 1,0
+        Fake f2; App a2(f2); UI u2(a2);
+        assert(u2.tick(10.0) && u2.fadeAt == 10.0);
+        u2.tick(10.1); assert(u2.fadeAt == 10.0);                    // mesma tela: nao reinicia
+        u2.handle(Input::Right); u2.screen = Screen::List; u2.tick(11.0); assert(u2.fadeAt == 11.0);   // tela mudou: reinicia o fade
+        for (double t = 0; t < 3; t += 0.05) { u2.tick(t); float p = u2.pulse(); assert(p >= 0.55f && p <= 1.01f); }
+        u2.screen = Screen::Help; assert(!u2.wantsFrames());          // tela de texto fica parada
+    }
     // --- uiFit: corta com "..." sem estourar a largura e sem quebrar UTF-8 ---
     {
         Rec r; std::string longo(200, 'a');
