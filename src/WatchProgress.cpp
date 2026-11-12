@@ -1,5 +1,5 @@
 // WatchProgress.cpp
-#include "WatchProgress.h"
+#include "WatchProgress.hpp"
 
 #include <algorithm>
 #include <cstdio>
