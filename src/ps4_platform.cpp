@@ -3423,8 +3423,6 @@ int main() {
     pf.app = &app;
     UI ui(app);
     trace("ui-ok");
-    g_sfx.enabled = (pf.loadSetting("sfx") != "0");          // R3 liga/desliga e grava
-    ui.sound = [](int k) { g_sfx.play(k); };
     g_covers.setFetchW([](int worker, const std::string &url0, std::string &body) -> bool {
         if (!kCoversOn) return false;
         // Cada thread de capas tem a SUA conexao (reaproveitada entre capas do mesmo servidor: sem novo handshake TLS a cada imagem).
@@ -3586,7 +3584,6 @@ int main() {
         animCost = nowSec() - tp0;
         if (firstDraw) {
             firstDraw = false; trace("menu-flip-ok"); ui.dbg = nullptr;
-            g_sfx.start(); g_sfx.play(sfx::Boot);      // som de abertura (so depois do 1o desenho do menu)
         }
     };
     auto presentWait = [&]() { FbRenderer r(shadow, W, H); player.renderWaiting(r); flip(); };
@@ -3825,14 +3822,6 @@ int main() {
         //  - No player ao vivo: troca qualidade (Fluido/720/1080) e reabre (ajuda se a Kick travar)
         //  - No player VOD: mostra/esconde HUD
         //  - No menu: abre busca (lupa)
-        if ((pressed & B_R3) && mode == Mode::Menu) {            // R3: sons do app ligados / desligados
-            bool on = !g_sfx.enabled.load();
-            g_sfx.enabled = on;
-            try { pf.saveSetting("sfx", on ? "1" : "0"); } catch (...) {}
-            app.say(on ? "Sons ligados" : "Sons desligados");
-            if (on) g_sfx.play(sfx::Ok);
-            dirty = true;
-        }
         if (pressed & B_OPTIONS) {
             if (mode == Mode::Play) {
                 if (!player.isVod && !player.url.empty()) {
