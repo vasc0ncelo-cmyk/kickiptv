@@ -57,6 +57,7 @@
 
 #include "fbrender.hpp"
 #include "keyboard.hpp"
+#include "sfx.hpp"
 #include "clock.hpp"
 
 // ---------- Cliente HTTP (libSceNet + libSceSsl + libSceHttp, ligadas no link) ----------
@@ -1263,6 +1264,60 @@ static double g_stallT[8] = {};              // instantes (relogio monotonico) d
 static unsigned g_stallI = 0;
 static double monoNow() { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec + ts.tv_nsec / 1e9; }
 static int liveRecentStalls() { return livebuf::recentStalls(g_stallT, 8, monoNow()); }
+
+// ---------- Sons da interface (bips sintetizados em src/sfx.hpp) ----------
+// Thread propria com a SUA porta de audio. Regras para nao brigar com o audio dos videos:
+//  - a porta so abre quando o 1o som e pedido (nunca no boot) e fecha SEMPRE antes de um video abrir (suspend) e durante PS/segundo plano;
+//  - falha ao abrir = fica mudo e tenta de novo depois (nunca derruba nada); sem som ligado nao existe thread tocando nada.
+struct SfxPlayer {
+    std::thread th;
+    std::atomic<bool> run{false}, suspended{false}, enabled{true};
+    std::atomic<int> pending{-1};
+    std::atomic<int> portOpen{0};
+    int port = -1;
+    std::vector<int16_t> bank[sfx::Count];
+    static double nowS() { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec + ts.tv_nsec / 1e9; }
+    void start() {
+        if (run.load()) return;
+        try {
+            for (int k = 0; k < sfx::Count; k++) bank[k] = sfx::render(k);
+            run = true;
+            th = std::thread([this] { loop(); });
+        } catch (...) { run = false; }
+    }
+    void play(int k) { if (run.load() && enabled.load() && !suspended.load() && k >= 0 && k < sfx::Count) pending = k; }
+    void suspend() {                                       // fecha a porta e espera (ate 0,3 s) ela fechar de verdade
+        suspended = true; pending = -1;
+        for (int i = 0; i < 150 && portOpen.load(); i++) sceKernelUsleep(2000);
+    }
+    void resume() { suspended = false; }
+    void stop() { run = false; if (th.joinable()) th.join(); }
+    void loop() {
+        double nextOpen = 0;
+        while (run.load()) {
+            if (suspended.load() || !enabled.load()) {
+                if (port > 0) { sceAudioOutClose(port); port = -1; portOpen = 0; }
+                pending = -1; sceKernelUsleep(10000); continue;
+            }
+            int k = pending.exchange(-1);
+            if (k < 0) { sceKernelUsleep(6000); continue; }
+            if (port < 0) {
+                double tn = nowS();
+                if (tn < nextOpen) continue;
+                int p = sceAudioOutOpen(0xFF, ORBIS_AUDIO_OUT_PORT_TYPE_MAIN, 0, 256, 48000, ORBIS_AUDIO_OUT_PARAM_FORMAT_S16_STEREO);
+                if (p <= 0) { nextOpen = tn + 3.0; continue; }
+                port = p; portOpen = 1;
+            }
+            const std::vector<int16_t> &pcm = bank[k];
+            for (size_t off = 0; off + 512 <= pcm.size() && run.load() && !suspended.load(); off += 512) {
+                sceAudioOutOutput(port, pcm.data() + off);
+                if (pending.load() >= 0) break;            // chegou outro som: troca na hora (sem fila)
+            }
+        }
+        if (port > 0) { sceAudioOutClose(port); port = -1; portOpen = 0; }
+    }
+};
+static SfxPlayer g_sfx;
 
 // ---------- Alimentador HLS -> AvPlayer ----------
 // O AvPlayer do PS4 nao abre https/HLS direto (AddSource=806A0002). Entao o app baixa o HLS (playlist + segmentos .ts)
@@ -3298,10 +3353,6 @@ int main() {
     int padInitRc = scePadInit();
     sceAudioOutInit();
     {
-        int uiPort = sceAudioOutOpen(0xFF, ORBIS_AUDIO_OUT_PORT_TYPE_MAIN, 0, 256, 48000, ORBIS_AUDIO_OUT_PARAM_FORMAT_S16_STEREO);
-        char b[32]; snprintf(b, sizeof b, "sfx-port=%d", uiPort); /* log apos boot */
-    }
-    {
         char b[40]; snprintf(b, sizeof b, "pad-init=%d user=%d", padInitRc, userId);
         // trace ainda nao existe — usa boot depois; guarda em variavel
     }
@@ -3372,6 +3423,8 @@ int main() {
     pf.app = &app;
     UI ui(app);
     trace("ui-ok");
+    g_sfx.enabled = (pf.loadSetting("sfx") != "0");          // R3 liga/desliga e grava
+    ui.sound = [](int k) { g_sfx.play(k); };
     g_covers.setFetchW([](int worker, const std::string &url0, std::string &body) -> bool {
         if (!kCoversOn) return false;
         // Cada thread de capas tem a SUA conexao (reaproveitada entre capas do mesmo servidor: sem novo handshake TLS a cada imagem).
@@ -3520,14 +3573,21 @@ int main() {
         sceVideoOutSubmitFlip(vh, back, ORBIS_VIDEO_OUT_FLIP_VSYNC, 0); back = (back + 1) % 3;
     };
     ui.dbg = [](const char *st) { static int n = 0; if (n < 6) { n++; trace(st); } };      // so o 1o desenho do menu (nao enche o log)
+    double animCost = 0.03;                              // custo do ultimo desenho do menu: define a taxa de quadros da animacao
     auto presentMenu = [&]() {
         FbRenderer r(shadow, W, H);
         static bool firstDraw = true;
         if (firstDraw) trace("menu-1o-desenho");
+        double tp0 = nowSec();
+        ui.tick(tp0);                                  // relogio das animacoes (fade, brilho do foco, varredura)
         ui.render(r);
         if (firstDraw) trace("menu-render-ok");
         flip();
-        if (firstDraw) { firstDraw = false; trace("menu-flip-ok"); ui.dbg = nullptr; }
+        animCost = nowSec() - tp0;
+        if (firstDraw) {
+            firstDraw = false; trace("menu-flip-ok"); ui.dbg = nullptr;
+            g_sfx.start(); g_sfx.play(sfx::Boot);      // som de abertura (so depois do 1o desenho do menu)
+        }
     };
     auto presentWait = [&]() { FbRenderer r(shadow, W, H); player.renderWaiting(r); flip(); };
     pf.busyFn = [&](const std::string &) { presentMenu(); };
@@ -3765,6 +3825,14 @@ int main() {
         //  - No player ao vivo: troca qualidade (Fluido/720/1080) e reabre (ajuda se a Kick travar)
         //  - No player VOD: mostra/esconde HUD
         //  - No menu: abre busca (lupa)
+        if ((pressed & B_R3) && mode == Mode::Menu) {            // R3: sons do app ligados / desligados
+            bool on = !g_sfx.enabled.load();
+            g_sfx.enabled = on;
+            try { pf.saveSetting("sfx", on ? "1" : "0"); } catch (...) {}
+            app.say(on ? "Sons ligados" : "Sons desligados");
+            if (on) g_sfx.play(sfx::Ok);
+            dirty = true;
+        }
         if (pressed & B_OPTIONS) {
             if (mode == Mode::Play) {
                 if (!player.isVod && !player.url.empty()) {
@@ -4200,6 +4268,7 @@ int main() {
             } else {
                 player.epUrls.clear(); player.epTitles.clear(); player.epIndex = -1;
             }
+            g_sfx.suspend();                     // fecha a porta de som da interface: o audio do video fica com a porta so dele
             mode = Mode::Play; gotFrame = false; lastWaitDraw = 0;
             g_sys.reset();                       // abrir video pode acender o aviso do sistema por engano: so vale depois de 1,5 s calmo
             presentWait();                       // mostra "Player" antes de bloquear
@@ -4233,6 +4302,14 @@ int main() {
             autoMode = false;
             continue;
         }
+        if (mode == Mode::Menu) {
+            g_sfx.resume();
+            // animacao: redesenha ~25 quadros/s (mais devagar se o desenho for pesado), so quando o menu esta na tela e o app em primeiro plano
+            static double lastAnim = 0;
+            double tn = nowSec();
+            double gap = animCost * 2.2; if (gap < 0.04) gap = 0.04; if (gap > 0.15) gap = 0.15;
+            if (!g_quitting && ui.wantsFrames() && tn - lastAnim >= gap) { lastAnim = tn; dirty = true; }
+        }
         if (dirty) { presentMenu(); dirty = false; static bool once = false; if (!once) { once = true; trace("menu-ok"); } }
         sceKernelUsleep(4000);                     // 4 ms: o controle e lido ~200x por segundo (antes 16 ms)
     }
@@ -4242,6 +4319,7 @@ int main() {
     // seguranca: se alguma thread nao largar a tempo, encerra de qualquer jeito em 2,5 s (o sistema nao espera mais que isso)
     try { std::thread([] { sceKernelUsleep(3500000); ps4Exit("saida-forcada"); }).detach(); } catch (...) {}
     try { pf.saveSetting("bgload", ""); } catch (...) {}
+    try { g_sfx.stop(); } catch (...) {}
     try { if (mode == Mode::Play || player.h) player.stop(); } catch (...) {}
     try { g_covers.setPaused(true); } catch (...) {}
     try { g_covers.cancelBackground(); } catch (...) {}
