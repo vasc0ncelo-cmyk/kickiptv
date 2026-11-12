@@ -29,6 +29,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include "hls.hpp"
+#include "aes128.hpp"
 #include "nativeplayer.hpp"
 #include "streambuf.hpp"
 #include "netstream.hpp"
@@ -1248,8 +1249,12 @@ struct AudioPump {
 };
 
 // Qualidade: 0 = "Fluido" (720p max, 30 fps) | 1 = "Maxima" (720p60) | 2 = "Ultra" (1080p60)
-static std::atomic<int> g_quality{0};  // 0=Fluido (mais estavel na Kick)
-static const char *kQualityName[3] = {"Fluido 30fps", "Maxima 720p60", "Ultra 1080p60"};
+// Qualidade da live (Kick): 0 Fluido = ate 30 fps (no 60 fps da Kick isso cai em 480p) | 1 Equilibrado (padrao) = 720p com o video em 60 fps
+// baixado, mas a TELA desenha 1 quadro a cada 2 (custo de CPU de 30 fps, imagem 720p); apos um congelamento volta sozinho para o Fluido |
+// 2 Maxima = 720p60 desenhando tudo | 3 Ultra = 1080p60.
+static std::atomic<int> g_quality{1};
+static const int kQualityCount = 4;
+static const char *kQualityName[kQualityCount] = {"Fluido 30fps", "Equilibrado 720p", "Maxima 720p60", "Ultra 1080p60"};
 
 // Reconexao automatica: se a live congelar ou a rede/pipeline quebrar, o app reabre a transmissao sozinho (ver Player::wantReconnect).
 static std::string g_reconnectNote;          // motivo da ultima reconexao (mostrado na tela "Conectando...")
@@ -1284,6 +1289,7 @@ struct HlsFeeder {
     static double nowSecF() { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec + ts.tv_nsec / 1e9; }
     std::mutex rm;                                                   // ultimos segmentos (para tocar em "pedacos")
     std::deque<std::pair<unsigned long long, std::string>> recent;
+    std::map<std::string, std::string> keyCache;                     // chaves AES-128 do HLS (so a thread do alimentador usa)
 
     void setStatus(const std::string &t) { std::lock_guard<std::mutex> l(lm); status = t; }
     std::string getStatus() { std::lock_guard<std::mutex> l(lm); return status; }
@@ -1292,7 +1298,7 @@ struct HlsFeeder {
     void start(const std::string &u, bool rawTs = false) {
         join(); sb.reset();
         { std::lock_guard<std::mutex> l(rm); recent.clear(); }
-        raw = rawTs;
+        raw = rawTs; keyCache.clear();
         url = u; segs = opens = reads = failed = 0; localId = 0; streamEnded = false; run = true; discardBuf = false; dlMs = dlMsMax = 0; setStatus("iniciando");
         wantSegs = rawTs ? livebuf::startSegs(2.0, livebuf::kStartSecsRaw) : 3;
         th = std::thread([this] { loop(); g_net.closeSession(sess); });
@@ -1345,8 +1351,10 @@ struct HlsFeeder {
         if (hlsIsMaster(body)) {
             auto v = hlsParseMaster(body);
             const int stalls = liveRecentStalls();                                     // congelamentos nos ultimos 5 min
-            const int maxH = livebuf::capHeight(g_quality.load() == 2 ? 1080 : 720, stalls);
-            int i = hlsPickVariant(v, maxH, g_quality.load() == 0 ? 30 : 0);
+            const int q = g_quality.load();
+            const int maxH = livebuf::capHeight(q == 3 ? 1080 : 720, stalls);
+            const int fpsCap = (q == 0 || (q == 1 && stalls > 0)) ? 30 : 0;       // Equilibrado: depois de congelar, volta a variante de 30 fps
+            int i = hlsPickVariant(v, maxH, fpsCap);
             if (i < 0) { fail("playlist mestre sem variantes"); return; }
             mediaUrl = hlsResolve(url, v[i].uri);
             setStatus("variante " + std::to_string(v[i].width) + "x" + std::to_string(v[i].height) + " " + std::to_string((int)(v[i].fps + 0.5)) +
@@ -1418,6 +1426,30 @@ struct HlsFeeder {
                 errs = 0;
                 segsSinceSess++;
                 lastSegWall = nowSecF();
+                if (!sg.keyMethod.empty()) {                  // HLS criptografado (comum em canais pagos/PPV, ex.: lutas)
+                    if (sg.keyMethod != "AES-128") { fail("canal com criptografia " + sg.keyMethod + " (nao suportada)"); return; }
+                    const std::string ku = hlsResolve(mediaUrl, sg.keyUri);
+                    auto kit = keyCache.find(ku);
+                    if (kit == keyCache.end()) {
+                        std::string kb; int ks = 0;
+                        if (!g_net.getKA(sess, ku, kb, ks, 4096) || ks < 200 || ks >= 300 || kb.size() != 16) {
+                            g_net.closeSession(sess);
+                            if (++errs > 8) { fail("chave de criptografia indisponivel (HTTP " + std::to_string(ks) + ")"); return; }
+                            setStatus("buscando a chave de criptografia (HTTP " + std::to_string(ks) + ")...");
+                            sleepMs(500, run);
+                            break;
+                        }
+                        if (keyCache.size() > 8) keyCache.clear();
+                        kit = keyCache.emplace(ku, kb).first;
+                    }
+                    unsigned char iv[16];
+                    if (sg.hasIv) memcpy(iv, sg.iv, 16);
+                    else { memset(iv, 0, 16); unsigned long long q = sg.seq; for (int b = 15; b >= 8; b--) { iv[b] = (unsigned char)(q & 0xFF); q >>= 8; } }
+                    if (!aes128::cbcDecrypt((const uint8_t *)kit->second.data(), iv, seg)) {
+                        if (++errs > 10) { fail("segmento criptografado invalido"); return; }
+                        next = sg.seq + 1; continue;
+                    }
+                }
                 if (outFile) {
                     fwrite(seg.data(), 1, seg.size(), outFile); fflush(outFile); outBytes += seg.size();
                     if (outBytes > 1200000000ULL) { fail("limite de gravacao (1,2 GB) atingido"); return; }
@@ -1686,6 +1718,7 @@ struct Player {
         vodEstDurMs = 0; vodContentLength = 0; vodBytesAtStart = 0; vodTimeAtStart = 0;
         playStartWall = nowSec(); pauseAccum = 0; pauseStartedAt = 0; lastGoodPtsMs = 0; lastPtsWall = playStartWall; fileDurMs = 0; playedMs = 0; lastPaceWall = 0;
         avLang = "eng"; langTry = 0; vodPath.clear(); vodAudioExpected = false;
+        decimN = 0;
         h2 = 0; bHandle = 0; bState = 0; nextReady = false; prepBusy = false; gapless = true;
         if (g_tearing.load() > 0) {
             log.push_back("Encerrando a exibicao anterior...");
@@ -1771,6 +1804,10 @@ struct Player {
             if (cancelled) { failed = true; stop(); return false; }
             log.push_back(std::string(tries[ti].second ? "MPEG-TS" : "HLS") + ": pedacos baixados=" + std::to_string(g_feed.segs.load()) + "  " + g_feed.getStatus());
             if (g_feed.segs.load() > 0) break;
+            if (tries[ti].second && g_feed.getStatus().find("nao devolveu video MPEG-TS") != std::string::npos) {     // a URL devolveu uma playlist, nao TS
+                bool have = false; for (auto &t : tries) if (!t.second && t.first == url) have = true;
+                if (!have) tries.push_back({url, false});
+            }
             g_feed.join();
         }
         if (g_feed.segs.load() == 0) { failed = true; log.push_back("ERRO: nenhum segmento baixado"); g_feed.join(); return false; }
@@ -1807,9 +1844,7 @@ struct Player {
             } else log.push_back("ERRO conversao TS->MP4: " + err);
         }
         if (cancelled) { failed = true; stop(); return false; }
-        if (!chunkMode && !log.empty() && log.back().find("tipo 36") != std::string::npos) {     // HEVC (H.265): o PS4 nao decodifica, nao adianta tentar
-            failed = true; log.push_back("ERRO: este canal e H.265 (HEVC), que o PS4 nao toca"); g_feed.join(); return false;
-        }
+        // (HEVC/MPEG-2/outros codecs: a conversao para MP4 nao cobre, mas o AvPlayer pode tocar o .ts cru - o plano B abaixo tenta.)
         if (chunkMode) { g_feed.discardBuf = true; g_feed.sb.reset(); }     // os segmentos so seguem para 'recent' (nao enche mais o StreamBuf)
         // Plano B (so se a conversao falhou): TS cru em poucas extensoes e depois leitura propria. Timeouts curtos: antes eram ~45 s no total.
         static const char *exts[] = {"ts", "mpg", "m2ts"};
@@ -1820,7 +1855,7 @@ struct Player {
             log.push_back("Tentando arquivo " + path + " ...");
             presentCb();
             if (!writeFile(path, chunk)) { log.push_back("   nao consegui gravar"); continue; }
-            if (openSource(path, false, 3, 3500, true)) {
+            if (openSource(path, false, 3, ext == exts[0] ? 6000 : 3500, true)) {      // 1a tentativa com mais folga (decoder de HEVC/MPEG-2 demora a entregar o 1o quadro)
                 chunkMode = true; chunkExt = ext; chunkIdx = 0; lastSeq = last;
                 log.push_back("OK: tocando por arquivos (." + std::string(ext) + ")");
                 break;
@@ -2216,6 +2251,7 @@ struct Player {
         while (g_tearing.load() > 0 && nowSec() - t0 < maxSec) sceKernelUsleep(20000);
     }
     // chama a cada iteracao; retorna true se desenhou um quadro novo
+    unsigned decimN = 0;                         // contador de quadros (modo Equilibrado)
     bool poll(FbRenderer &r) {
         if (paused || !active || failed || g_tearing.load() > 0) return false;
         if (useNative) {
@@ -2361,9 +2397,13 @@ struct Player {
                 if (w != (unsigned)lockW || hh != (unsigned)lockH) { lockW = (int)w; lockH = (int)hh; strideLocked = false; strideUndecided = 0; }
                 const uint8_t *src = fi.pData; size_t srcN = 0;
                 size_t avail = texAvail(fi.pData);
+                // Equilibrado com video de 60 fps: desenha 1 quadro a cada 2 (o decoder entrega todos; so a copia/desenho para a tela e pulada)
+                const bool decimSkip = !isVod && g_quality.load() == 1 && g_feed.variantFps.load() > 40 && (++decimN & 1) == 0;
                 if (isVod && frames == 0) { char b[128]; snprintf(b, sizeof b, "vod-1o-quadro %ux%u avail=%zu tex=%d", w, hh, avail, g_texType.load()); trace(b); }
                 double b0 = nowSec();
-                if (avail >= (size_t)w * hh * 3 / 2 && g_texType.load() == 0) {
+                if (decimSkip) {
+                    srcN = 0;                                  // quadro descartado de proposito (nada a copiar nem desenhar)
+                } else if (avail >= (size_t)w * hh * 3 / 2 && g_texType.load() == 0) {
                     // memoria Onion (com cache): le direto, sem copiar
                     size_t want = blit::strideBytes(strideLocked || !autoStride ? strideMode : 3, (int)w, (int)hh);
                     if (!strideLocked && autoStride) { size_t m = blit::strideBytes(3, (int)w, (int)hh); if (m > want) want = m; }
@@ -3054,7 +3094,7 @@ struct Player {
                 uiText(r, ox + 28, iy + 10, items[i], sel ? TEXT : SOFT, 20, sel);
                 const char *val = "";
                 char tmp[32];
-                if (i == 0) val = kQualityName[g_quality.load() % 3];
+                if (i == 0) val = kQualityName[g_quality.load() % kQualityCount];
                 else if (i == 1) val = aspectName(aspectMode);
                 else if (i == 2) val = muted ? "Mudo" : "Ativo";
                 else if (i == 3) val = showInfo ? "Abrir" : "";
@@ -3078,7 +3118,7 @@ struct Player {
             uiText(r, ox + 24, oy + 70, uiFit(r, line, 20, ow - 48), SOFT, 20);
             snprintf(line, sizeof line, "Resolucao: %ux%u", vw, vh);
             uiText(r, ox + 24, oy + 100, line, SOFT, 20);
-            snprintf(line, sizeof line, "Tipo: %s  |  Qualidade: %s", isVod ? "Filme/Serie" : "Ao vivo", kQualityName[g_quality.load() % 3]);
+            snprintf(line, sizeof line, "Tipo: %s  |  Qualidade: %s", isVod ? "Filme/Serie" : "Ao vivo", kQualityName[g_quality.load() % kQualityCount]);
             uiText(r, ox + 24, oy + 130, line, SOFT, 20);
             snprintf(line, sizeof line, "Proporcao: %s  |  Audio: %s", aspectName(aspectMode), muted ? "Mudo" : "Ativo");
             uiText(r, ox + 24, oy + 160, line, SOFT, 20);
@@ -3728,8 +3768,8 @@ int main() {
         if (pressed & B_OPTIONS) {
             if (mode == Mode::Play) {
                 if (!player.isVod && !player.url.empty()) {
-                    g_quality = (g_quality.load() + 1) % 3;
-                    app.say(std::string("Qualidade: ") + kQualityName[g_quality.load() % 3]);
+                    g_quality = (g_quality.load() + 1) % kQualityCount;
+                    app.say(std::string("Qualidade: ") + kQualityName[g_quality.load() % kQualityCount]);
                     safeRestartLive("options-quality");
                     sceKernelUsleep(30000);
                     continue;
@@ -3817,7 +3857,7 @@ int main() {
                 if (pressed & B_UP) { player.optCur = (player.optCur + 4) % 5; }
                 if (pressed & B_DOWN) { player.optCur = (player.optCur + 1) % 5; }
                 auto cycleOpt = [&](int dir) {
-                    if (player.optCur == 0) g_quality = (g_quality.load() + (dir > 0 ? 1 : 2)) % 3;
+                    if (player.optCur == 0) g_quality = (g_quality.load() + (dir > 0 ? 1 : kQualityCount - 1)) % kQualityCount;
                     if (player.optCur == 1) {
                         player.aspectMode = (player.aspectMode + (dir > 0 ? 1 : 2)) % 3;
                         // aplica na hora: sai da pausa visual forcando redraw
@@ -3833,12 +3873,12 @@ int main() {
                 if (pressed & B_CROSS) {
                     if (player.optCur == 0) {
                         if (!player.isVod && !player.url.empty()) {
-                            g_quality = (g_quality.load() + 1) % 3;
-                            app.say(std::string("Qualidade: ") + kQualityName[g_quality.load() % 3]);
+                            g_quality = (g_quality.load() + 1) % kQualityCount;
+                            app.say(std::string("Qualidade: ") + kQualityName[g_quality.load() % kQualityCount]);
                             safeRestartLive("opts-quality");
                             sceKernelUsleep(30000);
                             continue;
-                        } else g_quality = (g_quality.load() + 1) % 3;
+                        } else g_quality = (g_quality.load() + 1) % kQualityCount;
                     } else if (player.optCur == 1) {
                         player.aspectMode = (player.aspectMode + 1) % 3;
                     } else if (player.optCur == 2) {
