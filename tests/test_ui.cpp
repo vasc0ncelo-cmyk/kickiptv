@@ -39,7 +39,7 @@ int main() {
     { std::string t, d; clockStrings(1791773220LL, t, d); assert(t == "23:47" && d == "11 Out 2026"); }
     // --- Home: abre direto nos atalhos, FILMES selecionado (o 1o atalho e APOIAR; a Kick abre pelo banner) ---
     assert(ui.screen == Screen::Home && ui.homeRow == 1 && ui.homeCol == 1);
-    { Rec r; ui.render(r); assert(r.has("APOIAR") && !r.has("KICK TV") && r.has("FILMES") && r.has("SÉRIES") && r.has("CANAIS") && r.has("LISTA M3U") && r.has("Acessar Agora")); }
+    { Rec r; ui.render(r); assert(ui.hero.size() >= 1 && ui.hero[0].kind == 0 && !ui.listLocked()); }       // o texto do Inicio e proporcional (sem drawText): checa o estado
     // --- Lista M3U: pede o teclado, baixa e guarda ---
     ui.handle(Input::Down); assert(ui.homeRow == 2);
     ui.handle(Input::Confirm); assert(f.asked == "Endereço da lista M3U" && ui.textKind == 2);
@@ -93,7 +93,7 @@ int main() {
         ul.defaultUrl = "http://painel.com/lista.m3u?x=1";
         ul.loadSaved();
         assert(ul.listLocked() && ul.hasSavedList() && ul.m3uUrl == "http://painel.com/lista.m3u?x=1");     // vale a padrao, nao a guardada
-        { Rec r; ul.render(r); assert(r.has("LISTA IPTV") && r.has("X  ATUALIZAR") && !r.has("LISTA M3U")); }
+        { Rec r; ul.render(r); assert(ul.listLocked()); }
         ul.handle(Input::Down); assert(ul.homeRow == 2);
         ul.handle(Input::Confirm);
         assert(fl.asked.empty() && ul.textKind == 0 && ul.reloadRequested);                              // NAO abre teclado: ninguem digita outra lista
@@ -256,29 +256,19 @@ int main() {
         ub3.handle(Input::PrevTab); ub3.handle(Input::PrevTab); assert(ub3.tab == Tab::Movies && ub3.itemCount() == 1);
         ub3.handle(Input::Back); assert(!ub3.searching());                    // O limpa a busca
     }
-    // --- sons e animacao ---
+    // --- animacao (sem sons) ---
     {
-        Fake fs; App as(fs); UI us(as);
-        std::vector<int> snd; us.sound = [&](int k) { snd.push_back(k); };
-        std::string m = "#EXTM3U\n#EXTINF:-1 group-title=\"A\",Canal 1\nhttp://h/live/1.ts\n#EXTINF:-1 group-title=\"A\",Canal 2\nhttp://h/live/2.ts\n";
-        as.list = buildPlaylist(m);
-        us.screen = Screen::Home;
-        us.handle(Input::Right);                                      // anda entre os atalhos: som de navegacao
-        assert(!snd.empty() && snd.back() == 0);
-        snd.clear();
-        for (int i = 0; i < 6; i++) us.handle(Input::Right);          // chega no fim: nao anda mais, sem som
-        size_t atEdge = snd.size(); snd.clear();
-        us.handle(Input::Right); assert(snd.empty() && atEdge <= 3);
-        snd.clear(); us.handle(Input::Confirm); assert(!snd.empty() && snd[0] == 1);   // confirmar
-        snd.clear(); us.handle(Input::NextTab); assert(!snd.empty() && snd.back() == 4);   // trocar de aba
-        snd.clear(); us.handle(Input::Back); assert(!snd.empty());     // voltar
-        // animacao: o fade comeca quando a tela muda e termina em 0,3 s; o brilho do foco respira entre 0,56 e 1,0
         Fake f2; App a2(f2); UI u2(a2);
         assert(u2.tick(10.0) && u2.fadeAt == 10.0);
         u2.tick(10.1); assert(u2.fadeAt == 10.0);                    // mesma tela: nao reinicia
-        u2.handle(Input::Right); u2.screen = Screen::List; u2.tick(11.0); assert(u2.fadeAt == 11.0);   // tela mudou: reinicia o fade
+        u2.handle(Input::Right); u2.screen = Screen::List; u2.tick(11.0); assert(u2.fadeAt == 11.0);   // tela mudou: reinicia a transicao
         for (double t = 0; t < 3; t += 0.05) { u2.tick(t); float p = u2.pulse(); assert(p >= 0.55f && p <= 1.01f); }
         u2.screen = Screen::Help; assert(!u2.wantsFrames());          // tela de texto fica parada
+        // valores suavizados chegam ao alvo
+        Fake f3; App a3(f3); UI u3(a3);
+        u3.tick(1.0); assert(u3.sm(1, 0.f) == 0.f);
+        for (double t = 1.03; t < 2.0; t += 0.033) { u3.tick(t); u3.sm(1, 1.f); }
+        assert(u3.sm(1, 1.f) > 0.99f);
     }
     // --- uiFit: corta com "..." sem estourar a largura e sem quebrar UTF-8 ---
     {
@@ -289,23 +279,23 @@ int main() {
         for (size_t i = 0; i < u.size();) { unsigned char c = u[i]; size_t n = c < 0x80 ? 1 : (c >> 5) == 6 ? 2 : (c >> 4) == 14 ? 3 : 4; assert(i + n <= u.size()); i += n; }
         assert(uiFit(r, "curto", 28, 500) == "curto");
     }
-    // --- Apoiar o app: 1o atalho da linha de cima (no lugar da KICK TV); abre a tela com o QR Code ---
+    // --- Apoiar o app: cartao ao lado de COMANDOS E AJUDA (linha de baixo); KICK TV e sempre o 1o atalho ---
     {
         Fake fd; App ad(fd); UI ud(ad);
-        ud.donateUrl = "";                                                        // sem link configurado: volta o atalho KICK TV
-        { Rec r; ud.render(r); assert(r.has("KICK TV") && !r.has("APOIAR")); }
+        ud.donateUrl = "";                                                        // sem link configurado: so COMANDOS E AJUDA
+        { Rec r; ud.render(r); }
         ud.handle(Input::Left); assert(ud.homeCol == 0);
         ud.handle(Input::Confirm); assert(ud.screen == Screen::Kick); ud.handle(Input::Back); assert(ud.screen == Screen::Home);
+        ud.handle(Input::Down); ud.handle(Input::Down); assert(ud.homeRow == 3);
+        ud.handle(Input::Right); assert(ud.homeCol3 == 0);                        // sem link: nao ha o cartao APOIAR
         ud.donateUrl = "https://livepix.gg/exemplo"; ud.donatePix = "chave@exemplo.com";
-        { Rec r; ud.render(r); assert(r.has("APOIAR") && !r.has("KICK TV") && !r.has("APOIAR O APP") && r.has("COMANDOS E AJUDA")); }
-        assert(ud.homeRow == 1 && ud.homeCol == 0);
+        { Rec r; ud.render(r); }
+        ud.handle(Input::Right); assert(ud.homeRow == 3 && ud.homeCol3 == 1);
         ud.handle(Input::Confirm); assert(ud.screen == Screen::Donate);
         { Rec r; ud.render(r); assert(r.has("APOIE O KICK IPTV") && r.has("https://livepix.gg/exemplo") && r.has("chave@exemplo.com")); }
         ud.handle(Input::Extra); assert(ud.screen == Screen::Donate);              // triangulo (busca) nao sai da tela de apoio
-        ud.handle(Input::Back); assert(ud.screen == Screen::Home && ud.homeRow == 1 && ud.homeCol == 0);
-        ud.handle(Input::Down); ud.handle(Input::Down); assert(ud.homeRow == 3);   // linha de baixo: so COMANDOS E AJUDA
-        ud.handle(Input::Right); assert(ud.homeRow == 3);
-        ud.handle(Input::Confirm); assert(ud.screen == Screen::Help); ud.handle(Input::Back);
+        ud.handle(Input::Back); assert(ud.screen == Screen::Home && ud.homeRow == 3 && ud.homeCol3 == 1);
+        ud.handle(Input::Left); ud.handle(Input::Confirm); assert(ud.screen == Screen::Help); ud.handle(Input::Back);
         ud.handle(Input::Up); ud.handle(Input::Up); assert(ud.homeRow == 1);        // sai da linha de baixo normalmente
     }
     std::cout << "OK\n";
