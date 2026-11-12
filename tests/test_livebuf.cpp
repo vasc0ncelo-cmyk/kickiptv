@@ -26,5 +26,20 @@ int main() {
     assert(!shouldPrep(2, 12.0, 0.0, 300) && !shouldPrep(7, 12.0, 0.0, 300)); // o pedaco atual ainda nao mostrou o 1o quadro: nao prepara
     assert(shouldPrep(kMaxMerge, 12.0, 0.0, 300) && shouldPrep(kMaxMerge + 3, 12.0, 1.0, 300));   // segmentos demais: prepara mesmo assim
     assert(shouldPrep(2, 0.0, 0.0, 0) && shouldPrep(5, 0.0, 3.0, 0));         // sem a duracao do pedaco atual: como antes (assim que ha 2)
+    // ---- ajuste automatico depois de congelamentos ----
+    assert(extraStartSecs(0) == 0 && extraStartSecs(-2) == 0);
+    assert(extraStartSecs(1) == 4 && extraStartSecs(2) == 8 && extraStartSecs(3) == 12 && extraStartSecs(9) == 12);   // no maximo +12 s
+    assert(startSegs(2.0, kStartSecsHls + extraStartSecs(3), 1000, kExtraMaxSegs) == 12);                            // 24 s de buffer = 12 segmentos de 2 s
+    assert(startSegs(2.0, kStartSecsHls + extraStartSecs(3), 1000) == 8);                                            // sem o limite novo: 8 (como antes)
+    assert(startSegs(2.0, kStartSecsHls + extraStartSecs(3), 7, kExtraMaxSegs) == 7);                                // nunca mais do que a playlist tem
+    assert(capHeight(720, 0) == 720 && capHeight(720, 1) == 720 && capHeight(720, 2) == 480 && capHeight(720, 3) == 480);
+    assert(capHeight(720, 4) == 360 && capHeight(1080, 9) == 360 && capHeight(360, 2) == 360 && capHeight(240, 5) == 240);
+    { double ts[4] = {100.0, 0.0, 380.0, 399.0};                                  // 0 = vazio
+      assert(recentStalls(ts, 4, 400.0) == 2);                                    // o de 100 s ja tem 300 s: esquecido
+      assert(recentStalls(ts, 4, 150.0) == 1);                                    // os de 380/399 ainda estao no futuro: nao contam
+      assert(recentStalls(ts, 4, 700.0) == 0 && recentStalls(ts, 0, 700.0) == 0); }
+    assert(segDeadlineSecs(2.0) == 8.0 && segDeadlineSecs(4.0) == 16.0 && segDeadlineSecs(10.0) == 20.0);
+    assert(segDeadlineSecs(0.0) == 8.0 && segDeadlineSecs(NAN) == 8.0 && segDeadlineSecs(-1) == 8.0);
+    assert(backoffMs(0) == 400 && backoffMs(1) == 400 && backoffMs(2) == 800 && backoffMs(4) == 1600 && backoffMs(5) == 2000 && backoffMs(40) == 2000);
     std::cout << "OK\n";
 }
