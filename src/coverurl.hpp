@@ -7,6 +7,9 @@
 // ganha o sufixo "#LARGURAxALTURA" (coverVariantKey); o cache decodifica nesse tamanho e coverFetchUrl pede ao TMDB uma imagem maior.
 #include <string>
 
+// Variante especial: LOGO do titulo (PNG com transparencia). O cache nao corta: encaixa inteira, alinhada embaixo, sobre o fundo escuro do Inicio.
+static constexpr int kCoverLogoW = 480, kCoverLogoH = 150;
+
 // Troca o tamanho no endereco do TMDB (".../t/p/<tamanho>/..."). Devolve vazio se nao for um endereco do TMDB com tamanho reconhecivel.
 inline std::string coverTmdbResize(const std::string &url, const std::string &want, bool keepSmall) {
     static const char kKey[] = "image.tmdb.org/t/p/";
@@ -54,6 +57,7 @@ inline bool coverSplitVariant(const std::string &key, std::string &url, int &w, 
 inline std::string coverFetchUrl(const std::string &key) {
     std::string url; int w, h;
     if (!coverSplitVariant(key, url, w, h)) return coverThumbUrl(key);
-    std::string r = coverTmdbResize(url, w > h ? "w300" : "w500", false);
+    // poster/quadrado -> w500 | paisagem pequena (miniatura de episodio) -> w300 | paisagem grande (banner do Inicio) -> w780
+    std::string r = coverTmdbResize(url, (w == kCoverLogoW && h == kCoverLogoH) ? "w500" : w > h ? (w >= 600 ? "w780" : "w300") : "w500", false);
     return r.empty() ? url : r;
 }
