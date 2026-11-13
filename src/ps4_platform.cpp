@@ -46,6 +46,7 @@
 #include "padin.hpp"
 #include "stalldetect.hpp"
 #include "texpool.hpp"
+#include "tmdbkey.hpp"
 #include "livebuf.hpp"
 #include <orbis/libkernel.h>
 #include <orbis/VideoOut.h>
@@ -3419,6 +3420,8 @@ int main() {
     Ps4Platform pf;
     trace("pf-ok");
     App app(pf);
+    app.heroInfoEnabled = true;
+    app.tmdbKey = tmdbKey();
     app.prefetch = true;                       // painel Xtream: baixa o catalogo todo em segundo plano ao conectar
     pf.app = &app;
     UI ui(app);
