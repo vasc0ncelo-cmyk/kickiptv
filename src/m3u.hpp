@@ -30,7 +30,7 @@ struct Category {
 };
 
 // Serie do painel Xtream: id para pedir os episodios (get_series_info) e capa vinda da lista.
-struct SeriesRef { std::string id, cover; };
+struct SeriesRef { std::string id, cover, backdrop, plot; };   // backdrop/plot: so para o banner do Inicio (vem na lista de series do painel)
 
 struct Playlist {
     std::vector<Entry> channels, movies;
