@@ -13,47 +13,77 @@ static constexpr int kHeroBdW = 880, kHeroBdH = 340;      // backdrop (paisagem)
 static constexpr int kHeroPkW = 264, kHeroPkH = 288;      // capa das cartas laterais
 static constexpr int kHeroPsW = 178, kHeroPsH = 267;      // poster nitido (quando nao ha backdrop)
 
+inline int heroNameYear(const std::string &n) {          // ultimo numero de 4 digitos (1950..2100) isolado no nome, ex.: "Filme (2025)"
+    int best = 0;
+    for (size_t i = 0; i + 4 <= n.size(); i++) {
+        if (!(n[i] >= '1' && n[i] <= '2')) continue;
+        if (i > 0 && n[i - 1] >= '0' && n[i - 1] <= '9') continue;
+        if (i + 4 < n.size() && n[i + 4] >= '0' && n[i + 4] <= '9') continue;
+        int v = 0; bool ok = true;
+        for (int k = 0; k < 4; k++) { char c = n[i + k]; if (c < '0' || c > '9') { ok = false; break; } v = v * 10 + (c - '0'); }
+        if (ok && v >= 1950 && v <= 2100) best = v;
+    }
+    return best;
+}
+
 inline void UI::heroRebuild() {
     const Playlist &p = app.list;
     std::string sig = std::to_string(p.movieCats.size()) + "|" + std::to_string(p.seriesCats.size());
-    if (hero.size() < 4) sig += "|" + std::to_string(p.movies.size()) + "|" + std::to_string(p.seriesTree.size());
+    sig += "|" + std::to_string(p.movies.size() / 4000) + (hero.size() < 4 ? "|" + std::to_string(p.movies.size()) : std::string());   // catalogo chegando aos poucos: refaz a escolha
     if (sig == heroSig && !hero.empty()) return;
     if (sig == heroSig && p.movies.empty() && p.seriesTree.empty()) return;
     heroSig = sig;
     hero.clear(); heroCandM_.clear(); heroSettled_ = false;
     std::vector<HeroItem> mv, sr;
-    for (int round = 0; round < 2 && heroCandM_.size() < 10; round++) {      // ate 10 candidatos: 1 por categoria, depois o 2o de cada
-        int skip = round;
-        for (const auto &c : p.movieCats) {
-            if (heroCandM_.size() >= 10) break;
-            int seen = 0;
-            for (uint32_t i : c.items) if (i < p.movies.size() && !p.movies[i].logo.empty()) {
-                if (seen++ < skip) continue;
-                const auto &m = p.movies[i];
-                HeroItem h; h.kind = 1; h.idx = i; h.title = m.name; h.sub = c.name; h.logo = m.logo; h.cat = c.name;
-                std::string id = xtMovieIdFromUrl(m.url);
-                if (!id.empty()) h.key = "m:" + id;
-                heroCandM_.push_back(h); break;
+    // So filmes RECENTES e bem avaliados (os que todo mundo quer ver): painel Xtream = data de entrada no catalogo + nota;
+    // lista M3U = ano no nome. Sem nenhuma dessas informacoes, cai no 1o filme de cada categoria (como antes).
+    {
+        const auto &M = p.movies;
+        int maxAdded = 0, refYear = 0;
+        for (const auto &m : M) { if (m.added > maxAdded) maxAdded = m.added; if (m.added == 0) { int y = heroNameYear(m.name); if (y > refYear) refYear = y; } }
+        const int recentFrom = maxAdded - 120 * 86400;
+        std::vector<uint32_t> el;
+        for (uint32_t i = 0; i < M.size(); i++) {
+            const auto &m = M[i];
+            if (m.logo.size() < 8 || m.url.empty()) continue;
+            bool recent = m.added > 0 ? m.added >= recentFrom : (refYear > 0 && heroNameYear(m.name) >= refYear - 1);
+            if (!recent) continue;
+            if (m.rate10 > 0 && m.rate10 < 60) continue;                 // nota baixa: fora
+            el.push_back(i);
+        }
+        std::stable_sort(el.begin(), el.end(), [&](uint32_t x, uint32_t y) {
+            int rx = M[x].rate10 ? M[x].rate10 : 60, ry = M[y].rate10 ? M[y].rate10 : 60;
+            if (rx != ry) return rx > ry;
+            return M[x].added > M[y].added;
+        });
+        std::vector<std::string> seen;
+        for (uint32_t i : el) {
+            if (heroCandM_.size() >= 8) break;
+            const auto &m = M[i];
+            std::string ct = detailCleanTitle(m.name);
+            bool dup = false; for (const auto &t : seen) if (t == ct) { dup = true; break; }
+            if (dup) continue;
+            seen.push_back(ct);
+            std::string cat = movieCategoryOf(i);
+            HeroItem h; h.kind = 1; h.idx = i; h.title = m.name; h.sub = cat; h.logo = m.logo; h.cat = cat;
+            std::string id = xtMovieIdFromUrl(m.url);
+            if (!id.empty()) h.key = "m:" + id;
+            heroCandM_.push_back(h);
+        }
+        if (heroCandM_.empty()) {                                        // sem data/ano: 1 por categoria
+            for (const auto &c : p.movieCats) {
+                if (heroCandM_.size() >= 8) break;
+                for (uint32_t i : c.items) if (i < M.size() && !M[i].logo.empty()) {
+                    const auto &m = M[i];
+                    HeroItem h; h.kind = 1; h.idx = i; h.title = m.name; h.sub = c.name; h.logo = m.logo; h.cat = c.name;
+                    std::string id = xtMovieIdFromUrl(m.url);
+                    if (!id.empty()) h.key = "m:" + id;
+                    heroCandM_.push_back(h); break;
+                }
             }
         }
     }
-    for (size_t i = 0; i < heroCandM_.size() && i < 3; i++) mv.push_back(heroCandM_[i]);
-    for (int pass = 0; pass < 2; pass++) {                // 1a passada: so series com backdrop; 2a: completa
-        for (const auto &c : p.seriesCats) {
-            if (sr.size() >= 2) break;
-            for (const auto &n : c.series) {
-                std::string lg = seriesLogo(n); if (lg.empty()) continue;
-                auto it = p.seriesInfo.find(n);
-                std::string bd = it != p.seriesInfo.end() ? it->second.backdrop : std::string();
-                if (pass == 0 && bd.empty()) continue;
-                bool dup = false; for (const auto &x : sr) if (x.title == n) dup = true;
-                if (dup) continue;
-                HeroItem h; h.kind = 2; h.title = n; h.sub = c.name; h.logo = lg; h.cat = c.name; h.backdrop = bd; h.infoDone = true;
-                if (it != p.seriesInfo.end()) { h.plot = it->second.plot; if (!it->second.id.empty()) h.key = "s:" + it->second.id; }
-                sr.push_back(h); break;
-            }
-        }
-    }
+    for (size_t i = 0; i < heroCandM_.size() && i < 5; i++) mv.push_back(heroCandM_[i]);
     size_t mi = 0, si = 0;
     while (mi < mv.size() || si < sr.size()) {            // filme, serie, filme, serie, filme
         if (mi < mv.size()) hero.push_back(mv[mi++]);
@@ -85,8 +115,8 @@ inline void UI::heroApplyInfo() {
         std::string curTitle = hero.empty() ? std::string() : hero[heroCur].title;
         hero.clear();
         size_t mi = 0, si = 0;
-        while ((mi < 3 && mi < good.size()) || si < sr.size()) {
-            if (mi < 3 && mi < good.size()) hero.push_back(good[mi++]);
+        while ((mi < 5 && mi < good.size()) || si < sr.size()) {
+            if (mi < 5 && mi < good.size()) hero.push_back(good[mi++]);
             if (si < sr.size()) hero.push_back(sr[si++]);
         }
         heroCur = 0; for (size_t i = 0; i < hero.size(); i++) if (hero[i].title == curTitle) heroCur = (int)i;
@@ -111,7 +141,7 @@ inline void UI::requestHomeCovers() {
     std::vector<std::string> front;
     for (const auto &h : hero) {
         if (!h.backdrop.empty()) front.push_back(coverVariantKey(h.backdrop, kHeroBdW, kHeroBdH));
-        else if (!h.logo.empty() && h.infoDone) front.push_back(coverVariantKey(h.logo, kHeroPsW, kHeroPsH));
+        else if (!h.logo.empty()) front.push_back(coverVariantKey(h.logo, kHeroPsW, kHeroPsH));
     }
     for (const auto &h : hero) if (!h.tlogo.empty()) front.push_back(coverVariantKey(h.tlogo, kCoverLogoW, kCoverLogoH));
     for (const auto &h : hero) if (!h.logo.empty()) front.push_back(coverVariantKey(h.logo, kHeroPkW, kHeroPkH));
@@ -130,7 +160,7 @@ inline void UI::heroTick(double t) {
     heroRebuild();
     heroApplyInfo();
     if (heroAuto <= 0) heroAuto = t;
-    if (homeRow != 0 && t - heroAuto > 7.0) { int n = (int)hero.size(); if (n > 1) { heroFrom = heroCur; heroCur = (heroCur + 1) % n; heroT0 = t; } heroAuto = t; }
+    if (t - heroAuto > 2.0) { int n = (int)hero.size(); if (n > 1) { heroFrom = heroCur; heroCur = (heroCur + 1) % n; heroT0 = t; } heroAuto = t; }
 }
 
 inline void UI::heroOpen() {
@@ -139,6 +169,7 @@ inline void UI::heroOpen() {
     const HeroItem &h = hero[heroCur];
     if (h.kind == 1 && h.idx < app.list.movies.size()) openMovieDetail(app.list.movies[h.idx], h.cat);
     else if (h.kind == 2) openSeriesDetail(h.title, h.cat);
+    if (screen == Screen::Detail) detailBackHome = true;      // o detalhe aberto pelo banner volta para o Inicio
 }
 
 // particulas e brilho dos riscos de neon, bem sutis (atras do conteudo)
@@ -194,21 +225,30 @@ inline void UI::drawPeek(Renderer &r, int slide, int x, int y, int w, int h, flo
         std::string key = coverVariantKey(hero[slide].logo, kHeroPkW, kHeroPkH);
         ok = !key.empty() && coverGet(key, px, cw, ch) && px && cw > 0 && ch > 0;
     }
-    static std::vector<uint32_t> col;
-    for (int c = 0; c < w; c++) {
-        float t = (float)c / (float)(w - 1);                       // 0 = esquerda
-        float inner = dir < 0 ? t : 1.f - t;                       // 1 = lado que encosta no cartao
-        int dh = (int)(h * (0.84f + 0.16f * inner));
-        int yy = y + (h - dh) / 2;
-        if (ok) {
-            int u = c * cw / w; col.resize((size_t)ch);
-            for (int k = 0; k < ch; k++) col[(size_t)k] = px[(size_t)k * cw + u];
-            r.blitImage(x + c, yy, 1, dh, col.data(), 1, ch);
-        } else r.fillRect(x + c, yy, 1, dh, 0xFF161616);
-        r.fillRect(x + c, yy, 1, 2, uiAlpha(GREEN, 170)); r.fillRect(x + c, yy + dh - 2, 1, 2, uiAlpha(GREEN, 170));
-        if (c < 2 || c >= w - 2) r.fillRect(x + c, yy, 1, dh, uiAlpha(GREEN, 170));
-        r.fillRect(x + c, yy, 1, dh, ((unsigned)(int)(dimA * 255) << 24));
+    // A carta inclinada e montada UMA vez (por capa) num bloco de pixels e depois so copiada: antes eram ~270 colunas x 2 cartas redesenhadas a cada quadro.
+    const int di = dir < 0 ? 0 : 1;
+    const std::string key = (ok ? hero[slide].logo : std::string("-")) + "|" + std::to_string(w) + "x" + std::to_string(h) + "|" + std::to_string((int)(dimA * 100));
+    if (peekKey_[di] != key || peekBuf_[di].size() != (size_t)w * h) {
+        peekKey_[di] = key;
+        std::vector<uint32_t> &B = peekBuf_[di];
+        B.assign((size_t)w * h, 0u);
+        const unsigned keep = (unsigned)((1.f - dimA) * 256.f);                 // escurece (dimA = quanto de preto)
+        auto dark = [&](unsigned c) { return 0xFF000000u | (((((c >> 16) & 255) * keep) >> 8) << 16) | (((((c >> 8) & 255) * keep) >> 8) << 8) | ((((c) & 255) * keep) >> 8); };
+        for (int c = 0; c < w; c++) {
+            float t = (float)c / (float)(w - 1);                       // 0 = esquerda
+            float inner = dir < 0 ? t : 1.f - t;                       // 1 = lado que encosta no cartao
+            int dh = (int)(h * (0.84f + 0.16f * inner));
+            int yy = (h - dh) / 2;
+            int u = ok ? c * cw / w : 0;
+            for (int j = 0; j < dh; j++) {
+                unsigned col;
+                if (c < 2 || c >= w - 2 || j < 2 || j >= dh - 2) col = 0xFF000000u | (((unsigned)(0x53 * 170 + 0x16 * 85) / 255) << 16) | (((unsigned)(0xFC * 170 + 0x16 * 85) / 255) << 8) | ((unsigned)(0x18 * 170 + 0x16 * 85) / 255);
+                else col = ok ? px[(size_t)(j * ch / dh) * cw + u] : 0xFF161616u;
+                B[(size_t)(yy + j) * w + c] = dark(col);
+            }
+        }
     }
+    r.blitImageRound(x, y, w, h, peekBuf_[di].data(), w, h, 0, 0);
 }
 
 inline void UI::drawHeroCard(Renderer &r, int slide, int x, int y, int w, int h, float, bool focus) {
