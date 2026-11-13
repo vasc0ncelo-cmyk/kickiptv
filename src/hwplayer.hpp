@@ -14,6 +14,10 @@ extern void (*traceHook)(const char *);
 // Descarrega os modulos do AvPlayer via libSceSysmodule (resolvida em tempo de execucao). rc = retorno do sistema ou -1.
 void unloadSysmodules(int *rcInternal, int *rcAv);
 
+// Sonda de diagnostico: carrega os modulos de decodificacao do sistema (video, audio, AJM), lista quais funcoes existem e consulta o
+// decodificador de video com varios layouts. Grava tudo em `path` linha a linha (se o app cair, o arquivo mostra em que passo).
+void runProbe(const char *path);
+
 struct Frame {
     const uint8_t *nv12 = nullptr;
     int width  = 0;
