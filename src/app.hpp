@@ -241,7 +241,11 @@ struct App {
                 if (id.empty()) return;
                 Entry e; e.name = name; e.logo = it.str("stream_icon");
                 if (t == Tab::Channels) { e.kind = Kind::Channel; e.url = xtreamLiveUrl(xt.acct, id); list.channels.push_back(std::move(e)); items.push_back((uint32_t)list.channels.size() - 1); }
-                else { e.kind = Kind::Movie; e.url = xtreamMovieUrl(xt.acct, id, it.str("container_extension")); list.movies.push_back(std::move(e)); items.push_back((uint32_t)list.movies.size() - 1); }
+                else {
+                    e.kind = Kind::Movie; e.url = xtreamMovieUrl(xt.acct, id, it.str("container_extension"));
+                    e.added = (int)it.num("added");
+                    { double rt = atof(it.str("rating").c_str()); if (rt > 0 && rt <= 10) e.rate10 = (int)(rt * 10 + 0.5); }
+                    list.movies.push_back(std::move(e)); items.push_back((uint32_t)list.movies.size() - 1); }
             });
         } catch (const std::bad_alloc &) { say("Memoria insuficiente para esta categoria"); }
         std::sort(names.begin(), names.end());
