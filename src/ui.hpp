@@ -505,10 +505,14 @@ struct UI {
     int homeCol3 = 0;         // linha 3: 0 = comandos e ajuda, 1 = apoiar o app
     std::string donateUrl = kDonateUrl, donatePix = kDonatePixKey;   // (testes podem trocar)
     bool hasDonate() const { return !donateUrl.empty(); }
-    // carrossel do Inicio: slide 0 = Kick TV, os demais = filmes / series do catalogo (capas reais)
-    struct HeroItem { int kind = 0; std::string title, sub, logo, cat; uint32_t idx = 0; };   // kind: 0 Kick, 1 filme, 2 serie
+    // carrossel do Inicio: filmes e series do catalogo (a Kick aparece so no atalho KICK TV, nunca aqui)
+    //  logo = poster | backdrop = imagem larga do painel (vazio = nao tem) | plot = sinopse | key = "m:<id>" (filme) para pedir o backdrop ao painel
+    struct HeroItem { int kind = 1; std::string title, sub, logo, cat, key, backdrop, plot, tlogo; uint32_t idx = 0; bool infoDone = false, logoDone = false; };   // kind: 1 filme, 2 serie
     std::vector<HeroItem> hero;
     std::string heroSig, lastHeroKey_;
+    std::vector<HeroItem> heroCandM_;   // candidatos a filme (ate 10): os que tem backdrop sobem para o carrossel
+    bool heroSettled_ = false;
+    int heroInfoVer_ = 0;     // sobe quando chega um backdrop novo (pede a imagem)
     int heroCur = 0, heroFrom = 0;
     double heroT0 = -10, heroAuto = 0;
     int homeCol = 1;          // atalhos: 0 = apoiar (ou KICK TV se nao houver link), 1 = filmes, 2 = series, 3 = canais
@@ -716,18 +720,19 @@ struct UI {
         coverBackground(std::move(all));
     }
     // Inicio: ja baixa as primeiras capas de cada aba (quando a lista carrega), para abrir tudo com as capas prontas
-    void wantHomeCovers() {
-        if (!coverBatch) return;
+    // Capas das primeiras linhas de cada aba (carregam antes de abrir a aba). 'key' muda quando a lista muda.
+    std::string homeCoverKey() const {
         const Playlist &p = app.list;
-        std::string key = "H|" + std::to_string(p.channels.size()) + "|" + std::to_string(p.movies.size()) + "|" + std::to_string(p.seriesTree.size());
-        if (key == lastBatchKey) return;
-        lastBatchKey = key;
+        return "H|" + std::to_string(p.channels.size()) + "|" + std::to_string(p.movies.size()) + "|" + std::to_string(p.seriesTree.size());
+    }
+    std::vector<std::string> homeCoverList() const {
+        const Playlist &p = app.list;
         std::vector<std::string> back;
         const int per = kCols * kGridRows;
         if (!p.movieCats.empty()) for (size_t i = 0; i < p.movieCats[0].items.size() && (int)i < per; i++) back.push_back(p.movies[p.movieCats[0].items[i]].logo);
         if (!p.seriesCats.empty()) for (size_t i = 0; i < p.seriesCats[0].series.size() && (int)i < per; i++) back.push_back(seriesLogo(p.seriesCats[0].series[i]));
         if (!p.channelCats.empty()) for (size_t i = 0; i < p.channelCats[0].items.size() && (int)i < per; i++) back.push_back(p.channels[p.channelCats[0].items[i]].logo);
-        coverBatch({}, back);
+        return back;
     }
     const std::vector<Category> &cats(Tab t) const {
         const Playlist &p = app.list;
@@ -1260,8 +1265,11 @@ private:
     void heroRebuild();
     void drawAmbient(Renderer &r);
     void drawHeroCard(Renderer &r, int slide, int x, int y, int w, int h, float center, bool focus);
-    void drawPeek(Renderer &r, int slide, int x, int y, int w, int h, float dimA);
-    void heroArt(Renderer &r, const std::string &logo, int x, int y, int w, int h, int rt, int rb);
+    void drawPeek(Renderer &r, int slide, int x, int y, int w, int h, float dimA, int dir);
+    bool heroArt(Renderer &r, const std::string &imgUrl, int vw, int vh, int x, int y, int w, int h, int rt, int rb);
+    void heroApplyInfo();
+    void requestHomeCovers();
+    static void heroChevron(Renderer &r, int cx, int cy, int dir, unsigned c);
 
     // Tela "Apoiar": QR Code do LivePix (ou da pagina de doacao) + explicacao
     void renderDonate(Renderer &r) {
