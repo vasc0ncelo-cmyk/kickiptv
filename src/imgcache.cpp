@@ -32,14 +32,18 @@ bool imgDecodeToCover(const std::string &body, Cover &out, int tw, int th) {
     unsigned char *px = stbi_load_from_memory(data, (int)body.size(), &w, &h, &comp, 4);
     if (!px || w <= 0 || h <= 0) { if (px) stbi_image_free(px); return false; }
 
-    const uint32_t BG = 0xFF161C16u;
+    const bool logo = tw == kCoverLogoW && th == kCoverLogoH;      // logo do titulo: encaixa inteira (sem cortar), embaixo
+    const uint32_t BG = logo ? 0xFF0A0A0Au : 0xFF161C16u;
     out.w = tw; out.h = th;
     out.bgra.assign((size_t)tw * th, BG);
 
     // SEMPRE preenche o poster 2:3 (cover-crop): tamanhos consistentes na grade, sem faixas vazias
     double ar = (double)w / (double)h, tar = (double)tw / (double)th;
     int sx0 = 0, sy0 = 0, sw = w, sh = h, dx0 = 0, dy0 = 0, dw = tw, dh = th;
-    if (ar > tar) {                          // imagem mais larga: corta laterais
+    if (logo) {
+        if (ar > tar) { dh = std::max(1, (int)(tw / ar)); dy0 = th - dh; }
+        else { dw = std::max(1, (int)(th * ar)); }
+    } else if (ar > tar) {                          // imagem mais larga: corta laterais
         sw = std::max(1, (int)(h * tar));
         sx0 = (w - sw) / 2;
     } else {                                 // mais alta: corta embaixo (preserva rosto no topo)
