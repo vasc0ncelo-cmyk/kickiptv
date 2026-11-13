@@ -39,7 +39,7 @@ int main() {
     { std::string t, d; clockStrings(1791773220LL, t, d); assert(t == "23:47" && d == "11 Out 2026"); }
     // --- Home: abre direto nos atalhos, FILMES selecionado (o 1o atalho e APOIAR; a Kick abre pelo banner) ---
     assert(ui.screen == Screen::Home && ui.homeRow == 1 && ui.homeCol == 1);
-    { Rec r; ui.render(r); assert(ui.hero.size() >= 1 && ui.hero[0].kind == 0 && !ui.listLocked()); }       // o texto do Inicio e proporcional (sem drawText): checa o estado
+    { Rec r; ui.render(r); assert(ui.hero.empty() && !ui.listLocked()); }       // o texto do Inicio e proporcional (sem drawText): checa o estado
     // --- Lista M3U: pede o teclado, baixa e guarda ---
     ui.handle(Input::Down); assert(ui.homeRow == 2);
     ui.handle(Input::Confirm); assert(f.asked == "Endereço da lista M3U" && ui.textKind == 2);
@@ -75,8 +75,8 @@ int main() {
     ui.handle(Input::NextTab); assert(ui.tab == Tab::Channels);
     ui.handle(Input::NextTab); assert(ui.tab == Tab::Movies);                          // L1/R1 nao passa mais pela Kick
     ui.handle(Input::PrevTab); assert(ui.tab == Tab::Channels);
-    ui.handle(Input::Back); assert(ui.screen == Screen::Home);                      // a Kick TV abre pelo banner
-    ui.handle(Input::Up); assert(ui.homeRow == 0);
+    ui.handle(Input::Back); assert(ui.screen == Screen::Home);                      // a Kick TV abre pelo atalho KICK TV
+    ui.homeRow = 1; ui.homeCol = 0;
     ui.handle(Input::Confirm); assert(ui.tab == Tab::Kick && ui.screen == Screen::Kick);
     ui.handle(Input::Confirm); assert(f.asked == "@ do streamer" && ui.textKind == 1);
     ui.onText("@Streamer"); assert(f.played == "https://k/a.m3u8" && a.lastStatus == "Assistindo @streamer" && f.store["kick"] == "streamer");
