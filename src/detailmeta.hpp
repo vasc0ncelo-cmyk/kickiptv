@@ -13,6 +13,7 @@ struct DetailMeta {
     std::string rating;               // "8.7" (de 0 a 10)
     int runtimeMin = 0;               // filme: duracao total; serie: duracao media do episodio
     std::string quality;              // selo verde: "HD", "FHD", "4K"
+    std::string backdrop;             // imagem larga de fundo (paisagem) que o painel entrega; vazio = nao tem
     std::vector<int> epMin;           // opcional: duracao de cada episodio da temporada aberta (indice = posicao na lista)
 };
 
