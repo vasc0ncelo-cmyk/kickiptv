@@ -9,6 +9,7 @@
 #include "sans.hpp"
 #include <algorithm>
 #include <map>
+#include <chrono>
 #include <functional>
 #include <cctype>
 #include <cstdint>
@@ -513,6 +514,10 @@ struct UI {
     std::vector<HeroItem> heroCandM_;   // candidatos a filme (ate 10): os que tem backdrop sobem para o carrossel
     bool heroSettled_ = false;
     int heroInfoVer_ = 0;     // sobe quando chega um backdrop novo (pede a imagem)
+    std::vector<uint32_t> peekBuf_[2]; std::string peekKey_[2];   // cartas laterais inclinadas ja montadas
+    Screen prevScreen_ = Screen::Home;
+    uint32_t heroSeed_ = 0;            // semente do sorteio dos filmes do banner (muda a cada abertura do app)
+    bool detailBackHome = false;       // detalhe aberto pelo banner do Inicio: Voltar volta para o Inicio (nao para a aba)
     int heroCur = 0, heroFrom = 0;
     double heroT0 = -10, heroAuto = 0;
     int homeCol = 1;          // atalhos: 0 = apoiar (ou KICK TV se nao houver link), 1 = filmes, 2 = series, 3 = canais
@@ -539,6 +544,10 @@ struct UI {
             prevScreenDepth = d; prevTabSig = tb;
             smv_.clear();                               // cada tela comeca com o foco ja no lugar (sem "voar" de outra tela)
         }
+        if (screen == Screen::Home && prevScreen_ != Screen::Home && prevScreen_ != Screen::Donate && prevScreen_ != Screen::Help) {   // voltou ao Inicio: novo sorteio dos filmes do banner
+            heroSeed_ = 0; heroSig.clear(); heroCur = 0; heroFrom = 0; heroAuto = t;
+        }
+        prevScreen_ = screen;
         heroTick(t);
         return wantsFrames();
     }
