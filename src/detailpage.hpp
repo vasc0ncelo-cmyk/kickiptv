@@ -48,6 +48,7 @@ inline void star(Renderer &r, float cx, float cy, float R, unsigned c) {
 
 // ---------------- Abrir ----------------
 inline void UI::openMovieDetail(const Entry &e, const std::string &category) {
+    detailBackHome = false;
     detailSeries = false;
     std::string y, q;
     detailTitle = detailCleanTitle(e.name, &y, &q);
@@ -64,6 +65,7 @@ inline void UI::openMovieDetail(const Entry &e, const std::string &category) {
     app.say(e.url.empty() ? "Este filme nao tem link de video" : "Detalhes do filme");
 }
 inline void UI::openSeriesDetail(const std::string &name, const std::string &category) {
+    detailBackHome = false;
     detailSeries = true;
     std::string y, q;
     detailTitle = detailCleanTitle(name, &y, &q);
@@ -110,7 +112,7 @@ inline void UI::playSeriesEpisode(int epIndex) {
 
 // ---------------- Controle ----------------
 inline void UI::handleDetail(Input in) {
-    if (in == Input::Back) { screen = Screen::List; lastBatchKey.clear(); return; }
+    if (in == Input::Back) { screen = detailBackHome ? Screen::Home : Screen::List; detailBackHome = false; lastBatchKey.clear(); return; }
     if (!detailSeries) {
         if (in == Input::Confirm) {
             if (detailUrl.empty()) app.say("Sem link de video");
