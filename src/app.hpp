@@ -88,7 +88,7 @@ struct App {
     std::unordered_map<std::string, DetailMeta> metaCache; // "m:<id>" filmes, "s:<id>" series
     bool prefetch = false;                                 // painel Xtream: baixa as categorias todas em segundo plano ao conectar
     explicit App(Platform &p) : pf(p) {}
-    ~App() { stopPrefetch(0.3); }
+    ~App() { stopPrefetch(0.3); stopHeroInfo(0.3); }
     App(const App &) = delete;
     App &operator=(const App &) = delete;
 
@@ -233,7 +233,7 @@ struct App {
                 if (t == Tab::Series) {
                     std::string id = it.str("series_id");
                     if (id.empty() || list.seriesInfo.count(name)) return;
-                    list.seriesInfo[name] = SeriesRef{id, it.str("cover")};
+                    list.seriesInfo[name] = SeriesRef{id, it.str("cover"), xtBackdrop(it), dm::trimA(it.str("plot"))};
                     names.push_back(name);
                     return;
                 }
@@ -380,6 +380,7 @@ struct App {
     // ---------- Metadados do painel (sinopse, nota, generos, duracao) ----------
     static void applyMeta(const DetailMeta &src, DetailMeta &dst) {
         if (!src.plot.empty()) dst.plot = src.plot;
+        if (!src.backdrop.empty()) dst.backdrop = src.backdrop;
         if (!src.rating.empty()) dst.rating = src.rating;
         if (src.runtimeMin > 0) dst.runtimeMin = src.runtimeMin;
         if (!src.genres.empty()) dst.genres = src.genres;
@@ -412,6 +413,98 @@ struct App {
         if (c == metaCache.end()) return false;
         applyMeta(c->second, m);
         return true;
+    }
+
+
+    // ---------- Banner do Inicio: imagem larga (backdrop) e sinopse dos filmes ----------
+    // A lista de filmes do painel so traz o poster. O backdrop e a sinopse vem de get_vod_info (1 consulta por filme do banner, no maximo
+    // uns 3). Uma thread so faz essas consultas, uma de cada vez e com pausa, para nunca competir com o video nem com as capas.
+    // (As series ja trazem backdrop/sinopse na propria lista: SeriesRef.)
+    struct HeroInfo { std::string backdrop, plot, logo; };
+    struct HeroReq { std::string key, id; };
+    struct HeroShared {
+        std::mutex m; std::deque<HeroReq> q; std::unordered_map<std::string, HeroInfo> info; std::unordered_map<std::string, bool> asked;
+        std::atomic<bool> stop{false}; bool running = false;
+    };
+    std::string tmdbKey;                                  // chave TMDB (logos); vazia = sem logos
+    bool heroInfoEnabled = false;                         // a plataforma liga; os testes ficam sem consultas extras
+    std::shared_ptr<HeroShared> heroSh_ = std::make_shared<HeroShared>();
+    std::thread heroTh_;
+
+    bool heroInfoGet(const std::string &key, HeroInfo &out) {
+        std::lock_guard<std::mutex> l(heroSh_->m);
+        auto it = heroSh_->info.find(key);
+        if (it == heroSh_->info.end()) return false;
+        out = it->second; return true;
+    }
+    // Pede (uma vez so por filme) o backdrop/sinopse. Nao bloqueia.
+    void heroInfoRequest(const std::string &key, const std::string &id) {
+        if (!heroInfoEnabled || id.empty() || key.empty()) return;
+        const XtreamAcct acct = metaAccount();
+        if (!acct.valid()) return;
+        auto sh = heroSh_;
+        bool start = false;
+        {
+            std::lock_guard<std::mutex> l(sh->m);
+            if (sh->asked.count(key)) return;
+            sh->asked[key] = true; sh->q.push_back({key, id});
+            if (!sh->running) { sh->running = true; start = true; }
+        }
+        if (!start) return;                                // a thread que ja esta rodando pega este pedido
+        if (heroTh_.joinable()) heroTh_.join();            // a anterior ja terminou (running ficou falso)
+        Platform *plat = &pf;
+        const std::string tk = tmdbKey;
+        heroTh_ = std::thread([sh, acct, plat, tk] {
+            for (;;) {
+                HeroReq r;
+                {
+                    std::lock_guard<std::mutex> l(sh->m);
+                    if (sh->stop || sh->q.empty()) { sh->running = false; return; }
+                    r = sh->q.front(); sh->q.pop_front();
+                }
+                HeroInfo hi; std::string body; Json j; std::string tmdbId;
+                const bool isSeries = !r.key.empty() && r.key[0] == 's';
+                try {
+                    if (plat->httpGet(xtreamApi(acct, isSeries ? "get_series_info" : "get_vod_info", std::string(isSeries ? "series_id=" : "vod_id=") + r.id), body) && jsonParse(body, j))
+                        if (const Json *info = j.get("info")) {
+                            DetailMeta d; xtFillMeta(*info, d); hi.backdrop = d.backdrop; hi.plot = d.plot;
+                            tmdbId = info->str(isSeries ? "tmdb" : "tmdb_id"); if (tmdbId.empty()) tmdbId = info->str("tmdb_id");
+                            if (tmdbId == "0") tmdbId.clear();
+                        }
+                } catch (...) {}
+                if (!tk.empty() && !tmdbId.empty() && !sh->stop) {                // logo do titulo (PNG com transparencia) via TMDB
+                    try {
+                        std::string b2; Json j2;
+                        std::string u = std::string("https://api.themoviedb.org/3/") + (isSeries ? "tv/" : "movie/") + tmdbId + "/images?api_key=" + tk + "&include_image_language=pt,en,null";
+                        if (plat->httpGet(u, b2) && jsonParse(b2, j2))
+                            if (const Json *ls = j2.get("logos"); ls && ls->isArr()) {
+                                double best = -1; std::string bp;
+                                for (const Json &e : ls->arr) {
+                                    std::string fp = e.str("file_path"); if (fp.size() < 5 || fp.compare(fp.size() - 4, 4, ".png") != 0) continue;
+                                    std::string lang = e.str("iso_639_1");
+                                    double sc = (lang == "pt" ? 20.0 : lang == "en" ? 10.0 : 0.0) + (e.get("vote_average") ? e.get("vote_average")->n : 0.0);
+                                    if (sc > best) { best = sc; bp = fp; }
+                                }
+                                if (!bp.empty()) hi.logo = "https://image.tmdb.org/t/p/w500" + bp;
+                            }
+                    } catch (...) {}
+                }
+                { std::lock_guard<std::mutex> l(sh->m); sh->info[r.key] = hi; }          // mesmo vazio: nao consulta de novo
+                for (int i = 0; i < 15 && !sh->stop; i++) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+        });
+    }
+    void stopHeroInfo(double waitSec = 0.3) {
+        auto sh = heroSh_;
+        sh->stop = true;
+        auto until = std::chrono::steady_clock::now() + std::chrono::duration<double>(waitSec);
+        for (;;) {
+            { std::lock_guard<std::mutex> l(sh->m); if (!sh->running) break; }
+            if (std::chrono::steady_clock::now() >= until) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        bool done; { std::lock_guard<std::mutex> l(sh->m); done = !sh->running; }
+        if (heroTh_.joinable()) { if (done) heroTh_.join(); else heroTh_.detach(); }
     }
 
     // aviso quando a lista passou do limite de memoria e so os primeiros itens foram carregados
