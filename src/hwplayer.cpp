@@ -1,6 +1,7 @@
 // hwplayer.cpp — implementação do protótipo (fase 1)
 #include "hwplayer.hpp"
 
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -414,6 +415,89 @@ void unloadSysmodules(int *rcInternal, int *rcAv) {
         if (resolveOne(mod, "sceSysmoduleUnloadModule", &p)) *rcAv = ((int (*)(uint16_t))p)((uint16_t)0x00A5);
         return;
     }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------
+// Sonda de diagnostico (so roda se existir /data/kickiptv_x_decprobe). Nao decodifica nada: so descobre o que este PS4 oferece.
+// ---------------------------------------------------------------------------------------------------------------------------
+namespace {
+struct ProbeLog {
+    FILE *f = nullptr;
+    void line(const char *fmt, ...) __attribute__((format(printf, 2, 3))) {
+        if (!f) return;
+        va_list ap; va_start(ap, fmt); vfprintf(f, fmt, ap); va_end(ap);
+        fputc('\n', f); fflush(f);
+    }
+};
+}
+
+void runProbe(const char *path) {
+    ProbeLog L; L.f = fopen(path, "w");
+    if (!L.f) return;
+    const char *guard = "/data/kickiptv_probe_guard";
+    bool crashedBefore = false;
+    { FILE *g = fopen(guard, "rb"); if (g) { crashedBefore = true; fclose(g); } }
+    L.line("kickiptv decprobe v1");
+    if (crashedBefore) L.line("AVISO: a sonda anterior nao terminou (o app caiu). Passos de risco serao pulados.");
+    { FILE *g = fopen(guard, "wb"); if (g) { fputs("probe", g); fclose(g); } }
+
+    struct Mod { const char *name; int h; };
+    Mod mods[] = {{"libSceVideodec.sprx", -1}, {"libSceVideodec2.sprx", -1}, {"libSceAudiodec.sprx", -1}, {"libSceAjm.sprx", -1}, {"libSceAvPlayer.sprx", -1}};
+    static const char *dirs[] = {"/system/common/lib/", "/system/priv/lib/", ""};
+    for (auto &m : mods) {
+        for (const char *d : dirs) {
+            char full[160]; snprintf(full, sizeof full, "%s%s", d, m.name);
+            int res = 0;
+            int rc = sceKernelLoadStartModule(full, 0, nullptr, 0, nullptr, &res);
+            L.line("modulo %-40s rc=0x%08x res=%d", full, (unsigned)rc, res);
+            if (rc >= 0) { m.h = rc; break; }
+        }
+    }
+    struct Syms { int mod; const char *const *names; };
+    static const char *kVideodec[] = {"sceVideodecQueryResourceInfo", "sceVideodecCreateDecoder", "sceVideodecDecode", "sceVideodecFlush", "sceVideodecReset", "sceVideodecDeleteDecoder", "sceVideodecMapMemory", "sceVideodecInitLibrary", "sceVideodecTermLibrary", nullptr};
+    static const char *kVideodec2[] = {"sceVideodec2QueryComputeMemoryInfo", "sceVideodec2AllocateComputeQueue", "sceVideodec2ReleaseComputeQueue", "sceVideodec2QueryDecoderMemoryInfo", "sceVideodec2CreateDecoder", "sceVideodec2DeleteDecoder", "sceVideodec2Decode", "sceVideodec2Flush", "sceVideodec2Reset", "sceVideodec2GetPictureInfo", nullptr};
+    static const char *kAudiodec[] = {"sceAudiodecInitLibrary", "sceAudiodecTermLibrary", "sceAudiodecCreateDecoder", "sceAudiodecDecode", "sceAudiodecDeleteDecoder", "sceAudiodecClearContext", "sceAudiodecDecode2", nullptr};
+    static const char *kAjm[] = {"sceAjmInitialize", "sceAjmFinalize", "sceAjmModuleRegister", "sceAjmModuleUnregister", "sceAjmInstanceCreate", "sceAjmInstanceDestroy", "sceAjmBatchInitialize", "sceAjmBatchStart", "sceAjmBatchWait", "sceAjmBatchJobRun", "sceAjmBatchJobInlineBuffer", "sceAjmBatchJobInputBuffer", "sceAjmBatchJobOutputBuffer", "sceAjmBatchErrorDump", nullptr};
+    Syms table[] = {{mods[0].h, kVideodec}, {mods[1].h, kVideodec2}, {mods[2].h, kAudiodec}, {mods[3].h, kAjm}};
+    void *fnVideoQuery = nullptr, *fnAudInit = nullptr, *fnAudTerm = nullptr;
+    for (auto &t : table) {
+        if (t.mod < 0) continue;
+        for (int i = 0; t.names[i]; i++) {
+            void *p = nullptr; bool ok = resolveOne(t.mod, t.names[i], &p);
+            L.line("simbolo %-40s %s", t.names[i], ok ? "OK" : "nao existe");
+            if (ok && !strcmp(t.names[i], "sceVideodecQueryResourceInfo")) fnVideoQuery = p;
+            if (ok && !strcmp(t.names[i], "sceAudiodecInitLibrary")) fnAudInit = p;
+            if (ok && !strcmp(t.names[i], "sceAudiodecTermLibrary")) fnAudTerm = p;
+        }
+    }
+    if (crashedBefore) { L.line("fim (passos de risco pulados)"); fclose(L.f); return; }
+
+    // Audio: so inicializa a biblioteca para cada codec (1 = AT9, 2 = MP3, 3 = AAC) e devolve.
+    if (fnAudInit) for (uint32_t codec = 1; codec <= 3; codec++) {
+        L.line("audiodec InitLibrary(%u)...", codec);
+        int rc = ((int (*)(uint32_t))fnAudInit)(codec);
+        L.line("audiodec InitLibrary(%u) rc=0x%08x", codec, (unsigned)rc);
+        if (rc >= 0 && fnAudTerm) { int rt = ((int (*)(uint32_t))fnAudTerm)(codec); L.line("audiodec TermLibrary(%u) rc=0x%08x", codec, (unsigned)rt); }
+    }
+
+    // Video: QueryResourceInfo (so consulta, nao cria decoder) com varios codecType e tamanhos de estrutura.
+    if (fnVideoQuery) {
+        const uint64_t cfgSizes[] = {sizeof(vdec::ConfigInfo), 0x30, 0x38, 0x40};
+        const uint64_t resSizes[] = {sizeof(vdec::ResourceInfo), 0x38, 0x40};
+        L.line("sizeof ConfigInfo=%zu ResourceInfo=%zu", sizeof(vdec::ConfigInfo), sizeof(vdec::ResourceInfo));
+        for (uint32_t codec = 0; codec <= 3; codec++) for (uint64_t cs : cfgSizes) for (uint64_t rs : resSizes) {
+            vdec::ConfigInfo c{}; vdec::ResourceInfo r{};
+            c.thisSize = cs; c.codecType = codec; c.profile = 100; c.maxLevel = 41; c.maxFrameWidth = 1920; c.maxFrameHeight = 1080; c.maxDpbFrameCount = 16;
+            r.thisSize = rs;
+            L.line("videodec Query codec=%u cfgSize=0x%llx resSize=0x%llx ...", codec, (unsigned long long)cs, (unsigned long long)rs);
+            int rc = ((vdec::FnQueryResourceInfo)fnVideoQuery)(&c, &r);
+            if (rc >= 0) L.line("  rc=0x%08x cpuMem=%llu cpuGpuMem=%llu fbSize=%llu fbAlign=%u", (unsigned)rc, (unsigned long long)r.cpuMemorySize, (unsigned long long)r.cpuGpuMemorySize, (unsigned long long)r.maxFrameBufferSize, r.frameBufferAlignment);
+            else L.line("  rc=0x%08x", (unsigned)rc);
+        }
+    }
+    L.line("fim");
+    fclose(L.f);
+    remove(guard);
 }
 
 void Player::close() {
