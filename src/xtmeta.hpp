@@ -41,6 +41,17 @@ inline int xtDurationMin(const Json &info) {
     return 0;
 }
 
+// Imagem larga de fundo (backdrop): "backdrop_path" pode ser uma lista de enderecos, um texto, ou vir vazio. Pega o 1o endereco http(s).
+inline std::string xtBackdrop(const Json &o) {
+    const Json *b = o.get("backdrop_path");
+    if (!b) b = o.get("backdrop");
+    if (!b) return "";
+    auto ok = [](const std::string &u) { return u.compare(0, 7, "http://") == 0 || u.compare(0, 8, "https://") == 0; };
+    if (b->type == Json::Str) return ok(b->s) ? b->s : "";
+    if (b->isArr()) for (const Json &e : b->arr) if (e.type == Json::Str && ok(e.s)) return e.s;
+    return "";
+}
+
 // Preenche o que o painel trouxe. Generos do painel substituem o chip de categoria; ano da lista/nome so e trocado se estava vazio.
 inline void xtFillMeta(const Json &info, DetailMeta &m) {
     if (!info.isObj()) return;
@@ -69,4 +80,6 @@ inline void xtFillMeta(const Json &info, DetailMeta &m) {
     if (y.size() >= 4 && dm::isYear(y.substr(0, 4)) && m.year.empty()) m.year = y.substr(0, 4);
     int mins = xtDurationMin(info);
     if (mins > 0) m.runtimeMin = mins;
+    std::string bd = xtBackdrop(info);
+    if (!bd.empty()) m.backdrop = bd;
 }
