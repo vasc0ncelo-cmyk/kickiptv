@@ -15,6 +15,8 @@ struct Entry {
     Kind kind = Kind::Channel;
     int season = 0, episode = 0;    // so para series
     int mins = 0;                   // duracao em minutos (so quando o painel informa; episodios)
+    int added = 0;                  // filmes do painel Xtream: quando entrou no catalogo (unix); 0 = desconhecido
+    int rate10 = 0;                 // filmes do painel Xtream: nota 0..100 (nota 7,5 = 75); 0 = desconhecida
 };
 
 // Categoria (group-title da lista). Filmes/canais: indices em Playlist::movies / channels. Series: nomes (chave de seriesTree).
