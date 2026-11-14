@@ -24,7 +24,7 @@ struct Fake : Platform {
         st = 200;
         if (std::string(m) == "POST") { apiPosts++; out = "{\"access_token\":\"T\",\"expires_in\":3600}"; return true; }
         assert(auth == "Bearer T" && url.find("livestreams") != std::string::npos);
-        out = "{\"data\":[{\"slug\":\"pequeno\",\"stream_title\":\"t1\",\"viewer_count\":5,\"category\":{\"name\":\"Just Chatting\"}},{\"slug\":\"grande\",\"viewer_count\":900,\"category\":{\"name\":\"GTA V\"}}]}";
+        out = "{\"data\":[{\"slug\":\"pequeno\",\"stream_title\":\"t1\",\"viewer_count\":5,\"category\":{\"name\":\"Just Chatting\"}},{\"slug\":\"grande\",\"thumbnail\":\"https:\\/\\/i\\/g.webp\",\"viewer_count\":900,\"category\":{\"name\":\"GTA V\"}}]}";
         return true;
     }
     void play(const std::string &u, const std::string &) override { played = u; }
@@ -84,40 +84,63 @@ int main() {
     ui.handle(Input::NextTab); assert(ui.tab == Tab::Movies);                          // L1/R1 nao passa mais pela Kick
     ui.handle(Input::PrevTab); assert(ui.tab == Tab::Channels);
     ui.handle(Input::Back); assert(ui.screen == Screen::Home);                      // a Kick TV abre pelo atalho KICK TV
+    a.kickClient.setCredentials("", "");                  // o app real ja leva chaves: aqui simula sem elas
     ui.homeRow = 1; ui.homeCol = 0;
     ui.handle(Input::Confirm); assert(ui.tab == Tab::Kick && ui.screen == Screen::Kick);
-    ui.handle(Input::Confirm); assert(f.asked == "@ do streamer" && ui.textKind == 1);
-    ui.onText("@Streamer"); assert(f.played == "https://k/a.m3u8" && a.lastStatus == "Assistindo @streamer" && f.store["kick"] == "streamer");
-    // o ultimo canal aparece como segundo item
-    { Rec r; ui.render(r); assert(r.has("Assistir @streamer")); }
-    f.played.clear(); ui.handle(Input::Down); ui.handle(Input::Confirm); assert(f.played == "https://k/a.m3u8");
-    // --- Lives agora / favoritos / historico (sem chave, a lista oficial avisa em vez de quebrar) ---
+    // --- Tela Kick em grade: sem chave da API abre em "Seguindo" (vazio) e avisa; digitar @ continua funcionando ---
     {
+        a.kickClient.setCredentials("", "");
         ui.handle(Input::Back); ui.homeRow = 1; ui.homeCol = 0; ui.handle(Input::Confirm);
-        assert(ui.screen == Screen::Kick && ui.kickView == 0);
-        auto acts = ui.kickActions(); assert(acts.size() == 4 && acts[2] == UI::KA_LIVES);        // digitar, ultimo, lives, historico
+        assert(ui.screen == Screen::Kick && ui.kickView == 2 && ui.kickList.empty() && ui.kickInChips);
+        { Rec r; ui.render(r); assert(r.has("Você ainda não segue ninguém") && r.has("Ao vivo") && r.has("@ Digitar canal")); }
+        ui.handle(Input::Right); ui.handle(Input::Right); assert(ui.kickChip == 3);
+        ui.handle(Input::Confirm); assert(f.asked == "@ do streamer" && ui.textKind == 1);
+        ui.onText("@Streamer"); assert(f.played == "https://k/a.m3u8" && a.lastStatus == "Assistindo @streamer" && f.store["kick"] == "streamer");
         assert(f.store["kickhist"] == "streamer\n");
-        a.kickClient.setCredentials("", "");                                                 // o app real ja leva chaves: aqui simula sem elas
-        ui.cursor[(int)Tab::Kick] = 2; ui.handle(Input::Confirm);                                // Lives agora, sem chave
-        assert(ui.kickView == 0 && a.lastStatus.find("Falha") != std::string::npos);
-        a.kickClient.setCredentials("id", "sec");
-        ui.handle(Input::Confirm);
-        assert(ui.kickView == 1 && ui.kickList.size() == 2 && ui.kickList[0].slug == "grande" && f.apiPosts == 1);
-        { Rec r; ui.render(r); assert(r.has("@grande   900 assistindo")); assert(r.has("Lives agora") == false); }
-        ui.handle(Input::Fav); assert(ui.kickFavs.size() == 1 && ui.kickFavs[0] == "grande" && f.store["kickfav"] == "grande\n");
-        { Rec r; ui.render(r); assert(r.has("* @grande   900 assistindo")); }
-        ui.handle(Input::Fav); assert(ui.kickFavs.empty());
-        ui.handle(Input::Fav); ui.handle(Input::Down); ui.handle(Input::Confirm);              // assiste @pequeno
-        assert(f.played == "https://k/a.m3u8" && ui.kickLast == "pequeno" && ui.kickHist[0] == "pequeno" && ui.kickHist[1] == "streamer");
-        ui.handle(Input::Back); assert(ui.kickView == 0 && ui.screen == Screen::Kick);           // O: lista -> menu
-        ui.handle(Input::Back); assert(ui.screen == Screen::Home);                               // O: menu -> inicio
-        // favoritos guardados voltam depois de reabrir o app
-        UI ui2(a); ui2.loadSaved(); assert(ui2.kickFavs.size() == 1 && ui2.kickFavs[0] == "grande" && ui2.kickHist.size() == 2);
+        // sem favoritos, abre no historico (so o canal digitado) e a grade mostra o cartao
+        ui.handle(Input::Back); assert(ui.screen == Screen::Home);
         ui.homeRow = 1; ui.homeCol = 0; ui.handle(Input::Confirm);
-        acts = ui.kickActions(); assert(acts.size() == 5 && acts[3] == UI::KA_FAVS);
-        ui.cursor[(int)Tab::Kick] = 3; ui.handle(Input::Confirm);
-        assert(ui.kickView == 2 && ui.kickList.size() == 1 && ui.kickList[0].live);              // favorito consultado (ao vivo no fake)
-        ui.handle(Input::Back); ui.handle(Input::Back);
+        assert(ui.kickView == 3 && ui.kickList.size() == 1 && !ui.kickInChips);
+        { Rec r; ui.render(r); assert(r.has("@streamer") && r.has("OFFLINE") == false); }      // o fake responde "ao vivo"
+        f.played.clear(); ui.handle(Input::Confirm); assert(f.played == "https://k/a.m3u8");
+        // com a chave: "Ao vivo" baixa a lista oficial (maior audiencia primeiro) e pede as miniaturas 16:9
+        std::vector<std::string> wantFront;
+        ui.coverBatch = [&](const std::vector<std::string> &fr, const std::vector<std::string> &) { wantFront = fr; };
+        a.kickClient.setCredentials("id", "sec");
+        ui.handle(Input::Up); assert(ui.kickInChips);
+        ui.handle(Input::Left); ui.handle(Input::Left); assert(ui.kickChip == 0);
+        ui.handle(Input::Confirm);
+        assert(ui.kickView == 1 && ui.kickList.size() == 2 && ui.kickList[0].slug == "grande" && f.apiPosts == 1 && !ui.kickInChips);
+        { Rec r; ui.render(r); assert(r.has("@grande") && r.has("900") && r.has("Just Chatting") && r.has("GTA V")); }
+        assert(wantFront.size() == 2 && wantFront[0] == "https://i/g.webp#336x189" && wantFront[1].empty());
+        ui.handle(Input::Fav); assert(ui.kickFavs.size() == 1 && ui.kickFavs[0] == "grande" && f.store["kickfav"] == "grande\n");
+        { Rec r; ui.render(r); assert(r.has("FAV")); }
+        ui.handle(Input::Fav); assert(ui.kickFavs.empty());
+        ui.handle(Input::Fav);
+        ui.handle(Input::Right); assert(ui.kickSel == 1);
+        ui.handle(Input::Right); assert(ui.kickSel == 1);                                       // acabou a linha
+        ui.handle(Input::Left); ui.handle(Input::Left); assert(ui.kickSel == 0);
+        ui.handle(Input::Right); f.played.clear(); ui.handle(Input::Confirm);
+        assert(f.played == "https://k/a.m3u8" && ui.kickLast == "pequeno" && ui.kickHist[0] == "pequeno" && ui.kickHist[1] == "streamer");
+        // voltar e abrir de novo reaproveita a lista recem baixada (sem novo pedido a Kick)
+        ui.handle(Input::Back); assert(ui.screen == Screen::Home);
+        ui.homeRow = 1; ui.homeCol = 0; ui.handle(Input::Confirm);
+        assert(ui.kickView == 1 && f.apiPosts == 1 && !ui.kickInChips);
+        // favoritos guardados voltam depois de reabrir o app; "Seguindo" consulta quem esta ao vivo
+        UI ui2(a); ui2.loadSaved(); assert(ui2.kickFavs.size() == 1 && ui2.kickFavs[0] == "grande" && ui2.kickHist.size() == 2);
+        ui.handle(Input::Up); ui.handle(Input::Right); ui.handle(Input::Confirm);
+        assert(ui.kickView == 2 && ui.kickList.size() == 1 && ui.kickList[0].live);
+        // grade maior que a tela: rolagem por linhas
+        ui.kickList.clear();
+        for (int i = 0; i < 23; i++) { kickapi::Live l; l.slug = "c" + std::to_string(i); l.viewers = 100 - i; ui.kickList.push_back(l); }
+        ui.kickInChips = false; ui.kickSel = 0; ui.kickRowScroll = 0;
+        ui.handle(Input::Down); ui.handle(Input::Down); assert(ui.kickSel == 10 && ui.kickRowScroll == 1);
+        ui.handle(Input::Down); ui.handle(Input::Down); assert(ui.kickSel == 20 && ui.kickRowScroll == 3);
+        ui.handle(Input::Down); assert(ui.kickSel == 20);
+        ui.handle(Input::Right); ui.handle(Input::Right); assert(ui.kickSel == 22);               // ultima linha tem 3 cartoes
+        ui.handle(Input::Right); assert(ui.kickSel == 22);
+        { Rec r; ui.render(r); assert(r.has("@c22") && r.has("@c15") && !r.has("@c0")); }
+        ui.handle(Input::Back); assert(ui.screen == Screen::Home);
     }
     // --- Remover lista: campo vazio ---
     ui.handle(Input::Back); ui.homeRow = 2; ui.handle(Input::Confirm); ui.onText("");
