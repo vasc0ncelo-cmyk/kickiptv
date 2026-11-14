@@ -1,4 +1,5 @@
 #pragma once
+#include <ctime>
 // Logica do app independente de plataforma (testavel no PC).
 #include "kick.hpp"
 #include "kickapi.hpp"
@@ -432,11 +433,13 @@ struct App {
     // (As series ja trazem backdrop/sinopse na propria lista: SeriesRef.)
     struct HeroInfo { std::string backdrop, plot, logo; };
     struct HeroReq { std::string key, id; };
+    struct Trend { std::string id, title, orig, year, backdrop, overview; };      // filme em alta/recente do TMDB
     struct HeroShared {
         std::mutex m; std::deque<HeroReq> q; std::unordered_map<std::string, HeroInfo> info; std::unordered_map<std::string, bool> asked;
+        std::vector<Trend> trend; bool trendDone = false;
         std::atomic<bool> stop{false}; bool running = false;
     };
-    std::string tmdbKey;                                  // chave TMDB (logos); vazia = sem logos
+    std::string tmdbKey;                                  // chave TMDB (logos e filmes em alta); vazia = sem
     bool heroInfoEnabled = false;                         // a plataforma liga; os testes ficam sem consultas extras
     std::shared_ptr<HeroShared> heroSh_ = std::make_shared<HeroShared>();
     std::thread heroTh_;
@@ -447,11 +450,36 @@ struct App {
         if (it == heroSh_->info.end()) return false;
         out = it->second; return true;
     }
-    // Pede (uma vez so por filme) o backdrop/sinopse. Nao bloqueia.
+    bool trendingGet(std::vector<Trend> &out) {
+        std::lock_guard<std::mutex> l(heroSh_->m);
+        if (!heroSh_->trendDone) return false;
+        out = heroSh_->trend; return true;
+    }
+    void trendingRequest() { if (!tmdbKey.empty()) heroInfoRequest("T", "T"); }
+    // logo do TMDB: devolve o endereco do melhor PNG (pt > en > sem idioma, depois a nota) ou vazio
+    static std::string tmdbBestLogo(Platform *plat, const std::string &tk, bool tv, const std::string &tmdbId) {
+        try {
+            std::string b2; Json j2;
+            std::string u = std::string("https://api.themoviedb.org/3/") + (tv ? "tv/" : "movie/") + tmdbId + "/images?api_key=" + tk + "&include_image_language=pt,en,null";
+            if (plat->httpGet(u, b2) && jsonParse(b2, j2))
+                if (const Json *ls = j2.get("logos"); ls && ls->isArr()) {
+                    double best = -1; std::string bp;
+                    for (const Json &e : ls->arr) {
+                        std::string fp = e.str("file_path"); if (fp.size() < 5 || fp.compare(fp.size() - 4, 4, ".png") != 0) continue;
+                        std::string lang = e.str("iso_639_1");
+                        double sc = (lang == "pt" ? 20.0 : lang == "en" ? 10.0 : 0.0) + (e.get("vote_average") ? e.get("vote_average")->n : 0.0);
+                        if (sc > best) { best = sc; bp = fp; }
+                    }
+                    if (!bp.empty()) return "https://image.tmdb.org/t/p/w500" + bp;
+                }
+        } catch (...) {}
+        return "";
+    }
+    // Pede (uma vez so por chave). Chaves: "m:ID" filme do painel, "s:ID" serie do painel, "t:TMDBID" so a logo, "T" lista de filmes recentes em alta. Nao bloqueia.
     void heroInfoRequest(const std::string &key, const std::string &id) {
         if (!heroInfoEnabled || id.empty() || key.empty()) return;
         const XtreamAcct acct = metaAccount();
-        if (!acct.valid()) return;
+        if (!acct.valid() && key != "T" && key[0] != 't') return;
         auto sh = heroSh_;
         bool start = false;
         {
@@ -472,9 +500,31 @@ struct App {
                     if (sh->stop || sh->q.empty()) { sh->running = false; return; }
                     r = sh->q.front(); sh->q.pop_front();
                 }
+                if (r.key == "T") {                                        // filmes recentes mais populares (ate 3 paginas = 60)
+                    std::vector<Trend> tr;
+                    time_t t0 = time(nullptr) - 425 * 86400LL; struct tm g{}; gmtime_r(&t0, &g); char since[16]; strftime(since, sizeof since, "%Y-%m-%d", &g);
+                    for (int pg = 1; pg <= 3 && !sh->stop && !tk.empty(); pg++) {
+                        try {
+                            std::string b, u = "https://api.themoviedb.org/3/discover/movie?api_key=" + tk + "&language=pt-BR&region=BR&include_adult=false&sort_by=popularity.desc&primary_release_date.gte=" + since + "&page=" + std::to_string(pg);
+                            Json j;
+                            if (plat->httpGet(u, b) && jsonParse(b, j))
+                                if (const Json *rs = j.get("results"); rs && rs->isArr())
+                                    for (const Json &e : rs->arr) {
+                                        Trend x; x.id = e.str("id"); x.title = e.str("title"); x.orig = e.str("original_title"); x.overview = e.str("overview");
+                                        std::string d = e.str("release_date"); x.year = d.size() >= 4 ? d.substr(0, 4) : "";
+                                        std::string bd = e.str("backdrop_path"); if (!bd.empty()) x.backdrop = "https://image.tmdb.org/t/p/w780" + bd;
+                                        if (!x.id.empty() && !x.backdrop.empty() && !x.title.empty()) tr.push_back(x);
+                                    }
+                        } catch (...) {}
+                        std::this_thread::sleep_for(std::chrono::milliseconds(120));
+                    }
+                    { std::lock_guard<std::mutex> l(sh->m); sh->trend = tr; sh->trendDone = true; }
+                    continue;
+                }
                 HeroInfo hi; std::string body; Json j; std::string tmdbId;
                 const bool isSeries = !r.key.empty() && r.key[0] == 's';
-                try {
+                if (r.key[0] == 't') tmdbId = r.id;                        // so a logo (o painel nao e consultado)
+                else try {
                     if (plat->httpGet(xtreamApi(acct, isSeries ? "get_series_info" : "get_vod_info", std::string(isSeries ? "series_id=" : "vod_id=") + r.id), body) && jsonParse(body, j))
                         if (const Json *info = j.get("info")) {
                             DetailMeta d; xtFillMeta(*info, d); hi.backdrop = d.backdrop; hi.plot = d.plot;
@@ -482,23 +532,7 @@ struct App {
                             if (tmdbId == "0") tmdbId.clear();
                         }
                 } catch (...) {}
-                if (!tk.empty() && !tmdbId.empty() && !sh->stop) {                // logo do titulo (PNG com transparencia) via TMDB
-                    try {
-                        std::string b2; Json j2;
-                        std::string u = std::string("https://api.themoviedb.org/3/") + (isSeries ? "tv/" : "movie/") + tmdbId + "/images?api_key=" + tk + "&include_image_language=pt,en,null";
-                        if (plat->httpGet(u, b2) && jsonParse(b2, j2))
-                            if (const Json *ls = j2.get("logos"); ls && ls->isArr()) {
-                                double best = -1; std::string bp;
-                                for (const Json &e : ls->arr) {
-                                    std::string fp = e.str("file_path"); if (fp.size() < 5 || fp.compare(fp.size() - 4, 4, ".png") != 0) continue;
-                                    std::string lang = e.str("iso_639_1");
-                                    double sc = (lang == "pt" ? 20.0 : lang == "en" ? 10.0 : 0.0) + (e.get("vote_average") ? e.get("vote_average")->n : 0.0);
-                                    if (sc > best) { best = sc; bp = fp; }
-                                }
-                                if (!bp.empty()) hi.logo = "https://image.tmdb.org/t/p/w500" + bp;
-                            }
-                    } catch (...) {}
-                }
+                if (!tk.empty() && !tmdbId.empty() && !sh->stop) hi.logo = tmdbBestLogo(plat, tk, isSeries, tmdbId);
                 { std::lock_guard<std::mutex> l(sh->m); sh->info[r.key] = hi; }          // mesmo vazio: nao consulta de novo
                 for (int i = 0; i < 15 && !sh->stop; i++) std::this_thread::sleep_for(std::chrono::milliseconds(10));
             }
