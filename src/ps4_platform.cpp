@@ -161,7 +161,7 @@ struct NetClient {
 
     // GET simples. Retorna true se conseguiu falar com o servidor (mesmo com status de erro).
     bool get(const std::string &url, std::string &body, int &status, size_t maxBytes = 1536 * 1024,
-             const char *userAgent = nullptr, const char *referer = nullptr) {
+             const char *userAgent = nullptr, const char *referer = nullptr, unsigned timeoutSec = 15) {
         std::lock_guard<std::recursive_mutex> httpLk(httpMx);
         status = 0; body.clear();
         if (!init()) return false;
@@ -171,7 +171,7 @@ struct NetClient {
         if (tmpl < 0) return false;
         sceHttpsDisableOption(tmpl, 0x1F);   // sem verificacao de certificado (o app nao carrega os CAs do PS4)
         sceHttpSetAutoRedirect(tmpl, 1);
-        const unsigned T = 15 * 1000 * 1000;
+        const unsigned T = timeoutSec * 1000 * 1000;
         sceHttpSetResolveTimeOut(tmpl, T);
         sceHttpSetConnectTimeOut(tmpl, T);
         sceHttpSetSendTimeOut(tmpl, T);
@@ -485,13 +485,19 @@ struct Ps4Platform : Platform {
         static const char *kUa[2] = {
             "Mozilla/5.0 (PlayStation; PlayStation 4/11.00) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Safari/605.1.15",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"};
+        // No log do PS4 a 1a tentativa (User-Agent do PS4) caia sem resposta e a 2a (Chrome) funcionava: cada abertura de live esperava a 1a falhar.
+        // Agora lembra qual funcionou por ultimo e comeca por ele; sem historico, a 1a tentativa desiste mais cedo (6 s).
+        static std::atomic<int> good{-1};
         int st = 0;
-        for (int i = 0; i < 2; i++) {
+        const int first = good.load() >= 0 ? good.load() : 0;
+        for (int k = 0; k < 2; k++) {
+            const int i = (first + k) % 2;
             body.clear();
-            bool ok = g_net.get(url, body, st, 1536 * 1024, kUa[i], "https://kick.com/");
+            const unsigned to = (k == 0 && good.load() < 0) ? 6 : 15;
+            bool ok = g_net.get(url, body, st, 1536 * 1024, kUa[i], "https://kick.com/", to);
             lastStatus_ = ok ? st : 0;
             char b[48]; snprintf(b, sizeof b, "kick-http-%d-%d", i, ok ? st : 0); trace(b);
-            if (ok && st >= 200 && st < 300 && !body.empty()) return true;
+            if (ok && st >= 200 && st < 300 && !body.empty()) { good = i; return true; }
             if (ok && st == 404) return false;              // o canal nao existe: outro User-Agent nao muda isso
         }
         return false;
@@ -3631,6 +3637,10 @@ int main() {
         if (firstDraw) trace("menu-render-ok");
         flip();
         animCost = nowSec() - tp0;
+        {   // diagnostico de lentidao: quadros do menu que passam de 70 ms (maximo 30 linhas no log)
+            static int slow = 0, total = 0;
+            if (++total > 5 && animCost > 0.07 && slow < 30) { slow++; char b[96]; snprintf(b, sizeof b, "menu-quadro-lento %.0fms tela=%d", animCost * 1000, (int)ui.screen); trace(b); }
+        }
         if (firstDraw) {
             firstDraw = false; trace("menu-flip-ok"); ui.dbg = nullptr;
         }
