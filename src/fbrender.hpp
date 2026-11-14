@@ -84,10 +84,28 @@ inline std::vector<uint32_t> g_fbBgCache;
 
 struct FbRenderer : Renderer {
     uint32_t *fb; int W, H;
+    int cx0, cy0, cx1, cy1;                     // recorte: so pixels dentro deste retangulo sao escritos (padrao = tela inteira)
     bool buildingBg = false;                    // true so enquanto monta o cache do fundo (evita recursao)
-    FbRenderer(void *p, int w, int h) : fb((uint32_t *)p), W(w), H(h) {}
+    FbRenderer(void *p, int w, int h) : fb((uint32_t *)p), W(w), H(h), cx0(0), cy0(0), cx1(w), cy1(h) {}
     int width() const override { return W; }
     int height() const override { return H; }
+    // Limita o desenho a um retangulo [x0,x1) x [y0,y1). O resultado dentro dele e IDENTICO ao desenho da tela inteira
+    // (cada pixel so depende das coordenadas absolutas): serve para redesenhar so o trecho que mudou.
+    void setClip(int x0, int y0, int x1, int y1) {
+        cx0 = x0 < 0 ? 0 : x0; cy0 = y0 < 0 ? 0 : y0; cx1 = x1 > W ? W : x1; cy1 = y1 > H ? H : y1;
+        if (cx1 < cx0) cx1 = cx0;
+        if (cy1 < cy0) cy1 = cy0;
+    }
+    void clearClip() { cx0 = 0; cy0 = 0; cx1 = W; cy1 = H; }
+
+    // Formas por pixel (poligonos, icones): limita a caixa ao recorte; true = nada a desenhar.
+    bool paintBox(int, int &x0, int &y0, int &x1, int &y1, unsigned) override {
+        if (x0 < cx0) x0 = cx0;
+        if (y0 < cy0) y0 = cy0;
+        if (x1 > cx1) x1 = cx1;
+        if (y1 > cy1) y1 = cy1;
+        return x1 <= x0 || y1 <= y0;
+    }
 
     // Fundo pronto: copia do cache (so escreve no destino, em ordem).
     bool blitBackground() override {
@@ -101,7 +119,8 @@ struct FbRenderer : Renderer {
             uiBackground(t);
             g_fbTrunc = false;
         }
-        memcpy(fb, c.data(), (size_t)W * H * 4);
+        if (cx0 == 0 && cx1 == W) { memcpy(fb + (size_t)cy0 * W, c.data() + (size_t)cy0 * W, (size_t)(cy1 - cy0) * W * 4); return true; }
+        for (int j = cy0; j < cy1; j++) memcpy(fb + (size_t)j * W + cx0, c.data() + (size_t)j * W + cx0, (size_t)(cx1 - cx0) * 4);
         return true;
     }
 
@@ -125,10 +144,10 @@ struct FbRenderer : Renderer {
         const float cx = x + w * 0.5f, cy = y + h * 0.5f, hx = w * 0.5f, hy = h * 0.5f;
         const float ix = hx - rad, iy = hy - rad;
         int j0 = y - spread - 1, j1 = y + h + spread + 1, i0 = x - spread - 1, i1 = x + w + spread + 1;
-        if (j0 < 0) j0 = 0;
-        if (i0 < 0) i0 = 0;
-        if (j1 > H) j1 = H;
-        if (i1 > W) i1 = W;
+        if (j0 < cy0) j0 = cy0;
+        if (i0 < cx0) i0 = cx0;
+        if (j1 > cy1) j1 = cy1;
+        if (i1 > cx1) i1 = cx1;
         for (int j = j0; j < j1; j++) {
             float dy = (j + 0.5f) - cy; if (dy < 0) dy = -dy;
             float qy = dy - iy;
@@ -153,28 +172,33 @@ struct FbRenderer : Renderer {
         }
         return true;
     }
+
+    // Imagem escalada (vizinho mais proximo). A coluna de origem de cada pixel de destino vem de uma tabela montada uma vez
+    // por chamada (antes era uma divisao inteira POR PIXEL, que e lenta no processador do PS4); o resultado e o mesmo.
     void blitImage(int x, int y, int dw, int dh, const uint32_t *px, int sw, int sh) override {
         if (!px || sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) return;
-        for (int j = 0; j < dh; j++) {
-            int sy = j * sh / dh;
-            int dy = y + j;
-            if (dy < 0 || dy >= H) continue;
-            uint32_t *dst = fb + (size_t)dy * W;
-            const uint32_t *src = px + (size_t)sy * sw;
-            for (int i = 0; i < dw; i++) {
-                int sx = i * sw / dw;
-                int dx = x + i;
-                if (dx < 0 || dx >= W) continue;
-                uint32_t c = src[sx];
-                unsigned a = c >> 24;
-                if (a == 0) continue;
-                if (a >= 250) { dst[dx] = c | 0xFF000000u; continue; }
-                uint32_t d = dst[dx];
-                unsigned inv = 255 - a;
-                unsigned r = (((c >> 16) & 255) * a + ((d >> 16) & 255) * inv) / 255;
-                unsigned g = (((c >> 8) & 255) * a + ((d >> 8) & 255) * inv) / 255;
-                unsigned b = ((c & 255) * a + (d & 255) * inv) / 255;
-                dst[dx] = 0xFF000000u | (r << 16) | (g << 8) | b;
+        const int jlo = y < cy0 ? cy0 - y : 0, jhi = y + dh > cy1 ? cy1 - y : dh;
+        const int ilo = x < cx0 ? cx0 - x : 0, ihi = x + dw > cx1 ? cx1 - x : dw;
+        if (jlo >= jhi || ilo >= ihi) return;
+        int xm[1024];
+        for (int base = ilo; base < ihi; base += 1024) {
+            const int bend = base + 1024 < ihi ? base + 1024 : ihi;
+            for (int i = base; i < bend; i++) xm[i - base] = i * sw / dw;
+            for (int j = jlo; j < jhi; j++) {
+                const uint32_t *src = px + (size_t)(j * sh / dh) * sw;
+                uint32_t *dst = fb + (size_t)(y + j) * W + x;
+                for (int i = base; i < bend; i++) {
+                    uint32_t c = src[xm[i - base]];
+                    unsigned a = c >> 24;
+                    if (a == 0) continue;
+                    if (a >= 250) { dst[i] = c | 0xFF000000u; continue; }
+                    uint32_t d = dst[i];
+                    unsigned inv = 255 - a;
+                    unsigned r = (((c >> 16) & 255) * a + ((d >> 16) & 255) * inv) / 255;
+                    unsigned g = (((c >> 8) & 255) * a + ((d >> 8) & 255) * inv) / 255;
+                    unsigned b = ((c & 255) * a + (d & 255) * inv) / 255;
+                    dst[i] = 0xFF000000u | (r << 16) | (g << 8) | b;
+                }
             }
         }
     }
@@ -182,57 +206,61 @@ struct FbRenderer : Renderer {
     // Mascara de cobertura (texto proporcional): mistura 'argb' sobre o destino conforme a cobertura de cada pixel.
     void drawMask(int x, int y, int w, int h, const uint8_t *m, unsigned argb) override {
         const int A = argb >> 24;
-        for (int j = 0; j < h; j++) {
-            int py = y + j;
-            if (py < 0 || py >= H) continue;
-            uint32_t *row = fb + (size_t)py * W;
+        const int jlo = y < cy0 ? cy0 - y : 0, jhi = y + h > cy1 ? cy1 - y : h;
+        const int ilo = x < cx0 ? cx0 - x : 0, ihi = x + w > cx1 ? cx1 - x : w;
+        for (int j = jlo; j < jhi; j++) {
+            uint32_t *row = fb + (size_t)(y + j) * W + x;
             const uint8_t *src = m + (size_t)j * w;
-            for (int i = 0; i < w; i++) {
+            for (int i = ilo; i < ihi; i++) {
                 int cv = src[i];
                 if (!cv) continue;
-                int px = x + i;
-                if (px < 0 || px >= W) continue;
                 int a = A >= 255 ? cv : (A * cv + 127) / 255;
-                row[px] = a >= 255 ? (argb | 0xFF000000u) : blendPx(row[px], argb, a);
+                row[i] = a >= 255 ? (argb | 0xFF000000u) : blendPx(row[i], argb, a);
             }
         }
     }
     // Imagem com cantos arredondados em cima (rTop) e/ou embaixo (rBot), bordas suavizadas.
+    // Fora dos cantos (quase todos os pixels) a cobertura e 1: caminho inteiro, sem ponto flutuante.
     void blitImageRound(int x, int y, int dw, int dh, const uint32_t *px, int sw, int sh, int rTop, int rBot) override {
         if (!px || sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) return;
         if (rTop * 2 > dw) rTop = dw / 2;
         if (rBot * 2 > dw) rBot = dw / 2;
-        for (int j = 0; j < dh; j++) {
-            int dy = y + j;
-            if (dy < 0 || dy >= H) continue;
-            // cobertura do canto nesta linha: so as colunas dentro do raio precisam de conta
-            int rad = 0; float cyc = 0;
-            if (j < rTop) { rad = rTop; cyc = (float)rTop; }
-            else if (j >= dh - rBot) { rad = rBot; cyc = (float)(dh - rBot); }
-            float ddy = rad ? (j + 0.5f) - cyc : 0.f;
-            uint32_t *dst = fb + (size_t)dy * W;
-            const uint32_t *src = px + (size_t)(sh == dh ? j : j * sh / dh) * sw;
-            for (int i = 0; i < dw; i++) {
-                int dx = x + i;
-                if (dx < 0 || dx >= W) continue;
-                float cov = 1.f;
-                if (rad && (i < rad || i >= dw - rad)) {
-                    float ddx = i < rad ? (i + 0.5f) - (float)rad : (i + 0.5f) - (float)(dw - rad);
-                    cov = (float)rad - fsqrt(ddx * ddx + ddy * ddy) + 0.5f;
-                    if (cov <= 0.f) continue;
-                    if (cov > 1.f) cov = 1.f;
+        const int jlo = y < cy0 ? cy0 - y : 0, jhi = y + dh > cy1 ? cy1 - y : dh;
+        const int ilo = x < cx0 ? cx0 - x : 0, ihi = x + dw > cx1 ? cx1 - x : dw;
+        if (jlo >= jhi || ilo >= ihi) return;
+        int xm[1024];
+        for (int base = ilo; base < ihi; base += 1024) {
+            const int bend = base + 1024 < ihi ? base + 1024 : ihi;
+            for (int i = base; i < bend; i++) xm[i - base] = sw == dw ? i : i * sw / dw;
+            for (int j = jlo; j < jhi; j++) {
+                // cobertura do canto nesta linha: so as colunas dentro do raio precisam de conta
+                int rad = 0; float cyc = 0;
+                if (j < rTop) { rad = rTop; cyc = (float)rTop; }
+                else if (j >= dh - rBot) { rad = rBot; cyc = (float)(dh - rBot); }
+                const float ddy = rad ? (j + 0.5f) - cyc : 0.f;
+                uint32_t *dst = fb + (size_t)(y + j) * W + x;
+                const uint32_t *src = px + (size_t)(sh == dh ? j : j * sh / dh) * sw;
+                const int midLo = rad, midHi = dw - rad;             // [midLo, midHi) = sem canto
+                for (int i = base; i < bend; i++) {
+                    uint32_t c = src[xm[i - base]];
+                    unsigned a;
+                    if (rad && (i < midLo || i >= midHi)) {
+                        float ddx = i < rad ? (i + 0.5f) - (float)rad : (i + 0.5f) - (float)(dw - rad);
+                        float cov = (float)rad - fsqrt(ddx * ddx + ddy * ddy) + 0.5f;
+                        if (cov <= 0.f) continue;
+                        if (cov > 1.f) cov = 1.f;
+                        a = (unsigned)((c >> 24) * cov + 0.5f);
+                    } else a = c >> 24;
+                    if (a >= 255) dst[i] = c | 0xFF000000u;
+                    else if (a > 0) dst[i] = blendPx(dst[i], c, (int)a);
                 }
-                uint32_t c = src[sw == dw ? i : i * sw / dw];
-                unsigned a = (unsigned)((c >> 24) * cov + 0.5f);
-                if (a >= 255) dst[dx] = c | 0xFF000000u;
-                else if (a > 0) dst[dx] = blendPx(dst[dx], c, (int)a);
             }
         }
     }
 
     void fillRect(int x, int y, int w, int h, unsigned argb) override {
-        int x0 = x < 0 ? 0 : x, y0 = y < 0 ? 0 : y;
-        int x1 = x + w > W ? W : x + w, y1 = y + h > H ? H : y + h;
+        int x0 = x < cx0 ? cx0 : x, y0 = y < cy0 ? cy0 : y;
+        int x1 = x + w > cx1 ? cx1 : x + w, y1 = y + h > cy1 ? cy1 : y + h;
         int a = argb >> 24;
         for (int j = y0; j < y1; j++) {
             uint32_t *row = fb + (size_t)j * W;
@@ -241,7 +269,7 @@ struct FbRenderer : Renderer {
         }
     }
     void pixel(int x, int y, unsigned argb) override {
-        if (x < 0 || y < 0 || x >= W || y >= H) return;
+        if (x < cx0 || y < cy0 || x >= cx1 || y >= cy1) return;
         uint32_t *p = fb + (size_t)y * W + x;
         int a = argb >> 24;
         *p = a >= 255 ? argb : blendPx(*p, argb, a);
@@ -252,7 +280,7 @@ struct FbRenderer : Renderer {
         if (rad * 2 > w) rad = w / 2;
         if (rad <= 0) { fillRect(x, y, w, h, argb); return; }
         int a = argb >> 24;
-        int j0 = y < 0 ? 0 : y, j1 = y + h > H ? H : y + h;
+        int j0 = y < cy0 ? cy0 : y, j1 = y + h > cy1 ? cy1 : y + h;
         for (int j = j0; j < j1; j++) {
             uint32_t *row = fb + (size_t)j * W;
             bool top = j < y + rad, bot = j >= y + h - rad;
@@ -264,8 +292,9 @@ struct FbRenderer : Renderer {
                 for (int side = 0; side < 2; side++) {
                     int px0 = side ? x + w - rad : x, px1 = side ? x + w : x + rad;
                     float cx = side ? (float)(x + w - rad) : (float)(x + rad);
+                    if (px0 < cx0) px0 = cx0;
+                    if (px1 > cx1) px1 = cx1;
                     for (int i = px0; i < px1; i++) {
-                        if (i < 0 || i >= W) continue;
                         float dx = (i + 0.5f) - cx;
                         float cov = (float)rad - fsqrt(dx * dx + dy * dy) + 0.5f;
                         if (cov <= 0.f) continue;
@@ -274,14 +303,14 @@ struct FbRenderer : Renderer {
                     }
                 }
             }
-            int i0 = mx0 < 0 ? 0 : mx0, i1 = mx1 > W ? W : mx1;
+            int i0 = mx0 < cx0 ? cx0 : mx0, i1 = mx1 > cx1 ? cx1 : mx1;
             if (a >= 255) for (int i = i0; i < i1; i++) row[i] = argb;
             else for (int i = i0; i < i1; i++) row[i] = blendPx(row[i], argb, a);
         }
     }
     void gradient(int x, int y, int w, int h, unsigned top, unsigned bot) override {
-        int x0 = x < 0 ? 0 : x, y0 = y < 0 ? 0 : y;
-        int x1 = x + w > W ? W : x + w, y1 = y + h > H ? H : y + h;
+        int x0 = x < cx0 ? cx0 : x, y0 = y < cy0 ? cy0 : y;
+        int x1 = x + w > cx1 ? cx1 : x + w, y1 = y + h > cy1 ? cy1 : y + h;
         for (int j = y0; j < y1; j++) {
             int t = h > 1 ? (j - y) * 255 / (h - 1) : 0;
             uint32_t c = 0xFF000000u;
@@ -301,6 +330,7 @@ struct FbRenderer : Renderer {
     void drawText(int x, int y, const std::string &text, unsigned argb, int size) override {
         float s = size / 16.0f;
         int adv = (int)(8 * s + 0.5f);
+        if (y >= cy1 || y + (int)(16 * s) + 2 <= cy0) return;           // acima/abaixo do recorte
         int A = argb >> 24;
         int cx = x;
         for (size_t i = 0; i < text.size();) {
@@ -311,22 +341,23 @@ struct FbRenderer : Renderer {
             else if ((c >> 4) == 14 && i + 2 < text.size()) { cp = '?'; i += 3; }
             else if ((c >> 3) == 30 && i + 3 < text.size()) { cp = '?'; i += 4; }
             else { cp = '?'; i += 1; }
+            if (cx >= cx1) break;                                       // o resto do texto esta a direita do recorte
             int gi;
             if (cp >= 32 && cp <= 126) gi = cp - 32;
             else if (cp >= 160 && cp <= 255) gi = 95 + (cp - 160);
             else gi = '?' - 32;
-            if (cp != 32 && cx < W && cx + adv + 4 > 0) {
+            if (cp != 32 && cx + adv + 4 > cx0) {
                 const FbGlyph &g = fbGlyph(gi, size);
                 for (int dy = 0; dy < g.h; dy++) {
                     int py = y + dy;
-                    if (py < 0 || py >= H) continue;
+                    if (py < cy0 || py >= cy1) continue;
                     uint32_t *row = fb + (size_t)py * W;
                     const uint8_t *src = g.a.data() + (size_t)dy * g.w;
                     for (int dx = 0; dx < g.w; dx++) {
                         int cv = src[dx];
                         if (!cv) continue;
                         int px = cx + dx;
-                        if (px < 0 || px >= W) continue;
+                        if (px < cx0 || px >= cx1) continue;
                         int a = A >= 255 ? cv : (A * cv + 127) / 255;
                         row[px] = blendPx(row[px], argb, a);
                     }
