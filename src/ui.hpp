@@ -564,7 +564,7 @@ struct UI {
     std::vector<HeroItem> hero;
     std::string heroSig, lastHeroKey_;
     std::vector<HeroItem> heroCandM_;   // candidatos a filme (ate 10): os que tem backdrop sobem para o carrossel
-    bool heroSettled_ = false;
+    bool heroSettled_ = false, heroLocked_ = false;   // heroLocked_: banner fixo (nao refaz a escolha quando o catalogo cresce)
     int heroInfoVer_ = 0;     // sobe quando chega um backdrop novo (pede a imagem)
     std::vector<uint32_t> peekBuf_[2]; std::string peekKey_[2];   // cartas laterais inclinadas ja montadas
     Screen prevScreen_ = Screen::Home;
@@ -1260,6 +1260,7 @@ private:
     void requestReload() {
         if (m3uUrl.empty()) { app.say("Nenhuma lista configurada neste app"); return; }
         reloadRequested = true;
+        heroLocked_ = false; heroSig.clear();             // ATUALIZAR: sorteia o banner de novo com o catalogo novo
         app.say("Atualizando a lista...");
     }
 
