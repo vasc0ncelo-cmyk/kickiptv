@@ -19,6 +19,14 @@ struct Fake : Platform {
             "#EXTINF:-1 group-title=\"Series\",Dark S01E01\nhttp://h/series/5\n";
         return true;
     }
+    int apiPosts = 0;
+    bool httpApi(const char *m, const std::string &url, const std::string &auth, const std::string &, std::string &out, int &st) override {
+        st = 200;
+        if (std::string(m) == "POST") { apiPosts++; out = "{\"access_token\":\"T\",\"expires_in\":3600}"; return true; }
+        assert(auth == "Bearer T" && url.find("livestreams") != std::string::npos);
+        out = "{\"data\":[{\"slug\":\"pequeno\",\"stream_title\":\"t1\",\"viewer_count\":5,\"category\":{\"name\":\"Just Chatting\"}},{\"slug\":\"grande\",\"viewer_count\":900,\"category\":{\"name\":\"GTA V\"}}]}";
+        return true;
+    }
     void play(const std::string &u, const std::string &) override { played = u; }
     void requestText(const std::string &p) override { asked = p; }
     std::string loadSetting(const std::string &k) override { return store[k]; }
@@ -83,6 +91,33 @@ int main() {
     // o ultimo canal aparece como segundo item
     { Rec r; ui.render(r); assert(r.has("Assistir @streamer")); }
     f.played.clear(); ui.handle(Input::Down); ui.handle(Input::Confirm); assert(f.played == "https://k/a.m3u8");
+    // --- Lives agora / favoritos / historico (sem chave, a lista oficial avisa em vez de quebrar) ---
+    {
+        ui.handle(Input::Back); ui.homeRow = 1; ui.homeCol = 0; ui.handle(Input::Confirm);
+        assert(ui.screen == Screen::Kick && ui.kickView == 0);
+        auto acts = ui.kickActions(); assert(acts.size() == 4 && acts[2] == UI::KA_LIVES);        // digitar, ultimo, lives, historico
+        assert(f.store["kickhist"] == "streamer\n");
+        ui.cursor[(int)Tab::Kick] = 2; ui.handle(Input::Confirm);                                // Lives agora, sem chave
+        assert(ui.kickView == 0 && a.lastStatus.find("Falha") != std::string::npos);
+        a.kickClient.setCredentials("id", "sec");
+        ui.handle(Input::Confirm);
+        assert(ui.kickView == 1 && ui.kickList.size() == 2 && ui.kickList[0].slug == "grande" && f.apiPosts == 1);
+        { Rec r; ui.render(r); assert(r.has("@grande   900 assistindo")); assert(r.has("Lives agora") == false); }
+        ui.handle(Input::Fav); assert(ui.kickFavs.size() == 1 && ui.kickFavs[0] == "grande" && f.store["kickfav"] == "grande\n");
+        { Rec r; ui.render(r); assert(r.has("* @grande   900 assistindo")); }
+        ui.handle(Input::Fav); assert(ui.kickFavs.empty());
+        ui.handle(Input::Fav); ui.handle(Input::Down); ui.handle(Input::Confirm);              // assiste @pequeno
+        assert(f.played == "https://k/a.m3u8" && ui.kickLast == "pequeno" && ui.kickHist[0] == "pequeno" && ui.kickHist[1] == "streamer");
+        ui.handle(Input::Back); assert(ui.kickView == 0 && ui.screen == Screen::Kick);           // O: lista -> menu
+        ui.handle(Input::Back); assert(ui.screen == Screen::Home);                               // O: menu -> inicio
+        // favoritos guardados voltam depois de reabrir o app
+        UI ui2(a); ui2.loadSaved(); assert(ui2.kickFavs.size() == 1 && ui2.kickFavs[0] == "grande" && ui2.kickHist.size() == 2);
+        ui.homeRow = 1; ui.homeCol = 0; ui.handle(Input::Confirm);
+        acts = ui.kickActions(); assert(acts.size() == 5 && acts[3] == UI::KA_FAVS);
+        ui.cursor[(int)Tab::Kick] = 3; ui.handle(Input::Confirm);
+        assert(ui.kickView == 2 && ui.kickList.size() == 1 && ui.kickList[0].live);              // favorito consultado (ao vivo no fake)
+        ui.handle(Input::Back); ui.handle(Input::Back);
+    }
     // --- Remover lista: campo vazio ---
     ui.handle(Input::Back); ui.homeRow = 2; ui.handle(Input::Confirm); ui.onText("");
     assert(a.list.channels.empty() && f.store["m3u"].empty());
