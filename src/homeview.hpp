@@ -27,14 +27,15 @@ inline int heroNameYear(const std::string &n) {          // ultimo numero de 4 d
 }
 
 inline void UI::heroRebuild() {
-    if (heroLocked_ && !hero.empty()) return;             // banner ja escolhido: o catalogo chegando aos poucos nao troca mais os filmes
+    const bool locked = heroLocked_ && !hero.empty();     // banner ja escolhido: o catalogo chegando aos poucos nao troca os filmes na tela...
     const Playlist &p = app.list;
     std::string sig = std::to_string(p.movieCats.size()) + "|" + std::to_string(p.seriesCats.size());
     sig += "|" + std::to_string(p.movies.size() / 4000) + (hero.size() < 4 ? "|" + std::to_string(p.movies.size()) : std::string());   // catalogo chegando aos poucos: refaz a escolha
     if (sig == heroSig && !hero.empty()) return;
     if (sig == heroSig && p.movies.empty() && p.seriesTree.empty()) return;
     heroSig = sig;
-    hero.clear(); heroCandM_.clear(); heroSettled_ = false;
+    if (!locked) { hero.clear(); heroCandM_.clear(); heroSettled_ = false; }
+    std::vector<HeroItem> pool;                           // ate 25 filmes bons: o banner mostra 5 por vez e depois passa para os 5 seguintes
     std::vector<HeroItem> mv, sr;
     // So filmes RECENTES e bem avaliados (os que todo mundo quer ver): painel Xtream = data de entrada no catalogo + nota;
     // lista M3U = ano no nome. Sem nenhuma dessas informacoes, cai no 1o filme de cada categoria (como antes).
@@ -59,7 +60,7 @@ inline void UI::heroRebuild() {
         });
         std::vector<std::string> seen;
         for (uint32_t i : el) {
-            if (heroCandM_.size() >= 8) break;
+            if (pool.size() >= 25) break;
             const auto &m = M[i];
             std::string ct = detailCleanTitle(m.name);
             bool dup = false; for (const auto &t : seen) if (t == ct) { dup = true; break; }
@@ -69,21 +70,25 @@ inline void UI::heroRebuild() {
             HeroItem h; h.kind = 1; h.idx = i; h.title = m.name; h.sub = cat; h.logo = m.logo; h.cat = cat;
             std::string id = xtMovieIdFromUrl(m.url);
             if (!id.empty()) h.key = "m:" + id;
-            heroCandM_.push_back(h);
+            pool.push_back(h);
         }
-        if (heroCandM_.empty()) {                                        // sem data/ano: 1 por categoria
+        if (pool.empty()) {                                        // sem data/ano: 1 por categoria
             for (const auto &c : p.movieCats) {
-                if (heroCandM_.size() >= 8) break;
+                if (pool.size() >= 25) break;
                 for (uint32_t i : c.items) if (i < M.size() && !M[i].logo.empty()) {
                     const auto &m = M[i];
                     HeroItem h; h.kind = 1; h.idx = i; h.title = m.name; h.sub = c.name; h.logo = m.logo; h.cat = c.name;
                     std::string id = xtMovieIdFromUrl(m.url);
                     if (!id.empty()) h.key = "m:" + id;
-                    heroCandM_.push_back(h); break;
+                    pool.push_back(h); break;
                 }
             }
         }
     }
+    heroPool_ = pool;
+    if (locked) return;                                   // so o conjunto de reserva foi renovado
+    heroRound_ = 0;
+    for (size_t i = 0; i < pool.size() && i < 8; i++) heroCandM_.push_back(pool[i]);
     for (size_t i = 0; i < heroCandM_.size() && i < 5; i++) mv.push_back(heroCandM_[i]);
     size_t mi = 0, si = 0;
     while (mi < mv.size() || si < sr.size()) {            // filme, serie, filme, serie, filme
@@ -133,12 +138,16 @@ inline void UI::heroApplyInfo() {
         if (!h.infoDone) { h.infoDone = true; h.backdrop = hi.backdrop; h.plot = hi.plot; }
         heroInfoVer_++;
     }
+    if (!heroLocked_) {                                   // 3+ filmes ja com imagem larga na tela: fixa o banner (o catalogo que chega depois nao troca mais)
+        int withBd = 0; for (const auto &h : hero) if (!h.backdrop.empty()) withBd++;
+        if (withBd >= 3) heroLocked_ = true;
+    }
 }
 
 // Pede as imagens do carrossel primeiro (backdrops/capas) e as das abas depois; so quando algo mudou.
 inline void UI::requestHomeCovers() {
     if (!coverBatch) return;
-    std::string key = homeCoverKey() + "#" + heroSig + "#" + std::to_string(heroInfoVer_);
+    std::string key = homeCoverKey() + "#" + heroSig + "#" + std::to_string(heroInfoVer_) + "#" + std::to_string(heroRound_);
     if (key == lastHeroKey_) return;
     lastHeroKey_ = key;
     std::vector<std::string> front;
@@ -148,7 +157,12 @@ inline void UI::requestHomeCovers() {
     }
     for (const auto &h : hero) if (!h.tlogo.empty()) front.push_back(coverVariantKey(h.tlogo, kCoverLogoW, kCoverLogoH));
     for (const auto &h : hero) if (!h.logo.empty()) front.push_back(coverVariantKey(h.logo, kHeroPkW, kHeroPkH));
-    coverBatch(front, homeCoverList());
+    std::vector<std::string> back = homeCoverList();
+    if (heroPool_.size() > 5) {                                       // capas do proximo conjunto: ja baixam enquanto o atual passa
+        const size_t P = heroPool_.size(), next = ((size_t)(heroRound_ + 1) * 5) % P;
+        for (size_t k = 0; k < 5; k++) { const HeroItem &h = heroPool_[(next + k) % P]; if (!h.logo.empty()) back.push_back(coverVariantKey(h.logo, kHeroPkW, kHeroPkH)); if (!h.logo.empty()) back.push_back(coverVariantKey(h.logo, kHeroPsW, kHeroPsH)); }
+    }
+    coverBatch(front, back);
 }
 
 inline void UI::heroMove(int d) {
@@ -158,12 +172,35 @@ inline void UI::heroMove(int d) {
     heroT0 = animT; heroAuto = animT;
 }
 
+// Passou pelos 5 filmes: sorteia os 5 seguintes do conjunto de reserva (volta ao comeco quando acaba).
+inline void UI::heroNextSet() {
+    const size_t P = heroPool_.size();
+    if (P <= 5) return;
+    heroRound_++;
+    const size_t start = ((size_t)heroRound_ * 5) % P;
+    std::vector<HeroItem> g;
+    for (size_t k = 0; k < 5; k++) {
+        HeroItem h = heroPool_[(start + k) % P];
+        App::HeroInfo hi;
+        if (!h.key.empty() && app.heroInfoGet(h.key, hi)) { h.infoDone = h.logoDone = true; h.backdrop = hi.backdrop; h.plot = hi.plot; h.tlogo = hi.logo; }
+        g.push_back(h);
+    }
+    std::stable_sort(g.begin(), g.end(), [](const HeroItem &a, const HeroItem &b) { return a.backdrop.empty() < b.backdrop.empty(); });   // os com imagem larga primeiro
+    hero = g; heroCur = 0; heroFrom = 0; heroInfoVer_++;
+    const size_t next = ((size_t)(heroRound_ + 1) * 5) % P;          // ja pede as informacoes/capas do proximo conjunto
+    for (size_t k = 0; k < 5; k++) { const HeroItem &h = heroPool_[(next + k) % P]; if (!h.key.empty()) app.heroInfoRequest(h.key, h.key.substr(2)); }
+}
+
 inline void UI::heroTick(double t) {
     if (screen != Screen::Home) return;
     heroRebuild();
     heroApplyInfo();
     if (heroAuto <= 0) heroAuto = t;
-    if (t - heroAuto > 2.0) { int n = (int)hero.size(); if (n > 1) { heroFrom = heroCur; heroCur = (heroCur + 1) % n; heroT0 = t; } heroAuto = t; }
+    if (t - heroAuto > 2.0) {
+        int n = (int)hero.size();
+        if (n > 1) { heroFrom = heroCur; heroCur = (heroCur + 1) % n; heroT0 = t; if (heroCur == 0) heroNextSet(); }
+        heroAuto = t;
+    }
 }
 
 inline void UI::heroOpen() {
