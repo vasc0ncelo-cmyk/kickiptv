@@ -57,6 +57,7 @@
 #include "defaultlist.hpp"
 
 #include "fbrender.hpp"
+#include "damage.hpp"
 #include "keyboard.hpp"
 #include "sfx.hpp"
 #include "clock.hpp"
@@ -3620,22 +3621,34 @@ int main() {
     }
     trace("rascunho-ok");
     boot.line(shadow == shadowFallback.data() ? "[3] rascunho de tela: heap" : "[3] rascunho de tela: memoria direta");
+    // Menu com redesenho parcial (damage.hpp): so pinta e copia para a tela o que mudou; tela parada = nada a fazer.
+    MenuPainter menuPainter;
+    FlipStale flipStale;
+    double lastMenuPresent = 0;
     auto flip = [&]() {
         g_mainTick++;
+        menuPainter.invalidate();                                // algo que nao e o menu usou o rascunho/telas: o menu repinta tudo na volta
         memcpy(bufs[back], shadow, (size_t)W * H * 4);          // copia sequencial (rapida)
         sceVideoOutSubmitFlip(vh, back, ORBIS_VIDEO_OUT_FLIP_VSYNC, 0); back = (back + 1) % 3;
     };
     ui.dbg = [](const char *st) { static int n = 0; if (n < 6) { n++; trace(st); } };      // so o 1o desenho do menu (nao enche o log)
     double animCost = 0.03;                              // custo do ultimo desenho do menu: define a taxa de quadros da animacao
     auto presentMenu = [&]() {
-        FbRenderer r(shadow, W, H);
         static bool firstDraw = true;
         if (firstDraw) trace("menu-1o-desenho");
         double tp0 = nowSec();
-        ui.tick(tp0);                                  // relogio das animacoes (fade, brilho do foco, varredura)
-        ui.render(r);
+        lastMenuPresent = tp0;
+        g_mainTick++;
+        ui.tick(tp0);                                  // relogio das animacoes
+        if (!menuPainter.valid) flipStale.invalidateAll(W, H);   // as 3 telas de video nao tem o menu: copia tudo
+        auto dmg = menuPainter.paint(ui, shadow, W, H);          // pinta no rascunho so os retangulos que mudaram
         if (firstDraw) trace("menu-render-ok");
-        flip();
+        if (dmg.n > 0) {
+            for (int i = 0; i < dmg.n; i++) flipStale.mark(dmg.r[i]);
+            auto todo = flipStale.take(back);                    // o que ESTA tela de video ainda nao recebeu
+            dCopyRects((uint32_t *)bufs[back], shadow, W, todo.r, todo.n);
+            sceVideoOutSubmitFlip(vh, back, ORBIS_VIDEO_OUT_FLIP_VSYNC, 0); back = (back + 1) % 3;
+        }
         animCost = nowSec() - tp0;
         {   // diagnostico de lentidao: quadros do menu que passam de 70 ms (maximo 30 linhas no log)
             static int slow = 0, total = 0;
@@ -3743,6 +3756,7 @@ int main() {
     bool sysExit = false;                       // true = saindo porque o sistema (menu do PS) esta fechando/trocando o app
     for (;;) {
         g_mainTick++;
+        if (mode != Mode::Menu) menuPainter.invalidate();      // player/teclado escrevem direto nas telas de video: o menu repinta tudo ao voltar
         if (monoSec() >= hbNext) {                       // 1 linha por minuto no log (/data/kickiptv.log): ate quando o app estava vivo
             hbNext += 60;
             char hb[64]; snprintf(hb, sizeof hb, "vivo-%dmin", (int)((monoSec() - hbT0) / 60.0 + 0.5));
@@ -4353,13 +4367,15 @@ int main() {
         }
         if (mode == Mode::Menu) {
             g_sfx.resume();
-            // animacao: redesenha ~25 quadros/s (mais devagar se o desenho for pesado), so quando o menu esta na tela e o app em primeiro plano
-            static double lastAnim = 0;
+            // So redesenha quando ha algo a mostrar: animacao em andamento (~30 quadros/s), banner que passa sozinho,
+            // ou dados que chegaram de threads (backdrop do banner). Tela parada = 0% de CPU.
+            static double lastAnim = 0, lastPoll = 0;
             double tn = nowSec();
-            double gap = animCost * 2.2; if (gap < 0.04) gap = 0.04; if (gap > 0.15) gap = 0.15;
-            if (!g_quitting && ui.wantsFrames() && tn - lastAnim >= gap) { lastAnim = tn; dirty = true; }
+            if (!g_quitting && tn - lastPoll >= 0.25) { lastPoll = tn; if (ui.asyncPoll()) dirty = true; }
+            if (!g_quitting && ui.needsFrame(tn) && tn - lastAnim >= 0.033) { lastAnim = tn; dirty = true; }
         }
-        if (dirty) { presentMenu(); dirty = false; static bool once = false; if (!once) { once = true; trace("menu-ok"); } }
+        // limite de ~60 desenhos por segundo (nao enche a fila de flips do video)
+        if (dirty && nowSec() - lastMenuPresent >= 0.0165) { presentMenu(); dirty = false; static bool once = false; if (!once) { once = true; trace("menu-ok"); } }
         sceKernelUsleep(4000);                     // 4 ms: o controle e lido ~200x por segundo (antes 16 ms)
     }
     // ---- encerramento limpo (OPTIONS, background ou saida normal) ----
