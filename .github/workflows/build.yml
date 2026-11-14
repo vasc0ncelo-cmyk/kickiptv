@@ -143,6 +143,7 @@ jobs:
         if: always()
         with:
           name: kickiptv-pkg
+          retention-days: 3          # o GitHub apaga o arquivo sozinho depois de 3 dias (evita encher a cota de armazenamento)
           path: |
             build/*.pkg
             build/eboot.bin
