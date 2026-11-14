@@ -176,8 +176,8 @@ inline void UI::heroOpen() {
 inline void UI::drawAmbient(Renderer &r) {
     const int W = r.width();
     const float t = (float)animT;
-    // brilho que "respira" nos riscos de neon dos cantos
-    int a = (int)(14 + 10 * uiSin(t * 1.3f));
+    // brilho que "respira" nos riscos de neon dos cantos (parado quando kUiBreathing = false)
+    int a = kUiBreathing ? (int)(14 + 10 * uiSin(t * 1.3f)) : 14;
     // tracos de neon nos cantos (como na referencia)
     const unsigned G = 0xFF53FC18;
     uiBand(r, 100, 150, 0, 260, uiAlpha(G, 190), nullptr);   uiBand(r, 175, 195, 0, 260, uiAlpha(G, 130), nullptr);   uiBand(r, 230, 420, 0, 260, uiAlpha(G, 22), nullptr);
@@ -186,8 +186,8 @@ inline void UI::drawAmbient(Renderer &r) {
     uiBand(r, (float)W + 640, (float)W + 700, 560, 1080, uiAlpha(G, 90), nullptr);
     uiBand(r, 160, 178, 0, 300, uiAlpha(0xFF53FC18, a), nullptr);
     uiBand(r, (float)W + 40 + 65, (float)W + 40 + 83, 0, 300, uiAlpha(0xFF53FC18, a), nullptr);
-    // pontinhos verdes subindo devagar
-    for (int i = 0; i < 14; i++) {
+    // pontinhos verdes subindo devagar (redesenho continuo: so com kUiBreathing)
+    if (kUiBreathing) for (int i = 0; i < 14; i++) {
         float ph = uiFrac(t * (0.018f + 0.004f * (i % 4)) + i * 0.137f);
         int x = (int)((uiFrac(i * 0.6180339f) * 0.96f + 0.02f) * W + 12 * uiSin(t * 0.6f + i));
         int y = (int)(r.height() * (1.f - ph));
@@ -308,14 +308,14 @@ inline void UI::renderHome(Renderer &r) {
     heroApplyInfo();
     requestHomeCovers();
     const float age = (float)(animT - fadeAt);
-    auto intro = [&](float delay) { return uiEaseOut((age - delay) / 0.5f); };      // 0..1 por bloco (escalonado)
+    auto intro = [&](float delay) { return kUiFancyTransitions ? uiEaseOut((age - delay) / 0.5f) : 1.f; };      // 0..1 por bloco (escalonado)
 
     // ---------- carrossel ----------
     {
         UiFx fx(r, 0, (int)((1.f - intro(0.0f)) * 40.f), intro(0.0f));
         Renderer &q = fx;
         const int cx = 283, cy = 168, cw = 1358, chh = 432;
-        float tw = uiEaseInOut((float)(animT - heroT0) / 0.45f);                    // progresso da troca de slide
+        float tw = kUiFancyTransitions ? uiEaseInOut((float)(animT - heroT0) / 0.45f) : 1.f;      // progresso da troca de slide (sem animacao: troca seca)
         int n = (int)hero.size();
         int dirm = 0;
         if (tw < 1.f && n > 1) dirm = ((heroCur - heroFrom + n) % n) == 1 ? 1 : -1;
