@@ -20,7 +20,7 @@
 #include <xmmintrin.h>
 #endif
 
-enum class Input { Up, Down, Left, Right, PrevTab, NextTab, Confirm, Back, PageUp, PageDown, Extra };   // Extra = triangulo: buscar (lupa)
+enum class Input { Up, Down, Left, Right, PrevTab, NextTab, Confirm, Back, PageUp, PageDown, Extra, Fav };   // Fav = quadrado: favoritar (tela Kick)   // Extra = triangulo: buscar (lupa)
 enum class Screen { Home, Kick, List, Help, Detail, Donate };
 
 struct Renderer {
@@ -575,6 +575,10 @@ struct UI {
     std::string curSeries;
     int curSeason = 0;
     std::string kickLast;     // ultimo @ pesquisado
+    // Tela Kick: 0 = menu | 1 = Lives agora (API oficial) | 2 = Favoritos | 3 = Historico
+    int kickView = 0;
+    std::vector<kickapi::Live> kickList;              // itens da visao atual (1..3)
+    std::vector<std::string> kickFavs, kickHist;      // guardados em "kickfav" / "kickhist"
     std::string m3uUrl;       // lista M3U atual
     std::string defaultUrl;   // lista padrao do app (defaultlist.hpp). Preenchida = a lista e fixa: nao da para adicionar outra, so atualizar
     bool reloadRequested = false;   // o botao ATUALIZAR foi apertado: a plataforma baixa a lista de novo (veja o laco principal)
@@ -613,6 +617,8 @@ struct UI {
     // Dados guardados da ultima vez
     void loadSaved() {
         kickLast = kickSlug(app.pf.loadSetting("kick"));
+        kickFavs = kickapi::splitSlugs(app.pf.loadSetting("kickfav"));
+        kickHist = kickapi::splitSlugs(app.pf.loadSetting("kickhist"));
         m3uUrl = app.pf.loadSetting("m3u");
         if (!defaultUrl.empty()) m3uUrl = defaultUrl;       // lista fixa: ignora qualquer outra que tenha ficado guardada
     }
@@ -621,14 +627,91 @@ struct UI {
     void loadSavedList() { if (!m3uUrl.empty()) app.loadM3U(m3uUrl, true); }   // true = usa a copia salva (nao baixa de novo)
 
     // Itens da tela Kick TV
-    enum { KA_TYPE = 0, KA_LAST = 1 };
+    enum { KA_TYPE = 0, KA_LAST = 1, KA_LIVES = 2, KA_FAVS = 3, KA_HIST = 4, KA_ENTRY = 100 };
     std::vector<int> kickActions() const {
         std::vector<int> a;
+        if (kickView != 0) { for (size_t i = 0; i < kickList.size(); i++) a.push_back(KA_ENTRY + (int)i); return a; }
         a.push_back(KA_TYPE);
         if (!kickLast.empty()) a.push_back(KA_LAST);
+        a.push_back(KA_LIVES);
+        if (!kickFavs.empty()) a.push_back(KA_FAVS);
+        if (!kickHist.empty()) a.push_back(KA_HIST);
         return a;
     }
-    std::string kickLabel(int a) const { return a == KA_LAST ? "Assistir @" + kickLast : "Digitar @streamer"; }
+    const kickapi::Live *kickEntry(int a) const { int i = a - KA_ENTRY; return i >= 0 && i < (int)kickList.size() ? &kickList[i] : nullptr; }
+    std::string kickLabel(int a) const {
+        if (const kickapi::Live *l = kickEntry(a)) {
+            std::string s = "@" + l->slug;
+            if (kickapi::contains(kickFavs, l->slug)) s = "* " + s;
+            if (kickView == 2 && !l->live) return s + "   (offline)";
+            return l->live && l->viewers > 0 ? s + "   " + kickapi::fmtViewers(l->viewers) + " assistindo" : s;
+        }
+        switch (a) {
+        case KA_LAST: return "Assistir @" + kickLast;
+        case KA_LIVES: return "Lives agora";
+        case KA_FAVS: return "Favoritos (" + std::to_string(kickFavs.size()) + ")";
+        case KA_HIST: return "Histórico";
+        default: return "Digitar @streamer";
+        }
+    }
+    std::string kickSub(int a) const {
+        if (const kickapi::Live *l = kickEntry(a)) {
+            std::string s = l->category;
+            if (!l->title.empty()) s += (s.empty() ? "" : "  |  ") + l->title;
+            if (s.empty()) s = kickView == 1 ? "ao vivo" : (l->live ? "ao vivo agora" : "sem live no momento");
+            return s;
+        }
+        switch (a) {
+        case KA_LAST: return "Abrir de novo o último canal pesquisado";
+        case KA_LIVES: return "As lives mais assistidas agora (API oficial da Kick)";
+        case KA_FAVS: return "Seus streamers favoritos e quem está ao vivo";
+        case KA_HIST: return "Os últimos canais que você abriu";
+        default: return "Abre o teclado na tela e procura o canal ao vivo";
+        }
+    }
+    std::string kickIcon(int a) const {
+        if (const kickapi::Live *l = kickEntry(a)) return kickView == 1 || l->live ? "+" : "-";
+        switch (a) { case KA_LAST: return ">"; case KA_LIVES: return "L"; case KA_FAVS: return "*"; case KA_HIST: return "H"; default: return "@"; }
+    }
+    void kickPersist() {
+        app.pf.saveSetting("kickfav", kickapi::joinSlugs(kickFavs));
+        app.pf.saveSetting("kickhist", kickapi::joinSlugs(kickHist));
+    }
+    void kickWatch(const std::string &slug) {
+        kickLast = slug;
+        kickapi::remember(kickHist, slug);
+        app.pf.saveSetting("kick", slug);
+        kickPersist();
+        app.watchKick(slug);
+    }
+    void kickOpenView(int v) {
+        std::string err;
+        std::vector<kickapi::Live> items;
+        if (v == 1) {
+            if (!app.kickLives(items, err)) { app.say("Falha: " + err); return; }
+            if (items.empty()) { app.say("Nenhuma live no ar agora"); return; }
+        } else {
+            const std::vector<std::string> &src = v == 2 ? kickFavs : kickHist;
+            for (auto &sl : src) { kickapi::Live l; l.slug = sl; l.live = false; items.push_back(l); }
+            if (items.empty()) { app.say(v == 2 ? "Nenhum favorito ainda: aperte □ em um canal" : "Histórico vazio"); return; }
+            app.kickRefreshStatus(items);
+            if (v == 2) std::stable_sort(items.begin(), items.end(), [](const kickapi::Live &a, const kickapi::Live &b) { return a.live != b.live ? a.live : a.viewers > b.viewers; });
+        }
+        kickList = items; kickView = v;
+        cursor[(int)Tab::Kick] = scroll[(int)Tab::Kick] = 0;
+        app.say(v == 1 ? std::to_string(items.size()) + " lives no ar" : (v == 2 ? "Favoritos: □ remove" : "Histórico: □ favorita"));
+    }
+    void kickToggleFav() {
+        int t = (int)Tab::Kick;
+        auto acts = kickActions();
+        std::string slug;
+        if (kickView == 0) slug = kickLast;
+        else if (cursor[t] >= 0 && cursor[t] < (int)acts.size()) { if (const kickapi::Live *l = kickEntry(acts[cursor[t]])) slug = l->slug; }
+        if (slug.empty()) { app.say("Escolha um canal para favoritar"); return; }
+        bool now = kickapi::toggle(kickFavs, slug);
+        kickPersist();
+        app.say(now ? "@" + slug + " nos favoritos" : "@" + slug + " saiu dos favoritos");
+    }
     // Capa tvg-logo (filmes, canais, series)
     std::string itemLogo(int i) const {
         const Playlist &p = app.list;
@@ -658,10 +741,6 @@ struct UI {
         return "";
     }
 
-    std::string kickSub(int a) const {
-        return a == KA_LAST ? "Abrir de novo o último canal pesquisado" : "Abre o teclado na tela e procura o canal ao vivo";
-    }
-    static std::string kickIcon(int a) { return a == KA_LAST ? ">" : "@"; }
 
     // Quantidade de itens e nome de UM item, sem copiar a lista inteira.
     // (Antes, cada aperto de botao e cada quadro copiavam o nome de TODOS os canais: com listas de milhares de canais isso travava.)
@@ -890,7 +969,7 @@ struct UI {
         }
         kickLast = kickSlug(raw);
         if (kickLast.empty() && !raw.empty()) { app.say("@ invalido"); return; }
-        if (!kickLast.empty()) { app.pf.saveSetting("kick", kickLast); app.watchKick(kickLast); }
+        if (!kickLast.empty()) kickWatch(kickLast);
     }
     // Conta os resultados em Filmes, Series e Canais; fica na aba atual se ela tem resultado (ou se ja estava numa lista), senao vai para a que tem mais.
     void searchEverywhere() {
@@ -966,6 +1045,7 @@ struct UI {
 
     void handle(Input in) { handleImpl(in); }
     void handleImpl(Input in) {
+        if (in == Input::Fav) { if (screen == Screen::Kick) kickToggleFav(); return; }
         if (screen == Screen::Detail) { handleDetail(in); return; }
         if (screen == Screen::Donate) { if (in == Input::Back || in == Input::Confirm) screen = Screen::Home; return; }
         if (in == Input::Extra) { startSearch(); return; }
@@ -1054,7 +1134,7 @@ private:
 
     bool autoWant = false; int autoFrames = 0;
     void wantAutoOpen() { autoFrames = 0; autoWant = app.xt.active && browsable(tab) && curCat() && curCat()->unloaded(); }
-    void openTab(Tab t) { tab = t; screen = t == Tab::Kick ? Screen::Kick : Screen::List; level = 0; inItems = false; searchQ.clear(); searchHits.clear(); wantAutoOpen(); }
+    void openTab(Tab t) { kickView = 0; kickList.clear(); tab = t; screen = t == Tab::Kick ? Screen::Kick : Screen::List; level = 0; inItems = false; searchQ.clear(); searchHits.clear(); wantAutoOpen(); }
     void resetBrowse() {
         for (int i = 0; i < 4; i++) cursor[i] = scroll[i] = catCur[i] = catScroll[i] = 0;
         level = 0; inItems = false;
@@ -1063,6 +1143,7 @@ private:
     void goBack() {
         int t = (int)tab;
         if (searching()) { clearSearch(); app.say("Busca limpa"); return; }
+        if (screen == Screen::Kick && kickView != 0) { kickView = 0; kickList.clear(); cursor[t] = scroll[t] = 0; return; }   // de uma lista volta ao menu da Kick
         if (screen == Screen::Kick || !browsable(tab)) { screen = Screen::Home; return; }
         if (!inItems) { screen = Screen::Home; return; }
         if (tab == Tab::Series && level > 0) { level--; cursor[t] = 0; scroll[t] = 0; }
@@ -1471,7 +1552,7 @@ private:
         // titulo da secao
         std::string title;
         switch (tab) {
-        case Tab::Kick: title = "KICK TV"; break;
+        case Tab::Kick: title = kickView == 1 ? "KICK TV  /  LIVES AGORA" : kickView == 2 ? "KICK TV  /  FAVORITOS" : kickView == 3 ? "KICK TV  /  HISTÓRICO" : "KICK TV"; break;
         case Tab::Channels: title = "CANAIS"; break;
         case Tab::Movies: title = "FILMES"; break;
         default: title = level == 0 ? "SÉRIES" : level == 1 ? curSeries : curSeries + "  /  Temporada " + std::to_string(curSeason);
@@ -1524,12 +1605,12 @@ private:
             r.roundRect(W - 52, ky, 8, kh, 4, GREEN_DK);
         }
         // ajuda (tela Kick)
-        if (kick) {
+        if (kick && kickView == 0) {
             int hy = y0 + n * pitch + 10;
             uiFrame(r, x, hy, rw, 190, 18, 2, CARD_LINE, 0xFF0B0B0B);
             uiText(r, x + 30, hy + 20, "Como usar", GREEN, 24, true);
-            uiText(r, x + 30, hy + 62, "1. Escolha \"Digitar @streamer\" e informe o nome do canal (ex.: @dekin021).", SOFT, 22);
-            uiText(r, x + 30, hy + 98, "2. O canal precisa estar ao vivo. Aperte O para voltar ao menu a qualquer momento.", SOFT, 22);
+            uiText(r, x + 30, hy + 62, "1. \"Lives agora\" lista quem está no ar; ou digite o @ de um canal (ex.: @dekin021).", SOFT, 22);
+            uiText(r, x + 30, hy + 98, "2. Aperte □ em um canal para favoritar. O volta ao menu a qualquer momento.", SOFT, 22);
             uiText(r, x + 30, hy + 134, "3. As lives da Kick abrem direto aqui no PS4, sem navegador.", SOFT, 22);
         }
     }
@@ -1542,6 +1623,7 @@ private:
         else if (screen == Screen::Home) hints = {{"D-pad", "Navegar"}, {"X", "Selecionar"}};
         else if (browsable(tab) && !inItems) hints = {{"L1/R1", "Abas"}, {"X", "Abrir"}, {"O", "Início"}};
         else if (browsable(tab)) hints = {{"X", "Selecionar"}, {"O", searching() ? "Limpar busca" : "Categorias"}};
+        else if (screen == Screen::Kick) hints = {{"X", "Selecionar"}, {"[]", "Favoritar"}, {"O", "Voltar"}};
         else hints = {{"L1/R1", "Abas"}, {"X", "Selecionar"}, {"O", "Voltar"}};
         int hintsRight = W - 73;
         if (screen != Screen::Donate && screen != Screen::Help) {         // botao da lupa (canto inferior direito): mesmo que apertar △ (ou clicar o touchpad)
@@ -1597,7 +1679,12 @@ private:
         if (tab == Tab::Kick) {
             auto acts = kickActions();
             if (c >= (int)acts.size()) return;
-            if (acts[c] == KA_LAST) app.watchKick(kickLast);
+            int a = acts[c];
+            if (const kickapi::Live *l = kickEntry(a)) { std::string sl = l->slug; kickWatch(sl); }
+            else if (a == KA_LAST) kickWatch(kickLast);
+            else if (a == KA_LIVES) kickOpenView(1);
+            else if (a == KA_FAVS) kickOpenView(2);
+            else if (a == KA_HIST) kickOpenView(3);
             else { textKind = 1; app.pf.requestText("@ do streamer"); }
             return;
         }
