@@ -1,5 +1,6 @@
 #include "imgcache.hpp"
 #include "coverurl.hpp"
+#include "webpdec.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -28,9 +29,17 @@ bool imgDecodeToCover(const std::string &body, Cover &out, int tw, int th) {
     if (body.size() < 24 || body.size() > 3 * 1024 * 1024) return false;
     const stbi_uc *data = (const stbi_uc *)body.data();
     int w = 0, h = 0, comp = 0;
-    if (!stbi_info_from_memory(data, (int)body.size(), &w, &h, &comp) || w <= 0 || h <= 0 || (long long)w * h > 6000000) return false;   // gigante demais: nao arrisca a memoria
-    unsigned char *px = stbi_load_from_memory(data, (int)body.size(), &w, &h, &comp, 4);
-    if (!px || w <= 0 || h <= 0) { if (px) stbi_image_free(px); return false; }
+    std::vector<uint8_t> wp;                        // WebP (miniaturas da Kick): decodificador proprio (src/webpdec.hpp); o stb nao le WebP
+    const bool isWebp = webpIsWebp((const uint8_t *)body.data(), body.size());
+    unsigned char *px = nullptr;
+    if (isWebp) {
+        if (!webpDecode((const uint8_t *)body.data(), body.size(), w, h, wp) || w <= 0 || h <= 0 || wp.size() < (size_t)w * h * 4) return false;
+        px = wp.data();
+    } else {
+        if (!stbi_info_from_memory(data, (int)body.size(), &w, &h, &comp) || w <= 0 || h <= 0 || (long long)w * h > 6000000) return false;   // gigante demais: nao arrisca a memoria
+        px = stbi_load_from_memory(data, (int)body.size(), &w, &h, &comp, 4);
+        if (!px || w <= 0 || h <= 0) { if (px) stbi_image_free(px); return false; }
+    }
 
     const bool logo = tw == kCoverLogoW && th == kCoverLogoH;      // logo do titulo: encaixa inteira (sem cortar), embaixo
     const uint32_t BG = logo ? 0xFF0A0A0Au : 0xFF161C16u;
@@ -73,7 +82,7 @@ bool imgDecodeToCover(const std::string &body, Cover &out, int tw, int th) {
             d = 0xFF000000u | (r << 16) | (g << 8) | b;
         }
     }
-    stbi_image_free(px);
+    if (!isWebp) stbi_image_free(px);
     out.ready = true;
     return true;
 }
