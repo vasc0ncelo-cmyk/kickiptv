@@ -72,6 +72,7 @@ jobs:
           g++ -std=c++17 -pthread -o pf tests/test_progfile.cpp && ./pf
           g++ -std=c++17 -o s tests/test_tschunk.cpp && ./s
           g++ -std=c++17 -o tsd tests/test_tsdemux.cpp && ./tsd
+          g++ -std=c++17 -o ka tests/test_kickapi.cpp && ./ka
           g++ -std=c++17 -pthread -o l tests/test_listload.cpp src/m3u.cpp && ./l
           g++ -std=c++17 -o dt tests/test_detail.cpp src/m3u.cpp && ./dt
           g++ -std=c++17 -pthread -o xt tests/test_xtream.cpp src/m3u.cpp && ./xt
@@ -98,6 +99,17 @@ jobs:
             echo "logos: chave TMDB vem do segredo TMDB_KEY"
           else
             echo "sem segredo TMDB_KEY: o carrossel mostra o titulo em texto"
+          fi
+      - name: Chaves da API oficial da Kick (segredos KICK_CLIENT_ID e KICK_CLIENT_SECRET, opcionais)
+        env:
+          KICK_CLIENT_ID: ${{ secrets.KICK_CLIENT_ID }}
+          KICK_CLIENT_SECRET: ${{ secrets.KICK_CLIENT_SECRET }}
+        run: |
+          if [ -n "$KICK_CLIENT_ID" ] && [ -n "$KICK_CLIENT_SECRET" ]; then
+            printf 'static const char *kSecretKickId = R"KICKI(%s)KICKI";\nstatic const char *kSecretKickSecret = R"KICKS(%s)KICKS";\n' "$KICK_CLIENT_ID" "$KICK_CLIENT_SECRET" > src/kickkey_secret.hpp
+            echo "lives da Kick: chaves vem dos segredos"
+          else
+            echo "sem segredos KICK_CLIENT_ID/KICK_CLIENT_SECRET: a tela Lives agora fica indisponivel"
           fi
       - name: Toolchain OpenOrbis
         run: bash scripts/get_toolchain.sh
