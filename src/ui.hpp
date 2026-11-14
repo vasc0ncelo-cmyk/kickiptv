@@ -564,6 +564,7 @@ struct UI {
     std::vector<HeroItem> hero;
     std::string heroSig, lastHeroKey_;
     std::vector<HeroItem> heroCandM_;   // candidatos a filme (ate 10): os que tem backdrop sobem para o carrossel
+    std::vector<HeroItem> heroPool_; int heroRound_ = 0;   // conjunto de reserva (ate 25 filmes) e qual grupo de 5 esta no banner
     bool heroSettled_ = false, heroLocked_ = false;   // heroLocked_: banner fixo (nao refaz a escolha quando o catalogo cresce)
     int heroInfoVer_ = 0;     // sobe quando chega um backdrop novo (pede a imagem)
     std::vector<uint32_t> peekBuf_[2]; std::string peekKey_[2];   // cartas laterais inclinadas ja montadas
@@ -1426,6 +1427,7 @@ private:
     void heroMove(int d);
     void heroOpen();
     void heroRebuild();
+    void heroNextSet();
     void drawAmbient(Renderer &r);
     void drawHeroCard(Renderer &r, int slide, int x, int y, int w, int h, float center, bool focus);
     void drawPeek(Renderer &r, int slide, int x, int y, int w, int h, float dimA, int dir);
