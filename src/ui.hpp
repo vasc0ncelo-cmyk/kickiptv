@@ -46,6 +46,11 @@ struct Renderer {
     virtual void blitImageRound(int x, int y, int dw, int dh, const uint32_t *px, int sw, int sh, int /*rTop*/, int /*rBot*/) {
         blitImage(x, y, dw, dh, px, sw, sh);
     }
+    // Formas desenhadas pixel a pixel (poligonos, icones, brilhos procedurais): antes de gastar CPU, o chamador pergunta.
+    //  - FbRenderer: restringe a caixa (x0,y0,x1,y1) ao recorte atual; true = nada a desenhar ali (pule o laco).
+    //  - DamageRecorder: so anota (tag, caixa, key) para saber o que mudou na tela e devolve true (nao desenha nada).
+    //  'key' resume tudo que muda o desenho e nao esta na caixa nem na cor (geometria, opacidade...).
+    virtual bool paintBox(int /*tag*/, int & /*x0*/, int & /*y0*/, int & /*x1*/, int & /*y1*/, unsigned /*key*/) { return false; }
     // Mascara de cobertura 0..255 (w x h) pintada com argb: usada pelo texto proporcional (sans.hpp). Padrao: pixel a pixel.
     virtual void drawMask(int x, int y, int w, int h, const uint8_t *a, unsigned argb) {
         for (int j = 0; j < h; j++)
@@ -159,12 +164,38 @@ inline void uiSpan(Renderer &r, int row, float a, float b, unsigned c) {
     if (xb > xa) r.fillRect(xa, row, xb - xa, 1, c);
     if (fb > 0.01f) r.pixel(xb, row, uiAlpha(c, (int)(fb * 255)));
 }
+// hash simples (FNV-1a) para montar as 'key' dos formatos procedurais
+inline unsigned uiHash(unsigned h, unsigned v) { return (h ^ v) * 16777619u; }
+inline unsigned uiHashF(unsigned h, float f) { union { float f; unsigned u; } c; c.f = f; return uiHash(h, c.u); }
+
 // poligono (convexo ou simples), com recorte opcional em retangulo arredondado
 inline void uiPoly(Renderer &r, const UiPt *p, int n, unsigned c, const UiClip *clip = nullptr) {
-    float miny = p[0].y, maxy = p[0].y;
-    for (int i = 1; i < n; i++) { if (p[i].y < miny) miny = p[i].y; if (p[i].y > maxy) maxy = p[i].y; }
+    float miny = p[0].y, maxy = p[0].y, minx = p[0].x, maxx = p[0].x;
+    for (int i = 1; i < n; i++) {
+        if (p[i].y < miny) miny = p[i].y;
+        if (p[i].y > maxy) maxy = p[i].y;
+        if (p[i].x < minx) minx = p[i].x;
+        if (p[i].x > maxx) maxx = p[i].x;
+    }
     int y0 = (int)miny; if (y0 < 0) y0 = 0;
     int y1 = (int)maxy + 1; if (y1 > r.height()) y1 = r.height();
+    {   // caixa do poligono (e do recorte, se houver): o renderizador pode pular tudo ou limitar as linhas
+        int bx0 = (int)minx - 2, bx1 = (int)maxx + 3, by0 = y0, by1 = y1;
+        unsigned key = uiHash(2166136261u, (unsigned)n);
+        for (int i = 0; i < n; i++) { key = uiHashF(key, p[i].x); key = uiHashF(key, p[i].y); }
+        if (clip) {
+            if (clip->x > bx0) bx0 = clip->x;
+            if (clip->x + clip->w < bx1) bx1 = clip->x + clip->w;
+            if (clip->y > by0) by0 = clip->y;
+            if (clip->y + clip->h < by1) by1 = clip->y + clip->h;
+            key = uiHash(key, (unsigned)clip->x); key = uiHash(key, (unsigned)clip->y); key = uiHash(key, (unsigned)clip->w);
+            key = uiHash(key, (unsigned)clip->h); key = uiHash(key, (unsigned)clip->rad);
+        }
+        if (bx1 <= bx0 || by1 <= by0) return;
+        if (r.paintBox(1, bx0, by0, bx1, by1, uiHash(key, c))) return;
+        if (by0 > y0) y0 = by0;
+        if (by1 < y1) y1 = by1;
+    }
     for (int row = y0; row < y1; row++) {
         float yc = row + 0.5f, xs[16]; int k = 0;
         for (int i = 0; i < n && k < 16; i++) {
@@ -189,7 +220,9 @@ inline void uiBand(Renderer &r, float k0, float k1, float top, float bottom, uns
     uiPoly(r, p, 4, c, clip);
 }
 // pinta pixel a pixel por cobertura 0..1 (formas curvas)
-template <class F> inline void uiPaint(Renderer &r, int x0, int y0, int x1, int y1, unsigned col, F cov) {
+template <class F> inline void uiPaint(Renderer &r, int x0, int y0, int x1, int y1, unsigned col, F cov, unsigned key = 0) {
+    if (x1 <= x0 || y1 <= y0) return;
+    if (r.paintBox(2, x0, y0, x1, y1, uiHash(key, col))) return;
     for (int y = y0; y < y1; y++)
         for (int x = x0; x < x1; x++) {
             float c = cov(x + 0.5f, y + 0.5f);
@@ -262,6 +295,12 @@ struct UiFx : Renderer {
         r.blitImageRound(x + dx, y + dy, dw, dh, px, sw, sh, rt, rb); dim(x, y, dw, dh);
     }
     void drawMask(int x, int y, int w, int h, const uint8_t *m, unsigned c) override { r.drawMask(x + dx, y + dy, w, h, m, mul(c)); }
+    bool paintBox(int tag, int &x0, int &y0, int &x1, int &y1, unsigned key) override {
+        int a0 = x0 + dx, b0 = y0 + dy, a1 = x1 + dx, b1 = y1 + dy;
+        if (r.paintBox(tag, a0, b0, a1, b1, uiHash(key, (unsigned)(a * 255.f + 0.5f)))) return true;
+        x0 = a0 - dx; y0 = b0 - dy; x1 = a1 - dx; y1 = b1 - dy;
+        return false;
+    }
 };
 
 // Texto proporcional (Inter) posicionado pelo CENTRO vertical das maiusculas (cy) e nao pela linha de base.
@@ -342,7 +381,7 @@ inline void uiIconWifi(Renderer &r, int cx, int cy, int s, unsigned c) {   // (c
             if (dy > -s * 0.04f || uiAbs(dx) > -dy * 1.0f) return 0.f;
             float d = uiSqrt(dx * dx + dy * dy);
             return uiClamp01(0.5f - (uiAbs(d - R) - t * 0.5f));
-        });
+        }, uiHash(uiHash(11, (unsigned)s), (unsigned)k));
     }
     r.roundRect(cx - (int)(s * 0.08f), cy - (int)(s * 0.08f), (int)(s * 0.16f), (int)(s * 0.16f), (int)(s * 0.08f), c);
 }
@@ -358,7 +397,7 @@ inline void uiGlyphTriangle(Renderer &r, int cx, int cy, int s, unsigned c) {   
         float d2 = seg(px, py, bx, by, dx2, by); if (d2 < d) d = d2;
         float d3 = seg(px, py, dx2, by, ax, ay); if (d3 < d) d = d3;
         return uiClamp01(0.5f - (d - t * 0.5f));
-    });
+    }, uiHash(12, (unsigned)s));
 }
 inline void uiIconSearch(Renderer &r, int cx, int cy, int s, unsigned c) {   // lupa
     const float t = s * 0.11f, R = s * 0.30f, ox = cx - s * 0.10f, oy = cy - s * 0.10f;
@@ -373,7 +412,7 @@ inline void uiIconSearch(Renderer &r, int cx, int cy, int s, unsigned c) {   // 
         float qx = wx - vx * h, qy = wy - vy * h;
         float c2 = uiClamp01(0.5f - (uiSqrt(qx * qx + qy * qy) - t * 0.6f));
         return c2 > cv ? c2 : cv;
-    });
+    }, uiHash(13, (unsigned)s));
 }
 inline void uiIconLink(Renderer &r, int cx, int cy, int s, unsigned c) {
     const float k = 0.7071f, t = s * 0.085f, hx = s * 0.30f, hy = s * 0.17f;
@@ -387,7 +426,7 @@ inline void uiIconLink(Renderer &r, int cx, int cy, int s, unsigned c) {
             if (cv > best) best = cv;
         }
         return best;
-    });
+    }, uiHash(14, (unsigned)s));
 }
 inline void uiIconClapper(Renderer &r, int x, int y, int s, unsigned c, unsigned bg) {
     float S = (float)s, fx = (float)x, fy = (float)y;
@@ -489,6 +528,19 @@ inline void uiHeart(Renderer &r, int cx, int cy, int size, unsigned c) {
     }
 }
 
+// ---------- Desempenho (PS4) ----------
+// O desenho e por software (CPU), entao efeitos que mexem na tela inteira a cada quadro deixam o app lento.
+// Com tudo 'false' a tela PARA quando nada muda (0% de CPU) e so o trecho que mudou e redesenhado.
+// Quer de volta o visual animado? Mude para true (custa fluidez no PS4).
+#ifndef KICK_UI_FANCY
+#define KICK_UI_FANCY 0
+#endif
+#ifndef KICK_UI_BREATHING
+#define KICK_UI_BREATHING 0
+#endif
+constexpr bool kUiFancyTransitions = KICK_UI_FANCY != 0;   // deslizar/aparecer ao trocar de tela, entrada escalonada do Inicio, troca deslizante do banner
+constexpr bool kUiBreathing = KICK_UI_BREATHING != 0;      // brilho do foco "respirando", riscos de neon pulsando e particulas subindo
+
 struct UI {
     App &app;
     std::function<void(const std::string &)> coverRequest;
@@ -529,8 +581,10 @@ struct UI {
     int fadeSig = -1, trDir = 1;                        // trDir: de que lado a tela nova entra (+1 direita, -1 esquerda)
     int prevScreenDepth = 0, prevTabSig = 0;
     std::map<int, float> smv_;                          // valores que "deslizam" ate o alvo (foco, brilho, escala)
+    bool smFrozen_ = false, smBusy_ = false;
     static int screenDepth(Screen s) { return s == Screen::Home ? 0 : s == Screen::Detail ? 2 : 1; }
     bool tick(double t) {
+        smBusy_ = false;
         animDt = lastTickT > 0 ? (float)(t - lastTickT) : 0.033f;
         if (animDt < 0.001f) animDt = 0.001f;
         if (animDt > 0.1f) animDt = 0.1f;
@@ -556,12 +610,30 @@ struct UI {
     float sm(int id, float target, float speed = 14.f) {
         auto it = smv_.find(id);
         if (it == smv_.end()) { smv_[id] = target; return target; }
+        if (smFrozen_) return it->second;                                                         // 2a passada do mesmo quadro: nao avanca de novo
         float x = speed * animDt, k = x / (1.f + x + 0.5f * x * x);                             // ~ 1 - e^-x
         it->second += (target - it->second) * k;
-        if (uiAbs(target - it->second) < 0.003f) it->second = target;
+        if (uiAbs(target - it->second) < 0.003f) it->second = target; else smBusy_ = true;       // ainda deslizando: precisa de mais quadros
         return it->second;
     }
-    float pulse() const { return 0.80f + 0.20f * uiSin((float)animT * 3.2f); }                   // brilho do foco "respirando" (suave)
+    // O quadro e desenhado em duas passadas (1a: so descobre o que mudou; 2a: pinta so esse trecho). Na 2a, as animacoes ficam congeladas.
+    void freezeAnim(bool f) { smFrozen_ = f; }
+    // Tem alguma animacao em andamento? (senao a tela fica parada e o app nao redesenha nada)
+    bool animating() const { return smBusy_ || (kUiFancyTransitions && (animT - fadeAt < 1.1 || animT - heroT0 < 0.5)) || (kUiBreathing && screen != Screen::Help && screen != Screen::Donate); }
+    // O laco principal pergunta isto: precisa desenhar um quadro agora?
+    bool needsFrame(double t) const {
+        if (animating()) return true;
+        if (screen == Screen::Home && hero.size() > 1 && t - heroAuto > 2.0) return true;       // o banner passa sozinho
+        return false;
+    }
+    // Coisas que chegam de threads (backdrop/sinopse/logo do banner): chamar de tempos em tempos no laco principal. true = mudou algo.
+    bool asyncPoll() {
+        if (screen != Screen::Home) return false;
+        const int v = heroInfoVer_; const size_t n = hero.size();
+        heroRebuild(); heroApplyInfo();
+        return v != heroInfoVer_ || n != hero.size();
+    }
+    float pulse() const { return kUiBreathing ? 0.80f + 0.20f * uiSin((float)animT * 3.2f) : 0.90f; }   // brilho do foco (fixo; "respirando" so com kUiBreathing)
     int pk(int base) const { return (int)(base * pulse()); }
     static bool looksLikeError(const std::string &m) {
         return m.find("Falha") != std::string::npos || m.find("offline") != std::string::npos || m.find("inválido") != std::string::npos ||
@@ -1117,7 +1189,7 @@ struct UI {
         if (dbg) dbg("ui-header-ok");
         if (screen == Screen::Home) renderHome(r);          // o Inicio anima a propria entrada, bloco por bloco
         else {
-            const float age = (float)(animT - fadeAt), e = uiEaseOut(age / 0.34f);
+            const float age = (float)(animT - fadeAt), e = kUiFancyTransitions ? uiEaseOut(age / 0.34f) : 1.f;
             auto body = [&](Renderer &q) {
                 if (screen == Screen::Help) renderHelp(q); else if (screen == Screen::Donate) renderDonate(q);
                 else if (screen == Screen::Detail) renderDetail(q); else renderList(q);
