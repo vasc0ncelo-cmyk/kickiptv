@@ -1,4 +1,5 @@
 #pragma once
+#include <set>
 // Navegacao e desenho das telas. Independente de plataforma: o PS4 so implementa Renderer + leitura do pad.
 // Telas: Home (banner + 4 atalhos + lista M3U), Kick TV (digitar @streamer) e listas (Filmes / Series / Canais).
 #include "app.hpp"
@@ -563,9 +564,13 @@ struct UI {
     struct HeroItem { int kind = 1; std::string title, sub, logo, cat, key, backdrop, plot, tlogo; uint32_t idx = 0; bool infoDone = false, logoDone = false; };   // kind: 1 filme, 2 serie
     std::vector<HeroItem> hero;
     std::string heroSig, lastHeroKey_;
-    std::vector<HeroItem> heroCandM_;   // candidatos a filme (ate 10): os que tem backdrop sobem para o carrossel
-    std::vector<HeroItem> heroPool_; int heroRound_ = 0;   // conjunto de reserva (ate 25 filmes) e qual grupo de 5 esta no banner
-    bool heroSettled_ = false, heroLocked_ = false;   // heroLocked_: banner fixo (nao refaz a escolha quando o catalogo cresce)
+    std::vector<HeroItem> heroPool_;    // filmes recentes/populares do TMDB que existem no catalogo (ate 30)
+    std::vector<HeroItem> heroPend_;    // proximo conjunto de 5 (esperando as logos / esperando voltar ao Inicio)
+    std::set<std::string> heroShown_;   // chaves ja mostradas (nao repete ate passar por todos)
+    std::unordered_map<std::string, uint32_t> heroIdx_; size_t heroIdxN_ = 0, heroMatchN_ = 0;
+    double heroPendT_ = 0, heroMatchT_ = -10, heroFirstT_ = -1; int heroSetNo_ = 0;
+    bool heroWantSwap_ = false, heroAsked_ = false, heroTrendFail_ = false;
+    bool heroLocked_ = false;   // heroLocked_: banner fixo (nao refaz a escolha quando o catalogo cresce)
     int heroInfoVer_ = 0;     // sobe quando chega um backdrop novo (pede a imagem)
     std::vector<uint32_t> peekBuf_[2]; std::string peekKey_[2];   // cartas laterais inclinadas ja montadas
     Screen prevScreen_ = Screen::Home;
@@ -600,8 +605,9 @@ struct UI {
             smv_.clear();                               // cada tela comeca com o foco ja no lugar (sem "voar" de outra tela)
         }
         if (screen == Screen::Home && prevScreen_ != Screen::Home && prevScreen_ != Screen::Donate && prevScreen_ != Screen::Help) {   // voltou ao Inicio: novo sorteio dos filmes do banner
-            heroSeed_ = 0; heroSig.clear(); heroCur = 0; heroFrom = 0; heroAuto = t;
+            heroOnEnterHome(t);                           // voltou ao Inicio: o conjunto novo (se ja estiver pronto) entra agora
         }
+        if (screen != Screen::Home && prevScreen_ == Screen::Home && screen != Screen::Donate && screen != Screen::Help) heroOnLeaveHome();   // saiu: prepara os proximos filmes
         prevScreen_ = screen;
         heroTick(t);
         return wantsFrames();
@@ -1261,7 +1267,7 @@ private:
     void requestReload() {
         if (m3uUrl.empty()) { app.say("Nenhuma lista configurada neste app"); return; }
         reloadRequested = true;
-        heroLocked_ = false; heroSig.clear();             // ATUALIZAR: sorteia o banner de novo com o catalogo novo
+        heroLocked_ = false; heroPool_.clear(); heroPend_.clear(); heroIdxN_ = 0; heroMatchT_ = -10; heroSig.clear();   // ATUALIZAR: escolhe o banner de novo com o catalogo novo
         app.say("Atualizando a lista...");
     }
 
@@ -1427,7 +1433,10 @@ private:
     void heroMove(int d);
     void heroOpen();
     void heroRebuild();
-    void heroNextSet();
+    void heroMatch();
+    void heroPrepare(bool swap);
+    void heroOnLeaveHome();
+    void heroOnEnterHome(double t);
     void drawAmbient(Renderer &r);
     void drawHeroCard(Renderer &r, int slide, int x, int y, int w, int h, float center, bool focus);
     void drawPeek(Renderer &r, int slide, int x, int y, int w, int h, float dimA, int dir);
