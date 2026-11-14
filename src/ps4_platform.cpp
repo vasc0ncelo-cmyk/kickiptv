@@ -3492,7 +3492,12 @@ int main() {
         std::string url = coverFetchUrl(url0);           // TMDB: usa coverFetchUrl (variante/tamanho correto; miniatura se nao houver variante)
         int st = 0;
         try {
-            return g_net.getKA(ss, url, body, st, 768 * 1024) && st >= 200 && st < 300 && body.size() > 32;
+            bool ok = g_net.getKA(ss, url, body, st, 768 * 1024) && st >= 200 && st < 300 && body.size() > 32;
+            if (url.find("kick.com") != std::string::npos) {        // diagnostico das miniaturas da Kick (no maximo 12 linhas no log)
+                static std::atomic<int> nk{0};
+                if (nk++ < 12) { char b[96]; snprintf(b, sizeof b, "kick-thumb-%s-%d-%zu", ok ? "ok" : "falhou", st, body.size()); trace(b); }
+            }
+            return ok;
         } catch (...) { return false; }
     });
     ui.coverBackground = [](std::vector<std::string>) {};     // (nada automatico: o lote so roda quando voce aperta TRIANGULO)
