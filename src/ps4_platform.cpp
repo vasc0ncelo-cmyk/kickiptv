@@ -211,6 +211,45 @@ struct NetClient {
         return ok;
     }
 
+    // Requisicao da API oficial da Kick: GET com "Authorization: Bearer ..." ou POST de formulario (token). Resposta pequena (JSON).
+    bool request(bool post, const std::string &url, const std::string &auth, const std::string &postBody, std::string &body, int &status) {
+        std::lock_guard<std::recursive_mutex> httpLk(httpMx);
+        status = 0; body.clear();
+        if (!init()) return false;
+        int tmpl = sceHttpCreateTemplate(httpCtx, "KickIPTV/1.0 (PlayStation 4)", 1 /*HTTP/1.1*/, 1);
+        if (tmpl < 0) return false;
+        sceHttpsDisableOption(tmpl, 0x1F);
+        sceHttpSetAutoRedirect(tmpl, 1);
+        const unsigned T = 15 * 1000 * 1000;
+        sceHttpSetResolveTimeOut(tmpl, T); sceHttpSetConnectTimeOut(tmpl, T); sceHttpSetSendTimeOut(tmpl, T); sceHttpSetRecvTimeOut(tmpl, T);
+        int conn = sceHttpCreateConnectionWithURL(tmpl, url.c_str(), 1);
+        bool ok = false;
+        if (conn >= 0) {
+            int req = sceHttpCreateRequestWithURL(conn, post ? 1 /*POST*/ : 0 /*GET*/, url.c_str(), post ? (unsigned long long)postBody.size() : 0);
+            if (req >= 0) {
+                sceHttpAddRequestHeader(req, "Accept", "application/json", 0);
+                if (post) sceHttpAddRequestHeader(req, "Content-Type", "application/x-www-form-urlencoded", 0);
+                if (!auth.empty()) sceHttpAddRequestHeader(req, "Authorization", auth.c_str(), 0);
+                int rc = post ? sceHttpSendRequest(req, postBody.data(), postBody.size()) : sceHttpSendRequest(req, NULL, 0);
+                if (rc >= 0) {
+                    sceHttpGetStatusCode(req, &status);
+                    std::vector<char> buf(32 * 1024);
+                    for (;;) {
+                        int n = sceHttpReadData(req, buf.data(), buf.size());
+                        if (n <= 0) break;
+                        body.append(buf.data(), n);
+                        if (body.size() > 2u * 1024 * 1024) break;
+                    }
+                    ok = true;
+                }
+                sceHttpDeleteRequest(req);
+            }
+            sceHttpDeleteConnection(conn);
+        }
+        sceHttpDeleteTemplate(tmpl);
+        return ok;
+    }
+
     // GET em streaming (sem guardar nada), usado na lista M3U (dezenas de MB) e nos canais ao vivo em MPEG-TS cru.
     // Roda em QUALQUER thread. 'pos' = bytes ja entregues a onData (soma aqui). Com useRange e pos>0 pede "Range: bytes=pos-":
     // assim, se a conexao cair no meio, o download RETOMA de onde parou em vez de entregar a lista pela metade.
@@ -435,6 +474,11 @@ struct Ps4Platform : Platform {
     std::function<void(const std::string &)> busyFn;             // desenha um quadro antes de uma consulta que bloqueia (categoria, detalhes)
     void busy(const std::string &m) override { if (busyFn) busyFn(m); }
     int lastHttpStatus() override { return lastStatus_.load(); }
+    bool httpApi(const char *method, const std::string &url, const std::string &auth, const std::string &body, std::string &out, int &status) override {
+        bool ok = g_net.request(std::string(method) == "POST", url, auth, body, out, status);
+        char b[64]; snprintf(b, sizeof b, "kick-api-%s-%d", method, ok ? status : 0); trace(b);
+        return ok;
+    }
     // Kick: o Cloudflare da Kick recusa (403) clientes cujo "User-Agent" nao combina com o jeito de conectar. O PS4 conecta como o
     // navegador do proprio PS4, entao primeiro tentamos com o User-Agent dele (e Referer da Kick); depois com o do Chrome.
     bool httpGetKick(const std::string &url, std::string &body) override {
@@ -4115,6 +4159,7 @@ int main() {
         if (pressed & B_R2)     { ui.handle(Input::PageDown); dirty = true; }
         if (pressed & B_CROSS)  { ui.handle(Input::Confirm);  dirty = true; }
         if (pressed & B_CIRCLE) { ui.handle(Input::Back);     dirty = true; }
+        if ((pressed & B_SQUARE) && mode == Mode::Menu) { ui.handle(Input::Fav); dirty = true; }   // quadrado: favoritar (tela Kick)
         if (pressed & (B_TRIANGLE | B_TOUCH)) { ui.handle(Input::Extra);  dirty = true; }       // lupa: buscar (triangulo ou clique no touchpad)
         if (updateClock()) dirty = true;
         {   // andamento do lote de capas (TRIANGULO)
