@@ -122,7 +122,7 @@ inline const SansBmp &sansGlyph(int weight, int gi, float size) {
     uint32_t key = ((uint32_t)sq << 10) | ((uint32_t)gi << 2) | (uint32_t)weight;
     auto it = g_sansCache.find(key);
     if (it != g_sansCache.end()) return it->second;
-    if (g_sansCache.size() > 1500) g_sansCache.clear();          // limite de seguranca (so uns 100 glifos por tela)
+    if (g_sansCache.size() > 6000) g_sansCache.clear();          // limite de seguranca (so uns 100 glifos por tela)
     SansBmp &out = g_sansCache[key];
     const SansGlyphRec &rec = sansRecs(weight)[gi];
     const int16_t *d = sansData(weight) + rec.off;
