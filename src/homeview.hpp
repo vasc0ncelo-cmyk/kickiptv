@@ -13,182 +13,150 @@ static constexpr int kHeroBdW = 880, kHeroBdH = 340;      // backdrop (paisagem)
 static constexpr int kHeroPkW = 264, kHeroPkH = 288;      // capa das cartas laterais
 static constexpr int kHeroPsW = 178, kHeroPsH = 267;      // poster nitido (quando nao ha backdrop)
 
-inline int heroNameYear(const std::string &n) {          // ultimo numero de 4 digitos (1950..2100) isolado no nome, ex.: "Filme (2025)"
-    int best = 0;
-    for (size_t i = 0; i + 4 <= n.size(); i++) {
-        if (!(n[i] >= '1' && n[i] <= '2')) continue;
-        if (i > 0 && n[i - 1] >= '0' && n[i - 1] <= '9') continue;
-        if (i + 4 < n.size() && n[i + 4] >= '0' && n[i + 4] <= '9') continue;
-        int v = 0; bool ok = true;
-        for (int k = 0; k < 4; k++) { char c = n[i + k]; if (c < '0' || c > '9') { ok = false; break; } v = v * 10 + (c - '0'); }
-        if (ok && v >= 1950 && v <= 2100) best = v;
+// texto sem acento/maiuscula/pontuacao, para comparar titulos do painel com os do TMDB
+inline std::string homeNorm(const std::string &s) {
+    std::string o;
+    for (size_t i = 0; i < s.size(); i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c == 0xC3 && i + 1 < s.size()) {
+            unsigned char b = (unsigned char)s[++i]; if (b < 0xA0) b += 0x20;
+            char m = 0;
+            if (b >= 0xA0 && b <= 0xA5) m = 'a'; else if (b == 0xA7) m = 'c'; else if (b >= 0xA8 && b <= 0xAB) m = 'e'; else if (b >= 0xAC && b <= 0xAF) m = 'i';
+            else if (b == 0xB1) m = 'n'; else if (b >= 0xB2 && b <= 0xB6) m = 'o'; else if (b >= 0xB9 && b <= 0xBC) m = 'u';
+            if (m) o += m; continue;
+        }
+        if (c >= 'A' && c <= 'Z') c += 32;
+        if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) o += (char)c;
     }
-    return best;
+    return o;
+}
+
+// ---- Banner do Inicio: SO filmes recentes e populares (TMDB) que existem no catalogo, com imagem larga e sinopse ----
+// Fluxo: o TMDB entrega os ~60 filmes recentes mais populares (App::trendingGet). Cruzamos com os nomes do catalogo (titulo igual e ano
+// parecido) e o que casar vira o "conjunto" (ate 30, todos com imagem larga). O banner mostra 5 por vez:
+//  - o 1o conjunto e escolhido assim que ha 5 e FICA FIXO (o catalogo que continua chegando nao troca nada);
+//  - ao sair do Inicio (catalogo ja carregado) o proximo conjunto de 5 e preparado (logos e imagens baixam), e ao voltar ele aparece;
+//  - nunca repete filmes ate passar por todos do conjunto.
+inline void UI::heroMatch() {
+    const Playlist &p = app.list;
+    std::vector<App::Trend> tr;
+    if (!app.trendingGet(tr)) return;
+    heroTrendFail_ = tr.empty();
+    if (tr.empty() || p.movies.empty()) return;
+    if (heroIdxN_ != p.movies.size()) {                    // indice nome normalizado -> filme (refeito so quando o catalogo muda)
+        heroIdx_.clear(); heroIdxN_ = p.movies.size();
+        for (uint32_t i = 0; i < p.movies.size(); i++) {
+            const Entry &m = p.movies[i];
+            if (m.url.empty() || m.logo.size() < 8) continue;
+            std::string y, q, n = homeNorm(detailCleanTitle(m.name, &y, &q));
+            if (q == "CAM" || q == "TS" || q == "HDCAM") continue;
+            if (!n.empty() && !heroIdx_.count(n)) heroIdx_[n] = i;
+        }
+    }
+    heroMatchN_ = p.movies.size();
+    std::vector<HeroItem> got;
+    for (const auto &t : tr) {
+        if (got.size() >= 30) break;
+        auto it = heroIdx_.find(homeNorm(t.title));
+        if (it == heroIdx_.end()) it = heroIdx_.find(homeNorm(t.orig));
+        if (it == heroIdx_.end()) continue;
+        const Entry &m = p.movies[it->second];
+        std::string py; detailCleanTitle(m.name, &py);
+        if (py.size() == 4 && t.year.size() == 4 && std::abs(atoi(py.c_str()) - atoi(t.year.c_str())) > 1) continue;      // outro filme com o mesmo nome
+        const std::string cat = movieCategoryOf(it->second);
+        HeroItem h; h.kind = 1; h.idx = it->second; h.title = m.name; h.sub = cat; h.cat = cat; h.logo = m.logo;
+        h.key = "t:" + t.id; h.backdrop = t.backdrop; h.plot = t.overview; h.infoDone = true;
+        got.push_back(h);
+    }
+    heroPool_ = got;
+}
+
+// Escolhe o proximo conjunto de 5 (os que ainda nao passaram) e pede as logos. swap: ja pode aparecer assim que estiver pronto.
+inline void UI::heroPrepare(bool swap) {
+    if (heroPool_.size() < 3) return;
+    std::vector<HeroItem> set;
+    for (int pass = 0; pass < 2 && set.size() < 5; pass++) {
+        for (const auto &h : heroPool_) {
+            if (set.size() >= 5) break;
+            bool dup = false; for (const auto &x : set) if (x.key == h.key) dup = true;
+            if (dup || heroShown_.count(h.key)) continue;
+            set.push_back(h);
+        }
+        if (set.size() < 5 && pass == 0) heroShown_.clear();            // passou por todos: recomeca (sem repetir dentro do conjunto)
+    }
+    if (set.size() < 3) return;
+    for (const auto &h : set) { heroShown_.insert(h.key); app.heroInfoRequest(h.key, h.key.substr(2)); }
+    heroPend_ = set; heroPendT_ = animT; heroWantSwap_ = swap || hero.empty();
+    heroInfoVer_++;                                                      // pede as imagens do conjunto ja
 }
 
 inline void UI::heroRebuild() {
-    const bool locked = heroLocked_ && !hero.empty();     // banner ja escolhido: o catalogo chegando aos poucos nao troca os filmes na tela...
+    if (app.tmdbKey.empty() || !app.heroInfoEnabled) return;
     const Playlist &p = app.list;
-    std::string sig = std::to_string(p.movieCats.size()) + "|" + std::to_string(p.seriesCats.size());
-    sig += "|" + std::to_string(p.movies.size() / 4000) + (hero.size() < 4 ? "|" + std::to_string(p.movies.size()) : std::string());   // catalogo chegando aos poucos: refaz a escolha
-    if (sig == heroSig && !hero.empty()) return;
-    if (sig == heroSig && p.movies.empty() && p.seriesTree.empty()) return;
-    heroSig = sig;
-    if (!locked) { hero.clear(); heroCandM_.clear(); heroSettled_ = false; }
-    std::vector<HeroItem> pool;                           // ate 25 filmes bons: o banner mostra 5 por vez e depois passa para os 5 seguintes
-    std::vector<HeroItem> mv, sr;
-    // So filmes RECENTES e bem avaliados (os que todo mundo quer ver): painel Xtream = data de entrada no catalogo + nota;
-    // lista M3U = ano no nome. Sem nenhuma dessas informacoes, cai no 1o filme de cada categoria (como antes).
-    {
-        const auto &M = p.movies;
-        int maxAdded = 0, refYear = 0;
-        for (const auto &m : M) { if (m.added > maxAdded) maxAdded = m.added; if (m.added == 0) { int y = heroNameYear(m.name); if (y > refYear) refYear = y; } }
-        const int recentFrom = maxAdded - 120 * 86400;
-        std::vector<uint32_t> el;
-        for (uint32_t i = 0; i < M.size(); i++) {
-            const auto &m = M[i];
-            if (m.logo.size() < 8 || m.url.empty()) continue;
-            bool recent = m.added > 0 ? m.added >= recentFrom : (refYear > 0 && heroNameYear(m.name) >= refYear - 1);
-            if (!recent) continue;
-            if (m.rate10 > 0 && m.rate10 < 60) continue;                 // nota baixa: fora
-            el.push_back(i);
-        }
-        std::stable_sort(el.begin(), el.end(), [&](uint32_t x, uint32_t y) {
-            int rx = M[x].rate10 ? M[x].rate10 : 60, ry = M[y].rate10 ? M[y].rate10 : 60;
-            if (rx != ry) return rx > ry;
-            return M[x].added > M[y].added;
-        });
-        std::vector<std::string> seen;
-        for (uint32_t i : el) {
-            if (pool.size() >= 25) break;
-            const auto &m = M[i];
-            std::string ct = detailCleanTitle(m.name);
-            bool dup = false; for (const auto &t : seen) if (t == ct) { dup = true; break; }
-            if (dup) continue;
-            seen.push_back(ct);
-            std::string cat = movieCategoryOf(i);
-            HeroItem h; h.kind = 1; h.idx = i; h.title = m.name; h.sub = cat; h.logo = m.logo; h.cat = cat;
-            std::string id = xtMovieIdFromUrl(m.url);
-            if (!id.empty()) h.key = "m:" + id;
-            pool.push_back(h);
-        }
-        if (pool.empty()) {                                        // sem data/ano: 1 por categoria
-            for (const auto &c : p.movieCats) {
-                if (pool.size() >= 25) break;
-                for (uint32_t i : c.items) if (i < M.size() && !M[i].logo.empty()) {
-                    const auto &m = M[i];
-                    HeroItem h; h.kind = 1; h.idx = i; h.title = m.name; h.sub = c.name; h.logo = m.logo; h.cat = c.name;
-                    std::string id = xtMovieIdFromUrl(m.url);
-                    if (!id.empty()) h.key = "m:" + id;
-                    pool.push_back(h); break;
-                }
-            }
-        }
-    }
-    heroPool_ = pool;
-    if (locked) return;                                   // so o conjunto de reserva foi renovado
-    heroRound_ = 0;
-    for (size_t i = 0; i < pool.size() && i < 8; i++) heroCandM_.push_back(pool[i]);
-    for (size_t i = 0; i < heroCandM_.size() && i < 5; i++) mv.push_back(heroCandM_[i]);
-    size_t mi = 0, si = 0;
-    while (mi < mv.size() || si < sr.size()) {            // filme, serie, filme, serie, filme
-        if (mi < mv.size()) hero.push_back(mv[mi++]);
-        if (si < sr.size()) hero.push_back(sr[si++]);
-    }
-    for (const auto &h : heroCandM_) if (!h.key.empty()) app.heroInfoRequest(h.key, h.key.substr(2));
-    if (!app.tmdbKey.empty()) for (const auto &h : hero) if (h.kind == 2 && !h.key.empty()) app.heroInfoRequest(h.key, h.key.substr(2));   // series: so a logo
-    if (heroCandM_.empty() || !app.heroInfoEnabled) heroSettled_ = true;
-    if (heroCur >= (int)hero.size()) heroCur = 0;
-    heroFrom = heroCur;
-    heroInfoVer_++;
+    if (heroFirstT_ < 0 && !p.movies.empty()) heroFirstT_ = animT;
+    if (!heroAsked_) { heroAsked_ = true; app.trendingRequest(); }
+    if (heroLocked_ || !heroPend_.empty() || p.movies.empty()) return;
+    if (animT - heroMatchT_ < 2.5) return;                              // procura de novo a cada 2,5 s enquanto o catalogo chega
+    heroMatchT_ = animT;
+    if (heroIdxN_ != p.movies.size()) heroMatch(); else if (heroPool_.empty()) heroMatch();
+    if (heroPool_.size() >= 5 || (!app.prefetching() && heroPool_.size() >= 3)) heroPrepare(true);
 }
 
 inline void UI::heroApplyInfo() {
-    bool allDone = !heroCandM_.empty();
-    for (auto &h : heroCandM_) {
-        if (!h.infoDone && !h.key.empty()) {
+    if (!heroPend_.empty()) {                                           // conjunto novo: espera as logos (no maximo 4 s)
+        bool all = true;
+        for (auto &h : heroPend_) {
+            if (h.logoDone) continue;
             App::HeroInfo hi;
-            if (app.heroInfoGet(h.key, hi)) { h.infoDone = true; h.logoDone = true; h.backdrop = hi.backdrop; h.plot = hi.plot; h.tlogo = hi.logo; }
+            if (app.heroInfoGet(h.key, hi)) { h.logoDone = true; h.tlogo = hi.logo; } else all = false;
         }
-        if (!h.infoDone && !h.key.empty()) allDone = false;
-    }
-    if (allDone && !heroSettled_) {                       // todos os filmes candidatos responderam: os que tem backdrop vao para o carrossel
-        heroSettled_ = true;
-        std::vector<HeroItem> good, rest, sr;
-        for (const auto &h : heroCandM_) (h.backdrop.empty() ? rest : good).push_back(h);
-        const bool enough = good.size() >= 3;                // 3+ filmes com imagem larga: a escolha esta boa, fixa ate o usuario atualizar a lista
-        for (auto &x : rest) good.push_back(x);
-        for (const auto &h : hero) if (h.kind == 2) sr.push_back(h);
-        std::string curTitle = hero.empty() ? std::string() : hero[heroCur].title;
-        hero.clear();
-        size_t mi = 0, si = 0;
-        while ((mi < 5 && mi < good.size()) || si < sr.size()) {
-            if (mi < 5 && mi < good.size()) hero.push_back(good[mi++]);
-            if (si < sr.size()) hero.push_back(sr[si++]);
+        if ((all || animT - heroPendT_ > 4.0) && (hero.empty() || heroWantSwap_)) {
+            hero = heroPend_; heroPend_.clear(); heroCur = 0; heroFrom = 0; heroAuto = animT; heroWantSwap_ = false;
+            heroLocked_ = true; heroSig = std::to_string(++heroSetNo_); heroInfoVer_++;
         }
-        heroCur = 0; for (size_t i = 0; i < hero.size(); i++) if (hero[i].title == curTitle) heroCur = (int)i;
-        heroFrom = heroCur; heroInfoVer_++;
-        if (enough) heroLocked_ = true;
     }
-    for (auto &h : hero) {
+    for (auto &h : hero) {                                              // logo que chegou depois
         if (h.logoDone || h.key.empty()) continue;
         App::HeroInfo hi;
         if (!app.heroInfoGet(h.key, hi)) continue;
-        h.logoDone = true; h.tlogo = hi.logo;
-        if (!h.infoDone) { h.infoDone = true; h.backdrop = hi.backdrop; h.plot = hi.plot; }
-        heroInfoVer_++;
+        h.logoDone = true; h.tlogo = hi.logo; heroInfoVer_++;
     }
-    if (!heroLocked_) {                                   // 3+ filmes ja com imagem larga na tela: fixa o banner (o catalogo que chega depois nao troca mais)
-        int withBd = 0; for (const auto &h : hero) if (!h.backdrop.empty()) withBd++;
-        if (withBd >= 3) heroLocked_ = true;
-    }
+}
+
+inline void UI::heroOnLeaveHome() {
+    if (!heroLocked_ || app.prefetching() || !heroPend_.empty()) return;   // carregando a lista: nada muda
+    heroMatch();                                                         // catalogo completo: conjunto maior
+    heroPrepare(false);
+}
+inline void UI::heroOnEnterHome(double t) {
+    heroCur = 0; heroFrom = 0; heroAuto = t;
+    if (!heroPend_.empty() && !app.prefetching()) heroWantSwap_ = true;
 }
 
 // Pede as imagens do carrossel primeiro (backdrops/capas) e as das abas depois; so quando algo mudou.
 inline void UI::requestHomeCovers() {
     if (!coverBatch) return;
-    std::string key = homeCoverKey() + "#" + heroSig + "#" + std::to_string(heroInfoVer_) + "#" + std::to_string(heroRound_);
+    std::string key = homeCoverKey() + "#" + heroSig + "#" + std::to_string(heroInfoVer_) + "#" + std::to_string(heroPend_.size());
     if (key == lastHeroKey_) return;
     lastHeroKey_ = key;
     std::vector<std::string> front;
-    for (const auto &h : hero) {
-        if (!h.backdrop.empty()) front.push_back(coverVariantKey(h.backdrop, kHeroBdW, kHeroBdH));
-        else if (!h.logo.empty()) front.push_back(coverVariantKey(h.logo, kHeroPsW, kHeroPsH));
-    }
+    for (const auto &h : hero) if (!h.backdrop.empty()) front.push_back(coverVariantKey(h.backdrop, kHeroBdW, kHeroBdH));
     for (const auto &h : hero) if (!h.tlogo.empty()) front.push_back(coverVariantKey(h.tlogo, kCoverLogoW, kCoverLogoH));
     for (const auto &h : hero) if (!h.logo.empty()) front.push_back(coverVariantKey(h.logo, kHeroPkW, kHeroPkH));
-    std::vector<std::string> back = homeCoverList();
-    if (heroPool_.size() > 5) {                                       // capas do proximo conjunto: ja baixam enquanto o atual passa
-        const size_t P = heroPool_.size(), next = ((size_t)(heroRound_ + 1) * 5) % P;
-        for (size_t k = 0; k < 5; k++) { const HeroItem &h = heroPool_[(next + k) % P]; if (!h.logo.empty()) back.push_back(coverVariantKey(h.logo, kHeroPkW, kHeroPkH)); if (!h.logo.empty()) back.push_back(coverVariantKey(h.logo, kHeroPsW, kHeroPsH)); }
+    std::vector<std::string> back;
+    for (const auto &h : heroPend_) {                                   // conjunto seguinte: baixa enquanto o atual passa
+        if (!h.backdrop.empty()) back.push_back(coverVariantKey(h.backdrop, kHeroBdW, kHeroBdH));
+        if (!h.tlogo.empty()) back.push_back(coverVariantKey(h.tlogo, kCoverLogoW, kCoverLogoH));
+        if (!h.logo.empty()) back.push_back(coverVariantKey(h.logo, kHeroPkW, kHeroPkH));
     }
+    for (const auto &u : homeCoverList()) back.push_back(u);
     coverBatch(front, back);
 }
 
 inline void UI::heroMove(int d) {
-    heroRebuild();
     int n = (int)hero.size(); if (n < 2) return;
     heroFrom = heroCur; heroCur = ((heroCur + d) % n + n) % n;
     heroT0 = animT; heroAuto = animT;
-}
-
-// Passou pelos 5 filmes: sorteia os 5 seguintes do conjunto de reserva (volta ao comeco quando acaba).
-inline void UI::heroNextSet() {
-    const size_t P = heroPool_.size();
-    if (P <= 5) return;
-    heroRound_++;
-    const size_t start = ((size_t)heroRound_ * 5) % P;
-    std::vector<HeroItem> g;
-    for (size_t k = 0; k < 5; k++) {
-        HeroItem h = heroPool_[(start + k) % P];
-        App::HeroInfo hi;
-        if (!h.key.empty() && app.heroInfoGet(h.key, hi)) { h.infoDone = h.logoDone = true; h.backdrop = hi.backdrop; h.plot = hi.plot; h.tlogo = hi.logo; }
-        g.push_back(h);
-    }
-    std::stable_sort(g.begin(), g.end(), [](const HeroItem &a, const HeroItem &b) { return a.backdrop.empty() < b.backdrop.empty(); });   // os com imagem larga primeiro
-    hero = g; heroCur = 0; heroFrom = 0; heroInfoVer_++;
-    const size_t next = ((size_t)(heroRound_ + 1) * 5) % P;          // ja pede as informacoes/capas do proximo conjunto
-    for (size_t k = 0; k < 5; k++) { const HeroItem &h = heroPool_[(next + k) % P]; if (!h.key.empty()) app.heroInfoRequest(h.key, h.key.substr(2)); }
 }
 
 inline void UI::heroTick(double t) {
@@ -198,7 +166,7 @@ inline void UI::heroTick(double t) {
     if (heroAuto <= 0) heroAuto = t;
     if (t - heroAuto > 2.0) {
         int n = (int)hero.size();
-        if (n > 1) { heroFrom = heroCur; heroCur = (heroCur + 1) % n; heroT0 = t; if (heroCur == 0) heroNextSet(); }
+        if (n > 1) { heroFrom = heroCur; heroCur = (heroCur + 1) % n; heroT0 = t; }
         heroAuto = t;
     }
 }
