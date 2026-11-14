@@ -1,6 +1,8 @@
 #pragma once
 // Logica do app independente de plataforma (testavel no PC).
 #include "kick.hpp"
+#include "kickapi.hpp"
+#include "kickkey.hpp"
 #include "m3u.hpp"
 #include "xtload.hpp"
 #include "xtmeta.hpp"
@@ -62,6 +64,9 @@ struct Platform {
     virtual void requestText(const std::string &prompt) = 0; // abre o teclado (IME); depois chame UI::onText
     // Consulta a API da Kick (o Cloudflare da Kick recusa clientes que "parecem robo": a plataforma pode tentar outros cabecalhos).
     virtual bool httpGetKick(const std::string &url, std::string &body) { return httpGet(url, body); }
+    // API oficial da Kick (POST do token + GET com "Authorization: Bearer"). Padrao: sem suporte.
+    virtual bool httpApi(const char * /*method*/, const std::string & /*url*/, const std::string & /*authHeader*/, const std::string & /*body*/,
+                         std::string & /*out*/, int & /*status*/) { return false; }
     virtual std::string lastBodyHead() { return ""; }                                // primeiros bytes da ultima lista baixada (para mostrar o que o provedor respondeu)
     virtual int lastHttpStatus() { return 0; }                                       // status HTTP da ultima consulta (0 = sem resposta)
     virtual std::string loadSetting(const std::string &) { return ""; }              // dados guardados (ex.: "m3u", "kick")
@@ -87,7 +92,8 @@ struct App {
     XtreamAcct metaAcct;                                   // conta do painel para sinopse/nota (tambem com lista M3U comum)
     std::unordered_map<std::string, DetailMeta> metaCache; // "m:<id>" filmes, "s:<id>" series
     bool prefetch = false;                                 // painel Xtream: baixa as categorias todas em segundo plano ao conectar
-    explicit App(Platform &p) : pf(p) {}
+    kickapi::Client kickClient;                            // token da API oficial da Kick (em cache)
+    explicit App(Platform &p) : pf(p) { kickClient.setCredentials(kickClientId(), kickClientSecret()); }
     ~App() { stopPrefetch(0.3); stopHeroInfo(0.3); }
     App(const App &) = delete;
     App &operator=(const App &) = delete;
@@ -544,6 +550,26 @@ struct App {
         std::string hls = jsonString(body, "playback_url");
         if (hls.empty() && err) *err = "sem playback_url";
         return hls;
+    }
+
+    // "Lives agora": as lives mais assistidas (API oficial). false + mensagem em 'err' se nao deu.
+    bool kickLives(std::vector<kickapi::Live> &out, std::string &err) {
+        pf.busy("Buscando lives na Kick...");
+        return kickClient.lives([this](const char *m, const std::string &u, const std::string &a, const std::string &b, std::string &o, int &st) {
+            return pf.httpApi(m, u, a, b, o, st);
+        }, out, err, 60);
+    }
+    // Favoritos: ao vivo agora? (endpoint do canal, sem chave). Uma consulta por canal, no maximo 'cap'.
+    void kickRefreshStatus(std::vector<kickapi::Live> &items, size_t cap = 12) {
+        for (size_t i = 0; i < items.size() && i < cap; i++) {
+            std::string body;
+            pf.busy("Verificando @" + items[i].slug + " (" + std::to_string(i + 1) + "/" + std::to_string(std::min(cap, items.size())) + ")");
+            bool got = false;
+            for (auto &u : kickApiUrls(items[i].slug)) { body.clear(); if (pf.httpGetKick(u, body) && !body.empty()) { got = true; break; } }
+            if (!got) continue;
+            kickapi::Live l = kickapi::parseChannelStatus(items[i].slug, body);
+            items[i].live = l.live; items[i].viewers = l.viewers; items[i].title = l.title;
+        }
     }
 
     void watchKick(const std::string &input) {
