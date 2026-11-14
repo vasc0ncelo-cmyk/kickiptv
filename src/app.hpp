@@ -575,6 +575,8 @@ struct App {
     void watchKick(const std::string &input) {
         std::string slug = kickSlug(input);
         if (slug.empty()) { say("@ invalido"); return; }
+        say("Abrindo @" + slug + "...");
+        pf.busy("Abrindo @" + slug + "...");                    // desenha um quadro antes da consulta de rede (que bloqueia)
         std::string err, hls = resolveKickHls(slug, &err);
         if (hls.empty()) {
             if (err.find("offline") != std::string::npos) say("@" + slug + " esta offline");
