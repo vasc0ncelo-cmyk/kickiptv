@@ -27,6 +27,7 @@ inline int heroNameYear(const std::string &n) {          // ultimo numero de 4 d
 }
 
 inline void UI::heroRebuild() {
+    if (heroLocked_ && !hero.empty()) return;             // banner ja escolhido: o catalogo chegando aos poucos nao troca mais os filmes
     const Playlist &p = app.list;
     std::string sig = std::to_string(p.movieCats.size()) + "|" + std::to_string(p.seriesCats.size());
     sig += "|" + std::to_string(p.movies.size() / 4000) + (hero.size() < 4 ? "|" + std::to_string(p.movies.size()) : std::string());   // catalogo chegando aos poucos: refaz a escolha
@@ -110,6 +111,7 @@ inline void UI::heroApplyInfo() {
         heroSettled_ = true;
         std::vector<HeroItem> good, rest, sr;
         for (const auto &h : heroCandM_) (h.backdrop.empty() ? rest : good).push_back(h);
+        const bool enough = good.size() >= 3;                // 3+ filmes com imagem larga: a escolha esta boa, fixa ate o usuario atualizar a lista
         for (auto &x : rest) good.push_back(x);
         for (const auto &h : hero) if (h.kind == 2) sr.push_back(h);
         std::string curTitle = hero.empty() ? std::string() : hero[heroCur].title;
@@ -121,6 +123,7 @@ inline void UI::heroApplyInfo() {
         }
         heroCur = 0; for (size_t i = 0; i < hero.size(); i++) if (hero[i].title == curTitle) heroCur = (int)i;
         heroFrom = heroCur; heroInfoVer_++;
+        if (enough) heroLocked_ = true;
     }
     for (auto &h : hero) {
         if (h.logoDone || h.key.empty()) continue;
