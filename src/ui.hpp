@@ -1,5 +1,4 @@
 #pragma once
-#include <set>
 // Navegacao e desenho das telas. Independente de plataforma: o PS4 so implementa Renderer + leitura do pad.
 // Telas: Home (banner + 4 atalhos + lista M3U), Kick TV (digitar @streamer) e listas (Filmes / Series / Canais).
 #include "app.hpp"
@@ -564,13 +563,9 @@ struct UI {
     struct HeroItem { int kind = 1; std::string title, sub, logo, cat, key, backdrop, plot, tlogo; uint32_t idx = 0; bool infoDone = false, logoDone = false; };   // kind: 1 filme, 2 serie
     std::vector<HeroItem> hero;
     std::string heroSig, lastHeroKey_;
-    std::vector<HeroItem> heroPool_;    // filmes recentes/populares do TMDB que existem no catalogo (ate 30)
-    std::vector<HeroItem> heroPend_;    // proximo conjunto de 5 (esperando as logos / esperando voltar ao Inicio)
-    std::set<std::string> heroShown_;   // chaves ja mostradas (nao repete ate passar por todos)
-    std::unordered_map<std::string, uint32_t> heroIdx_; size_t heroIdxN_ = 0, heroMatchN_ = 0;
-    double heroPendT_ = 0, heroMatchT_ = -10, heroFirstT_ = -1; int heroSetNo_ = 0;
-    bool heroWantSwap_ = false, heroAsked_ = false, heroTrendFail_ = false;
-    bool heroLocked_ = false;   // heroLocked_: banner fixo (nao refaz a escolha quando o catalogo cresce)
+    std::vector<HeroItem> heroCandM_;   // candidatos a filme (ate 10): os que tem backdrop sobem para o carrossel
+    std::vector<HeroItem> heroPool_; int heroRound_ = 0;   // conjunto de reserva (ate 25 filmes) e qual grupo de 5 esta no banner
+    bool heroSettled_ = false, heroLocked_ = false;   // heroLocked_: banner fixo (nao refaz a escolha quando o catalogo cresce)
     int heroInfoVer_ = 0;     // sobe quando chega um backdrop novo (pede a imagem)
     std::vector<uint32_t> peekBuf_[2]; std::string peekKey_[2];   // cartas laterais inclinadas ja montadas
     Screen prevScreen_ = Screen::Home;
@@ -605,9 +600,8 @@ struct UI {
             smv_.clear();                               // cada tela comeca com o foco ja no lugar (sem "voar" de outra tela)
         }
         if (screen == Screen::Home && prevScreen_ != Screen::Home && prevScreen_ != Screen::Donate && prevScreen_ != Screen::Help) {   // voltou ao Inicio: novo sorteio dos filmes do banner
-            heroOnEnterHome(t);                           // voltou ao Inicio: o conjunto novo (se ja estiver pronto) entra agora
+            heroSeed_ = 0; heroSig.clear(); heroCur = 0; heroFrom = 0; heroAuto = t;
         }
-        if (screen != Screen::Home && prevScreen_ == Screen::Home && screen != Screen::Donate && screen != Screen::Help) heroOnLeaveHome();   // saiu: prepara os proximos filmes
         prevScreen_ = screen;
         heroTick(t);
         return wantsFrames();
@@ -658,6 +652,11 @@ struct UI {
     int kickView = 0;
     std::vector<kickapi::Live> kickList;              // itens da visao atual (1..3)
     std::vector<std::string> kickFavs, kickHist;      // guardados em "kickfav" / "kickhist"
+    int kickChip = 0, kickSel = 0, kickRowScroll = 0;  // tela Kick em grade: aba (0 ao vivo, 1 seguindo, 2 historico, 3 digitar), cartao e linha de cima
+    bool kickInChips = true;                           // foco na barra de abas (senao na grade)
+    double kickLoadedAt = -1e9;                        // quando a lista de lives foi baixada (relogio da UI)
+    std::string kickErr, kickCoverSig;                 // motivo da falha da lista | assinatura do ultimo pedido de miniaturas
+    enum { kKCols = 5, kKRows = 2 };                   // grade de cartoes 5 x 2
     std::string m3uUrl;       // lista M3U atual
     std::string defaultUrl;   // lista padrao do app (defaultlist.hpp). Preenchida = a lista e fixa: nao da para adicionar outra, so atualizar
     bool reloadRequested = false;   // o botao ATUALIZAR foi apertado: a plataforma baixa a lista de novo (veja o laco principal)
@@ -763,33 +762,86 @@ struct UI {
         kickPersist();
         app.watchKick(slug);
     }
-    void kickOpenView(int v) {
+    bool kickOpenView(int v) {
         std::string err;
         std::vector<kickapi::Live> items;
         if (v == 1) {
-            if (!app.kickLives(items, err)) { app.say("Falha: " + err); return; }
-            if (items.empty()) { app.say("Nenhuma live no ar agora"); return; }
+            if (!app.kickLives(items, err)) { kickErr = err; app.say("Falha: " + err); return false; }
+            kickErr.clear();
+            if (items.empty()) { app.say("Nenhuma live no ar agora"); }
         } else {
             const std::vector<std::string> &src = v == 2 ? kickFavs : kickHist;
             for (auto &sl : src) { kickapi::Live l; l.slug = sl; l.live = false; items.push_back(l); }
-            if (items.empty()) { app.say(v == 2 ? "Nenhum favorito ainda: aperte □ em um canal" : "Histórico vazio"); return; }
+            if (items.empty()) { app.say(v == 2 ? "Nenhum favorito ainda: aperte □ em um canal" : "Histórico vazio"); return false; }
             app.kickRefreshStatus(items);
             if (v == 2) std::stable_sort(items.begin(), items.end(), [](const kickapi::Live &a, const kickapi::Live &b) { return a.live != b.live ? a.live : a.viewers > b.viewers; });
         }
-        kickList = items; kickView = v;
-        cursor[(int)Tab::Kick] = scroll[(int)Tab::Kick] = 0;
-        app.say(v == 1 ? std::to_string(items.size()) + " lives no ar" : (v == 2 ? "Favoritos: □ remove" : "Histórico: □ favorita"));
+        kickList = items; kickView = v; kickChip = v - 1;
+        kickSel = kickRowScroll = 0; kickInChips = kickList.empty(); kickLoadedAt = animT; kickCoverSig.clear();
+        if (!items.empty()) app.say(v == 1 ? std::to_string(items.size()) + " lives no ar" : (v == 2 ? "Seguindo: □ remove dos favoritos" : "Histórico: □ favorita"));
+        return true;
     }
+    // Ao abrir a tela da Kick: lives no ar (se ha chave da API), senao os favoritos, senao o historico.
+    void kickEnter() {
+        kickSel = kickRowScroll = 0; kickInChips = true; kickCoverSig.clear();
+        if (kickView == 1 && !kickList.empty() && animT - kickLoadedAt < 90) { kickInChips = false; return; }     // acabou de baixar: reaproveita
+        if (app.kickClient.configured() && kickOpenView(1)) return;
+        if (!kickFavs.empty() && kickOpenView(2)) return;
+        if (!kickHist.empty() && kickOpenView(3)) return;
+        kickView = app.kickClient.configured() ? 1 : 2; kickChip = kickView - 1; kickList.clear(); kickInChips = true;
+    }
+    const kickapi::Live *kickSelected() const { return kickSel >= 0 && kickSel < (int)kickList.size() ? &kickList[kickSel] : nullptr; }
     void kickToggleFav() {
-        int t = (int)Tab::Kick;
-        auto acts = kickActions();
-        std::string slug;
-        if (kickView == 0) slug = kickLast;
-        else if (cursor[t] >= 0 && cursor[t] < (int)acts.size()) { if (const kickapi::Live *l = kickEntry(acts[cursor[t]])) slug = l->slug; }
+        const kickapi::Live *l = kickSelected();
+        std::string slug = l && !kickInChips ? l->slug : kickLast;
         if (slug.empty()) { app.say("Escolha um canal para favoritar"); return; }
         bool now = kickapi::toggle(kickFavs, slug);
         kickPersist();
         app.say(now ? "@" + slug + " nos favoritos" : "@" + slug + " saiu dos favoritos");
+    }
+    void handleKick(Input in) {
+        const int n = (int)kickList.size(), cols = kKCols;
+        if (in == Input::Back) { screen = Screen::Home; return; }
+        if (kickInChips) {
+            switch (in) {
+            case Input::Left: kickChip = std::max(0, kickChip - 1); break;
+            case Input::Right: kickChip = std::min(3, kickChip + 1); break;
+            case Input::Down: if (n > 0) kickInChips = false; break;
+            case Input::Confirm:
+                if (kickChip == 3) { textKind = 1; app.pf.requestText("@ do streamer"); }
+                else kickOpenView(kickChip + 1);
+                break;
+            default: break;
+            }
+            return;
+        }
+        int row = kickSel / cols, col = kickSel % cols, rows = (n + cols - 1) / cols;
+        switch (in) {
+        case Input::Left: if (col > 0) kickSel--; break;
+        case Input::Right: if (col < cols - 1 && kickSel + 1 < n) kickSel++; break;
+        case Input::Up: if (row == 0) kickInChips = true; else kickSel -= cols; break;
+        case Input::Down: if (row + 1 < rows) kickSel = std::min(n - 1, kickSel + cols); break;
+        case Input::PageUp: kickSel = std::max(0, kickSel - cols * kKRows); break;
+        case Input::PageDown: kickSel = std::min(n - 1, kickSel + cols * kKRows); break;
+        case Input::Confirm: if (const kickapi::Live *l = kickSelected()) { std::string sl = l->slug; kickWatch(sl); } break;
+        default: break;
+        }
+        row = kickSel / cols;
+        if (row < kickRowScroll) kickRowScroll = row;
+        if (row >= kickRowScroll + kKRows) kickRowScroll = row - kKRows + 1;
+    }
+    // miniaturas (16:9) do que esta na tela e das proximas linhas
+    static std::string kickThumbKey(const kickapi::Live &l) { return l.thumb.size() > 8 ? coverVariantKey(l.thumb, 336, 189) : std::string(); }
+    void kickWantCovers() {
+        if (!coverBatch) return;
+        std::string sig = std::to_string(kickView) + "|" + std::to_string(kickRowScroll) + "|" + std::to_string(kickList.size()) + "|" + std::to_string(kickLoadedAt);
+        if (sig == kickCoverSig) return;
+        kickCoverSig = sig;
+        std::vector<std::string> front, back;
+        const int per = kKCols * kKRows, first = kickRowScroll * kKCols;
+        for (int i = first; i < first + per && i < (int)kickList.size(); i++) front.push_back(kickThumbKey(kickList[i]));
+        for (int i = first + per; i < first + per * 3 && i < (int)kickList.size(); i++) back.push_back(kickThumbKey(kickList[i]));
+        coverBatch(front, back);
     }
     // Capa tvg-logo (filmes, canais, series)
     std::string itemLogo(int i) const {
@@ -1141,6 +1193,7 @@ struct UI {
         case Input::NextTab: if (searching()) { switchTabKeepSearch(1); return; } openTab(cycleTab(tab, 1)); return;
         default: break;
         }
+        if (screen == Screen::Kick && tab == Tab::Kick) { handleKick(in); return; }
         if (!browsable(tab)) { handleItems(in); return; }
         if (searching()) { inItems = true; handleItems(in); return; }
         if (inItems) {
@@ -1213,7 +1266,7 @@ private:
 
     bool autoWant = false; int autoFrames = 0;
     void wantAutoOpen() { autoFrames = 0; autoWant = app.xt.active && browsable(tab) && curCat() && curCat()->unloaded(); }
-    void openTab(Tab t) { kickView = 0; kickList.clear(); tab = t; screen = t == Tab::Kick ? Screen::Kick : Screen::List; level = 0; inItems = false; searchQ.clear(); searchHits.clear(); wantAutoOpen(); }
+    void openTab(Tab t) { tab = t; screen = t == Tab::Kick ? Screen::Kick : Screen::List; level = 0; inItems = false; searchQ.clear(); searchHits.clear(); wantAutoOpen(); if (t == Tab::Kick) kickEnter(); }
     void resetBrowse() {
         for (int i = 0; i < 4; i++) cursor[i] = scroll[i] = catCur[i] = catScroll[i] = 0;
         level = 0; inItems = false;
@@ -1267,7 +1320,7 @@ private:
     void requestReload() {
         if (m3uUrl.empty()) { app.say("Nenhuma lista configurada neste app"); return; }
         reloadRequested = true;
-        heroLocked_ = false; heroPool_.clear(); heroPend_.clear(); heroIdxN_ = 0; heroMatchT_ = -10; heroSig.clear();   // ATUALIZAR: escolhe o banner de novo com o catalogo novo
+        heroLocked_ = false; heroSig.clear();             // ATUALIZAR: sorteia o banner de novo com o catalogo novo
         app.say("Atualizando a lista...");
     }
 
@@ -1433,10 +1486,7 @@ private:
     void heroMove(int d);
     void heroOpen();
     void heroRebuild();
-    void heroMatch();
-    void heroPrepare(bool swap);
-    void heroOnLeaveHome();
-    void heroOnEnterHome(double t);
+    void heroNextSet();
     void drawAmbient(Renderer &r);
     void drawHeroCard(Renderer &r, int slide, int x, int y, int w, int h, float center, bool focus);
     void drawPeek(Renderer &r, int slide, int x, int y, int w, int h, float dimA, int dir);
@@ -1627,8 +1677,90 @@ private:
         }
     }
 
+    // ---- Tela Kick: grade de cartoes no estilo da pagina inicial da Kick ----
+    void renderKick(Renderer &r) {
+        using namespace theme;
+        const int W = r.width(), x0 = 73;
+        uiKMark(r, 73, 146, 40, 41, GREEN);
+        uiHeavy(r, 130, 152, "KICK TV", TEXT, 36);
+        r.fillRect(73, 196, W - 146, 2, 0xFF1C1C1C);
+        // abas
+        static const char *names[4] = {"Ao vivo", "Seguindo", "Histórico", "@ Digitar canal"};
+        int cx = x0;
+        for (int i = 0; i < 4; i++) {
+            std::string lb = names[i];
+            if (i == 1 && !kickFavs.empty()) lb += " (" + std::to_string(kickFavs.size()) + ")";
+            const int cw = r.textWidth(lb, 22) + 44, ch = 46, cy = 214;
+            const bool cur = kickView == i + 1 && i < 3, foc = kickInChips && kickChip == i;
+            if (foc) uiGlow(r, cx, cy, cw, ch, 23, GREEN, 10, pk(120), false);
+            r.roundRect(cx, cy, cw, ch, 23, cur ? GREEN : (foc ? 0xFF2A3A24 : CHIP));
+            if (foc) uiFrame(r, cx, cy, cw, ch, 23, 3, GREEN, cur ? GREEN : 0xFF1E2A1A);
+            uiCenter(r, cx + cw / 2, cy + ch / 2, lb, cur ? BLACK : TEXT, 22, true);
+            cx += cw + 14;
+        }
+        const int n = (int)kickList.size();
+        if (n > 0) { std::string c = std::to_string(n) + (kickView == 1 ? " ao vivo" : kickView == 2 ? " canais" : " recentes"); uiText(r, W - 73 - r.textWidth(c, 22), 224, c, MUTED, 22); }
+        if (n == 0) {
+            std::string a, b;
+            if (kickView == 1) {
+                a = kickErr.empty() ? "Nenhuma live no ar agora" : "Não deu para carregar as lives";
+                b = kickErr.empty() ? "Aperte X em \"Ao vivo\" para tentar de novo." : kickErr;
+            } else if (kickView == 2) { a = "Você ainda não segue ninguém"; b = "Aperte □ sobre uma live para favoritar o canal."; }
+            else { a = "Nada por aqui ainda"; b = "Os canais que você abrir aparecem nesta aba."; }
+            if (!app.kickClient.configured() && kickView == 1) { a = "Lives agora precisa da chave da API da Kick"; b = "Sem a chave, use \"@ Digitar canal\", Seguindo e Histórico."; }
+            uiCenterHeavy(r, W / 2, 520, a, TEXT, 34);
+            uiCenter(r, W / 2, 580, b, SOFT, 24);
+            return;
+        }
+        kickWantCovers();
+        const int cwid = 336, thH = 189, gap = 24, pitch = 345, y0 = 290;
+        for (int rr = 0; rr < kKRows; rr++) for (int cc = 0; cc < kKCols; cc++) {
+            int idx = (kickRowScroll + rr) * kKCols + cc;
+            if (idx >= n) break;
+            const kickapi::Live &l = kickList[idx];
+            const int x = x0 + cc * (cwid + gap), y = y0 + rr * pitch;
+            const bool sel = !kickInChips && idx == kickSel;
+            if (sel) uiGlow(r, x - 4, y - 4, cwid + 8, thH + 96 + 8, 18, GREEN, 12, pk(120), false);
+            r.roundRect(sel ? x - 4 : x, sel ? y - 4 : y, sel ? cwid + 8 : cwid, sel ? thH + 96 + 8 : thH + 96, 16, sel ? GREEN : CARD_LINE);
+            r.roundRect(x, y, cwid, thH + 96, 14, CARD);
+            // miniatura (ou um bloco escuro com a inicial enquanto baixa)
+            bool drew = false;
+            const uint32_t *px = nullptr; int pw = 0, ph = 0;
+            std::string key = kickThumbKey(l);
+            if (!key.empty() && coverGet && coverGet(key, px, pw, ph) && px && pw > 0 && ph > 0) { r.blitImageRound(x, y, cwid, thH, px, pw, ph, 14, 0); drew = true; }
+            if (!drew) {
+                r.roundRect(x, y, cwid, thH, 14, 0xFF1A2216);
+                std::string ini = l.slug.empty() ? "K" : std::string(1, (char)toupper((unsigned char)l.slug[0]));
+                uiCenterHeavy(r, x + cwid / 2, y + thH / 2, ini, 0xFF2E4A24, 64);
+            }
+            if (!l.live) r.roundRect(x, y, cwid, thH, 14, 0x99000000);
+            // etiqueta: ponto vermelho + espectadores (ao vivo) ou OFFLINE
+            std::string tag = l.live ? kickapi::fmtViewers(l.viewers) : "OFFLINE";
+            int tw = r.textWidth(tag, 20) + (l.live ? 44 : 28);
+            r.roundRect(x + 10, y + thH - 40, tw, 30, 15, 0xCC000000);
+            if (l.live) { r.roundRect(x + 22, y + thH - 31, 12, 12, 6, 0xFFFF2D3C); uiText(r, x + 42, y + thH - 36, tag, TEXT, 20, true); }
+            else uiText(r, x + 24, y + thH - 36, tag, MUTED, 20, true);
+            if (kickapi::contains(kickFavs, l.slug)) { r.roundRect(x + cwid - 74, y + 10, 64, 30, 15, GREEN); uiCenter(r, x + cwid - 42, y + 25, "FAV", BLACK, 18, true); }
+            // texto: titulo, @canal, categoria
+            const int tx = x + 14, tmax = cwid - 28;
+            std::string title = l.title.empty() ? "@" + l.slug : l.title;
+            uiText(r, tx, y + thH + 10, uiFit(r, title, 22, tmax), TEXT, 22, true);
+            uiText(r, tx, y + thH + 42, uiFit(r, "@" + l.slug, 20, tmax), sel ? GREEN : SOFT, 20);
+            std::string cat = l.category.empty() ? (l.live ? "ao vivo" : "sem live no momento") : l.category;
+            uiText(r, tx, y + thH + 68, uiFit(r, cat, 19, tmax), MUTED, 19);
+        }
+        // indicador de rolagem
+        const int rows = (n + kKCols - 1) / kKCols;
+        if (rows > kKRows) {
+            const int trackH = kKRows * pitch - 40, th = std::max(40, trackH * kKRows / rows), ty = y0 + (trackH - th) * kickRowScroll / std::max(1, rows - kKRows);
+            r.roundRect(W - 52, y0, 6, trackH, 3, 0xFF1C1C1C);
+            r.roundRect(W - 52, ty, 6, th, 3, GREEN);
+        }
+    }
+
     void renderList(Renderer &r) {
         using namespace theme;
+        if (tab == Tab::Kick) { renderKick(r); return; }
         if (browsable(tab)) { renderBrowse(r); return; }
         const int W = r.width();
         int t = (int)tab, n = itemCount();
@@ -1707,7 +1839,7 @@ private:
         else if (screen == Screen::Home) hints = {{"D-pad", "Navegar"}, {"X", "Selecionar"}};
         else if (browsable(tab) && !inItems) hints = {{"L1/R1", "Abas"}, {"X", "Abrir"}, {"O", "Início"}};
         else if (browsable(tab)) hints = {{"X", "Selecionar"}, {"O", searching() ? "Limpar busca" : "Categorias"}};
-        else if (screen == Screen::Kick) hints = {{"X", "Selecionar"}, {"[]", "Favoritar"}, {"O", "Voltar"}};
+        else if (screen == Screen::Kick) hints = kickInChips ? std::vector<std::pair<std::string, std::string>>{{"X", "Abrir"}, {"O", "Início"}} : std::vector<std::pair<std::string, std::string>>{{"X", "Assistir"}, {"[]", "Favoritar"}, {"O", "Início"}};
         else hints = {{"L1/R1", "Abas"}, {"X", "Selecionar"}, {"O", "Voltar"}};
         int hintsRight = W - 73;
         if (screen != Screen::Donate && screen != Screen::Help) {         // botao da lupa (canto inferior direito): mesmo que apertar △ (ou clicar o touchpad)
