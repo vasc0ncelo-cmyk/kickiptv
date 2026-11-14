@@ -97,6 +97,7 @@ int main() {
         assert(ui.screen == Screen::Kick && ui.kickView == 0);
         auto acts = ui.kickActions(); assert(acts.size() == 4 && acts[2] == UI::KA_LIVES);        // digitar, ultimo, lives, historico
         assert(f.store["kickhist"] == "streamer\n");
+        a.kickClient.setCredentials("", "");                                                 // o app real ja leva chaves: aqui simula sem elas
         ui.cursor[(int)Tab::Kick] = 2; ui.handle(Input::Confirm);                                // Lives agora, sem chave
         assert(ui.kickView == 0 && a.lastStatus.find("Falha") != std::string::npos);
         a.kickClient.setCredentials("id", "sec");
