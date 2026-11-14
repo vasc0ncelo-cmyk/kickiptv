@@ -16,7 +16,7 @@ inline void ring(Renderer &r, float cx, float cy, float R, float t, unsigned c) 
     uiPaint(r, (int)(cx - R - 2), (int)(cy - R - 2), (int)(cx + R + 3), (int)(cy + R + 3), c, [&](float px, float py) {
         float dx = px - cx, dy = py - cy, d = uiSqrt(dx * dx + dy * dy);
         return uiClamp01(0.5f - (uiAbs(d - (R - t * 0.5f)) - t * 0.5f));
-    });
+    }, uiHashF(uiHashF(21, R), t));
 }
 inline void thickLine(Renderer &r, float x0, float y0, float x1, float y1, float t, unsigned c) {
     float dx = x1 - x0, dy = y1 - y0, len = uiSqrt(dx * dx + dy * dy);
@@ -191,6 +191,7 @@ inline void UI::renderDetail(Renderer &r) {
         if (x0 < 0) x0 = 0;
         if (y0 < 0) y0 = 0;
         if (y1 > H) y1 = H;
+        if (r.paintBox(3, x0, y0, x1, y1, uiHash(uiHash(5, (unsigned)W), (unsigned)H))) { x0 = x1 = y0 = y1 = 0; }    // 400 mil pixels: so o trecho que mudou
         for (int y = y0; y < y1; y++) {
             float dy = (y + 0.5f - cy) / ry;
             for (int x = x0; x < x1; x++) {
@@ -303,7 +304,7 @@ inline void UI::renderDetail(Renderer &r) {
                 uiPaint(r, (int)bx - 1, (int)by - 1, (int)(bx + bs) + 2, (int)(by + bs) + 2, TXT, [&](float px, float py) {
                     float sd = uiSdBox(px - (bx + bs / 2), py - (by + bs / 2), bs / 2 - F(1), bs / 2 - F(1), F(4));
                     return uiClamp01(0.5f - (uiAbs(sd + F(1.1f)) - F(1.1f)));
-                });
+                }, uiHashF(22, bs));
                 dp::triRight(r, bx + bs * 0.38f, by + bs * 0.3f, bs * 0.3f, bs * 0.4f, TXT);
                 ix += S(37);
             } else {
