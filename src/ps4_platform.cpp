@@ -1734,6 +1734,7 @@ struct Player {
     KAvHandle bHandle = 0;
     int restarts = 0, switchesOk = 0;
     double lastGapMs = 0, gapStartT = 0, switchedAt = 0, blitMs = 0;
+    double diagT = 0, prepBusySince = 0, tearSince = 0; int greenDrops = 0, greenRun = 0;   // diagnostico/vigia da live
     std::function<bool()> cancelCb;          // main liga: true = o usuario cancelou (O) ou pediu para sair
     bool cancelled = false;
     // Filme sem som: o AvPlayer escolhe a faixa de audio pelo idioma padrao. Se nenhum audio chegar, reabre o arquivo
@@ -2542,6 +2543,18 @@ struct Player {
                              skipDraw ? "detectando alinhamento" : (srcN ? "nao cabe" : "sem acesso ao quadro"));
                     waitNote = nb;
                 }
+                if (fits && !skipDraw && !isVod) {
+                    // quadro VERDE (decoder entregou buffer zerado: Y=0 U=0 V=0): preto de verdade e Y16/U128/V128. Nao desenha; mantem o ultimo quadro bom
+                    size_t uvOff = (size_t)pitch * (size_t)yRows;
+                    if (uvOff + 64 <= srcN) {
+                        int dark = 0, n = 0; size_t span = srcN - uvOff - 2;
+                        for (int i = 0; i < 48; i++) { size_t o = uvOff + ((span / 48) * i & ~(size_t)1); if (o + 1 < srcN) { n++; if (src[o] < 24 && src[o + 1] < 24) dark++; } }
+                        if (n >= 16 && dark == n) {
+                            skipDraw = true; greenDrops++;
+                            if (++greenRun == 1 && greenDrops <= 20) { char gb[64]; snprintf(gb, sizeof gb, "quadro-verde-descartado n=%d", greenDrops); trace(gb); }
+                        } else greenRun = 0;
+                    }
+                }
                 if (fits && !skipDraw) {
                     b0 = nowSec();
                     // proporcao: 0=16:9 (fit), 1=esticar, 2=zoom
@@ -2584,12 +2597,17 @@ struct Player {
             if (lastDrawT > 0 && (t - lastDrawT) * 1000.0 > worstGap) worstGap = (t - lastDrawT) * 1000.0;
             lastDrawT = t;
             lastFrameT = t; inactiveSince = 0;
-            if (chunkT0 == 0) { chunkT0 = t; if (gapStartT > 0) { lastGapMs = (t - gapStartT) * 1000.0; gapStartT = 0; } }
+            if (chunkT0 == 0) { chunkT0 = t; if (gapStartT > 0) { lastGapMs = (t - gapStartT) * 1000.0; gapStartT = 0; if (!isVod && lastGapMs > 600) { char gb[64]; snprintf(gb, sizeof gb, "troca-lenta %dms", (int)lastGapMs); trace(gb); } } }
         }
         // Filme que abriu mas nao entrega nenhum audio apos ~4 s: tenta outra faixa (idioma) em vez de ficar mudo
         if (isVod && active && !paused && !failed && drew && vodAudioExpected && !vodPath.empty() && langTry < 3 &&
             audio.state.load() == 1 && audio.chunks.load() == 0 && t - t0 > 4.0) retryAudioLang();
         if (chunkMode && h && !failed && active && g_tearing.load() == 0) managePipeline(t);
+        if (!isVod && active && useFeed && t - diagT >= 15.0) {
+            diagT = t;
+            char db[200]; snprintf(db, sizeof db, "live-diag fps=%.0f pior=%.0fms troca=%.0fms conv=%.0fms blit=%.1fms prep=%d prox=%d verdes=%d reinicios=%d trocas=%d", fps, worstShown, lastGapMs, convMs, blitMs, (int)prepBusy.load(), (int)nextReady.load(), greenDrops, restarts, switchesOk);
+            trace(db);
+        }
         if (t - lastFps >= 1.0) { fps = fpsFrames / (t - lastFps); fpsFrames = 0; lastFps = t; worstShown = worstGap; worstGap = 0; }
         return drew;
     }
@@ -2636,6 +2654,11 @@ struct Player {
             why = "sem segmentos novos ha " + std::to_string((int)(t - lastFeedSegWall)) + " s";
             return true;
         }
+        // preparo do proximo pedaco preso / limpeza do player antigo presa: o pipeline nao anda mais
+        if (prepBusy.load()) { if (prepBusySince == 0) prepBusySince = t; if (t - prepBusySince > 15.0 && still > 2.0) { why = "preparo do pedaco travado"; return true; } } else prepBusySince = 0;
+        if (g_tearing.load() > 0) { if (tearSince == 0) tearSince = t; if (t - tearSince > 10.0 && still > 2.0) { why = "limpeza do player travada"; return true; } } else tearSince = 0;
+        // quadros chegam mas o relogio do video nao anda (imagem repetida/congelada)
+        if (frames > 90 && lastGoodPtsMs > 0 && lastPtsWall > 0 && (t - lastPtsWall) > 6.0 && !paused) { why = "video sem avancar ha " + std::to_string((int)(t - lastPtsWall)) + " s"; return true; }
         // 4 s sem quadro = congelou de verdade
         if (still > 4.0 && frames > 0) { why = "imagem parada ha " + std::to_string((int)still) + " s"; return true; }
         if (frames == 0 && t - t0 > 10.0) { why = "sem imagem apos abrir"; return true; }
@@ -3676,7 +3699,7 @@ int main() {
     boot.line("[4] abrindo a interface...");
     trace("abertura");
 
-    const bool kShowIntro = true;      // animacao de abertura (K + titulo + barra); false = pula
+    const bool kShowIntro = false;      // animacao de abertura (K + titulo + barra); false = pula
     if (kShowIntro) {   // ---- abertura animada: marca K aparece, titulo, barra de carregamento ----
         double ti = nowSec();
         for (;;) {
