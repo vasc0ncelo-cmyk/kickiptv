@@ -3486,6 +3486,7 @@ int main() {
     // A leitura da Garlic e rapida (copyFromWC), so um pouco mais lenta no total.
     if (expFlag("kickiptv_x_garlic")) g_texType = 3;
     { char b[128]; snprintf(b, sizeof b, "exp livra-textura=%d nao-descarrega=%d desmapeia=%d garlic=%d", (int)g_expFreeTex.load(), (int)g_expNoUnload.load(), (int)g_expUnmapTex.load(), g_texType.load() == 3 ? 1 : 0); trace(b); }
+    trace("build " __DATE__ " " __TIME__ " estavel-v3");
     // Sonda dos decodificadores do sistema: crie o arquivo vazio /data/kickiptv_x_decprobe; ao abrir, o app grava /data/kickiptv_probe.txt (apague o flag depois).
     if (expFlag("kickiptv_x_decprobe")) { trace("decprobe-inicio"); hwplayer::traceHook = [](const char *st) { trace(st); }; hwplayer::runProbe("/data/kickiptv_probe.txt"); trace("decprobe-fim"); }
     installCrashLog();
