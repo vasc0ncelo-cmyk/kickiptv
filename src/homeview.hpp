@@ -164,7 +164,7 @@ inline void UI::heroTick(double t) {
     heroRebuild();
     heroApplyInfo();
     if (heroAuto <= 0) heroAuto = t;
-    if (t - heroAuto > 2.0) {
+    if (false && t - heroAuto > 2.0) {         // troca automatica do banner desligada (sem animacao)
         int n = (int)hero.size();
         if (n > 1) { heroFrom = heroCur; heroCur = (heroCur + 1) % n; heroT0 = t; }
         heroAuto = t;
