@@ -65,8 +65,8 @@ int main() {
         // catalogo chegando: nada muda
         app.list = buildPlaylist(m + "#EXTINF:-1 tvg-logo=\"http://img/z.jpg\" group-title=\"Filmes\",Mais Um (2026)\nhttp://h/movie/u/p/99.mp4\n");
         spin(40); assert(ui.hero.size() == 5 && ui.hero[0].title == first && ui.hero[0].tlogo.size());
-        // passa sozinho a cada 2 s
-        ui.heroAuto = t; int c0 = ui.heroCur; t += 2.5; ui.tick(t); assert(ui.heroCur == (c0 + 1) % 5);
+        // banner fica parado
+        ui.heroAuto = t; int c0 = ui.heroCur; t += 2.5; ui.tick(t); assert(ui.heroCur == c0);      // troca automatica desligada (sem animacao)
         // sai do Inicio e volta: outros filmes (o conjunto novo e preparado ao sair)
         std::vector<std::string> before; for (const auto &h : ui.hero) before.push_back(h.title);
         ui.homeRow = 1; ui.homeCol = 1; ui.handle(Input::Confirm); assert(ui.screen == Screen::List);
