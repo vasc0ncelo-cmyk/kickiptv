@@ -618,6 +618,7 @@ struct UI {
     bool wantsFrames() const { return screen != Screen::Help && screen != Screen::Donate; }     // as telas de texto/QR ficam paradas
     // valor que desliza ate 'target' (velocidade em 1/s). Na 1a vez ja nasce no alvo.
     float sm(int id, float target, float speed = 14.f) {
+        (void)id; (void)speed; return target;      // SEM animacao: o foco vai direto ao alvo
         auto it = smv_.find(id);
         if (it == smv_.end()) { smv_[id] = target; return target; }
         if (smFrozen_) return it->second;                                                         // 2a passada do mesmo quadro: nao avanca de novo
