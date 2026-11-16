@@ -4306,6 +4306,10 @@ int main() {
             dirty = true;
         }
 
+        {   // lista de lives da Kick baixada com o menu parado (so uma vez): depois, entrar na Kick e instantaneo
+            static bool kickPre = false; static int kickPreFrames = 0;
+            if (!kickPre && mode == Mode::Menu && !autoLoadList && ++kickPreFrames >= 250 && ui.screen == Screen::Home) { kickPre = true; try { ui.kickPrefetch(); } catch (...) {} dirty = true; trace("kick-prefetch"); }
+        }
         if (ui.reloadRequested) {                 // botao ATUALIZAR (menu): baixa a lista de novo, pelo mesmo caminho do download manual
             ui.reloadRequested = false;
             if (mode == Mode::Menu && !ui.m3uUrl.empty()) {
