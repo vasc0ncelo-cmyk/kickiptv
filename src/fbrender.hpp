@@ -275,6 +275,14 @@ struct FbRenderer : Renderer {
         *p = a >= 255 ? argb : blendPx(*p, argb, a);
     }
     // retangulo com cantos arredondados (bordas suavizadas)
+    // cobertura de um canto arredondado: lut[k*rad+m], k = coluna, m = linha a partir do centro (so para raios pequenos; guarda por raio)
+    static const float *cornerLut(int rad) {
+        if (rad <= 0 || rad >= 64) return nullptr;
+        static std::vector<float> tab[64];
+        std::vector<float> &t = tab[rad];
+        if (t.empty()) { t.resize((size_t)rad * rad); for (int k = 0; k < rad; k++) for (int m = 0; m < rad; m++) { float dx = k + 0.5f, dy = m + 0.5f; t[(size_t)k * rad + m] = (float)rad - fsqrt(dx * dx + dy * dy) + 0.5f; } }
+        return t.data();
+    }
     void roundRect(int x, int y, int w, int h, int rad, unsigned argb) override {
         if (rad * 2 > h) rad = h / 2;
         if (rad * 2 > w) rad = w / 2;
@@ -288,6 +296,8 @@ struct FbRenderer : Renderer {
             if (top || bot) {
                 float cy = top ? (float)(y + rad) : (float)(y + h - rad);
                 float dy = (j + 0.5f) - cy;
+                int lutRow = top ? (int)(cy - j) - 1 : j - (int)cy;                      // distancia vertical ao centro do canto, em pixels inteiros
+                const float *lut = cornerLut(rad);
                 mx0 = x + rad; mx1 = x + w - rad;
                 for (int side = 0; side < 2; side++) {
                     int px0 = side ? x + w - rad : x, px1 = side ? x + w : x + rad;
@@ -295,8 +305,9 @@ struct FbRenderer : Renderer {
                     if (px0 < cx0) px0 = cx0;
                     if (px1 > cx1) px1 = cx1;
                     for (int i = px0; i < px1; i++) {
-                        float dx = (i + 0.5f) - cx;
-                        float cov = (float)rad - fsqrt(dx * dx + dy * dy) + 0.5f;
+                        float cov;
+                        if (lut) cov = lut[(size_t)(side ? i - (int)cx : (int)cx - i - 1) * (size_t)rad + (size_t)lutRow];     // cobertura pre-calculada (igual a de baixo, sem raiz quadrada)
+                        else { float dx = (i + 0.5f) - cx; cov = (float)rad - fsqrt(dx * dx + dy * dy) + 0.5f; }
                         if (cov <= 0.f) continue;
                         if (cov > 1.f) cov = 1.f;
                         row[i] = blendPx(row[i], argb, (int)(a * cov));
