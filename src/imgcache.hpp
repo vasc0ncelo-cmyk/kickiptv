@@ -56,7 +56,9 @@ public:
                 std::lock_guard<std::mutex> l(m_);
                 for (auto &u : front) { if (u.size() < 8 || u.compare(0, 4, "http") != 0) continue; auto it = map_.find(u); if (it == map_.end() || (!it->second->ready && !inflight_.count(u) && !it->second->failed)) miss.push_back(u); }
             }
+            const double budgetT0 = nowSec();     // no PS4 cada leitura+decodificacao custa dezenas de ms: depois de ~40 ms o resto fica para os trabalhadores (logo em seguida), em vez de travar o quadro
             for (auto &u : miss) {
+                if (nowSec() - budgetT0 > 0.040) break;
                 Cover c;
                 if (!loadDisk(u, c)) continue;
                 std::lock_guard<std::mutex> l(m_);
