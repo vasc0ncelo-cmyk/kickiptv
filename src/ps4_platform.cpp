@@ -753,6 +753,7 @@ static void traceInit() {
         size_t p = all.rfind('\n');
         std::string last = p == std::string::npos ? all : all.substr(p + 1);
         if (!last.empty()) g_prevRaw = last;
+        if (!last.empty() && last[0] == '[') { size_t rb = last.find("] "); if (rb != std::string::npos && rb < 14) last = last.substr(rb + 2); }     // tira o carimbo de tempo
         if (!last.empty() && last != "fim" && last != "saindo" && last != "inicio") {
             g_prevStage = last;
             std::vector<std::string> v; size_t st = 0;
@@ -770,7 +771,11 @@ static void trace(const char *stage) {
     std::lock_guard<std::mutex> lk(g_traceMu);
     strncpy(g_lastTrace, stage, sizeof g_lastTrace - 1); g_lastTrace[sizeof g_lastTrace - 1] = 0;
     FILE *f = fopen("/data/kickiptv.log", "ab");
-    if (f) { fwrite(stage, 1, strlen(stage), f); fwrite("\n", 1, 1, f); fclose(f); }
+    if (f) {
+        static const double t0 = monoSec();                       // segundos desde o 1o registro: mostra ONDE o tempo vai
+        char ts[24]; int tn = snprintf(ts, sizeof ts, "[%7.2f] ", monoSec() - t0);
+        fwrite(ts, 1, (size_t)tn, f); fwrite(stage, 1, strlen(stage), f); fwrite("\n", 1, 1, f); fclose(f);
+    }
     // Tambem sai no log do sistema (klog): a mesma captura que mostra "Suspend App"/"App Crash" passa a mostrar, na ordem certa,
     // o que o app estava fazendo antes (menu-ps, av-close, avmod-descarregado...). Prefixo [kickiptv] para dar grep.
     fprintf(stderr, "[kickiptv] %s\n", stage);
@@ -3486,7 +3491,11 @@ int main() {
     // A leitura da Garlic e rapida (copyFromWC), so um pouco mais lenta no total.
     if (expFlag("kickiptv_x_garlic")) g_texType = 3;
     { char b[128]; snprintf(b, sizeof b, "exp livra-textura=%d nao-descarrega=%d desmapeia=%d garlic=%d", (int)g_expFreeTex.load(), (int)g_expNoUnload.load(), (int)g_expUnmapTex.load(), g_texType.load() == 3 ? 1 : 0); trace(b); }
-    trace("build " __DATE__ " " __TIME__ " estavel-v3");
+    #ifdef __OPTIMIZE__
+    trace("build " __DATE__ " " __TIME__ " estavel-v4 otimizado=SIM");
+#else
+    trace("build " __DATE__ " " __TIME__ " estavel-v4 otimizado=NAO");
+#endif
     // Sonda dos decodificadores do sistema: crie o arquivo vazio /data/kickiptv_x_decprobe; ao abrir, o app grava /data/kickiptv_probe.txt (apague o flag depois).
     if (expFlag("kickiptv_x_decprobe")) { trace("decprobe-inicio"); hwplayer::traceHook = [](const char *st) { trace(st); }; hwplayer::runProbe("/data/kickiptv_probe.txt"); trace("decprobe-fim"); }
     installCrashLog();
@@ -3550,6 +3559,11 @@ int main() {
     ui.defaultUrl = defaultListUrl();         // a lista do app e fixa (defaultlist.hpp): sem "adicionar lista", so ATUALIZAR
     ui.loadSaved();                           // ultimo streamer e lista M3U guardados
     if (!g_prevStage.empty()) app.say("Aviso: da ultima vez o app parou no passo: " + g_prevStage);
+#ifdef __OPTIMIZE__
+    if (g_prevStage.empty()) app.say("Build " __DATE__ " " __TIME__ " (otimizado)");
+#else
+    if (g_prevStage.empty()) app.say("Build " __DATE__ " " __TIME__ " (SEM otimizacao)");
+#endif
     trace("estado-criado");
     boot.line("[2] estado do app criado");
 
@@ -3681,6 +3695,10 @@ int main() {
         animCost = nowSec() - tp0;
         {   // diagnostico de lentidao: quadros do menu que passam de 70 ms (maximo 30 linhas no log)
             static int slow = 0, total = 0;
+            static double pfT = 0, pfSum = 0, pfMax = 0; static int pfN = 0, pfSlow = 0;           // resumo a cada 5 s de uso do menu
+            if (total > 5) { pfN++; pfSum += animCost; if (animCost > pfMax) pfMax = animCost; if (animCost > 0.033) pfSlow++; }
+            if (pfT == 0) pfT = tp0;
+            if (tp0 - pfT >= 5.0) { if (pfN > 0) { char pb[120]; snprintf(pb, sizeof pb, "menu-perf quadros=%d media=%.0fms max=%.0fms acima33ms=%d tela=%d", pfN, pfSum / pfN * 1000, pfMax * 1000, pfSlow, (int)ui.screen); trace(pb); } pfT = tp0; pfN = pfSlow = 0; pfSum = pfMax = 0; }
             if (++total > 5 && animCost > 0.07 && slow < 30) { slow++; char b[96]; snprintf(b, sizeof b, "menu-quadro-lento %.0fms tela=%d", animCost * 1000, (int)ui.screen); trace(b); }
         }
         if (firstDraw) {
