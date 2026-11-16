@@ -264,7 +264,54 @@ struct App {
     // Uma thread so baixa o JSON de cada categoria (rede); a thread principal e que le e preenche a lista (prefetchTick), um por vez e
     // so no menu (nunca durante o video). Passou do limite de memoria: para e o resto abre por categoria, como antes.
     static constexpr size_t kXtPrefetchCap = 80000;
-    struct PfItem { Tab t; int idx; std::string body; bool ok; };
+    // Registro ja lido do JSON (a leitura pesada acontece na THREAD DE REDE; a principal so monta a lista, em fatias pequenas)
+    struct PfRec { std::string name, id, logo, ext, cover, backdrop, plot; int added = 0, rate10 = 0; };
+    struct PfItem { Tab t; int idx; std::string body; bool ok; std::vector<PfRec> recs; };
+    // le o corpo JSON de uma categoria em registros (funcao pura: roda em qualquer thread). false = nao e uma lista
+    static bool parseCategoryRecs(Tab t, const std::string &body, std::vector<PfRec> &out) {
+        size_t f = body.find_first_not_of(" \t\r\n\xEF\xBB\xBF");
+        if (f == std::string::npos || body[f] != '[') return false;
+        try {
+            jsonForEach(body, [&](const Json &it) {
+                PfRec r; r.name = it.str("name");
+                if (r.name.empty()) return;
+                if (t == Tab::Series) { r.id = it.str("series_id"); if (r.id.empty()) return; r.cover = it.str("cover"); r.backdrop = xtBackdrop(it); r.plot = dm::trimA(it.str("plot")); }
+                else {
+                    r.id = it.str("stream_id"); if (r.id.empty()) return;
+                    r.logo = it.str("stream_icon");
+                    if (t == Tab::Movies) { r.ext = it.str("container_extension"); r.added = (int)it.num("added"); double rt = atof(it.str("rating").c_str()); if (rt > 0 && rt <= 10) r.rate10 = (int)(rt * 10 + 0.5); }
+                }
+                out.push_back(std::move(r));
+            });
+        } catch (const std::bad_alloc &) { out.clear(); out.shrink_to_fit(); return false; }
+        return true;
+    }
+    // Aplicacao em FATIAS (thread principal): monta Entry/lista a partir dos registros ja lidos. true = terminou esta categoria.
+    PfItem cur_; size_t curPos_ = 0; bool curActive_ = false;
+    std::vector<uint32_t> curItems_; std::vector<std::string> curNames_;
+    bool applySlice(double budgetSec) {
+        std::vector<Category> &cv = cur_.t == Tab::Channels ? list.channelCats : cur_.t == Tab::Movies ? list.movieCats : list.seriesCats;
+        if (cur_.idx < 0 || cur_.idx >= (int)cv.size() || !cv[cur_.idx].unloaded()) { curActive_ = false; return true; }     // o usuario abriu esta no meio: descarta
+        auto t0 = std::chrono::steady_clock::now();
+        while (curPos_ < cur_.recs.size()) {
+            PfRec &r = cur_.recs[curPos_++];
+            if (cur_.t == Tab::Series) {
+                if (list.seriesInfo.count(r.name)) continue;
+                list.seriesInfo[r.name] = SeriesRef{r.id, std::move(r.cover), std::move(r.backdrop), std::move(r.plot)};
+                curNames_.push_back(std::move(r.name));
+            } else {
+                Entry e; e.name = std::move(r.name); e.logo = std::move(r.logo);
+                if (cur_.t == Tab::Channels) { e.kind = Kind::Channel; e.url = xtreamLiveUrl(xt.acct, r.id); list.channels.push_back(std::move(e)); curItems_.push_back((uint32_t)list.channels.size() - 1); }
+                else { e.kind = Kind::Movie; e.url = xtreamMovieUrl(xt.acct, r.id, r.ext); e.added = r.added; e.rate10 = r.rate10; list.movies.push_back(std::move(e)); curItems_.push_back((uint32_t)list.movies.size() - 1); }
+            }
+            if ((curPos_ & 63) == 0 && std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() > budgetSec) return false;
+        }
+        std::sort(curNames_.begin(), curNames_.end());
+        Category &c = cv[cur_.idx];
+        c.items = std::move(curItems_); c.series = std::move(curNames_); c.loaded = true;
+        curActive_ = false; cur_ = PfItem(); curItems_.clear(); curNames_.clear();
+        return true;
+    }
     struct PfShared { std::atomic<bool> stop{false}, finished{false}; std::mutex m; std::deque<PfItem> q; size_t total = 0, done = 0; };
     std::shared_ptr<PfShared> pfs_;
     std::thread pfTh_;
@@ -294,6 +341,7 @@ struct App {
                 const char *action = j.t == Tab::Channels ? "get_live_streams" : j.t == Tab::Movies ? "get_vod_streams" : "get_series";
                 PfItem it{j.t, j.idx, std::string(), false};
                 try { it.ok = plat->httpGet(xtreamApi(acct, action, "category_id=" + j.id), it.body); } catch (...) { it.ok = false; }
+                if (it.ok) { it.ok = parseCategoryRecs(j.t, it.body, it.recs); std::string().swap(it.body); }          // leitura pesada AQUI, fora da thread principal
                 std::lock_guard<std::mutex> l(sh->m);
                 sh->q.push_back(std::move(it));
             }
@@ -301,6 +349,7 @@ struct App {
         });
     }
     void stopPrefetch(double waitSec = 0.3) {
+        curActive_ = false; cur_ = PfItem(); curItems_.clear(); curNames_.clear();
         if (!pfs_) return;
         pfs_->stop = true;
         auto until = std::chrono::steady_clock::now() + std::chrono::duration<double>(waitSec);
@@ -308,11 +357,16 @@ struct App {
         if (pfTh_.joinable()) { if (pfs_->finished) pfTh_.join(); else pfTh_.detach(); }
         pfs_.reset();
     }
-    bool prefetching() const { return pfs_ && !(pfs_->finished && pfs_->done >= pfs_->total); }
+    bool prefetching() const { return curActive_ || (pfs_ && !(pfs_->finished && pfs_->done >= pfs_->total)); }
     size_t loadedCount() const { return list.channels.size() + list.movies.size() + list.seriesInfo.size(); }
     // Thread principal, uma vez por quadro no menu. true = algo novo na lista (redesenhar).
     bool prefetchTick() {
         if (!pfs_ || !xt.active) return false;
+        if (curActive_) {                                       // continua a categoria em andamento (fatia de ~10 ms)
+            bool fin = applySlice(0.010);
+            if (fin) { say("Carregando catalogo... " + std::to_string(pfs_ ? pfs_->done : 0) + "/" + std::to_string(pfs_ ? pfs_->total : 0) + " categorias"); }
+            return true;
+        }
         PfItem it; bool got = false;
         { std::lock_guard<std::mutex> l(pfs_->m); if (!pfs_->q.empty()) { it = std::move(pfs_->q.front()); pfs_->q.pop_front(); got = true; } }
         if (!got) {
@@ -334,8 +388,10 @@ struct App {
         }
         Category &c = cv[it.idx];
         if (!c.unloaded()) return false;                        // o usuario ja abriu esta
-        if (!it.ok || !applyCategoryBody(it.t, c, it.body)) return false;   // falhou: continua lazy (abre ao apertar X)
+        if (!it.ok) return false;                               // falhou: continua lazy (abre ao apertar X)
         say("Carregando catalogo... " + std::to_string(pfs_->done) + "/" + std::to_string(pfs_->total) + " categorias");
+        cur_ = std::move(it); curPos_ = 0; curActive_ = true; curItems_.clear(); curNames_.clear();
+        applySlice(0.010);
         return true;
     }
     std::string summaryXt() const {
