@@ -665,6 +665,7 @@ struct UI {
     int kickChip = 0, kickSel = 0, kickRowScroll = 0;  // tela Kick em grade: aba (0 ao vivo, 1 seguindo, 2 historico, 3 digitar), cartao e linha de cima
     bool kickInChips = true;                           // foco na barra de abas (senao na grade)
     double kickLoadedAt = -1e9;                        // quando a lista de lives foi baixada (relogio da UI)
+    std::vector<kickapi::Live> kickCache; double kickCacheAt = -1000;       // lives baixadas ha pouco: trocar de aba nao refaz a consulta de rede
     std::string kickErr, kickCoverSig;                 // motivo da falha da lista | assinatura do ultimo pedido de miniaturas
     enum { kKCols = 5, kKRows = 2 };                   // grade de cartoes 5 x 2
     std::string m3uUrl;       // lista M3U atual
@@ -772,18 +773,30 @@ struct UI {
         kickPersist();
         app.watchKick(slug);
     }
+    // lives no ar, com cache de 60 s (cada consulta de rede trava a tela enquanto espera)
+    bool kickFetchLives(std::vector<kickapi::Live> &out, std::string &err) {
+        if (!kickCache.empty() && animT - kickCacheAt < 60.0 && animT >= kickCacheAt) { out = kickCache; return true; }
+        if (!app.kickLives(out, err)) return false;
+        kickCache = out; kickCacheAt = animT;
+        return true;
+    }
+    static std::string kickLow(std::string x) { for (auto &c : x) if (c >= 'A' && c <= 'Z') c = (char)(c + 32); return x; }
     bool kickOpenView(int v) {
         std::string err;
         std::vector<kickapi::Live> items;
         if (v == 1) {
-            if (!app.kickLives(items, err)) { kickErr = err; app.say("Falha: " + err); return false; }
+            if (!kickFetchLives(items, err)) { kickErr = err; app.say("Falha: " + err); return false; }
             kickErr.clear();
             if (items.empty()) { app.say("Nenhuma live no ar agora"); }
         } else {
             const std::vector<std::string> &src = v == 2 ? kickFavs : kickHist;
             for (auto &sl : src) { kickapi::Live l; l.slug = sl; l.live = false; items.push_back(l); }
             if (items.empty()) { app.say(v == 2 ? "Nenhum favorito ainda: aperte □ em um canal" : "Histórico vazio"); return false; }
-            app.kickRefreshStatus(items);
+            // Status ao vivo: cruza com a lista oficial (1 consulta, ou nenhuma se ja esta em cache) em vez de 1 consulta POR canal (travava a tela por varios segundos)
+            std::vector<kickapi::Live> all; std::string e2;
+            if (app.kickClient.configured() && kickFetchLives(all, e2)) {
+                for (auto &it : items) for (auto &a : all) if (kickLow(a.slug) == kickLow(it.slug)) { it = a; it.slug = a.slug; break; }
+            } else app.kickRefreshStatus(items, 6);
             if (v == 2) std::stable_sort(items.begin(), items.end(), [](const kickapi::Live &a, const kickapi::Live &b) { return a.live != b.live ? a.live : a.viewers > b.viewers; });
         }
         kickList = items; kickView = v; kickChip = v - 1;
