@@ -2557,9 +2557,14 @@ struct Player {
                     // quadro VERDE (decoder entregou buffer zerado: Y=0 U=0 V=0): preto de verdade e Y16/U128/V128. Nao desenha; mantem o ultimo quadro bom
                     size_t uvOff = (size_t)pitch * (size_t)yRows;
                     if (uvOff + 64 <= srcN) {
-                        int dark = 0, n = 0; size_t span = srcN - uvOff - 2;
-                        for (int i = 0; i < 48; i++) { size_t o = uvOff + ((span / 48) * i & ~(size_t)1); if (o + 1 < srcN) { n++; if (src[o] < 24 && src[o + 1] < 24) dark++; } }
-                        if (n >= 16 && dark == n) {
+                        // 3 faixas (topo, meio, base) com 24 pontos cada: quadro PARCIALMENTE decodificado (metade de baixo verde) tambem e descartado
+                        size_t uvLen = srcN - uvOff; bool bad = false;
+                        for (int band = 0; band < 3 && !bad; band++) {
+                            int dark = 0, n = 0; size_t b0o = uvOff + uvLen * (size_t)band / 3, bl = uvLen / 3;
+                            for (int i = 0; i < 24; i++) { size_t o = b0o + ((bl / 24) * (size_t)i & ~(size_t)1); if (o + 1 < srcN) { n++; if (src[o] < 24 && src[o + 1] < 24) dark++; } }
+                            if (n >= 16 && dark * 10 >= n * 9) bad = true;
+                        }
+                        if (bad) {
                             skipDraw = true; greenDrops++;
                             if (++greenRun == 1 && greenDrops <= 20) { char gb[64]; snprintf(gb, sizeof gb, "quadro-verde-descartado n=%d", greenDrops); trace(gb); }
                         } else greenRun = 0;
@@ -3807,6 +3812,7 @@ int main() {
     double hbNext = monoSec() + 60, hbT0 = monoSec();
     bool sysExit = false;                       // true = saindo porque o sistema (menu do PS) esta fechando/trocando o app
     double loopPrevT = monoSec(); int loopSlowN = 0;
+    double lastPressT = 0;                                     // ultimo botao/direcional: tarefas pesadas de fundo esperam o app ficar parado
     double lapT = monoSec(); std::string lapS;                 // cronometra as partes da volta do laco: a que passar de 40 ms aparece no log
     auto lap = [&](const char *nm) { double t = monoSec(), d = t - lapT; lapT = t; if (d > 0.04 && lapS.size() < 160) { char b[48]; snprintf(b, sizeof b, " %s=%.0f", nm, d * 1000); lapS += b; } };
     for (;;) {
@@ -3825,6 +3831,7 @@ int main() {
         // --- Controle: PadIn + fallback direto do scePad (se a fila falhar, o estado ainda vale) ---
         pin.poll(); lap("pad");
         uint32_t pressed = pin.take();
+        if (pressed) lastPressT = nowSec();
         {
             static uint32_t prevHw = 0;
             OrbisPadData hw;
@@ -4233,10 +4240,19 @@ int main() {
             for (int i = 0; i < nD; i++) { ui.handle(Input::Down); }
             for (int i = 0; i < nL; i++) ui.handle(Input::Left);
             for (int i = 0; i < nR; i++) ui.handle(Input::Right);
-            if (nU + nD + nL + nR > 0) dirty = true;
+            if (nU + nD + nL + nR > 0) { dirty = true; lastPressT = nowSec(); }
         }
         lap("direcional");
-        if (mode == Mode::Menu && app.prefetchTick()) dirty = true;      // catalogo do painel chegando (um pedaco por quadro, so no menu)
+        {   // catalogo do painel chegando: cada pedaco leva 0,1 a 1 s no PS4 e TRAVAVA o app inteiro (log: prefetch=1033 ms).
+            // Agora so processa com o app parado ha 1,5 s e deixa 4x o tempo gasto de folga: o app responde enquanto o catalogo carrega.
+            static double pfNext = 0;
+            double tpf = nowSec();
+            if (mode == Mode::Menu && tpf >= pfNext && tpf - lastPressT > 1.5) {
+                if (app.prefetchTick()) dirty = true;
+                double dpf = nowSec() - tpf;
+                pfNext = nowSec() + (dpf * 4.0 > 0.25 ? dpf * 4.0 : 0.25);
+            }
+        }
         if (mode == Mode::Menu && ui.autoOpenTick()) dirty = true;      // painel Xtream: abre a categoria quando o cursor para nela
         lap("prefetch");
         if (pressed & B_L1)     { ui.handle(Input::PrevTab);  dirty = true; }
