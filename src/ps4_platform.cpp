@@ -4243,16 +4243,7 @@ int main() {
             if (nU + nD + nL + nR > 0) { dirty = true; lastPressT = nowSec(); }
         }
         lap("direcional");
-        {   // catalogo do painel chegando: cada pedaco leva 0,1 a 1 s no PS4 e TRAVAVA o app inteiro (log: prefetch=1033 ms).
-            // Agora so processa com o app parado ha 1,5 s e deixa 4x o tempo gasto de folga: o app responde enquanto o catalogo carrega.
-            static double pfNext = 0;
-            double tpf = nowSec();
-            if (mode == Mode::Menu && tpf >= pfNext && tpf - lastPressT > 1.5) {
-                if (app.prefetchTick()) dirty = true;
-                double dpf = nowSec() - tpf;
-                pfNext = nowSec() + (dpf * 4.0 > 0.25 ? dpf * 4.0 : 0.25);
-            }
-        }
+        if (mode == Mode::Menu && app.prefetchTick()) dirty = true;      // catalogo do painel chegando: a leitura pesada e feita na thread de rede; aqui so fatias de ~10 ms
         if (mode == Mode::Menu && ui.autoOpenTick()) dirty = true;      // painel Xtream: abre a categoria quando o cursor para nela
         lap("prefetch");
         if (pressed & B_L1)     { ui.handle(Input::PrevTab);  dirty = true; }
