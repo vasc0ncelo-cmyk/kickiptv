@@ -744,9 +744,10 @@ static std::string g_prevRaw = "(nenhum)";      // ultima linha do log da vez an
 static std::vector<std::string> g_prevTail;   // ultimas linhas do log da vez anterior (so quando o app nao saiu direito)
 static void traceInit() {
     // le o log da ultima vez (libkernel, como as configuracoes) para mostrar na tela em que passo o app parou
+    std::string all;                          // conteudo do log da vez anterior (fica visivel fora do bloco para ser guardado abaixo)
     int fd = sceKernelOpen("/data/kickiptv.log", 0, 0);
     if (fd >= 0) {
-        std::string all; char buf[1024];
+        char buf[1024];
         for (;;) { long n = (long)sceKernelRead(fd, buf, sizeof buf); if (n <= 0) break; all.append(buf, (size_t)n); if (all.size() > 400000) break; }
         sceKernelClose(fd);
         while (!all.empty() && (all.back() == '\n' || all.back() == '\r')) all.pop_back();
