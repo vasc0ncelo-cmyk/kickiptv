@@ -3402,9 +3402,10 @@ extern "C" int sceSystemServiceGetStatus(OrbisSystemServiceStatus *status);
 static const bool kPsStopLogic = true;
 // false = ao ir para o inicio/fechar pelo menu do PS o app SO para video/rede/capas e espera o proprio sistema encerrar o processo
 // (como um app normal). true = o app tambem se encerra sozinho, PELO SISTEMA (ps4Exit). Os testes antigos davam CE-34878-0 porque saiam por _Exit (syscall cru recusado).
-// Segundo plano: por padrao o app SO PARA TUDO (video, rede, capas, decodificador) e fica suspenso, quieto: da para voltar a ele sem perder nada
-// e o PS4 consegue fecha-lo pelo menu (PS -> Fechar aplicativo) sem CE-34878-0. Quem quiser que ele se encerre sozinho ao ir para o inicio cria /data/kickiptv_exitbg.
-static bool kSelfExitOnBg = false;
+// Segundo plano (PS -> Fechar aplicativo, ou trocar de app): o app para TUDO e, estavel 1,5 s, se encerra sozinho PELO SISTEMA depois de juntar todas as
+// threads (ps4Exit). E o unico jeito que fecha sem CE-34878-0: deixar o PS4 matar o processo com threads vivas e o que dava o erro (log: bg=1 e nada mais).
+// Quem preferir deixar o app SUSPENSO para voltar depois cria /data/kickiptv_suspende (o PS4 pode dar erro ao fechar nesse modo).
+static bool kSelfExitOnBg = true;
 static const double kBgExitDelay = 1.5;                 // segundos estavel em segundo plano antes de sair (descarta aviso falso)
 struct SysWatch {
     double calmSince = -1, lastOvlTrip = -1e9;     // lastOvlTrip: ultima vez que o menu do PS apareceu de verdade
@@ -3441,7 +3442,7 @@ using PadIn = PadInT<OrbisPadSrc>;
 
 int main() {
     sceUserServiceInitialize(NULL);
-    kSelfExitOnBg = fileExists("/data/kickiptv_exitbg");
+    kSelfExitOnBg = !fileExists("/data/kickiptv_suspende");
     int userId = 0;
     sceUserServiceGetInitialUser(&userId);
     int padInitRc = scePadInit();
@@ -4472,6 +4473,8 @@ int main() {
     try { g_covers.cancelBackground(); } catch (...) {}
     try { if (loader.stillAlive()) loader.cancel(0.4); } catch (...) {}
     try { g_feed.abort(); abortHf(); abortPf(); } catch (...) {}
+    try { app.stopPrefetch(0.3); } catch (...) {}          // thread do catalogo Xtream: tem que estar parada antes de sair
+    try { app.stopHeroInfo(0.3); } catch (...) {}
     Player::waitTeardown(0.8);
     if (g_avClosedAt > 0) {                   // depois de fechar o AvPlayer, da tempo das threads internas dele (decodificador/audio) terminarem
         struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
