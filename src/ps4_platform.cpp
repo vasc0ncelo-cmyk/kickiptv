@@ -747,7 +747,7 @@ static void traceInit() {
     int fd = sceKernelOpen("/data/kickiptv.log", 0, 0);
     if (fd >= 0) {
         std::string all; char buf[1024];
-        for (;;) { long n = (long)sceKernelRead(fd, buf, sizeof buf); if (n <= 0) break; all.append(buf, (size_t)n); if (all.size() > 65536) break; }
+        for (;;) { long n = (long)sceKernelRead(fd, buf, sizeof buf); if (n <= 0) break; all.append(buf, (size_t)n); if (all.size() > 400000) break; }
         sceKernelClose(fd);
         while (!all.empty() && (all.back() == '\n' || all.back() == '\r')) all.pop_back();
         size_t p = all.rfind('\n');
@@ -760,6 +760,10 @@ static void traceInit() {
             while (st < all.size()) { size_t nl = all.find('\n', st); if (nl == std::string::npos) nl = all.size(); if (nl > st) v.push_back(all.substr(st, nl - st)); st = nl + 1; }
             for (size_t i = v.size() > 8 ? v.size() - 8 : 0; i < v.size(); i++) g_prevTail.push_back(v[i]);
         }
+    }
+    if (!all.empty()) {                       // guarda o log da vez anterior: abrir o app de novo nao apaga mais o log do travamento
+        FILE *pv = fopen("/data/kickiptv_anterior.log", "wb");
+        if (pv) { fwrite(all.data(), 1, all.size(), pv); fwrite("\n", 1, 1, pv); fclose(pv); }
     }
     FILE *f = fopen("/data/kickiptv.log", "wb");
     if (f) { fwrite("inicio\n", 1, 7, f); fclose(f); }
@@ -3801,8 +3805,13 @@ int main() {
     startWatchdog();
     double hbNext = monoSec() + 60, hbT0 = monoSec();
     bool sysExit = false;                       // true = saindo porque o sistema (menu do PS) esta fechando/trocando o app
+    double loopPrevT = monoSec(); int loopSlowN = 0;
     for (;;) {
         g_mainTick++;
+        {   // volta do laco demorou? (rede, trava de mutex, copia lenta...): grava quanto e o ultimo passo registrado
+            double ln = monoSec(), dl = ln - loopPrevT; loopPrevT = ln;
+            if (dl > 0.12 && dl < 5.0 && loopSlowN < 60) { loopSlowN++; char lb[140]; snprintf(lb, sizeof lb, "laco-lento %.0fms modo=%d ultimo=%s", dl * 1000, (int)mode, g_lastTrace); trace(lb); }
+        }
         if (mode != Mode::Menu) menuPainter.invalidate();      // player/teclado escrevem direto nas telas de video: o menu repinta tudo ao voltar
         if (monoSec() >= hbNext) {                       // 1 linha por minuto no log (/data/kickiptv.log): ate quando o app estava vivo
             hbNext += 60;
