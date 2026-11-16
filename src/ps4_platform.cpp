@@ -3406,7 +3406,7 @@ static const bool kPsStopLogic = true;
 // threads (ps4Exit). E o unico jeito que fecha sem CE-34878-0: deixar o PS4 matar o processo com threads vivas e o que dava o erro (log: bg=1 e nada mais).
 // Quem preferir deixar o app SUSPENSO para voltar depois cria /data/kickiptv_suspende (o PS4 pode dar erro ao fechar nesse modo).
 static bool kSelfExitOnBg = true;
-static const double kBgExitDelay = 1.5;                 // segundos estavel em segundo plano antes de sair (descarta aviso falso)
+static const double kBgExitDelay = 0.25;                 // segundos estavel em segundo plano antes de sair (descarta aviso falso)
 struct SysWatch {
     double calmSince = -1, lastOvlTrip = -1e9;     // lastOvlTrip: ultima vez que o menu do PS apareceu de verdade
     bool armed = false, tripped = false, ovl = false, bg = false;
@@ -4465,24 +4465,25 @@ int main() {
     trace("saindo");
     g_quitting = true;
     // seguranca: se alguma thread nao largar a tempo, encerra de qualquer jeito em 2,5 s (o sistema nao espera mais que isso)
-    try { std::thread([] { sceKernelUsleep(3500000); ps4Exit("saida-forcada"); }).detach(); } catch (...) {}
+    try { const unsigned fu = sysExit ? 1500000u : 3500000u; std::thread([fu] { sceKernelUsleep(fu); ps4Exit("saida-forcada"); }).detach(); } catch (...) {}
     try { pf.saveSetting("bgload", ""); } catch (...) {}
     try { g_sfx.stop(); } catch (...) {}
     try { if (mode == Mode::Play || player.h) player.stop(); } catch (...) {}
     try { g_covers.setPaused(true); } catch (...) {}
     try { g_covers.cancelBackground(); } catch (...) {}
-    try { if (loader.stillAlive()) loader.cancel(0.4); } catch (...) {}
+    try { if (loader.stillAlive()) loader.cancel(sysExit ? 0.1 : 0.4); } catch (...) {}
     try { g_feed.abort(); abortHf(); abortPf(); } catch (...) {}
-    try { app.stopPrefetch(0.3); } catch (...) {}          // thread do catalogo Xtream: tem que estar parada antes de sair
-    try { app.stopHeroInfo(0.3); } catch (...) {}
-    Player::waitTeardown(0.8);
+    try { app.stopPrefetch(sysExit ? 0.1 : 0.3); } catch (...) {}          // thread do catalogo Xtream: tem que estar parada antes de sair
+    try { app.stopHeroInfo(sysExit ? 0.1 : 0.3); } catch (...) {}
+    Player::waitTeardown(sysExit ? 0.3 : 0.8);
     if (g_avClosedAt > 0) {                   // depois de fechar o AvPlayer, da tempo das threads internas dele (decodificador/audio) terminarem
         struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
         double since = ts.tv_sec + ts.tv_nsec / 1e9 - g_avClosedAt;
-        if (since < 1.2) { trace("espera-avplayer-assentar"); sceKernelUsleep((unsigned)((1.2 - since) * 1e6)); }
+        const double settle = sysExit ? 0.3 : 1.2;          // fechando pelo sistema: o PS4 tem pressa (matava o app aqui, com o erro CE-34878-0)
+        if (since < settle) { trace("espera-avplayer-assentar"); sceKernelUsleep((unsigned)((settle - since) * 1e6)); }
     }
     if (g_tearing.load() == 0) unloadAvModules();
-    try { if (!g_covers.shutdownFor(1.0)) trace("fim-capas-timeout"); } catch (...) {}
+    try { if (!g_covers.shutdownFor(sysExit ? 0.3 : 1.0)) trace("fim-capas-timeout"); } catch (...) {}
     try { g_feed.join(); } catch (...) {}
     try { auto r = takeHf(); if (r) r->join(); } catch (...) {}
     try { auto r = takePf(); if (r) { r->join(); r.reset(); } } catch (...) {}
