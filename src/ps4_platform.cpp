@@ -3402,11 +3402,14 @@ extern "C" int sceSystemServiceGetStatus(OrbisSystemServiceStatus *status);
 static const bool kPsStopLogic = true;
 // false = ao ir para o inicio/fechar pelo menu do PS o app SO para video/rede/capas e espera o proprio sistema encerrar o processo
 // (como um app normal). true = o app tambem se encerra sozinho, PELO SISTEMA (ps4Exit). Os testes antigos davam CE-34878-0 porque saiam por _Exit (syscall cru recusado).
-static const bool kSelfExitOnBg = true;                 // agora sai PELO SISTEMA (ps4Exit); antes usava _Exit, que dava CE-34878-0
+// Segundo plano: por padrao o app SO PARA TUDO (video, rede, capas, decodificador) e fica suspenso, quieto: da para voltar a ele sem perder nada
+// e o PS4 consegue fecha-lo pelo menu (PS -> Fechar aplicativo) sem CE-34878-0. Quem quiser que ele se encerre sozinho ao ir para o inicio cria /data/kickiptv_exitbg.
+static bool kSelfExitOnBg = false;
 static const double kBgExitDelay = 1.5;                 // segundos estavel em segundo plano antes de sair (descarta aviso falso)
 struct SysWatch {
     double calmSince = -1, lastOvlTrip = -1e9;     // lastOvlTrip: ultima vez que o menu do PS apareceu de verdade
     bool armed = false, tripped = false, ovl = false, bg = false;
+    bool everArmed = false;      // ja ficou calmo 1,5 s alguma vez: dai em diante todo aviso do sistema vale na hora (antes exigia calmaria de novo e ignorava PS -> Fechar rapido)
     void reset() { calmSince = -1; armed = false; tripped = false; }
     // le o sistema; true = pedido VALIDO de parar (menu do PS aberto ou app indo para o inicio)
     bool poll() {
@@ -3420,11 +3423,11 @@ struct SysWatch {
         bg = st.isInBackground != 0;
         if (!ovl && !bg) {
             if (calmSince < 0) calmSince = t;
-            if (t - calmSince >= 1.5) armed = true;
+            if (t - calmSince >= 1.5) { armed = true; everArmed = true; }
             tripped = false;
         } else {
             calmSince = -1;
-            if (armed) tripped = true;
+            if (armed || everArmed) tripped = true;
             if (tripped && ovl) lastOvlTrip = t;
             armed = false;
         }
@@ -3438,6 +3441,7 @@ using PadIn = PadInT<OrbisPadSrc>;
 
 int main() {
     sceUserServiceInitialize(NULL);
+    kSelfExitOnBg = fileExists("/data/kickiptv_exitbg");
     int userId = 0;
     sceUserServiceGetInitialUser(&userId);
     int padInitRc = scePadInit();
