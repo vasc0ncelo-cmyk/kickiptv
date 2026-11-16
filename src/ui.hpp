@@ -773,9 +773,15 @@ struct UI {
         kickPersist();
         app.watchKick(slug);
     }
-    // lives no ar, com cache de 60 s (cada consulta de rede trava a tela enquanto espera)
+    // lives no ar, com cache de 5 min (△ ou X no chip "Ao vivo" atualiza na hora) (cada consulta de rede trava a tela enquanto espera)
+    // Baixa a lista uma vez com o app parado no menu (chamado pela plataforma ~2 s depois de abrir): entrar na Kick fica instantaneo.
+    void kickPrefetch() {
+        if (!app.kickClient.configured() || !kickCache.empty()) return;
+        std::vector<kickapi::Live> v; std::string e;
+        kickFetchLives(v, e);
+    }
     bool kickFetchLives(std::vector<kickapi::Live> &out, std::string &err) {
-        if (!kickCache.empty() && animT - kickCacheAt < 60.0 && animT >= kickCacheAt) { out = kickCache; return true; }
+        if (!kickCache.empty() && animT - kickCacheAt < 300.0 && animT >= kickCacheAt) { out = kickCache; return true; }
         if (!app.kickLives(out, err)) return false;
         kickCache = out; kickCacheAt = animT;
         return true;
@@ -832,7 +838,7 @@ struct UI {
             case Input::Down: if (n > 0) kickInChips = false; break;
             case Input::Confirm:
                 if (kickChip == 3) { textKind = 1; app.pf.requestText("@ do streamer"); }
-                else kickOpenView(kickChip + 1);
+                else { if (kickChip == 0 && kickView == 1) kickCacheAt = -1000; kickOpenView(kickChip + 1); }     // X no chip "Ao vivo" ja ativo = atualizar
                 break;
             default: break;
             }
@@ -847,6 +853,7 @@ struct UI {
         case Input::PageUp: kickSel = std::max(0, kickSel - cols * kKRows); break;
         case Input::PageDown: kickSel = std::min(n - 1, kickSel + cols * kKRows); break;
         case Input::Confirm: if (const kickapi::Live *l = kickSelected()) { std::string sl = l->slug; kickWatch(sl); } break;
+        case Input::Extra: if (kickView == 1) { kickCacheAt = -1000; kickOpenView(1); } break;     // triangulo: atualizar as lives
         default: break;
         }
         row = kickSel / cols;
