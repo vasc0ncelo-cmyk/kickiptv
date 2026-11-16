@@ -3807,11 +3807,14 @@ int main() {
     double hbNext = monoSec() + 60, hbT0 = monoSec();
     bool sysExit = false;                       // true = saindo porque o sistema (menu do PS) esta fechando/trocando o app
     double loopPrevT = monoSec(); int loopSlowN = 0;
+    double lapT = monoSec(); std::string lapS;                 // cronometra as partes da volta do laco: a que passar de 40 ms aparece no log
+    auto lap = [&](const char *nm) { double t = monoSec(), d = t - lapT; lapT = t; if (d > 0.04 && lapS.size() < 160) { char b[48]; snprintf(b, sizeof b, " %s=%.0f", nm, d * 1000); lapS += b; } };
     for (;;) {
         g_mainTick++;
         {   // volta do laco demorou? (rede, trava de mutex, copia lenta...): grava quanto e o ultimo passo registrado
             double ln = monoSec(), dl = ln - loopPrevT; loopPrevT = ln;
-            if (dl > 0.12 && dl < 5.0 && loopSlowN < 60) { loopSlowN++; char lb[140]; snprintf(lb, sizeof lb, "laco-lento %.0fms modo=%d ultimo=%s", dl * 1000, (int)mode, g_lastTrace); trace(lb); }
+            if (dl > 0.12 && dl < 5.0 && loopSlowN < 60) { loopSlowN++; char lb[260]; snprintf(lb, sizeof lb, "laco-lento %.0fms modo=%d partes:%s", dl * 1000, (int)mode, lapS.empty() ? " (nenhuma>40ms)" : lapS.c_str()); trace(lb); }
+            lapS.clear(); lapT = monoSec();
         }
         if (mode != Mode::Menu) menuPainter.invalidate();      // player/teclado escrevem direto nas telas de video: o menu repinta tudo ao voltar
         if (monoSec() >= hbNext) {                       // 1 linha por minuto no log (/data/kickiptv.log): ate quando o app estava vivo
@@ -3820,7 +3823,7 @@ int main() {
             trace(hb);
         }
         // --- Controle: PadIn + fallback direto do scePad (se a fila falhar, o estado ainda vale) ---
-        pin.poll();
+        pin.poll(); lap("pad");
         uint32_t pressed = pin.take();
         {
             static uint32_t prevHw = 0;
@@ -4232,8 +4235,10 @@ int main() {
             for (int i = 0; i < nR; i++) ui.handle(Input::Right);
             if (nU + nD + nL + nR > 0) dirty = true;
         }
+        lap("direcional");
         if (mode == Mode::Menu && app.prefetchTick()) dirty = true;      // catalogo do painel chegando (um pedaco por quadro, so no menu)
         if (mode == Mode::Menu && ui.autoOpenTick()) dirty = true;      // painel Xtream: abre a categoria quando o cursor para nela
+        lap("prefetch");
         if (pressed & B_L1)     { ui.handle(Input::PrevTab);  dirty = true; }
         if (pressed & B_R1)     { ui.handle(Input::NextTab);  dirty = true; }
         if (pressed & B_L2)     { ui.handle(Input::PageUp);   dirty = true; }
@@ -4242,7 +4247,9 @@ int main() {
         if (pressed & B_CIRCLE) { ui.handle(Input::Back);     dirty = true; }
         if ((pressed & B_SQUARE) && mode == Mode::Menu) { ui.handle(Input::Fav); dirty = true; }   // quadrado: favoritar (tela Kick)
         if (pressed & (B_TRIANGLE | B_TOUCH)) { ui.handle(Input::Extra);  dirty = true; }       // lupa: buscar (triangulo ou clique no touchpad)
+        lap("botoes");
         if (updateClock()) dirty = true;
+        lap("relogio");
         {   // andamento do lote de capas (TRIANGULO)
             static bool wasBulk = false; static double nextSay = 0;
             bool act = g_covers.backgroundActive();
@@ -4316,6 +4323,7 @@ int main() {
             dirty = true;
         }
 
+        lap("capas-lista");
         {   // lista de lives da Kick baixada com o menu parado (so uma vez): depois, entrar na Kick e instantaneo
             static bool kickPre = false; static int kickPreFrames = 0;
             if (!kickPre && mode == Mode::Menu && !autoLoadList && ++kickPreFrames >= 250 && ui.screen == Screen::Home) { kickPre = true; try { ui.kickPrefetch(); } catch (...) {} dirty = true; trace("kick-prefetch"); }
@@ -4433,10 +4441,12 @@ int main() {
             static double lastAnim = 0, lastPoll = 0;
             double tn = nowSec();
             if (!g_quitting && tn - lastPoll >= 0.25) { lastPoll = tn; if (ui.asyncPoll()) dirty = true; }
+            lap("asyncPoll");
             if (!g_quitting && ui.needsFrame(tn) && tn - lastAnim >= 0.033) { lastAnim = tn; dirty = true; }
         }
         // limite de ~60 desenhos por segundo (nao enche a fila de flips do video)
-        if (dirty && nowSec() - lastMenuPresent >= 0.0165) { presentMenu(); dirty = false; static bool once = false; if (!once) { once = true; trace("menu-ok"); } }
+        lap("antes-desenho");
+        if (dirty && nowSec() - lastMenuPresent >= 0.0165) { presentMenu(); lap("desenho"); dirty = false; static bool once = false; if (!once) { once = true; trace("menu-ok"); } }
         sceKernelUsleep(4000);                     // 4 ms: o controle e lido ~200x por segundo (antes 16 ms)
     }
     // ---- encerramento limpo (OPTIONS, background ou saida normal) ----
