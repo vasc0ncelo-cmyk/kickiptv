@@ -3405,7 +3405,7 @@ static const bool kPsStopLogic = true;
 // Segundo plano (PS -> Fechar aplicativo, ou trocar de app): o app para TUDO e, estavel 1,5 s, se encerra sozinho PELO SISTEMA depois de juntar todas as
 // threads (ps4Exit). E o unico jeito que fecha sem CE-34878-0: deixar o PS4 matar o processo com threads vivas e o que dava o erro (log: bg=1 e nada mais).
 // Quem preferir deixar o app SUSPENSO para voltar depois cria /data/kickiptv_suspende (o PS4 pode dar erro ao fechar nesse modo).
-static bool kSelfExitOnBg = true;
+static bool kSelfExitOnBg = false;
 static const double kBgExitDelay = 0.0;                  // segundos estavel em segundo plano antes de sair (descarta aviso falso)
 struct SysWatch {
     double calmSince = -1, lastOvlTrip = -1e9;     // lastOvlTrip: ultima vez que o menu do PS apareceu de verdade
@@ -3442,7 +3442,7 @@ using PadIn = PadInT<OrbisPadSrc>;
 
 int main() {
     sceUserServiceInitialize(NULL);
-    kSelfExitOnBg = !fileExists("/data/kickiptv_suspende");
+    kSelfExitOnBg = fileExists("/data/kickiptv_saiauto");   // padrao: NAO sai sozinho; fica parado em segundo plano e o PS4 mostra "Fechar aplicativo"
     int userId = 0;
     sceUserServiceGetInitialUser(&userId);
     int padInitRc = scePadInit();
