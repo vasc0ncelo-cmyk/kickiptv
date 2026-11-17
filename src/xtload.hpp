@@ -3,6 +3,7 @@
 // Os itens de cada categoria sao baixados depois, quando voce abre a categoria (App::ensureCategory).
 // Listas de provedores grandes (200 mil+ itens) nao cabem na memoria do PS4 como M3U; assim nao ha limite.
 // Independente de plataforma (a rede entra como funcao): testavel no PC.
+#include "thrprio.hpp"
 #include <atomic>
 #include <chrono>
 #include <functional>
@@ -62,6 +63,7 @@ public:
         taken_ = false;
         auto sh = sh_;
         th_ = std::thread([sh, url, get] {
+            bgPrio();
             Result r; r.list = std::make_shared<Playlist>();
             try { r.code = xtreamConnect(get, url, r.acct, *r.list, r.msg); } catch (...) { r.code = 0; }
             { std::lock_guard<std::mutex> l(sh->m); sh->res = std::move(r); }
