@@ -5,6 +5,7 @@
 // resultado com take(), trocando a lista de uma vez so.
 // Ordem: copia salva no console -> se nao houver (ou estiver vazia), baixa da rede.
 // Independente de plataforma (a leitura e o download entram como funcoes): testavel no PC.
+#include "thrprio.hpp"
 #include <atomic>
 #include <chrono>
 #include <functional>
@@ -32,7 +33,7 @@ public:
         sh_ = std::make_shared<Shared>();
         taken_ = false;
         auto sh = sh_;
-        th_ = std::thread([sh, url, cache, net] { run(sh, url, cache, net); });
+        th_ = std::thread([sh, url, cache, net] { bgPrio(); run(sh, url, cache, net); });
     }
     // Pede para parar e espera ate 'waitSec'. true = a thread terminou. Se ficou presa na rede, e solta (termina sozinha).
     bool cancel(double waitSec = 3.0) {
