@@ -3406,7 +3406,7 @@ static const bool kPsStopLogic = true;
 // threads (ps4Exit). E o unico jeito que fecha sem CE-34878-0: deixar o PS4 matar o processo com threads vivas e o que dava o erro (log: bg=1 e nada mais).
 // Quem preferir deixar o app SUSPENSO para voltar depois cria /data/kickiptv_suspende (o PS4 pode dar erro ao fechar nesse modo).
 static bool kSelfExitOnBg = true;
-static const double kBgExitDelay = 0.25;                 // segundos estavel em segundo plano antes de sair (descarta aviso falso)
+static const double kBgExitDelay = 0.0;                  // segundos estavel em segundo plano antes de sair (descarta aviso falso)
 struct SysWatch {
     double calmSince = -1, lastOvlTrip = -1e9;     // lastOvlTrip: ultima vez que o menu do PS apareceu de verdade
     bool armed = false, tripped = false, ovl = false, bg = false;
@@ -3911,8 +3911,10 @@ int main() {
                     static double bgAnySince = -1; static bool keepAny = false;
                     if (bgAny) { if (bgAnySince < 0) { bgAnySince = nowSec(); keepAny = fileExists(kKeepBgFile); } } else bgAnySince = -1;
                     if (kSelfExitOnBg && bgAny && seenFg && !keepAny && bgAnySince > 0 && nowSec() - bgAnySince >= kBgExitDelay) {
-                        trace("bg-estavel-saindo");
-                        g_quitting = true; sysExit = true; break;
+                        // O sistema congela o processo em menos de 0,25 s depois de bg=1 (os logs terminavam em "bg-aguardando-sistema"):
+                        // tudo ja foi parado no menu do PS, entao pede a saida AGORA, sem juntar threads.
+                        g_quitting = true;
+                        ps4Exit("bg-saida-imediata");
                     }
                 }
                 if (bg && !wasBg) {
@@ -3939,8 +3941,7 @@ int main() {
                         // Nao da _Exit seco: depois de assistir video ainda existem threads (download do filme, rede, decodificador, capas).
                         // Matar o processo com elas rodando derruba o app (CE-34878-0). Vai para o encerramento limpo (junta todas as threads).
                         g_quitting = true;
-                        sysExit = true;
-                        break;
+                        ps4Exit("bg-saida-imediata2");
                     }
                     { static bool said = false; if (!said) { said = true; trace("bg-aguardando-sistema"); } }
                     sceKernelUsleep(30000);
