@@ -3898,7 +3898,7 @@ int main() {
                 try { g_feed.abort(); abortHf(); abortPf(); } catch (...) {}
                 // da um momento pro stop assincrono soltar o AvPlayer
                 Player::waitTeardown(0.35);
-                if (g_tearing.load() == 0) unloadAvModules();      // sem player aberto: solta os modulos do AvPlayer para o PS4 poder fechar o app
+                if (g_tearing.load() == 0 && kSelfExitOnBg) unloadAvModules();      // (so no modo de saida automatica; em segundo plano o PS4 vai fechar o app e nao deve achar modulos ja soltos) sem player aberto: solta os modulos do AvPlayer para o PS4 poder fechar o app
                 trace("tudo-parado");
                 dirty = true;
             };
