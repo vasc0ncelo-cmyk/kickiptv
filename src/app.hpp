@@ -1,4 +1,5 @@
 #pragma once
+#include "thrprio.hpp"
 #include <ctime>
 // Logica do app independente de plataforma (testavel no PC).
 #include "kick.hpp"
@@ -332,6 +333,7 @@ struct App {
         pfs_ = sh;
         XtreamAcct acct = xt.acct; Platform *plat = &pf;
         pfTh_ = std::thread([sh, jobs, acct, plat] {
+            bgPrio();
             for (const Job &j : jobs) {
                 while (!sh->stop) {                                // a thread principal e mais lenta que a rede: espera ela esvaziar a fila
                     { std::lock_guard<std::mutex> l(sh->m); if (sh->q.size() < 3) break; }
@@ -549,6 +551,7 @@ struct App {
         Platform *plat = &pf;
         const std::string tk = tmdbKey;
         heroTh_ = std::thread([sh, acct, plat, tk] {
+            bgPrio();
             for (;;) {
                 HeroReq r;
                 {
