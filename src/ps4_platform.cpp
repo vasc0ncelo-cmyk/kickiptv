@@ -911,7 +911,20 @@ static void crashHandler(int sig, CrashSigInfo *si, void *uc) {
     sigaction(sig, &dfl, NULL);             // volta ao padrao: a instrucao e reexecutada e o PS4 trata a queda como sempre
     g_inCrash = 0;
 }
+// O sistema fecha um app suspenso mandando um sinal de encerramento. Sem tratador, o padrao do libc chama exit() -> syscall "exit" cru -> CE-34878-0.
+// Com este tratador o app pede a saida AO SISTEMA (como os apps da Sony).
+static void closeSignalHandler(int sig) {
+    char b[48]; snprintf(b, sizeof b, "sinal-fechar sig=%d", sig);
+    ps4Exit(b);
+}
 static void installCrashLog() {
+    {   // sinais de encerramento -> saida pelo sistema
+        struct sigaction st; memset(&st, 0, sizeof st);
+        { void (*fp)(int) = closeSignalHandler; memcpy(&st, &fp, sizeof fp); }
+        sigemptyset(&st.sa_mask);
+        const int tsigs[] = {SIGTERM, SIGHUP, SIGINT, SIGQUIT, SIGSYS};
+        for (int sg : tsigs) sigaction(sg, &st, NULL);
+    }
     g_crashFd = open("/data/kickiptv_crash.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
     struct sigaction sa; memset(&sa, 0, sizeof sa);
     // O signal.h do toolchain define a macro 'sa_sigaction' quebrada (expande para um membro que nao existe) e nao compila.
@@ -3405,6 +3418,7 @@ static const bool kPsStopLogic = true;
 // Segundo plano (PS -> Fechar aplicativo, ou trocar de app): o app para TUDO e, estavel 1,5 s, se encerra sozinho PELO SISTEMA depois de juntar todas as
 // threads (ps4Exit). E o unico jeito que fecha sem CE-34878-0: deixar o PS4 matar o processo com threads vivas e o que dava o erro (log: bg=1 e nada mais).
 // Quem preferir deixar o app SUSPENSO para voltar depois cria /data/kickiptv_suspende (o PS4 pode dar erro ao fechar nesse modo).
+static double g_bgLastIter = 0;                          // ultima volta que o laco de segundo plano rodou (0 = fora do segundo plano)
 static bool kSelfExitOnBg = false;
 static const double kBgExitDelay = 0.0;                  // segundos estavel em segundo plano antes de sair (descarta aviso falso)
 struct SysWatch {
@@ -3918,6 +3932,7 @@ int main() {
                     }
                 }
                 if (bg && !wasBg) {
+                    g_bgLastIter = 0;
                     bgSince = nowSec();
                     keepBg = fileExists(kKeepBgFile);
                     // O menu do PS ja parou tudo (video, rede, capas). So para de novo se ainda tiver algo rodando: cada espera aqui
@@ -3926,7 +3941,7 @@ int main() {
                     else trace("sistema-background");
                 }
                 if (!bg && wasBg) {
-                    trace("sistema-foreground");
+                    trace("sistema-foreground"); g_bgLastIter = 0;
                     g_quitting = false;
                     g_covers.setPaused(false);
                     dirty = true;
@@ -3944,6 +3959,11 @@ int main() {
                         ps4Exit("bg-saida-imediata2");
                     }
                     { static bool said = false; if (!said) { said = true; trace("bg-aguardando-sistema"); } }
+                    {   // o processo ficou congelado e acordou ainda em segundo plano: o sistema esta fechando o app -> sai pelo sistema
+                        double tn2 = nowSec();
+                        if (g_bgLastIter > 0 && tn2 - g_bgLastIter > 0.5 && g_sys.poll() && g_sys.bg) ps4Exit("bg-acordou-fechando");
+                        g_bgLastIter = tn2;
+                    }
                     {   // batimento a cada 1 s: o log mostra ate quando o processo viveu em segundo plano antes do sistema fecha-lo
                         static double nextBeat = 0; double tb = nowSec();
                         if (tb >= nextBeat) { nextBeat = tb + 1.0; char b[64]; snprintf(b, sizeof b, "bg-vivo %.1fs", tb - bgSince); trace(b); }
