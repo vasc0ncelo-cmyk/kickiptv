@@ -4,6 +4,7 @@
 //  2) o resto baixa em paralelo (visivel primeiro, depois as proximas paginas);
 //  3) um baixador em segundo plano (setBackground) enche o disco com as capas da lista inteira enquanto o app esta parado
 //     (pausa durante videos: setPaused), entao na proxima vez que abrir uma aba as capas ja estao la.
+#include "thrprio.hpp"
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -173,12 +174,12 @@ private:
     void startWorkers() {
         std::lock_guard<std::mutex> l(m_);
         if (!ths_.empty() || stop_) return;
-        for (int i = 0; i < kWorkers; i++) { alive_++; ths_.emplace_back([this, i] { workerLoop(i); alive_--; }); }
+        for (int i = 0; i < kWorkers; i++) { alive_++; ths_.emplace_back([this, i] { bgPrio(); workerLoop(i); alive_--; }); }
     }
     void startBg() {
         std::lock_guard<std::mutex> l(m_);
         if (!bgTh_.empty() || stop_) return;
-        for (int i = 0; i < kBgThreads; i++) { alive_++; bgTh_.emplace_back([this, i] { bgLoop(kWorkers + i); alive_--; }); }
+        for (int i = 0; i < kBgThreads; i++) { alive_++; bgTh_.emplace_back([this, i] { bgPrio(); bgLoop(kWorkers + i); alive_--; }); }
     }
     void bgLoop(int id) {
         for (;;) {
