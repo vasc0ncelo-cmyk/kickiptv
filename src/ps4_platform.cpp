@@ -3944,6 +3944,10 @@ int main() {
                         ps4Exit("bg-saida-imediata2");
                     }
                     { static bool said = false; if (!said) { said = true; trace("bg-aguardando-sistema"); } }
+                    {   // batimento a cada 1 s: o log mostra ate quando o processo viveu em segundo plano antes do sistema fecha-lo
+                        static double nextBeat = 0; double tb = nowSec();
+                        if (tb >= nextBeat) { nextBeat = tb + 1.0; char b[64]; snprintf(b, sizeof b, "bg-vivo %.1fs", tb - bgSince); trace(b); }
+                    }
                     sceKernelUsleep(30000);
                     continue;
                 }
