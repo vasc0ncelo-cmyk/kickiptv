@@ -44,29 +44,30 @@ build/app.elf: $(OBJS)
 build/eboot.bin: build/app.elf
 > $(BIN)/create-fself -in=build/app.elf -out=build/app.oelf --eboot=build/eboot.bin --paid 0x3800000000000011
 
-build/sce_sys/param.sfo:
-> @mkdir -p build/sce_sys
-> $(PKGTOOL) sfo_new $@
-> $(PKGTOOL) sfo_setentry $@ APP_VER --type Integer --maxsize 4 --value 1
-> $(PKGTOOL) sfo_setentry $@ ATTRIBUTE --type Integer --maxsize 4 --value 0
-> $(PKGTOOL) sfo_setentry $@ CATEGORY --type Utf8 --maxsize 4 --value "gd"
-> $(PKGTOOL) sfo_setentry $@ CONTENT_ID --type Utf8 --maxsize 48 --value "$(CONTENT_ID)"
-> $(PKGTOOL) sfo_setentry $@ DOWNLOAD_DATA_SIZE --type Integer --maxsize 4 --value 0
-> $(PKGTOOL) sfo_setentry $@ SYSTEM_VER --type Integer --maxsize 4 --value 0
-> $(PKGTOOL) sfo_setentry $@ TITLE --type Utf8 --maxsize 128 --value "$(TITLE)"
-> $(PKGTOOL) sfo_setentry $@ TITLE_ID --type Utf8 --maxsize 12 --value "$(TITLE_ID)"
-> $(PKGTOOL) sfo_setentry $@ VERSION --type Utf8 --maxsize 8 --value "01.00"
+# Sempre regenera o param.sfo (o do sample copiado pelo script teria o ID antigo)
+.PHONY: sfo
+sfo:
+> rm -f sce_sys/param.sfo
+> $(PKGTOOL) sfo_new sce_sys/param.sfo
+> $(PKGTOOL) sfo_setentry sce_sys/param.sfo APP_TYPE --type Integer --maxsize 4 --value 0
+> $(PKGTOOL) sfo_setentry sce_sys/param.sfo APP_VER --type Utf8 --maxsize 8 --value '01.00'
+> $(PKGTOOL) sfo_setentry sce_sys/param.sfo ATTRIBUTE --type Integer --maxsize 4 --value 0
+> $(PKGTOOL) sfo_setentry sce_sys/param.sfo CATEGORY --type Utf8 --maxsize 4 --value 'gd'
+> $(PKGTOOL) sfo_setentry sce_sys/param.sfo CONTENT_ID --type Utf8 --maxsize 48 --value '$(CONTENT_ID)'
+> $(PKGTOOL) sfo_setentry sce_sys/param.sfo DOWNLOAD_DATA_SIZE --type Integer --maxsize 4 --value 0
+> $(PKGTOOL) sfo_setentry sce_sys/param.sfo SYSTEM_VER --type Integer --maxsize 4 --value 0
+> $(PKGTOOL) sfo_setentry sce_sys/param.sfo TITLE --type Utf8 --maxsize 128 --value '$(TITLE)'
+> $(PKGTOOL) sfo_setentry sce_sys/param.sfo TITLE_ID --type Utf8 --maxsize 12 --value '$(TITLE_ID)'
+> $(PKGTOOL) sfo_setentry sce_sys/param.sfo VERSION --type Utf8 --maxsize 8 --value '01.00'
 
-build/$(CONTENT_ID).pkg: build/eboot.bin build/sce_sys/param.sfo
-> @mkdir -p build/pkg/sce_sys
-> cp build/eboot.bin build/pkg/eboot.bin
-> cp build/sce_sys/param.sfo build/pkg/sce_sys/
-> if [ -f sce_sys/icon0.png ]; then cp sce_sys/icon0.png build/pkg/sce_sys/; fi
-> cd build/pkg && $(BIN)/create-gp4 -out pkg.gp4 -content-id $(CONTENT_ID) -files "eboot.bin sce_sys/param.sfo $$(test -f sce_sys/icon0.png && echo sce_sys/icon0.png)"
-> $(PKGTOOL) pkg_build build/pkg/pkg.gp4 build/
-> @echo "PKG pronto: build/$(CONTENT_ID).pkg"
+pkg.gp4: build/eboot.bin sfo
+> cp build/eboot.bin eboot.bin
+> $(BIN)/create-gp4 -out pkg.gp4 --content-id=$(CONTENT_ID) --files "eboot.bin $$(find sce_sys sce_module -type f ! -name .gitkeep | tr '\n' ' ')"
+
+build/$(CONTENT_ID).pkg: pkg.gp4
+> $(PKGTOOL) pkg_build pkg.gp4 .
+> mv $(CONTENT_ID).pkg build/
+> @ls -la build
 
 clean:
-> rm -rf build
-
-.PHONY: all clean
+> rm -rf build eboot.bin pkg.gp4 sce_sys/param.sfo
