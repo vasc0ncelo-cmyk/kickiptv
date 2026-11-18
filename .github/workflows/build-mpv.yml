@@ -77,6 +77,11 @@ jobs:
         run: |
           set -o pipefail
           { cmake -B build -DCMAKE_BUILD_TYPE=Release && make -C build -j$(nproc) VERBOSE=1; } 2>&1 | tee build-log.txt
+      - name: Resumo dos erros do compilador (se a compilacao falhou)
+        if: failure()
+        run: |
+          echo "===== ERROS ====="
+          grep -n -E "error:|fatal error:|undefined reference|undefined symbol" build-log.txt | head -80 || true
       - name: Conferir o PKG
         if: success()
         run: |
