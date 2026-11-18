@@ -40,7 +40,18 @@ jobs:
           if [ -d sce_sys ]; then cp -r sce_sys/. ps4pkg/sce_sys/ || true; fi
           pip install pillow >/dev/null 2>&1 && python3 scripts/make_icon.py && cp sce_sys/icon0.png sce_sys/pic1.png ps4pkg/sce_sys/ || echo "icone: mantido o padrao"
           rm -f ps4pkg/sce_sys/param.sfo
-          ls -la ps4pkg/sce_module ps4pkg/sce_sys
+          # O app precisa dos .prx (libc / Fios2) dentro do PKG; sem eles o PS4 fecha na hora (CE-34878-0).
+          # Se os do borealis nao vieram, usa os do sample da toolchain.
+          n=$(ls ps4pkg/sce_module/*.prx 2>/dev/null | wc -l)
+          if [ "$n" -lt 2 ]; then
+            echo "AVISO: so $n .prx do borealis; tentando os samples da toolchain"
+            for d in $OPENORBIS/samples/*/sce_module; do
+              [ -d "$d" ] && cp -n "$d"/*.prx ps4pkg/sce_module/ 2>/dev/null || true
+            done
+          fi
+          ls -la ps4pkg/sce_module ps4pkg/sce_sys | tee pkg-contents.txt
+          n=$(ls ps4pkg/sce_module/*.prx 2>/dev/null | wc -l)
+          [ "$n" -ge 2 ] || { echo "ERRO: faltam os .prx em ps4pkg/sce_module"; exit 1; }
       - name: Lista padrao do app (segredo LIST_URL, opcional)
         env:
           LIST_URL: ${{ secrets.LIST_URL }}
@@ -86,6 +97,7 @@ jobs:
         if: success()
         run: |
           ls -l build/*.pkg
+          { echo '== conteudo de build/ps4 (o que entra no PKG)'; find build/ps4 -type f | xargs ls -l; } | tee -a pkg-contents.txt
           mv build/*.pkg build/Kick-IPTV-mpv.pkg
       - name: Publicar numa Release (PKG e log)
         if: always()
@@ -97,4 +109,5 @@ jobs:
             build/Kick-IPTV-mpv.pkg
             build-log.txt
             toolchain-info.txt
+            pkg-contents.txt
           make_latest: false
