@@ -39,14 +39,14 @@ target_compile_options(${PROJECT_NAME} PRIVATE
     -O2 -fno-strict-aliasing -fno-omit-frame-pointer -funwind-tables -D_GNU_SOURCE)
 target_link_options(${PROJECT_NAME} PRIVATE "LINKER:--wrap=clock_gettime")
 target_link_directories(${PROJECT_NAME} PRIVATE ${OPENORBIS}/usr/lib)
-# Ordem/grupo: o mpv puxa ffmpeg, mbedtls, SDL2 (audio), libass etc. (lista = Libs.private do mpv.pc do pacote)
+# Sem -Wl,--start-group aqui: o ld.lld e chamado direto (nao pelo clang) e nao entende '-Wl,'; o cmake do toolchain ja envolve tudo em --start-group/--end-group.
+# Ordem: o mpv puxa ffmpeg, mbedtls, SDL2 (audio), libass etc. (lista = Libs.private do mpv.pc do pacote)
 target_link_libraries(${PROJECT_NAME} PRIVATE
-    -Wl,--start-group
     mpv avformat avcodec avfilter swscale swresample avutil dav1d mbedtls mbedx509 mbedcrypto
     ass fribidi freetype bz2 png16 samplerate SDL2 z
     SceVideoOut SceUserService SceSystemService SceSysUtil ScePad SceSysmodule SceNet SceSsl SceHttp SceAvPlayer SceAudioOut
     ScePigletv2VSH SceLibcInternal rt pthread m
-    -Wl,--end-group)
+)
 
 add_self(${PROJECT_NAME})
 add_pkg(${PROJECT_NAME}
