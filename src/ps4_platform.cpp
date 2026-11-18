@@ -1668,8 +1668,6 @@ static void releasePfAsync() {                                                  
 
 static double nowSec() { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec + ts.tv_nsec / 1e9; }
 
-static bool g_noMpv = false;        // libmpv falhou nesta sessao: usa o player antigo (AvPlayer)
-
 struct Player {
     KAvHandle h = 0;
     bool active = false;
@@ -1875,11 +1873,11 @@ struct Player {
             while (!kickSlug.empty() && (kickSlug.back()==' '||kickSlug.back()=='\n')) kickSlug.pop_back();
         }
 
-        // --- libmpv (GMCA/Switchfin): se o build tem USE_LIBMPV, tenta primeiro ---
-#ifdef USE_LIBMPV
+        // --- Player ÚNICO: libmpv (igual GMCA/Switchfin). O player antigo (AvPlayer/HLS proprio) foi DESLIGADO: sem fallback. ---
         useMpv = false;
-        if (!g_noMpv && mpv_player::available()) {
-            log.push_back("tentando libmpv (PacBrew)...");
+#ifdef USE_LIBMPV
+        if (mpv_player::available()) {
+            log.push_back("abrindo com libmpv (PacBrew)...");
             trace("mpv-tentando");
             if (mpv_player::play(url)) {
                 trace("mpv-play-ok");
@@ -1888,14 +1886,23 @@ struct Player {
                 paused = false; muted = false; failed = false;
                 active = true;
                 isVod = (url.find(".m3u8") == std::string::npos) && kickSlug.empty();
-                log.push_back("player: libmpv OK (mesmo stack do GMCA)");
+                log.push_back("player: libmpv OK");
                 return true;
             }
-            log.push_back("libmpv falhou: " + mpv_player::status().error + " — caindo no AvPlayer");
-            { std::string e = "mpv-erro: " + mpv_player::status().error; trace(e.c_str()); }
+            std::string e = mpv_player::status().error;
+            log.push_back("ERRO libmpv: " + e);
+            { std::string t = "mpv-erro: " + e; trace(t.c_str()); }
             try { mpv_player::stop(); } catch (...) {}
+        } else {
+            log.push_back("ERRO: libmpv indisponivel neste build");
+            trace("mpv-indisponivel");
         }
+#else
+        log.push_back("ERRO: este PKG foi compilado SEM libmpv (o download/link do PacBrew falhou no GitHub Actions)");
+        trace("mpv-nao-compilado");
 #endif
+        failed = true; active = false;
+        return false;
 
         // titulo "@slug" = live Kick: guarda slug para renovar o m3u8 na reconexao
         kickSlug.clear(); nextKickUrl.clear(); kickUrlAt = nowSec();
@@ -4170,12 +4177,13 @@ int main() {
                 player.epUrls.clear(); player.epTitles.clear(); player.epIndex = -1;
                 mode = Mode::Menu; dirty = true; sceKernelUsleep(16000); continue;
             }
-            if ((st.failed && !player.mpvGot) || (!player.mpvGot && tn - player.mpvT0 > 45.0)) {
-                // o mpv nao conseguiu abrir: usa o player antigo nesta sessao (reabre a mesma URL)
-                trace("mpv-falhou-fallback");
-                g_noMpv = true;
-                const std::string u = player.url, t = player.title; const int ep = player.epIndex;
-                requeue(u, t, ep); sceKernelUsleep(16000); continue;
+            if ((st.failed && !player.mpvGot) || (!player.mpvGot && tn - player.mpvT0 > 60.0)) {
+                // sem fallback: mostra o motivo e volta ao menu
+                trace("mpv-sem-video");
+                app.say(st.failed ? "libmpv: " + st.error : std::string("libmpv: nenhum quadro em 60 s"));
+                player.stop(); player.quietWait = false;
+                player.epUrls.clear(); player.epTitles.clear(); player.epIndex = -1;
+                mode = Mode::Menu; dirty = true; sceKernelUsleep(16000); continue;
             }
             if (st.failed || (st.eof && !st.paused)) {
                 if (st.eof && player.canNextEp()) {
