@@ -11,6 +11,8 @@ struct Status {
     bool paused = false;
     bool eof = false;
     bool failed = false;
+    bool buffering = false;      // mpv esta esperando a rede (paused-for-cache)
+    int bufferPct = 0;           // 0..100 enquanto buffering
     double positionSec = 0;
     double durationSec = 0;
     std::string error;
@@ -20,6 +22,7 @@ bool available();
 bool boot();
 bool play(const std::string &url);
 void pause(bool on);
+void setMute(bool on);
 bool seekSec(double sec);
 bool seekRelative(double deltaSec);
 void stop();
@@ -29,7 +32,7 @@ bool isOpen();
 void poll();
 
 // Software render -> buffer BGRA/RGB0 para blit no VideoOut do Kick
-// width/height: tamanho do framebuffer (ex.: 1920x1080). Devolve true se pintou.
+// width/height: tamanho do framebuffer (ex.: 1920x1080). Devolve true SO quando havia quadro novo e ele foi pintado em dst.
 bool renderToBgra(uint8_t *dst, int width, int height, int strideBytes);
 
 } // namespace mpv_player
