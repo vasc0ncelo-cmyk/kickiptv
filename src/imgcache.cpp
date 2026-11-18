@@ -96,8 +96,11 @@ std::string ImgCache::diskPath(const std::string &url) {
 }
 
 bool ImgCache::diskHas(const std::string &url) {
-    struct stat st;
-    return stat(diskPath(url).c_str(), &st) == 0 && st.st_size > 16;
+    FILE *f = fopen(diskPath(url).c_str(), "rb");          // tamanho pelo stdio (sem struct stat: a toolchain musl do GMCA nao fecha com ele)
+    if (!f) return false;
+    bool ok = fseek(f, 0, SEEK_END) == 0 && ftell(f) > 16;
+    fclose(f);
+    return ok;
 }
 
 // arquivo: largura, altura (int32) + w*h pixels RGB565 (metade do tamanho do BGRA, e a diferenca nao aparece em poster)
