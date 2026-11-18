@@ -6,15 +6,17 @@
 #include <cstring>
 
 // Orbis / OpenOrbis
+// Nomes proprios (k_*) ligados ao simbolo real por "asm label": assim NAO conflitam com <orbis/libkernel.h>
+// (a toolchain pacbrew/GMCA inclui esse header por dentro do libc++ e declara estas funcoes com outros tipos).
 extern "C" {
-int sceKernelLoadStartModule(const char *path, size_t args, const void *argp, uint32_t flags,
-                             void *opt, int *res);
-int sceKernelStopUnloadModule(int handle, size_t args, const void *argp, uint32_t flags,
-                              void *opt, int *res);
-int sceKernelDlsym(int handle, const char *name, void **addr);
-int sceKernelAllocateDirectMemory(int64_t searchStart, int64_t searchEnd, size_t length, size_t alignment, int type, int64_t *physOut);
-int sceKernelMapDirectMemory(void **addr, size_t length, int prot, int flags, int64_t physStart, size_t alignment);
-int64_t sceKernelGetDirectMemorySize(void);
+int k_LoadStartModule(const char *path, size_t args, const void *argp, uint32_t flags,
+                      void *opt, int *res) __asm__("sceKernelLoadStartModule");
+int k_StopUnloadModule(int handle, size_t args, const void *argp, uint32_t flags,
+                       void *opt, int *res) __asm__("sceKernelStopUnloadModule");
+int k_Dlsym(int handle, const char *name, void **addr) __asm__("sceKernelDlsym");
+int k_AllocateDirectMemory(int64_t searchStart, int64_t searchEnd, size_t length, size_t alignment, int type, int64_t *physOut) __asm__("sceKernelAllocateDirectMemory");
+int k_MapDirectMemory(void **addr, size_t length, int prot, int flags, int64_t physStart, size_t alignment) __asm__("sceKernelMapDirectMemory");
+int64_t k_GetDirectMemorySize(void) __asm__("sceKernelGetDirectMemorySize");
 }
 
 namespace hwplayer {
@@ -33,8 +35,8 @@ DirectBlock g_gpuBlock, g_fbBlock;
 void *directAlloc(DirectBlock &blk, size_t size, size_t align) {
     if (blk.ptr && blk.size >= size) return blk.ptr;
     int64_t phys = 0; void *addr = nullptr;
-    if (sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), size, align, 0, &phys) < 0) return nullptr;
-    if (sceKernelMapDirectMemory(&addr, size, 0x33, 0, phys, align) < 0) return nullptr;
+    if (k_AllocateDirectMemory(0, k_GetDirectMemorySize(), size, align, 0, &phys) < 0) return nullptr;
+    if (k_MapDirectMemory(&addr, size, 0x33, 0, phys, align) < 0) return nullptr;
     blk.ptr = addr; blk.size = size;
     return addr;
 }
@@ -44,7 +46,7 @@ size_t roundUp(size_t v, size_t a) { return (v + a - 1) / a * a; }
 
 bool resolveOne(int mod, const char *name, void **out) {
     *out = nullptr;
-    if (sceKernelDlsym(mod, name, out) != 0 || !*out) return false;
+    if (k_Dlsym(mod, name, out) != 0 || !*out) return false;
     return true;
 }
 
@@ -66,7 +68,7 @@ bool Player::tryLoadApi() {
         int mod = -1;
         int res = 0;
         { char b[160]; snprintf(b, sizeof b, "hw-loadmodule %s", kModuleCandidates[i]); T(b); }
-        int rc = sceKernelLoadStartModule(kModuleCandidates[i], 0, nullptr, 0, nullptr, &res);
+        int rc = k_LoadStartModule(kModuleCandidates[i], 0, nullptr, 0, nullptr, &res);
         if (rc < 0) continue;
         mod = rc;
 
@@ -83,7 +85,7 @@ bool Player::tryLoadApi() {
         if (resolveOne(mod, "sceVideodecMapMemory", &p)) g_api.mapMemory = (vdec::FnMapMemory)p;
 
         if (!ok) {
-            sceKernelStopUnloadModule(mod, 0, nullptr, 0, nullptr, nullptr);
+            k_StopUnloadModule(mod, 0, nullptr, 0, nullptr, nullptr);
             g_api = vdec::Api{};
             continue;
         }
@@ -408,7 +410,7 @@ void unloadSysmodules(int *rcInternal, int *rcAv) {
     static const char *paths[] = {"/system/common/lib/libSceSysmodule.sprx", "libSceSysmodule.sprx", nullptr};
     for (int i = 0; paths[i]; i++) {
         int res = 0;
-        int mod = sceKernelLoadStartModule(paths[i], 0, nullptr, 0, nullptr, &res);
+        int mod = k_LoadStartModule(paths[i], 0, nullptr, 0, nullptr, &res);
         { char b[120]; snprintf(b, sizeof b, "hw-sysmodule %s mod=%d", paths[i], mod); T(b); }
         if (mod < 0) continue;
         void *p = nullptr;
@@ -450,7 +452,7 @@ void runProbe(const char *path) {
         for (const char *d : dirs) {
             char full[160]; snprintf(full, sizeof full, "%s%s", d, m.name);
             int res = 0;
-            int rc = sceKernelLoadStartModule(full, 0, nullptr, 0, nullptr, &res);
+            int rc = k_LoadStartModule(full, 0, nullptr, 0, nullptr, &res);
             L.line("modulo %-40s rc=0x%08x res=%d", full, (unsigned)rc, res);
             if (rc >= 0) { m.h = rc; break; }
         }

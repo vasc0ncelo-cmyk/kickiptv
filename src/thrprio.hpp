@@ -3,12 +3,13 @@
 #pragma once
 #if defined(__FreeBSD__)
 extern "C" {
-__attribute__((weak)) void *scePthreadSelf(void);
-__attribute__((weak)) int scePthreadSetprio(void *thread, int prio);
+// nomes proprios + "asm label": nao conflitam com <orbis/libkernel.h> (toolchain pacbrew/GMCA)
+__attribute__((weak)) void *kk_PthreadSelf(void) __asm__("scePthreadSelf");
+__attribute__((weak)) int kk_PthreadSetprio(void *thread, int prio) __asm__("scePthreadSetprio");
 }
 #endif
 inline void bgPrio() {
 #if defined(__FreeBSD__)
-    if (scePthreadSelf && scePthreadSetprio) scePthreadSetprio(scePthreadSelf(), 767);
+    if (kk_PthreadSelf && kk_PthreadSetprio) kk_PthreadSetprio(kk_PthreadSelf(), 767);
 #endif
 }
