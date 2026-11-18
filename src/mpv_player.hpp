@@ -1,18 +1,8 @@
 #pragma once
-// =============================================================================
-// mpv_player — mesmo caminho do GMCA / Switchfin no PS4
-// =============================================================================
-// O "player próprio" do GMCA NÃO é sceAvPlayer: é libmpv + FFmpeg (PacBrew).
-// Este módulo espelha o ciclo de vida do MPVCore do GMCA:
-//   mpv_create -> options -> mpv_initialize -> loadfile -> ...
-//   stop -> quit -> mpv_terminate_destroy  (saída limpa, sem CE do AvPlayer)
-//
-// Build: compile com -DUSE_LIBMPV e linke as libs PacBrew (ver MPV_PS4.md).
-// Sem USE_LIBMPV este header vira stub (sempre unavailable).
-// =============================================================================
-
+// Player estilo GMCA/Switchfin: libmpv + FFmpeg (PacBrew). Saida limpa via mpv_terminate_destroy.
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace mpv_player {
 
@@ -26,26 +16,20 @@ struct Status {
     std::string error;
 };
 
-// true se o binário foi linkado com libmpv
 bool available();
-
-// Cria o contexto mpv (uma vez). Idempotente.
 bool boot();
-
-// Abre URL http(s)/file e começa a tocar (direto, como loadfile do GMCA).
 bool play(const std::string &url);
-
 void pause(bool on);
-bool seekSec(double sec);           // absoluto
-bool seekRelative(double deltaSec); // +/- segundos
-
-void stop();                        // mpv "stop" (mantém contexto)
-void shutdown();                    // quit + mpv_terminate_destroy (saída limpa)
-
+bool seekSec(double sec);
+bool seekRelative(double deltaSec);
+void stop();
+void shutdown(); // quit + terminate_destroy (igual GMCA)
 Status status();
 bool isOpen();
-
-// Processa eventos do mpv (chamar no loop principal).
 void poll();
+
+// Software render -> buffer BGRA/RGB0 para blit no VideoOut do Kick
+// width/height: tamanho do framebuffer (ex.: 1920x1080). Devolve true se pintou.
+bool renderToBgra(uint8_t *dst, int width, int height, int strideBytes);
 
 } // namespace mpv_player
