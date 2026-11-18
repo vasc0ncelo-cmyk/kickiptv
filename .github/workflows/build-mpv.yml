@@ -73,6 +73,7 @@ jobs:
             echo "sem segredos KICK_CLIENT_ID/KICK_CLIENT_SECRET: a tela Lives agora fica indisponivel"
           fi
       - name: Compilar
+        shell: bash
         run: |
           set -o pipefail
           { cmake -B build -DCMAKE_BUILD_TYPE=Release && make -C build -j$(nproc) VERBOSE=1; } 2>&1 | tee build-log.txt
