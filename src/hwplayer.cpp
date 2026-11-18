@@ -4,7 +4,6 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
-#include <fstream>
 
 // Orbis / OpenOrbis
 extern "C" {
@@ -267,21 +266,24 @@ bool Player::openFile(const std::string &path, int maxW, int maxH) {
         return false;
     }
 
-    std::ifstream f(path, std::ios::binary);
+    // stdio em vez de std::ifstream: o libc++ da toolchain do GMCA (musl) nao traz <fstream> completo
+    FILE *f = fopen(path.c_str(), "rb");
     if (!f) {
         err_ = "nao abriu arquivo: " + path;
         return false;
     }
-    f.seekg(0, std::ios::end);
-    std::streamoff sz = f.tellg();
-    f.seekg(0, std::ios::beg);
+    fseek(f, 0, SEEK_END);
+    long long sz = (long long)ftell(f);
+    fseek(f, 0, SEEK_SET);
     if (sz <= 0 || sz > 512ll * 1024 * 1024) {
+        fclose(f);
         err_ = "arquivo vazio ou grande demais para o prototipo";
         return false;
     }
     file_.resize((size_t)sz);
-    f.read((char *)file_.data(), sz);
-    if (!f) {
+    size_t got = fread((char *)file_.data(), 1, (size_t)sz, f);
+    fclose(f);
+    if (got != (size_t)sz) {
         err_ = "falha ao ler arquivo";
         file_.clear();
         return false;
