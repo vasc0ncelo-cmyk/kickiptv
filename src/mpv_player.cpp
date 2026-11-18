@@ -103,9 +103,13 @@ bool boot() {
     mpv_set_option_string(g_mpv, "audio-channels", "stereo");
     mpv_set_option_string(g_mpv, "vo", "libmpv");
     mpv_set_option_string(g_mpv, "hwdec", "no");
-    mpv_set_option_string(g_mpv, "vd-lavc-threads", "2");
-    mpv_set_option_string(g_mpv, "vd-lavc-fast", "yes");              // decodificacao por software no Jaguar: abre mao de precisao por velocidade
-    mpv_set_option_string(g_mpv, "vd-lavc-skiploopfilter", "nonref");
+    // identico ao mpv_core.cpp do GMCA para PS4 (decodificacao por software, 6 threads)
+    mpv_set_option_string(g_mpv, "vd-lavc-skiploopfilter", "all");
+    mpv_set_option_string(g_mpv, "vd-lavc-fast", "yes");
+    mpv_set_option_string(g_mpv, "vd-lavc-dr", "yes");
+    mpv_set_option_string(g_mpv, "vd-lavc-threads", "6");
+    mpv_set_option_string(g_mpv, "sdl-buflen", "0.2");
+    mpv_set_option_string(g_mpv, "audio-buffer", "0.5");
     mpv_set_option_string(g_mpv, "framedrop", "vo");
     mpv_set_option_string(g_mpv, "sws-fast", "yes");
     mpv_set_option_string(g_mpv, "cache", "yes");
