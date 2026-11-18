@@ -31,6 +31,7 @@
 #include "hls.hpp"
 #include "aes128.hpp"
 #include "nativeplayer.hpp"
+#include "mpv_player.hpp"
 #include "streambuf.hpp"
 #include "netstream.hpp"
 #include "httpfile.hpp"
@@ -1688,6 +1689,7 @@ struct Player {
     bool paused = false;
     bool isVod = false;                    // true = arquivo (mp4/mkv/...), false = live/HLS
     bool useNative = false;                // true = sceVideodec (sem AvPlayer)
+    bool useMpv = false;                   // true = libmpv (PacBrew, igual GMCA)
     nativeplayer::Session native;
     // ---- seek por janela (ver progfile.hpp::want) e retomada da pausa ----
     mp4s::Demuxer seekDm;                  // indice do arquivo LOCAL: tempo -> endereco do quadro-chave
@@ -1860,6 +1862,29 @@ struct Player {
         }
         if (!g_reconnectNote.empty()) { log.push_back("Reconexao automatica #" + std::to_string(g_autoRestarts) + ": " + g_reconnectNote); g_reconnectNote.clear(); }
         this->title = title; this->url = url; hudUntil = nowSec() + 8;
+        kickSlug.clear(); nextKickUrl.clear(); kickUrlAt = nowSec();
+        if (!title.empty() && title[0] == '@') {
+            kickSlug = title.substr(1);
+            while (!kickSlug.empty() && (kickSlug.back()==' '||kickSlug.back()=='\n')) kickSlug.pop_back();
+        }
+
+        // --- libmpv (GMCA/Switchfin): se o build tem USE_LIBMPV, tenta primeiro ---
+#ifdef USE_LIBMPV
+        useMpv = false;
+        if (mpv_player::available()) {
+            log.push_back("tentando libmpv (PacBrew)...");
+            if (mpv_player::play(url)) {
+                useMpv = true;
+                active = true;
+                isVod = (url.find(".m3u8") == std::string::npos) && kickSlug.empty();
+                log.push_back("player: libmpv OK (mesmo stack do GMCA)");
+                return true;
+            }
+            log.push_back("libmpv falhou: " + mpv_player::status().error + " — caindo no AvPlayer");
+            try { mpv_player::stop(); } catch (...) {}
+        }
+#endif
+
         // titulo "@slug" = live Kick: guarda slug para renovar o m3u8 na reconexao
         kickSlug.clear(); nextKickUrl.clear(); kickUrlAt = nowSec();
         if (!title.empty() && title[0] == '@') {
@@ -2342,6 +2367,11 @@ struct Player {
     }
     // Desmonta TUDO em segundo plano: o botao O volta ao menu na hora (antes travava ate a rede responder).
     void stop() {
+        if (useMpv) {
+            try { mpv_player::stop(); } catch (...) {}
+            useMpv = false;
+            active = false;
+        }
         if (useNative) {
             try { native.close(); } catch (...) {}
             useNative = false;
@@ -3654,7 +3684,8 @@ int main() {
         try { g_feed.abort(); } catch (...) {}
         sceKernelUsleep(50000);
         std::string u = player.url, ti = player.title, slug = player.kickSlug;
-        try { player.stop(); } catch (...) {}
+        try { mpv_player::shutdown(); } catch (...) {}
+                try { player.stop(); } catch (...) {}
         Player::waitTeardown(0.6);
         try { g_feed.join(); } catch (...) {}
         try { g_feed.sb.reset(); } catch (...) {}
@@ -4057,6 +4088,16 @@ int main() {
             continue;
         }
 
+        if (mode == Mode::Play && player.useMpv) {
+            mpv_player::poll();
+            auto st = mpv_player::status();
+            if (st.failed) { player.failed = true; player.useMpv = false; }
+            if (st.eof && player.isVod && player.canNextEp()) {
+                // auto next episode handled elsewhere; mark end
+            }
+            player.lastPtsMs = (int64_t)(st.positionSec * 1000.0);
+            if (st.durationSec > 0) player.durationMs = (int64_t)(st.durationSec * 1000.0);
+        }
         if (mode == Mode::Play) {
             // O = sair (ou fecha menu/info primeiro)
             if (pressed & B_CIRCLE) {
