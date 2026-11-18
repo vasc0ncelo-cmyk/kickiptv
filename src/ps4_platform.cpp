@@ -1880,7 +1880,9 @@ struct Player {
         useMpv = false;
         if (!g_noMpv && mpv_player::available()) {
             log.push_back("tentando libmpv (PacBrew)...");
+            trace("mpv-tentando");
             if (mpv_player::play(url)) {
+                trace("mpv-play-ok");
                 useMpv = true;
                 mpvGot = false; mpvT0 = nowSec(); mpvLastOv = 0; mpvLastHud = false; mpvClean.clear(); mpvSeekAcc = 0; toastUntil = 0;
                 paused = false; muted = false; failed = false;
@@ -1890,6 +1892,7 @@ struct Player {
                 return true;
             }
             log.push_back("libmpv falhou: " + mpv_player::status().error + " — caindo no AvPlayer");
+            { std::string e = "mpv-erro: " + mpv_player::status().error; trace(e.c_str()); }
             try { mpv_player::stop(); } catch (...) {}
         }
 #endif
@@ -3606,6 +3609,11 @@ int main() {
     trace("build " __DATE__ " " __TIME__ " estavel-v4 otimizado=SIM");
 #else
     trace("build " __DATE__ " " __TIME__ " estavel-v4 otimizado=NAO");
+#endif
+#ifdef USE_LIBMPV
+    trace("libmpv=COMPILADO no build");
+#else
+    trace("libmpv=NAO compilado (build sem USE_LIBMPV)");
 #endif
     // Sonda dos decodificadores do sistema: crie o arquivo vazio /data/kickiptv_x_decprobe; ao abrir, o app grava /data/kickiptv_probe.txt (apague o flag depois).
     if (expFlag("kickiptv_x_decprobe")) { trace("decprobe-inicio"); hwplayer::traceHook = [](const char *st) { trace(st); }; hwplayer::runProbe("/data/kickiptv_probe.txt"); trace("decprobe-fim"); }
