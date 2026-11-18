@@ -1,5 +1,6 @@
 #include "mpv_player.hpp"
 #include <atomic>
+#include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <vector>
@@ -11,6 +12,7 @@ bool available() { return false; }
 bool boot() { return false; }
 bool play(const std::string &) { return false; }
 void pause(bool) {}
+void setMute(bool) {}
 bool seekSec(double) { return false; }
 bool seekRelative(double) { return false; }
 void stop() {}
@@ -38,6 +40,8 @@ std::atomic<bool> g_open{false};
 std::atomic<bool> g_paused{false};
 std::atomic<bool> g_eof{false};
 std::atomic<bool> g_failed{false};
+std::atomic<bool> g_buffering{false};
+std::atomic<int> g_bufPct{0};
 std::string g_err;
 double g_pos = 0, g_dur = 0;
 int g_needRedraw = 0;
@@ -100,6 +104,10 @@ bool boot() {
     mpv_set_option_string(g_mpv, "vo", "libmpv");
     mpv_set_option_string(g_mpv, "hwdec", "no");
     mpv_set_option_string(g_mpv, "vd-lavc-threads", "2");
+    mpv_set_option_string(g_mpv, "vd-lavc-fast", "yes");              // decodificacao por software no Jaguar: abre mao de precisao por velocidade
+    mpv_set_option_string(g_mpv, "vd-lavc-skiploopfilter", "nonref");
+    mpv_set_option_string(g_mpv, "framedrop", "vo");
+    mpv_set_option_string(g_mpv, "sws-fast", "yes");
     mpv_set_option_string(g_mpv, "cache", "yes");
     mpv_set_option_string(g_mpv, "demuxer-max-bytes", "64MiB");
     mpv_set_option_string(g_mpv, "demuxer-max-back-bytes", "32MiB");
@@ -116,6 +124,8 @@ bool boot() {
     mpv_observe_property(g_mpv, 2, "duration", MPV_FORMAT_DOUBLE);
     mpv_observe_property(g_mpv, 3, "pause", MPV_FORMAT_FLAG);
     mpv_observe_property(g_mpv, 4, "eof-reached", MPV_FORMAT_FLAG);
+    mpv_observe_property(g_mpv, 5, "paused-for-cache", MPV_FORMAT_FLAG);
+    mpv_observe_property(g_mpv, 6, "cache-buffering-state", MPV_FORMAT_INT64);
 
     if (!ensureRender()) {
         // segue sem video SW (audio/eventos ainda funcionam)
@@ -131,6 +141,8 @@ bool play(const std::string &url) {
     if (!g_mpv) return false;
     g_eof = false;
     g_failed = false;
+    g_buffering = false;
+    g_pos = 0; g_dur = 0;
     g_err.clear();
     ensureRender();
     const char *cmd[] = {"loadfile", url.c_str(), "replace", nullptr};
@@ -146,6 +158,13 @@ void pause(bool on) {
     int f = on ? 1 : 0;
     mpv_set_property(g_mpv, "pause", MPV_FORMAT_FLAG, &f);
     g_paused = on;
+}
+
+void setMute(bool on) {
+    std::lock_guard<std::mutex> lk(g_mx);
+    if (!g_mpv) return;
+    int f = on ? 1 : 0;
+    mpv_set_property(g_mpv, "mute", MPV_FORMAT_FLAG, &f);
 }
 
 bool seekSec(double sec) {
@@ -212,7 +231,10 @@ void poll() {
             if (prop->format == MPV_FORMAT_DOUBLE) {
                 if (!std::strcmp(prop->name, "time-pos")) g_pos = *(double *)prop->data;
                 if (!std::strcmp(prop->name, "duration")) g_dur = *(double *)prop->data;
+            } else if (prop->format == MPV_FORMAT_INT64) {
+                if (!std::strcmp(prop->name, "cache-buffering-state")) g_bufPct = (int)*(int64_t *)prop->data;
             } else if (prop->format == MPV_FORMAT_FLAG) {
+                if (!std::strcmp(prop->name, "paused-for-cache")) g_buffering = *(int *)prop->data != 0;
                 if (!std::strcmp(prop->name, "pause")) g_paused = *(int *)prop->data != 0;
                 if (!std::strcmp(prop->name, "eof-reached")) g_eof = *(int *)prop->data != 0;
             }
@@ -230,7 +252,7 @@ bool renderToBgra(uint8_t *dst, int width, int height, int strideBytes) {
     if (!ensureRender()) return false;
     // Atualiza o contexto (pode liberar frames)
     uint64_t flags = mpv_render_context_update(g_rr);
-    (void)flags;
+    if (!(flags & MPV_RENDER_UPDATE_FRAME)) return false;      // sem quadro novo: nao redesenha (poupa CPU); o chamador mantem a imagem anterior
 
     int size[2] = {width, height};
     mpv_render_param params[] = {
@@ -255,6 +277,8 @@ Status status() {
     s.paused = g_paused;
     s.eof = g_eof;
     s.failed = g_failed;
+    s.buffering = g_buffering;
+    s.bufferPct = g_bufPct;
     s.positionSec = g_pos;
     s.durationSec = g_dur;
     s.error = g_err;
