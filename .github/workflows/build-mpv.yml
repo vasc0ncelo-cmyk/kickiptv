@@ -1,0 +1,94 @@
+name: Build PKG (libmpv, toolchain do GMCA)
+# Roda so quando voce mandar: aba Actions > "Build PKG (libmpv, toolchain do GMCA)" > Run workflow.
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: xfangfang/pacbrew:250221
+    env:
+      DEPS_URL: https://github.com/thcolin/gamepad-media-center-aggregator/releases/download/ci-deps
+      OPENORBIS: /opt/pacbrew/ps4/openorbis
+    steps:
+      - uses: actions/checkout@v4
+      - name: Preparar git
+        run: git config --global --add safe.directory '*'
+      - name: Bibliotecas (mesmas do GMCA)
+        run: |
+          for pkg in musl-1.5-3 mbedtls-2.28.10-2 sdl2-2.0.18-19 libcurl-7.80.0-5 dav1d-1.5.4-1 ffmpeg-7.1.5-3 libmpv-0.36.0-2; do
+            pacman --noconfirm -U $DEPS_URL/ps4-openorbis-${pkg}-any.pkg.tar.gz
+          done
+      - name: Informacoes da toolchain (vao para o log)
+        run: |
+          {
+            echo "== OPENORBIS=$OPENORBIS"; ls $OPENORBIS $OPENORBIS/lib | head -150
+            echo "== bin"; ls $OPENORBIS/bin $OPENORBIS/bin/linux 2>/dev/null | head -50
+            echo "== ps4.cmake"; cat $OPENORBIS/cmake/ps4.cmake 2>/dev/null
+            echo "== stubs Sce"; ls $OPENORBIS/lib | grep -i "sce" | head -80
+          } > toolchain-info.txt 2>&1 || true
+          head -c 6000 toolchain-info.txt
+      - name: Arquivos do pacote (sce_module / sce_sys)
+        run: |
+          mkdir -p ps4pkg/sce_module ps4pkg/sce_sys
+          git clone --depth 1 https://github.com/dragonflylee/borealis /tmp/bor || true
+          git -C /tmp/bor fetch --depth 1 origin 7f03684805befffb1be18a1b2bdb81fa66945af2 && git -C /tmp/bor checkout -q FETCH_HEAD || true
+          cp /tmp/bor/ps4/sce_module/*.prx ps4pkg/sce_module/
+          cp /tmp/bor/ps4/sce_sys/icon0.png ps4pkg/sce_sys/icon0.png
+          if [ -d sce_sys ]; then cp -r sce_sys/. ps4pkg/sce_sys/ || true; fi
+          pip install pillow >/dev/null 2>&1 && python3 scripts/make_icon.py && cp sce_sys/icon0.png sce_sys/pic1.png ps4pkg/sce_sys/ || echo "icone: mantido o padrao"
+          rm -f ps4pkg/sce_sys/param.sfo
+          ls -la ps4pkg/sce_module ps4pkg/sce_sys
+      - name: Lista padrao do app (segredo LIST_URL, opcional)
+        env:
+          LIST_URL: ${{ secrets.LIST_URL }}
+        run: |
+          if [ -n "$LIST_URL" ]; then
+            printf 'static const char *kSecretListUrl = R"KICKURL(%s)KICKURL";\n' "$LIST_URL" > src/defaultlist_secret.hpp
+            echo "lista padrao: vem do segredo LIST_URL (nao fica no codigo do repositorio)"
+          else
+            echo "sem segredo LIST_URL: vale o endereco de src/defaultlist.hpp"
+          fi
+      - name: Chave do TMDB para as logos (segredo TMDB_KEY, opcional)
+        env:
+          TMDB_KEY: ${{ secrets.TMDB_KEY }}
+        run: |
+          if [ -n "$TMDB_KEY" ]; then
+            printf 'static const char *kSecretTmdbKey = R"TMDBK(%s)TMDBK";\n' "$TMDB_KEY" > src/tmdbkey_secret.hpp
+            echo "logos: chave TMDB vem do segredo TMDB_KEY"
+          else
+            echo "sem segredo TMDB_KEY: o carrossel mostra o titulo em texto"
+          fi
+      - name: Chaves da API oficial da Kick (segredos KICK_CLIENT_ID e KICK_CLIENT_SECRET, opcionais)
+        env:
+          KICK_CLIENT_ID: ${{ secrets.KICK_CLIENT_ID }}
+          KICK_CLIENT_SECRET: ${{ secrets.KICK_CLIENT_SECRET }}
+        run: |
+          if [ -n "$KICK_CLIENT_ID" ] && [ -n "$KICK_CLIENT_SECRET" ]; then
+            printf 'static const char *kSecretKickId = R"KICKI(%s)KICKI";\nstatic const char *kSecretKickSecret = R"KICKS(%s)KICKS";\n' "$KICK_CLIENT_ID" "$KICK_CLIENT_SECRET" > src/kickkey_secret.hpp
+            echo "lives da Kick: chaves vem dos segredos"
+          else
+            echo "sem segredos KICK_CLIENT_ID/KICK_CLIENT_SECRET: a tela Lives agora fica indisponivel"
+          fi
+      - name: Compilar
+        run: |
+          set -o pipefail
+          { cmake -B build -DCMAKE_BUILD_TYPE=Release && make -C build -j$(nproc) VERBOSE=1; } 2>&1 | tee build-log.txt
+      - name: Conferir o PKG
+        if: success()
+        run: |
+          ls -l build/*.pkg
+          mv build/*.pkg build/Kick-IPTV-mpv.pkg
+      - name: Publicar numa Release (PKG e log)
+        if: always()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: mpv-${{ github.run_number }}
+          name: Kick IPTV mpv - build ${{ github.run_number }}
+          files: |
+            build/Kick-IPTV-mpv.pkg
+            build-log.txt
+            toolchain-info.txt
+          make_latest: false
