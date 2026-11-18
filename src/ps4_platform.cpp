@@ -1668,6 +1668,8 @@ static void releasePfAsync() {                                                  
 
 static double nowSec() { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec + ts.tv_nsec / 1e9; }
 
+static bool g_noMpv = false;        // libmpv falhou nesta sessao: usa o player antigo (AvPlayer)
+
 struct Player {
     KAvHandle h = 0;
     bool active = false;
@@ -1690,6 +1692,11 @@ struct Player {
     bool isVod = false;                    // true = arquivo (mp4/mkv/...), false = live/HLS
     bool useNative = false;                // true = sceVideodec (sem AvPlayer)
     bool useMpv = false;                   // true = libmpv (PacBrew, igual GMCA)
+    bool mpvGot = false, mpvLastHud = false;  // ja chegou 1 quadro do mpv / estado do OSD no ultimo desenho
+    double mpvT0 = 0, mpvLastOv = 0;
+    std::vector<uint32_t> mpvClean;        // copia do quadro puro (sem OSD) para redesenhar o OSD com o video pausado
+    int mpvSeekAcc = 0;                    // segundos acumulados dos saltos L1/R1 (para o aviso central)
+    std::string toastText; double toastUntil = 0;
     nativeplayer::Session native;
     // ---- seek por janela (ver progfile.hpp::want) e retomada da pausa ----
     mp4s::Demuxer seekDm;                  // indice do arquivo LOCAL: tempo -> endereco do quadro-chave
@@ -1871,10 +1878,12 @@ struct Player {
         // --- libmpv (GMCA/Switchfin): se o build tem USE_LIBMPV, tenta primeiro ---
 #ifdef USE_LIBMPV
         useMpv = false;
-        if (mpv_player::available()) {
+        if (!g_noMpv && mpv_player::available()) {
             log.push_back("tentando libmpv (PacBrew)...");
             if (mpv_player::play(url)) {
                 useMpv = true;
+                mpvGot = false; mpvT0 = nowSec(); mpvLastOv = 0; mpvLastHud = false; mpvClean.clear(); mpvSeekAcc = 0; toastUntil = 0;
+                paused = false; muted = false; failed = false;
                 active = true;
                 isVod = (url.find(".m3u8") == std::string::npos) && kickSlug.empty();
                 log.push_back("player: libmpv OK (mesmo stack do GMCA)");
@@ -3159,103 +3168,146 @@ struct Player {
         uiText(r, trackX + trackW - tw, trackY - 26, t1, 0xFFAAAAAAu, 18);
     }
 
+    // ---- icones do OSD (desenhados com retangulos: a fonte nao tem esses glifos) ----
+    static void osdCircle(FbRenderer &r, int cx, int cy, int d, unsigned argb) { r.roundRect(cx - d / 2, cy - d / 2, d, d, d / 2, argb); }
+    static void osdLine(FbRenderer &r, int x0, int y0, int x1, int y1, int th, unsigned c) {       // traco diagonal/reto (quadradinhos ao longo da reta)
+        int n = std::max(std::abs(x1 - x0), std::abs(y1 - y0)); if (n < 1) n = 1;
+        for (int i = 0; i <= n; i++) r.fillRect(x0 + (x1 - x0) * i / n - th / 2, y0 + (y1 - y0) * i / n - th / 2, th, th, c);
+    }
+    static void osdIconClose(FbRenderer &r, int cx, int cy, unsigned c) { osdLine(r, cx - 10, cy - 10, cx + 10, cy + 10, 4, c); osdLine(r, cx - 10, cy + 10, cx + 10, cy - 10, 4, c); }
+    static void osdIconPlay(FbRenderer &r, int cx, int cy, int s, unsigned c) {                   // triangulo apontando p/ direita
+        for (int i = 0; i < s; i++) { int hh = (int)((float)(s - i) / s * s * 0.5f + 0.5f); r.fillRect(cx - s / 3 + i, cy - hh, 1, hh * 2, c); }
+    }
+    static void osdIconPause(FbRenderer &r, int cx, int cy, int s, unsigned c) {
+        r.roundRect(cx - s / 2 + s / 12, cy - s / 2, s / 3, s, 3, c); r.roundRect(cx + s / 2 - s / 12 - s / 3, cy - s / 2, s / 3, s, 3, c);
+    }
+    static void osdIconSliders(FbRenderer &r, int cx, int cy, unsigned c) {                       // engrenagem simplificada: 3 linhas com botoes
+        const int ys[3] = {-10, 0, 10}, ks[3] = {-6, 6, -2};
+        for (int i = 0; i < 3; i++) { r.fillRect(cx - 14, cy + ys[i] - 1, 28, 3, c); osdCircle(r, cx + ks[i], cy + ys[i], 10, c); }
+    }
+    static void osdIconVolume(FbRenderer &r, int cx, int cy, bool mute, unsigned c) {
+        r.fillRect(cx - 14, cy - 5, 7, 10, c);
+        for (int i = 0; i < 10; i++) r.fillRect(cx - 7 + i, cy - 5 - i, 1, 10 + 2 * i, c);
+        if (mute) osdLine(r, cx + 6, cy - 8, cx + 18, cy + 8, 3, 0xFFFF5555u);
+        else { r.roundRect(cx + 7, cy - 6, 3, 12, 1, c); r.roundRect(cx + 13, cy - 11, 3, 22, 1, c); }
+    }
+    void osdPill(FbRenderer &r, int rx, int cy, const std::string &t, unsigned col) {            // rotulo em "pilula" alinhado a direita em rx; devolve nada
+        int w = r.textWidth(t, 20) + 34;
+        r.roundRect(rx - w, cy - 22, w, 44, 22, 0xA0303030u);
+        uiText(r, rx - w + 17, cy - 12, t, col, 20);
+    }
+    int osdPillW(FbRenderer &r, const std::string &t) { return r.textWidth(t, 20) + 34; }
+
     void overlay(FbRenderer &r) {
         using namespace theme;
         if (nowSec() > hudUntil && !feedProblem() && !paused && !vodDlFailed() && !showOpts && !showInfo) return;
         const int W = r.W, H = r.H;
+        const unsigned ACC = 0xFF53FC18u, WHITE = 0xFFFFFFFFu, BTN = 0xA0303030u, ACC_FOCUS = 0x7353FC18u;
 
-        // ---- overlay estilo YouTube ----
-        for (int y = 0; y < 120; y++) {
-            unsigned a = (unsigned)((120 - y) * 180 / 120);
-            r.fillRect(0, y, W, 1, (a << 24));
-        }
-        for (int y = 0; y < 220; y++) {
-            unsigned a = (unsigned)((y) * 210 / 220);
-            r.fillRect(0, H - 220 + y, W, 1, (a << 24));
-        }
+        // ---- degradês (topo e base), como o OSD do GMCA: preto ~83% -> transparente ----
+        for (int y = 0; y < 150; y++) r.fillRect(0, y, W, 1, ((unsigned)((150 - y) * 213 / 150) << 24));
+        for (int y = 0; y < 240; y++) r.fillRect(0, H - 240 + y, W, 1, ((unsigned)(y * 213 / 240) << 24));
 
-        // ---- TOPO: titulo ----
-        uiHeavy(r, 48, 28, uiFit(r, title, 28, W - 120), 0xFFFFFFFFu, 28);
+        // ---- TOPO: botao fechar + titulo + opcoes ----
         {
-            std::string sub = isVod ? (hasEpisodes() ? "Serie" : "Filme") : "Ao vivo · Kick IPTV";
-            uiText(r, 48, 64, sub, 0xFFB0B0B0u, 18);
+            const int cy = 58;
+            osdCircle(r, 78, cy, 60, BTN);
+            osdIconClose(r, 78, cy, WHITE);
+            uiHeavy(r, 128, 30, uiFit(r, title, 30, W - 128 - 160), WHITE, 30);
+            std::string sub = isVod ? (hasEpisodes() ? "Série" : "Filme") : "Ao vivo · Kick IPTV";
+            uiText(r, 128, 70, sub, 0xFFB8B8B8u, 18);
+            if (!useMpv) {
+                if (showOpts) osdCircle(r, W - 78, cy, 76, ACC_FOCUS);
+                osdCircle(r, W - 78, cy, 60, BTN);
+                osdIconSliders(r, W - 78, cy, WHITE);
+            }
         }
 
-        // ---- CENTRO: pause grande ----
-        if (paused) {
-            r.roundRect(W / 2 - 50, H / 2 - 50, 100, 100, 50, 0xCC000000u);
-            r.roundRect(W / 2 - 18, H / 2 - 26, 12, 52, 3, 0xFFFFFFFFu);
-            r.roundRect(W / 2 + 6, H / 2 - 26, 12, 52, 3, 0xFFFFFFFFu);
+        // ---- CENTRO: aviso de busca (+/- segundos), no estilo da caixinha do GMCA ----
+        const bool seekToast = isVod && scrubMode && trigScrub;
+        if (seekToast) {
+            int64_t dl = scrubMs - scrubFromMs;
+            char dtx[32]; fmtTime((uint64_t)(dl < 0 ? -dl : dl), dtx, sizeof dtx);
+            std::string t = std::string(dl < 0 ? "-" : "+") + dtx;
+            int tw = r.textWidth(t, 34) + 70;
+            r.roundRect(W / 2 - tw / 2, H / 2 - 50, tw, 100, 16, BTN);
+            uiCenterHeavy(r, W / 2, H / 2 - 4, t, WHITE, 34);
+            uiCenter(r, W / 2, H / 2 + 30, "solte para ir", 0xFFC8C8C8u, 17);
         }
 
-        // ---- BARRA DE PROGRESSO (vermelho YouTube) ----
-        const unsigned YT_RED = 0xFFFF0000u;
-        const unsigned YT_GRAY = 0xFF555555u;
-        const unsigned YT_WHITE = 0xFFFFFFFFu;
-        int trackX = 48, trackW = W - 96, trackY = H - 110;
-        int trackH = scrubMode ? 8 : 5;
+        if (nowSec() < toastUntil && !toastText.empty()) {                 // aviso central generico (salto de tempo, mudo)
+            int tw = r.textWidth(toastText, 34) + 70;
+            r.roundRect(W / 2 - tw / 2, H / 2 - 40, tw, 80, 16, BTN);
+            uiCenterHeavy(r, W / 2, H / 2 - 2, toastText, WHITE, 34);
+        }
+
+        // ---- BASE: botao play/pause + barra + tempo + icones ----
+        const int cyBar = H - 118;
+        const int btnCx = 86;
+        osdCircle(r, btnCx, cyBar, 76, BTN);
+        if (paused) osdIconPlay(r, btnCx + 2, cyBar, 34, WHITE); else osdIconPause(r, btnCx, cyBar, 30, WHITE);
+
+        const std::string qn = kQualityName[g_quality.load() % kQualityCount];
+        const std::string an = aspectName(aspectMode);
+        const int rightEdge = W - 48;
+        const int wQ = useMpv ? 0 : osdPillW(r, qn), wA = useMpv ? 0 : osdPillW(r, an);
+        const int volCx = useMpv ? rightEdge - 28 : rightEdge - wQ - 14 - wA - 14 - 28;
+        const int trackX = 150, trackW = std::max(200, volCx - 60 - trackX);
+        const int trackH = 7, trackY = cyBar - 22;                // linha de 7px como a do GMCA
         if (isVod) {
-            uint64_t pos = displayPosMs();
-            uint64_t dur = displayDurMs();
+            uint64_t pos = displayPosMs(), dur = displayDurMs();
             if (dur < 1) dur = 1;
             if (pos > dur) pos = dur;
-            double frac = (double)pos / (double)dur;
-            r.roundRect(trackX, trackY, trackW, trackH, 3, YT_GRAY);
-            {   // quanto do filme ja foi baixado a frente (cinza claro), como no YouTube
+            const double frac = (double)pos / (double)dur;
+            r.roundRect(trackX, trackY, trackW, trackH, 3, 0x66FFFFFFu);                            // vazio
+            {   // quanto ja foi baixado a frente
                 auto pfb = getPf();
                 double bf = frac;
                 if (pfb && pfb->state() == 3) bf = 1.0;
                 else if (bufKnown) bf = (double)(pos + bufAheadMs) / (double)dur;
                 if (bf > 1.0) bf = 1.0;
                 int bw = (int)(trackW * bf);
-                if (bw > 2 && bf > frac) r.roundRect(trackX, trackY, bw, trackH, 3, 0xFF9A9A9Au);
+                if (bw > 2 && bf > frac) r.roundRect(trackX, trackY, bw, trackH, 3, 0x99FFFFFFu);
             }
             int filled = (int)(trackW * frac);
             if (filled < 2 && pos > 0) filled = 2;
-            r.roundRect(trackX, trackY, filled, trackH, 3, YT_RED);
-            // knob
-            int kx = trackX + filled - 8;
-            if (kx < trackX) kx = trackX;
-            r.roundRect(kx, trackY - 5, 16, trackH + 10, 8, YT_WHITE);
+            r.roundRect(trackX, trackY, filled, trackH, 3, ACC);
+            const int kx = trackX + filled, ky = trackY + trackH / 2;
+            if (scrubMode) osdCircle(r, kx, ky, 42, ACC_FOCUS);                                     // halo de foco (acento translucido)
+            osdCircle(r, kx, ky, 22, WHITE);
             char t0[32], t1[32];
-            fmtTime(pos, t0, sizeof t0);
-            fmtTime(dur, t1, sizeof t1);
-            // Fundo opaco atras dos textos que mudam: pausado, o HUD e redesenhado sempre sobre o mesmo quadro e o texto novo borraria o antigo.
-            r.roundRect(trackX - 6, trackY + trackH + 8, r.textWidth(t0, 18) + 12, 26, 6, 0xFF000000u);
-            uiText(r, trackX, trackY + trackH + 12, t0, YT_WHITE, 18);
-            uiText(r, trackX + trackW - r.textWidth(t1, 18), trackY + trackH + 12, t1, 0xFFCCCCCCu, 18);
+            fmtTime(pos, t0, sizeof t0); fmtTime(dur, t1, sizeof t1);
+            std::string tt = std::string(t0) + " / " + t1;
+            uiText(r, trackX + trackW / 2 - r.textWidth(tt, 22) / 2, trackY + 26, tt, WHITE, 22);
             {
-                std::string st; unsigned col = YT_WHITE;
-                if (scrubMode && trigScrub) {                                  // segurando L2/R2: mostra quanto ja andou
-                    int64_t dl = scrubMs - scrubFromMs;
-                    char dtx[32]; fmtTime((uint64_t)(dl < 0 ? -dl : dl), dtx, sizeof dtx);
-                    st = std::string(dl < 0 ? "<< -" : ">> +") + dtx + "   solte para ir";
-                } else if (scrubMode) st = "SEEK  L2/R2  L1/R1 1min  X ok";
+                std::string st; unsigned col = WHITE;
+                if (scrubMode && !trigScrub) st = "SEEK  L2/R2  L1/R1 1min  X ok";
                 else if (bufPaused) { st = "Carregando... " + std::to_string(bufPct) + "%  (internet mais lenta que o filme)"; col = 0xFFFFCC33u; }
-                else if (pendJumpMs >= 0) { st = "Baixando ate o ponto... " + std::to_string(jumpPct) + "%"; col = 0xFFFFCC33u; }
+                else if (pendJumpMs >= 0) { st = "Baixando até o ponto... " + std::to_string(jumpPct) + "%"; col = 0xFFFFCC33u; }
                 else if (seekSkip || (jumpTargetMs >= 0 && nowSec() < jumpSettleUntil)) { st = "Indo para o ponto..."; col = 0xFFFFCC33u; }
                 if (!st.empty()) {
-                    int tw = r.textWidth(st, 16), cx0 = trackX + trackW / 2;
-                    r.roundRect(cx0 - tw / 2 - 10, trackY - 30, tw + 20, 26, 6, 0xFF000000u);
-                    uiText(r, cx0 - tw / 2, trackY - 26, st, col, 16);
+                    int tw = r.textWidth(st, 18), cx0 = trackX + trackW / 2;
+                    r.roundRect(cx0 - tw / 2 - 16, trackY - 58, tw + 32, 36, 18, BTN);
+                    uiText(r, cx0 - tw / 2, trackY - 51, st, col, 18);
                 }
             }
         } else {
-            r.roundRect(trackX, trackY, trackW, trackH, 3, YT_GRAY);
-            r.roundRect(trackX, trackY, trackW * 9 / 10, trackH, 3, YT_RED);
-            uiText(r, trackX, trackY + trackH + 12, "AO VIVO", YT_RED, 16);
+            r.roundRect(trackX, trackY, trackW, trackH, 3, ACC);
+            r.roundRect(trackX + trackW / 2 - 56, trackY + 20, 112, 34, 17, BTN);
+            osdCircle(r, trackX + trackW / 2 - 34, trackY + 37, 12, 0xFFFF3333u);
+            uiText(r, trackX + trackW / 2 - 20, trackY + 27, "AO VIVO", WHITE, 18, true);
         }
 
-        // ---- rodape: som + dica dos botoes (filme/serie: so a barra de tempo; ao vivo: L1/R1 trocam de canal) ----
-        {
-            const char *vs = muted ? "Mudo" : "Som";
-            uiText(r, W - 160, H - 58 - 8, vs, muted ? 0xFFFF6666u : 0xFFAAAAAAu, 18);
-        }
+        // icones da direita: som, proporcao, qualidade
+        osdIconVolume(r, volCx, cyBar, muted, muted ? 0xFFFF7777u : WHITE);
+        if (!useMpv) { osdPill(r, rightEdge - wQ - 14, cyBar, an, 0xFFE0E0E0u); osdPill(r, rightEdge, cyBar, qn, ACC); }
 
-        uiText(r, 48, H - 22,
-               isVod ? "□ mudo   △ Opcoes   O sair"
-                     : (hasEpisodes() ? "L1/R1 canal anterior/proximo   □ mudo   △ Opcoes   O sair" : "□ mudo   △ Opcoes   O sair"),
-               0xFF888888u, 15);
+        // dica dos botoes (pequena, embaixo)
+        uiText(r, 48, H - 40,
+               useMpv ? std::string(isVod ? "X = pausar     L1/R1 = -10/+10 s     " : "X = pausar     ") + "Quadrado = mudo     Triângulo = mostrar/ocultar     O = sair" :
+               isVod ? "Quadrado = mudo     Triângulo = opções     O = sair"
+                     : (hasEpisodes() ? "L1/R1 = canal anterior/próximo     Quadrado = mudo     Triângulo = opções     O = sair" : "Quadrado = mudo     Triângulo = opções     O = sair"),
+               0xFF9A9A9Au, 16);
 
         // ---- MENU OPCOES (direita) ----
         if (showOpts) {
@@ -3315,13 +3367,13 @@ struct Player {
 
         if (feedProblem()) {
             std::string m = uiFit(r, g_feed.getStatus(), 20, W - 160);
-            r.roundRect(32, 100, r.textWidth(m, 20) + 48, 44, 22, 0xD0801520);
-            uiText(r, 56, 112, m, TEXT, 20);
+            r.roundRect(32, 140, r.textWidth(m, 20) + 48, 44, 22, 0xD0801520);
+            uiText(r, 56, 152, m, TEXT, 20);
         }
         if (auto pfd = getPf(); pfd && pfd->state() == 2) {
             std::string m = uiFit(r, "Download interrompido: " + pfd->error(), 20, W - 160);
-            r.roundRect(32, 100, r.textWidth(m, 20) + 48, 44, 22, 0xD0801520);
-            uiText(r, 56, 112, m, TEXT, 20);
+            r.roundRect(32, 140, r.textWidth(m, 20) + 48, 44, 22, 0xD0801520);
+            uiText(r, 56, 152, m, TEXT, 20);
         }
     }
 
@@ -4089,14 +4141,97 @@ int main() {
         }
 
         if (mode == Mode::Play && player.useMpv) {
+            // ---- libmpv (igual GMCA): o mpv decodifica e entrega o quadro; aqui so desenhamos o OSD por cima e fazemos o flip ----
             mpv_player::poll();
-            auto st = mpv_player::status();
-            if (st.failed) { player.failed = true; player.useMpv = false; }
-            if (st.eof && player.isVod && player.canNextEp()) {
-                // auto next episode handled elsewhere; mark end
-            }
+            const auto st = mpv_player::status();
+            const double tn = nowSec();
             player.lastPtsMs = (int64_t)(st.positionSec * 1000.0);
             if (st.durationSec > 0) player.durationMs = (int64_t)(st.durationSec * 1000.0);
+            player.paused = st.paused;
+            player.bufPaused = st.buffering && player.mpvGot;
+            player.bufPct = st.bufferPct;
+            // volta ao menu (ou enfileira outra URL, como os botoes L1/R1 do ao vivo fazem)
+            auto requeue = [&](const std::string &u, const std::string &t, int ep) {
+                pf.pendingPlayUrl = u; pf.pendingPlayTitle = t; pf.pendingEpIndex = ep;
+                pf.pendingEpUrls = player.epUrls; pf.pendingEpTitles = player.epTitles;
+                player.quietWait = true;
+                player.stop(); mode = Mode::Menu; dirty = true;
+            };
+            if (pressed & B_CIRCLE) {
+                player.stop(); player.quietWait = false;
+                player.epUrls.clear(); player.epTitles.clear(); player.epIndex = -1;
+                mode = Mode::Menu; dirty = true; sceKernelUsleep(16000); continue;
+            }
+            if ((st.failed && !player.mpvGot) || (!player.mpvGot && tn - player.mpvT0 > 45.0)) {
+                // o mpv nao conseguiu abrir: usa o player antigo nesta sessao (reabre a mesma URL)
+                trace("mpv-falhou-fallback");
+                g_noMpv = true;
+                const std::string u = player.url, t = player.title; const int ep = player.epIndex;
+                requeue(u, t, ep); sceKernelUsleep(16000); continue;
+            }
+            if (st.failed || (st.eof && !st.paused)) {
+                if (st.eof && player.canNextEp()) {
+                    player.epIndex++;
+                    requeue(player.epUrls[player.epIndex], player.epTitles[player.epIndex], player.epIndex);
+                } else {
+                    if (st.failed) app.say("Falha na reprodução: " + st.error);
+                    player.stop(); player.quietWait = false;
+                    player.epUrls.clear(); player.epTitles.clear(); player.epIndex = -1;
+                    mode = Mode::Menu; dirty = true;
+                }
+                sceKernelUsleep(16000); continue;
+            }
+            // ---- controles (como no GMCA): X pausa, L1/R1 saltam, quadrado muda o som, triangulo mostra/oculta o OSD ----
+            if (pressed) player.hudUntil = tn + 12;
+            if (player.mpvGot) {
+                if (pressed & B_CROSS) { mpv_player::pause(!st.paused); player.paused = !st.paused; player.hudUntil = tn + 12; }
+                if (player.isVod && (pressed & (B_L1 | B_R1 | B_LEFT | B_RIGHT))) {
+                    const int d = (pressed & (B_L1 | B_LEFT)) ? -10 : 10;
+                    if (tn - player.toastUntil > 0.6) player.mpvSeekAcc = 0;       // aviso anterior ja sumiu: recomeca a soma
+                    player.mpvSeekAcc += d;
+                    mpv_player::seekRelative((double)d);
+                    char b[32]; snprintf(b, sizeof b, "%+d s", player.mpvSeekAcc);
+                    player.toastText = b; player.toastUntil = tn + 1.2;
+                }
+                if (pressed & B_SQUARE) {
+                    player.muted = !player.muted; mpv_player::setMute(player.muted);
+                    player.toastText = player.muted ? "Mudo" : "Som ligado"; player.toastUntil = tn + 1.2;
+                }
+                if (pressed & B_TRIANGLE) player.hudUntil = (tn <= player.hudUntil && !player.paused) ? 0 : tn + 12;
+            }
+            if (!player.mpvGot) {                                    // ate o 1o quadro: tela de espera com o spinner
+                static double lastW = 0;
+                FbRenderer r(shadow, W, H);
+                if (mpv_player::renderToBgra((uint8_t *)shadow, W, H, W * 4)) {
+                    player.mpvGot = true; player.hudUntil = tn + 8; gotFrame = true;
+                    trace("mpv-1o-quadro");
+                } else if (tn - lastW > 0.12) { lastW = tn; presentWait(); }
+                else sceKernelUsleep(4000);
+                if (!player.mpvGot) continue;
+                std::vector<uint32_t> &C = player.mpvClean;
+                if (C.size() != (size_t)W * H) C.resize((size_t)W * H);
+                memcpy(C.data(), shadow, (size_t)W * H * 4);
+                if (player.hudActive() || tn < player.toastUntil) player.overlay(r);
+                flip(); player.mpvLastOv = tn; player.mpvLastHud = true;
+                continue;
+            }
+            {
+                FbRenderer r(shadow, W, H);
+                const bool hudNow = player.hudActive() || tn < player.toastUntil;
+                std::vector<uint32_t> &C = player.mpvClean;
+                if (C.size() != (size_t)W * H) C.resize((size_t)W * H);
+                if (mpv_player::renderToBgra((uint8_t *)shadow, W, H, W * 4)) {          // quadro novo
+                    memcpy(C.data(), shadow, (size_t)W * H * 4);                            // guarda o quadro puro (para redesenhar o OSD pausado)
+                    if (hudNow) player.overlay(r);
+                    flip(); player.mpvLastOv = tn; player.mpvLastHud = hudNow;
+                } else if (pressed || hudNow != player.mpvLastHud || (hudNow && tn - player.mpvLastOv > 0.5)) {
+                    memcpy(shadow, C.data(), (size_t)W * H * 4);                            // sem quadro novo: OSD sobre o ultimo quadro
+                    if (hudNow) player.overlay(r);
+                    flip(); player.mpvLastOv = tn; player.mpvLastHud = hudNow;
+                }
+            }
+            sceKernelUsleep(4000);
+            continue;
         }
         if (mode == Mode::Play) {
             // O = sair (ou fecha menu/info primeiro)
