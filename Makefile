@@ -12,8 +12,15 @@ TITLE := Kick IPTV
 SRCS := $(wildcard src/*.cpp)
 OBJS := $(patsubst src/%.cpp,build/%.o,$(SRCS))
 
-# -O2: ANTES nao havia otimizacao nenhuma (-O0), por isso o app todo (menu, blit do video) era lento. Se algo quebrar, troque por -O1 ou -O0.
-CXXFLAGS := --target=x86_64-pc-freebsd12-elf -std=c++17 -O2 -fno-strict-aliasing -fno-omit-frame-pointer -D_GNU_SOURCE -fPIC -funwind-tables -c -isysroot $(OO) \
+# Com PacBrew: make USE_LIBMPV=1 PACBREW=/opt/pacbrew/ps4/openorbis
+USE_LIBMPV ?= 0
+PACBREW  ?=
+ifeq ($(USE_LIBMPV),1)
+CXXFLAGS += -DUSE_LIBMPV -I$(PACBREW)/usr/include
+LIBS     += -L$(PACBREW)/usr/lib -lmpv -lavformat -lavcodec -lavutil -lswscale -lswresample -lSDL2
+endif
+
+CXXFLAGS := --target=x86_64-pc-freebsd12-elf -std=c++17 -D_GNU_SOURCE -fPIC -funwind-tables -c -isysroot $(OO) \
             -isystem $(OO)/include -isystem $(OO)/include/c++/v1
 LDFLAGS  := -m elf_x86_64 -pie --script $(OO)/link.x --eh-frame-hdr -L$(OO)/lib
 LIBS     := -lc -lc++ -lkernel -lSceVideoOut -lSceUserService -lSceSystemService -lScePad -lSceSysmodule -lSceNet -lSceSsl -lSceHttp -lSceAvPlayer -lSceAudioOut
