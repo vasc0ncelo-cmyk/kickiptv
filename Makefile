@@ -62,8 +62,8 @@ build/$(CONTENT_ID).pkg: build/eboot.bin build/sce_sys/param.sfo
 > cp build/eboot.bin build/pkg/eboot.bin
 > cp build/sce_sys/param.sfo build/pkg/sce_sys/
 > if [ -f sce_sys/icon0.png ]; then cp sce_sys/icon0.png build/pkg/sce_sys/; fi
-> $(BIN)/create-gp4 -out build/pkg.gp4 -content-id $(CONTENT_ID) -title "$(TITLE)" -path build/pkg -files eboot.bin sce_sys/param.sfo $$(test -f build/pkg/sce_sys/icon0.png && echo sce_sys/icon0.png)
-> $(PKGTOOL) pkg_build build/pkg.gp4 build/
+> cd build/pkg && $(BIN)/create-gp4 -out pkg.gp4 -content-id $(CONTENT_ID) -files "eboot.bin sce_sys/param.sfo $$(test -f sce_sys/icon0.png && echo sce_sys/icon0.png)"
+> $(PKGTOOL) pkg_build build/pkg/pkg.gp4 build/
 > @echo "PKG pronto: build/$(CONTENT_ID).pkg"
 
 clean:
