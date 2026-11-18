@@ -1,8 +1,8 @@
 #include "mpv_player.hpp"
-
 #include <atomic>
 #include <cstring>
 #include <mutex>
+#include <vector>
 
 #ifndef USE_LIBMPV
 
@@ -18,12 +18,14 @@ void shutdown() {}
 Status status() { return {}; }
 bool isOpen() { return false; }
 void poll() {}
+bool renderToBgra(uint8_t *, int, int, int) { return false; }
 }
 
 #else
 
 extern "C" {
 #include <mpv/client.h>
+#include <mpv/render.h>
 }
 
 namespace mpv_player {
@@ -31,24 +33,49 @@ namespace {
 
 std::mutex g_mx;
 mpv_handle *g_mpv = nullptr;
+mpv_render_context *g_rr = nullptr;
 std::atomic<bool> g_open{false};
 std::atomic<bool> g_paused{false};
 std::atomic<bool> g_eof{false};
 std::atomic<bool> g_failed{false};
 std::string g_err;
 double g_pos = 0, g_dur = 0;
+int g_needRedraw = 0;
 
 static void setErr(const char *s) {
     g_err = s ? s : "";
     g_failed = true;
 }
-
 static int chk(int st) {
     if (st < 0) {
         setErr(mpv_error_string(st));
         return st;
     }
     return st;
+}
+static void onRender(void *) { g_needRedraw = 1; }
+
+static void destroyRender() {
+    if (g_rr) {
+        mpv_render_context_free(g_rr);
+        g_rr = nullptr;
+    }
+}
+
+static bool ensureRender() {
+    if (g_rr) return true;
+    if (!g_mpv) return false;
+    mpv_render_param params[] = {
+        {MPV_RENDER_PARAM_API_TYPE, (void *)MPV_RENDER_API_TYPE_SW},
+        {MPV_RENDER_PARAM_INVALID, nullptr}
+    };
+    if (mpv_render_context_create(&g_rr, g_mpv, params) < 0) {
+        setErr("mpv_render_context_create(SW) falhou");
+        g_rr = nullptr;
+        return false;
+    }
+    mpv_render_context_set_update_callback(g_rr, onRender, nullptr);
+    return true;
 }
 
 } // namespace
@@ -59,22 +86,26 @@ bool boot() {
     std::lock_guard<std::mutex> lk(g_mx);
     if (g_mpv) return true;
     g_mpv = mpv_create();
-    if (!g_mpv) { setErr("mpv_create falhou"); return false; }
+    if (!g_mpv) {
+        setErr("mpv_create falhou");
+        return false;
+    }
 
-    // Opções alinhadas ao GMCA (mpv_core.cpp) no PS4
+    // Opcoes alinhadas ao GMCA (PS4)
     mpv_set_option_string(g_mpv, "ytdl", "no");
     mpv_set_option_string(g_mpv, "osd-level", "0");
     mpv_set_option_string(g_mpv, "video-timing-offset", "0");
     mpv_set_option_string(g_mpv, "reset-on-next-file", "speed,pause");
     mpv_set_option_string(g_mpv, "audio-channels", "stereo");
-    mpv_set_option_string(g_mpv, "vo", "libmpv");           // render API (precisa GL como no GMCA)
-    mpv_set_option_string(g_mpv, "hwdec", "no");            // FFmpeg software no PS4 homebrew
+    mpv_set_option_string(g_mpv, "vo", "libmpv");
+    mpv_set_option_string(g_mpv, "hwdec", "no");
     mpv_set_option_string(g_mpv, "vd-lavc-threads", "2");
     mpv_set_option_string(g_mpv, "cache", "yes");
     mpv_set_option_string(g_mpv, "demuxer-max-bytes", "64MiB");
     mpv_set_option_string(g_mpv, "demuxer-max-back-bytes", "32MiB");
     mpv_set_option_string(g_mpv, "network-timeout", "30");
     mpv_set_option_string(g_mpv, "user-agent", "KickIPTV/mpv");
+    mpv_set_option_string(g_mpv, "audio-client-name", "KickIPTV");
 
     if (chk(mpv_initialize(g_mpv)) < 0) {
         mpv_terminate_destroy(g_mpv);
@@ -85,6 +116,10 @@ bool boot() {
     mpv_observe_property(g_mpv, 2, "duration", MPV_FORMAT_DOUBLE);
     mpv_observe_property(g_mpv, 3, "pause", MPV_FORMAT_FLAG);
     mpv_observe_property(g_mpv, 4, "eof-reached", MPV_FORMAT_FLAG);
+
+    if (!ensureRender()) {
+        // segue sem video SW (audio/eventos ainda funcionam)
+    }
     g_failed = false;
     g_err.clear();
     return true;
@@ -97,7 +132,7 @@ bool play(const std::string &url) {
     g_eof = false;
     g_failed = false;
     g_err.clear();
-    // loadfile <url> replace
+    ensureRender();
     const char *cmd[] = {"loadfile", url.c_str(), "replace", nullptr};
     if (chk(mpv_command(g_mpv, cmd)) < 0) return false;
     g_open = true;
@@ -141,11 +176,11 @@ void stop() {
 }
 
 void shutdown() {
-    // IGUAL ao GMCA MPVCore::clean(): quit + terminate_destroy
     std::lock_guard<std::mutex> lk(g_mx);
     if (!g_mpv) return;
     mpv_command_string(g_mpv, "quit");
-    mpv_terminate_destroy(g_mpv);  // chave da saída sem CE
+    destroyRender();
+    mpv_terminate_destroy(g_mpv);
     g_mpv = nullptr;
     g_open = false;
     g_paused = false;
@@ -175,11 +210,11 @@ void poll() {
             auto *prop = (mpv_event_property *)ev->data;
             if (!prop || !prop->data) break;
             if (prop->format == MPV_FORMAT_DOUBLE) {
-                if (std::strcmp(prop->name, "time-pos") == 0) g_pos = *(double *)prop->data;
-                if (std::strcmp(prop->name, "duration") == 0) g_dur = *(double *)prop->data;
+                if (!std::strcmp(prop->name, "time-pos")) g_pos = *(double *)prop->data;
+                if (!std::strcmp(prop->name, "duration")) g_dur = *(double *)prop->data;
             } else if (prop->format == MPV_FORMAT_FLAG) {
-                if (std::strcmp(prop->name, "pause") == 0) g_paused = *(int *)prop->data != 0;
-                if (std::strcmp(prop->name, "eof-reached") == 0) g_eof = *(int *)prop->data != 0;
+                if (!std::strcmp(prop->name, "pause")) g_paused = *(int *)prop->data != 0;
+                if (!std::strcmp(prop->name, "eof-reached")) g_eof = *(int *)prop->data != 0;
             }
             break;
         }
@@ -187,6 +222,31 @@ void poll() {
             break;
         }
     }
+}
+
+bool renderToBgra(uint8_t *dst, int width, int height, int strideBytes) {
+    std::lock_guard<std::mutex> lk(g_mx);
+    if (!g_mpv || !g_open || !dst || width <= 0 || height <= 0) return false;
+    if (!ensureRender()) return false;
+    // Atualiza o contexto (pode liberar frames)
+    uint64_t flags = mpv_render_context_update(g_rr);
+    (void)flags;
+
+    int size[2] = {width, height};
+    mpv_render_param params[] = {
+        {MPV_RENDER_PARAM_SW_SIZE, size},
+        {MPV_RENDER_PARAM_SW_FORMAT, (void *)"bgr0"},
+        {MPV_RENDER_PARAM_SW_STRIDE, &strideBytes},
+        {MPV_RENDER_PARAM_SW_POINTER, dst},
+        {MPV_RENDER_PARAM_INVALID, nullptr}
+    };
+    int r = mpv_render_context_render(g_rr, params);
+    if (r < 0) {
+        // fallback rgb0
+        params[1].data = (void *)"rgb0";
+        r = mpv_render_context_render(g_rr, params);
+    }
+    return r >= 0;
 }
 
 Status status() {
@@ -205,4 +265,4 @@ bool isOpen() { return g_open.load(); }
 
 } // namespace mpv_player
 
-#endif // USE_LIBMPV
+#endif
