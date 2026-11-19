@@ -137,7 +137,11 @@ jobs:
         run: |
           set +e
           mkdir -p out
-          # 1) PKG normal (sem mpv): e o que sabidamente abre no console
+          # 0) PKG de TESTE minimo (hello): se ele fecha na hora, o problema e a toolchain/empacotamento, nao o codigo do app
+          mkdir -p /tmp/full && mv src /tmp/full/src && mkdir src && cp hello/hello.cpp src/
+          make TITLE="Kick IPTV teste hello" TITLE_ID=KICK00009 CONTENT_ID=IV0000-KICK00009_00-KICKIPTV00000000 && mv build/*.pkg out/Teste-Hello.pkg || echo "hello falhou"
+          rm -rf src && mv /tmp/full/src src && make clean
+          # 1) PKG normal (sem mpv)
           make TITLE="Kick IPTV" && mv build/*.pkg out/Kick-IPTV.pkg || { echo "ERRO: build sem mpv falhou"; exit 1; }
           make clean
           # 2) PKG com mpv (id diferente: KICK00002). Sem fallback silencioso: o log completo vai para a Release
