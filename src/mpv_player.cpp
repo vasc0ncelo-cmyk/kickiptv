@@ -1,3 +1,4 @@
+// KICKIPTV_STREAM_CB_V3 - loadfile DEVE usar khttp:// (HTTP do app, nao FFmpeg DNS)
 #include "mpv_player.hpp"
 #include <atomic>
 #include <cstdio>
@@ -293,8 +294,13 @@ bool play(const std::string &url) {
         g_err.clear();
         ensureRender();
 
+        // Se esta linha nao aparecer no /data/kickiptv_mpv.log como khttp://... o PKG e velho
         std::string wrap = std::string("khttp://") + url;
-        // Dica de formato pro lavf (sem isso o probe do stream_cb as vezes da "unrecognized file format")
+        if (wrap.find("khttp://http://") != 0 && wrap.find("khttp://https://") != 0) {
+            // url relativa? ainda assim prefixa
+            wrap = std::string("khttp://") + url;
+        }
+        // Dica de formato pro lavf
         std::string opts = "force-seekable=yes";
         auto lower = url;
         for (char &c : lower) if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
