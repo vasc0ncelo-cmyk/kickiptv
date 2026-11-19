@@ -132,6 +132,21 @@ jobs:
           else
             echo "HAVE_PACBREW=0" >> $GITHUB_ENV
           fi
+      - name: Completar libs do mpv (libass, freetype, png, z... vindas do container do GMCA)
+        continue-on-error: true
+        run: |
+          [ -f third_party/pacbrew/PREFIX ] || exit 0
+          P="$(cat third_party/pacbrew/PREFIX)"
+          docker pull xfangfang/pacbrew:250221
+          id=$(docker create xfangfang/pacbrew:250221)
+          mkdir -p extra
+          docker cp "$id":/opt/pacbrew/ps4/openorbis/usr/lib extra/lib || true
+          docker cp "$id":/opt/pacbrew/ps4/openorbis/usr/include extra/include || true
+          docker rm "$id"
+          mkdir -p "$P/usr/lib" "$P/usr/include"
+          cp -n extra/lib/*.a "$P/usr/lib/" || true
+          cp -rn extra/include/. "$P/usr/include/" || true
+          ls "$P/usr/lib" | grep -E "ass|fribidi|freetype|png|bz2|libz|samplerate" || echo "AVISO: libs extras nao encontradas"
       - name: Compilar PKG (sem mpv = garantido; com mpv = teste, com log)
         shell: bash
         run: |
