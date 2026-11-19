@@ -132,32 +132,36 @@ jobs:
           else
             echo "HAVE_PACBREW=0" >> $GITHUB_ENV
           fi
-      - name: Compilar PKG
+      - name: Compilar PKG (sem mpv = garantido; com mpv = teste, com log)
+        shell: bash
         run: |
+          set +e
+          mkdir -p out
+          # 1) PKG normal (sem mpv): e o que sabidamente abre no console
+          make TITLE="Kick IPTV" && mv build/*.pkg out/Kick-IPTV.pkg || { echo "ERRO: build sem mpv falhou"; exit 1; }
+          make clean
+          # 2) PKG com mpv (id diferente: KICK00002). Sem fallback silencioso: o log completo vai para a Release
           if [ "${HAVE_PACBREW:-0}" = "1" ] && [ -n "${PACBREW:-}" ]; then
-            echo "Build COM libmpv (USE_LIBMPV=1) PACBREW=$PACBREW"
-            make TITLE="Kick IPTV" USE_LIBMPV=1 PACBREW="$PACBREW" || {
-              echo "Link mpv falhou — fallback sem mpv"
-              make clean || true
-              make TITLE="Kick IPTV"
-            }
+            make TITLE="Kick IPTV mpv" TITLE_ID=KICK00002 CONTENT_ID=IV0000-KICK00002_00-KICKIPTV00000000 USE_LIBMPV=1 PACBREW="$PACBREW" 2>&1 | tee mpv-build-log.txt
+            if ls build/*.pkg >/dev/null 2>&1; then mv build/*.pkg out/Kick-IPTV-mpv.pkg; echo "OK mpv"; else echo "mpv: LINK/BUILD FALHOU (veja mpv-build-log.txt)"; grep -n -E "error|undefined|cannot find|unable" mpv-build-log.txt | head -40; fi
           else
-            echo "Build sem libmpv (stub)"
-            make TITLE="Kick IPTV"
+            echo "pacbrew indisponivel: sem build mpv" | tee mpv-build-log.txt
           fi
-          mv build/*.pkg build/Kick-IPTV.pkg
+          cp out/Kick-IPTV.pkg build/Kick-IPTV.pkg
+          ls -l out
       - name: Conferir o PKG
         run: |
-          ls -l build/*.pkg
-          sha256sum build/*.pkg
-          head -c 4 build/*.pkg | xxd || true
+          ls -l out/*.pkg
+          sha256sum out/*.pkg
       - name: Publicar PKG numa Release (baixa o .pkg direto, sem zip)
         continue-on-error: true
         uses: softprops/action-gh-release@v2
         with:
           tag_name: build-${{ github.run_number }}
           name: Kick IPTV - build ${{ github.run_number }}
-          files: build/*.pkg
+          files: |
+            out/*.pkg
+            mpv-build-log.txt
           make_latest: true
       - uses: actions/upload-artifact@v4
         if: always()
