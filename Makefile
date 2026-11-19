@@ -14,7 +14,10 @@ OBJS := $(patsubst src/%.cpp,build/%.o,$(SRCS))
 USE_LIBMPV ?= 0
 PACBREW  ?=
 
-CXXFLAGS := --target=x86_64-pc-freebsd12-elf -std=c++17 -D_GNU_SOURCE -fPIC -funwind-tables -c \
+# -O2: sem otimizacao o app desenha ~10x mais devagar (o log mostrava "otimizado=NAO", menu com 130 ms por quadro e video travando).
+# Mesmas flags do CMakeLists.txt (-fno-strict-aliasing e frame pointer mantidos por seguranca).
+OPTFLAGS := -O2 -fno-strict-aliasing -fno-omit-frame-pointer
+CXXFLAGS := --target=x86_64-pc-freebsd12-elf -std=c++17 $(OPTFLAGS) -D_GNU_SOURCE -fPIC -funwind-tables -c \
             -isysroot $(OO) -isystem $(OO)/include -isystem $(OO)/include/c++/v1
 LDFLAGS  := -m elf_x86_64 -pie --script $(OO)/link.x --eh-frame-hdr -L$(OO)/lib
 LIBS     := -lc -lc++ -lkernel -lSceVideoOut -lSceUserService -lSceSystemService -lScePad \
@@ -53,7 +56,7 @@ build/%.o: src/%.cpp $(wildcard src/*.hpp)
 
 build/%.o: ps4c/%.c
 > @mkdir -p build
-> clang --target=x86_64-pc-freebsd12-elf -D_GNU_SOURCE -fPIC -funwind-tables -c -isysroot $(OO) -isystem $(OO)/include -o $@ $<
+> clang --target=x86_64-pc-freebsd12-elf $(OPTFLAGS) -D_GNU_SOURCE -fPIC -funwind-tables -c -isysroot $(OO) -isystem $(OO)/include -o $@ $<
 
 build/app.elf: $(OBJS) $(COBJS)
 > ld.lld $(LDFLAGS) $(OO)/lib/crt1.o $(OBJS) $(COBJS) --start-group $(LIBS) --end-group -o $@
