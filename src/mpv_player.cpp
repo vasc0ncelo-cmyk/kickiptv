@@ -271,7 +271,18 @@ bool boot() {
     mpv_set_option_string(g_mpv, "osd-level", "0");
     mpv_set_option_string(g_mpv, "vo", "libmpv");
     mpv_set_option_string(g_mpv, "hwdec", "no");
-    mpv_set_option_string(g_mpv, "vd-lavc-threads", "4");
+    mpv_set_option_string(g_mpv, "vd-lavc-threads", "6");
+    // CPU fraca do PS4: tudo no modo mais barato (o decodificador e o escalonamento sao por software)
+    mpv_set_option_string(g_mpv, "sw-fast", "yes");
+    mpv_set_option_string(g_mpv, "scale", "bilinear");
+    mpv_set_option_string(g_mpv, "cscale", "bilinear");
+    mpv_set_option_string(g_mpv, "dscale", "bilinear");
+    mpv_set_option_string(g_mpv, "correct-downscaling", "no");
+    mpv_set_option_string(g_mpv, "dither-depth", "no");
+    mpv_set_option_string(g_mpv, "interpolation", "no");
+    mpv_set_option_string(g_mpv, "vd-lavc-skiploopfilter", "all");
+    mpv_set_option_string(g_mpv, "vd-lavc-dr", "no");
+    mpv_set_option_string(g_mpv, "framedrop", "decoder+vo");
     mpv_set_option_string(g_mpv, "vd-lavc-fast", "yes");
     mpv_set_option_string(g_mpv, "cache", "yes");
     mpv_set_option_string(g_mpv, "demuxer-max-bytes", "96MiB");
@@ -481,6 +492,18 @@ void poll() {
     std::lock_guard<std::mutex> lk(g_mx);
     if (!g_mpv) return;
     drainEventsUnlocked(nullptr, nullptr);
+    // a cada ~5 s grava fps real e quadros descartados em /data/kickiptv.log (para ver se o decodificador da conta)
+    static auto last = std::chrono::steady_clock::now();
+    auto now = std::chrono::steady_clock::now();
+    if (g_open && std::chrono::duration_cast<std::chrono::seconds>(now - last).count() >= 5) {
+        last = now;
+        double fps = 0; int64_t vo = 0, dec = 0;
+        mpv_get_property(g_mpv, "estimated-vf-fps", MPV_FORMAT_DOUBLE, &fps);
+        mpv_get_property(g_mpv, "vo-drop-frame-count", MPV_FORMAT_INT64, &vo);
+        mpv_get_property(g_mpv, "decoder-frame-drop-count", MPV_FORMAT_INT64, &dec);
+        char b[128]; snprintf(b, sizeof b, "mpv-perf fps=%.1f drop-vo=%lld drop-dec=%lld pos=%.0f", fps, (long long)vo, (long long)dec, g_pos);
+        tr(b);
+    }
 }
 
 bool renderToBgra(uint8_t *dst, int width, int height, int strideBytes) {
