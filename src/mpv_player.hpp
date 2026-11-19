@@ -1,5 +1,4 @@
 #pragma once
-// libmpv no PS4 (PacBrew). Rede via stream_cb + HTTP do app (sceHttp), nao via FFmpeg.
 #include <cstdint>
 #include <string>
 
@@ -17,11 +16,13 @@ struct Status {
     std::string error;
 };
 
-// Backend HTTP do app (preenchido em ps4_platform com g_net).
-// read_at: le ate 'n' bytes a partir de 'offset'. Devolve bytes lidos, 0 = EOF, -1 = erro.
-// size_out: tamanho total do recurso se conhecido (0 = desconhecido).
+// Backend HTTP do app. O cookie e opaco e vive ate close().
 struct StreamIo {
-    int64_t (*read_at)(void *ud, const char *url, uint64_t offset, char *buf, uint64_t n, uint64_t *size_out) = nullptr;
+    // Abre a URL; devolve cookie != nullptr em sucesso. size_out pode ficar 0 se desconhecido.
+    void *(*open)(void *ud, const char *url, uint64_t *size_out) = nullptr;
+    // Le a partir de offset (seek absoluto por leitura). n bytes no maximo.
+    int64_t (*read)(void *cookie, uint64_t offset, char *buf, uint64_t n) = nullptr;
+    void (*close)(void *cookie) = nullptr;
     void *ud = nullptr;
 };
 
@@ -29,7 +30,7 @@ void setStreamIo(const StreamIo &io);
 
 bool available();
 bool boot();
-bool play(const std::string &url);   // usa khttp:// + stream_cb
+bool play(const std::string &url);
 void pause(bool on);
 void setMute(bool on);
 bool seekSec(double sec);
