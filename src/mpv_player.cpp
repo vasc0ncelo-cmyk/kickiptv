@@ -4,7 +4,6 @@
 #include <cstring>
 #include <mutex>
 #include <string>
-#include <vector>
 
 #ifndef USE_LIBMPV
 
@@ -61,25 +60,18 @@ static int chk(int st) {
     }
     return st;
 }
-static void onRender(void *) {}
 
 struct StreamState {
-    std::string url;
+    void *io_cookie = nullptr; // do StreamIo::open
     uint64_t pos = 0;
-    uint64_t size = 0;   // 0 = unknown
+    uint64_t size = 0;
     bool size_known = false;
 };
 
-// ---- stream_cb (mpv le pelo HTTP do app) ----
 static int64_t cb_read(void *cookie, char *buf, uint64_t nbytes) {
     auto *st = (StreamState *)cookie;
-    if (!st || !g_io.read_at || !buf || nbytes == 0) return -1;
-    uint64_t total = st->size;
-    int64_t n = g_io.read_at(g_io.ud, st->url.c_str(), st->pos, buf, nbytes, &total);
-    if (total > 0) {
-        st->size = total;
-        st->size_known = true;
-    }
+    if (!st || !st->io_cookie || !g_io.read || !buf || nbytes == 0) return -1;
+    int64_t n = g_io.read(st->io_cookie, st->pos, buf, nbytes);
     if (n < 0) return -1;
     if (n == 0) return 0;
     st->pos += (uint64_t)n;
@@ -102,39 +94,39 @@ static int64_t cb_size(void *cookie) {
 }
 
 static void cb_close(void *cookie) {
-    delete (StreamState *)cookie;
+    auto *st = (StreamState *)cookie;
+    if (st) {
+        if (st->io_cookie && g_io.close) g_io.close(st->io_cookie);
+        delete st;
+    }
 }
 
 static int cb_open(void * /*user_data*/, char *uri, mpv_stream_cb_info *info) {
-    if (!uri || !info || !g_io.read_at) return MPV_ERROR_UNSUPPORTED;
-    // uri = "khttp://http://host/path"  ou  "khttp://https://..."
+    if (!uri || !info || !g_io.open || !g_io.read || !g_io.close)
+        return MPV_ERROR_UNSUPPORTED;
+
     const char *u = uri;
     if (!strncmp(u, "khttp://", 8)) u += 8;
     if (!*u) return MPV_ERROR_INVALID_PARAMETER;
 
-    auto *st = new StreamState();
-    st->url = u;
-    st->pos = 0;
+    uint64_t sz = 0;
+    void *io_cookie = g_io.open(g_io.ud, u, &sz);
+    if (!io_cookie) return MPV_ERROR_LOADING_FAILED;
 
-    // Probe tamanho com 1 byte Range (o backend preenche size_out)
-    char tmp[8];
-    uint64_t total = 0;
-    int64_t n = g_io.read_at(g_io.ud, st->url.c_str(), 0, tmp, 1, &total);
-    if (n < 0 && total == 0) {
-        delete st;
-        return MPV_ERROR_LOADING_FAILED;
-    }
-    if (total > 0) {
-        st->size = total;
+    auto *st = new StreamState();
+    st->io_cookie = io_cookie;
+    st->pos = 0;
+    if (sz > 0) {
+        st->size = sz;
         st->size_known = true;
     }
-    st->pos = 0; // probe nao deve avançar a leitura logica para o demuxer
 
     info->cookie = st;
     info->read_fn = cb_read;
     info->seek_fn = cb_seek;
     info->size_fn = cb_size;
     info->close_fn = cb_close;
+    info->cancel_fn = nullptr;
     return 0;
 }
 
@@ -156,11 +148,10 @@ static bool ensureRender() {
         g_rr = nullptr;
         return false;
     }
-    mpv_render_context_set_update_callback(g_rr, onRender, nullptr);
     return true;
 }
 
-static void drainEvents(bool *gotLoaded, bool *gotFail) {
+static void drainEventsUnlocked(bool *gotLoaded, bool *gotFail) {
     while (true) {
         mpv_event *ev = mpv_wait_event(g_mpv, 0);
         if (!ev || ev->event_id == MPV_EVENT_NONE) break;
@@ -192,9 +183,11 @@ static void drainEvents(bool *gotLoaded, bool *gotFail) {
                 if (!std::strcmp(prop->name, "time-pos")) g_pos = *(double *)prop->data;
                 if (!std::strcmp(prop->name, "duration")) g_dur = *(double *)prop->data;
             } else if (prop->format == MPV_FORMAT_INT64) {
-                if (!std::strcmp(prop->name, "cache-buffering-state")) g_bufPct = (int)*(int64_t *)prop->data;
+                if (!std::strcmp(prop->name, "cache-buffering-state"))
+                    g_bufPct = (int)*(int64_t *)prop->data;
             } else if (prop->format == MPV_FORMAT_FLAG) {
-                if (!std::strcmp(prop->name, "paused-for-cache")) g_buffering = *(int *)prop->data != 0;
+                if (!std::strcmp(prop->name, "paused-for-cache"))
+                    g_buffering = *(int *)prop->data != 0;
                 if (!std::strcmp(prop->name, "pause")) g_paused = *(int *)prop->data != 0;
                 if (!std::strcmp(prop->name, "eof-reached")) g_eof = *(int *)prop->data != 0;
             }
@@ -225,7 +218,7 @@ bool boot() {
     }
 
     mpv_set_option_string(g_mpv, "log-file", "/data/kickiptv_mpv.log");
-    mpv_set_option_string(g_mpv, "msg-level", "ffmpeg=info,cplayer=info,stream=info");
+    mpv_set_option_string(g_mpv, "msg-level", "ffmpeg=v,cplayer=v,stream=v,demux=v");
     mpv_set_option_string(g_mpv, "ytdl", "no");
     mpv_set_option_string(g_mpv, "osd-level", "0");
     mpv_set_option_string(g_mpv, "vo", "libmpv");
@@ -238,9 +231,10 @@ bool boot() {
     mpv_set_option_string(g_mpv, "force-seekable", "yes");
     mpv_set_option_string(g_mpv, "audio-channels", "stereo");
     mpv_set_option_string(g_mpv, "ao", "sdl,null");
-    // Demuxer deve tratar o khttp como arquivo local/stream
-    mpv_set_option_string(g_mpv, "demuxer-lavf-analyzeduration", "3");
-    mpv_set_option_string(g_mpv, "demuxer-lavf-probesize", "2097152");
+    mpv_set_option_string(g_mpv, "demuxer-lavf-analyzeduration", "5");
+    mpv_set_option_string(g_mpv, "demuxer-lavf-probesize", "5242880");
+    // stream_cb e tratado como arquivo: evita lavf tentar reabrir como http
+    mpv_set_option_string(g_mpv, "demuxer", "lavf");
 
     if (chk(mpv_initialize(g_mpv)) < 0) {
         mpv_terminate_destroy(g_mpv);
@@ -248,11 +242,10 @@ bool boot() {
         return false;
     }
 
-    // Protocolo custom: loadfile khttp://<url real>
     if (!g_cb_registered) {
+        // Assinatura correta: (ctx, protocol, user_data, open_fn)
         if (mpv_stream_cb_add_ro(g_mpv, "khttp", nullptr, cb_open) < 0) {
             setErr("stream_cb_add_ro falhou");
-            // segue mesmo assim (pode tentar URL direta)
         } else {
             g_cb_registered = true;
         }
@@ -273,69 +266,88 @@ bool boot() {
 
 bool play(const std::string &url) {
     if (!boot()) return false;
-    std::lock_guard<std::mutex> lk(g_mx);
-    if (!g_mpv) return false;
     if (url.empty()) {
         setErr("URL vazia");
         return false;
     }
-    if (!g_io.read_at) {
-        setErr("StreamIo nao configurado (HTTP do app)");
-        return false;
+
+    {
+        std::lock_guard<std::mutex> lk(g_mx);
+        if (!g_mpv) return false;
+        if (!g_io.open || !g_io.read || !g_io.close) {
+            setErr("StreamIo nao configurado (HTTP do app)");
+            return false;
+        }
+        if (!g_cb_registered) {
+            setErr("stream_cb nao registrado");
+            return false;
+        }
+
+        g_eof = false;
+        g_failed = false;
+        g_buffering = true;
+        g_bufPct = 0;
+        g_pos = 0;
+        g_dur = 0;
+        g_err.clear();
+        ensureRender();
+
+        std::string wrap = std::string("khttp://") + url;
+        const char *cmd[] = {"loadfile", wrap.c_str(), "replace", nullptr};
+        if (chk(mpv_command(g_mpv, cmd)) < 0) {
+            g_open = false;
+            return false;
+        }
     }
-
-    g_eof = false;
-    g_failed = false;
-    g_buffering = true;
-    g_bufPct = 0;
-    g_pos = 0;
-    g_dur = 0;
-    g_err.clear();
-    ensureRender();
-
-    // Forca o demuxer a ler via stream_cb (HTTP do Kick), nao via FFmpeg/rede do mpv
-    std::string wrap = "khttp://" + url;
-
-    const char *cmd[] = {"loadfile", wrap.c_str(), "replace", nullptr};
-    if (chk(mpv_command(g_mpv, cmd)) < 0) {
-        g_open = false;
-        return false;
-    }
+    // IMPORTANTE: nao segurar g_mx enquanto o demuxer le via stream_cb
 
     bool gotLoaded = false, gotFail = false;
-    for (int i = 0; i < 300 && !gotLoaded && !gotFail; i++) {
-        drainEvents(&gotLoaded, &gotFail);
+    for (int i = 0; i < 400 && !gotLoaded && !gotFail; i++) {
+        {
+            std::lock_guard<std::mutex> lk(g_mx);
+            if (!g_mpv) return false;
+            drainEventsUnlocked(&gotLoaded, &gotFail);
+        }
         if (gotLoaded || gotFail) break;
-        mpv_event *ev = mpv_wait_event(g_mpv, 0.1);
-        if (!ev || ev->event_id == MPV_EVENT_NONE) continue;
-        if (ev->event_id == MPV_EVENT_FILE_LOADED) {
-            gotLoaded = true;
-            g_failed = false;
-            g_err.clear();
-        } else if (ev->event_id == MPV_EVENT_END_FILE) {
-            auto *e = (mpv_event_end_file *)ev->data;
-            if (e && e->reason == MPV_END_FILE_REASON_ERROR) {
-                gotFail = true;
-                g_failed = true;
-                g_err = std::string("end-file: ") + mpv_error_string(e->error);
+        mpv_event *ev = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(g_mx);
+            if (!g_mpv) return false;
+            ev = mpv_wait_event(g_mpv, 0.1);
+            if (ev && ev->event_id != MPV_EVENT_NONE) {
+                if (ev->event_id == MPV_EVENT_FILE_LOADED) {
+                    gotLoaded = true;
+                    g_failed = false;
+                    g_err.clear();
+                } else if (ev->event_id == MPV_EVENT_END_FILE) {
+                    auto *e = (mpv_event_end_file *)ev->data;
+                    if (e && e->reason == MPV_END_FILE_REASON_ERROR) {
+                        gotFail = true;
+                        g_failed = true;
+                        g_err = std::string("end-file: ") + mpv_error_string(e->error);
+                    }
+                } else if (ev->event_id == MPV_EVENT_PROPERTY_CHANGE) {
+                    auto *prop = (mpv_event_property *)ev->data;
+                    if (prop && prop->data && prop->format == MPV_FORMAT_DOUBLE) {
+                        if (!std::strcmp(prop->name, "duration") && *(double *)prop->data > 0.5) {
+                            gotLoaded = true;
+                            g_dur = *(double *)prop->data;
+                        }
+                        if (!std::strcmp(prop->name, "time-pos")) g_pos = *(double *)prop->data;
+                    }
+                }
             }
-        } else if (ev->event_id == MPV_EVENT_PROPERTY_CHANGE) {
-            auto *prop = (mpv_event_property *)ev->data;
-            if (prop && prop->data && prop->format == MPV_FORMAT_DOUBLE &&
-                !std::strcmp(prop->name, "duration") && *(double *)prop->data > 0.5) {
-                gotLoaded = true;
-                g_dur = *(double *)prop->data;
-            }
-            if (prop && prop->data && prop->format == MPV_FORMAT_DOUBLE &&
-                !std::strcmp(prop->name, "time-pos")) g_pos = *(double *)prop->data;
         }
     }
 
     if (gotFail || g_failed || !gotLoaded) {
+        std::lock_guard<std::mutex> lk(g_mx);
         g_open = false;
         if (g_err.empty()) setErr("loading failed (stream_cb)");
-        const char *stopc[] = {"stop", nullptr};
-        mpv_command(g_mpv, stopc);
+        if (g_mpv) {
+            const char *stopc[] = {"stop", nullptr};
+            mpv_command(g_mpv, stopc);
+        }
         return false;
     }
 
@@ -406,7 +418,7 @@ void shutdown() {
 void poll() {
     std::lock_guard<std::mutex> lk(g_mx);
     if (!g_mpv) return;
-    drainEvents(nullptr, nullptr);
+    drainEventsUnlocked(nullptr, nullptr);
 }
 
 bool renderToBgra(uint8_t *dst, int width, int height, int strideBytes) {
