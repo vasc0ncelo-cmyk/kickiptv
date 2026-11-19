@@ -458,7 +458,37 @@ struct KickMpvStream {
     NetClient::Session sess;
     uint64_t size = 0;
     bool opened = false;
+    std::string prefetch;      // primeiros bytes ja baixados no open
+    uint64_t prefetch_off = 0; // offset correspondente (sempre 0)
 };
+static bool kickLooksLikeMedia(const std::string &b) {
+    if (b.size() < 4) return false;
+    // ISO BMFF / MP4: ....ftyp
+    if (b.size() >= 8 && b[4]=='f' && b[5]=='t' && b[6]=='y' && b[7]=='p') return true;
+    // Matroska / WebM
+    if ((unsigned char)b[0]==0x1A && (unsigned char)b[1]==0x45 && (unsigned char)b[2]==0xDF && (unsigned char)b[3]==0xA3) return true;
+    // MPEG-TS
+    if ((unsigned char)b[0]==0x47) return true;
+    // RIFF / AVI
+    if (b[0]=='R' && b[1]=='I' && b[2]=='F' && b[3]=='F') return true;
+    // MPEG-PS / pack
+    if ((unsigned char)b[0]==0x00 && (unsigned char)b[1]==0x00 && (unsigned char)b[2]==0x01 &&
+        ((unsigned char)b[3]==0xBA || (unsigned char)b[3]==0xB3 || (unsigned char)b[3]==0xB6)) return true;
+    // ID3 then maybe audio - still ok for mpv
+    if (b[0]=='I' && b[1]=='D' && b[2]=='3') return true;
+    return false;
+}
+static bool kickLooksLikeHtml(const std::string &b) {
+    // pagina de erro do painel / CDN
+    if (b.size() < 12) return false;
+    if (b[0]=='<' || (b[0]=='\xef' && b.size()>3)) {
+        auto l = b.substr(0, 64);
+        for (char &c : l) if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        return l.find("<!doctype") != std::string::npos || l.find("<html") != std::string::npos ||
+               l.find("<head") != std::string::npos || l.find("<error") != std::string::npos;
+    }
+    return false;
+}
 static void *kickMpvOpen(void * /*ud*/, const char *url, uint64_t *size_out) {
     if (!url || !*url) return nullptr;
     if (!g_net.init()) return nullptr;
@@ -469,29 +499,50 @@ static void *kickMpvOpen(void * /*ud*/, const char *url, uint64_t *size_out) {
         return nullptr;
     }
     s->opened = true;
-    // Probe: 1 byte Range para descobrir tamanho total
+    // Le os primeiros 64 KB: valida se e midia de verdade (nao HTML de erro)
     std::string tip;
     int st = 0;
     uint64_t total = 0;
-    if (g_net.getRange(s->sess, s->url, 0, 0, tip, st, &total) && total > 0) {
+    const uint64_t probeTo = 64 * 1024 - 1;
+    if (!g_net.getRange(s->sess, s->url, 0, probeTo, tip, st, &total)) {
+        g_net.closeSession(s->sess);
+        s->opened = false;
+        delete s;
+        return nullptr;
+    }
+    if (total > 0) {
         s->size = total;
         if (size_out) *size_out = total;
-    } else {
-        // tenta 0-15 (alguns servidores nao gostam de bytes=0-0)
-        tip.clear(); st = 0; total = 0;
-        if (g_net.getRange(s->sess, s->url, 0, 15, tip, st, &total) && total > 0) {
-            s->size = total;
-            if (size_out) *size_out = total;
-        } else if (size_out) {
-            *size_out = 0;
-        }
-        // mesmo sem tamanho conhecido, segue (live / server sem Content-Range)
+    } else if (size_out) {
+        *size_out = 0;
     }
+    if (st != 206 && st != 200) {
+        delete s;
+        return nullptr;
+    }
+    // Se veio 200 com arquivo inteiro numa "range", ainda usamos o comeco
+    if (kickLooksLikeHtml(tip)) {
+        // painel devolveu pagina HTML — mpv reportaria "unrecognized file format"
+        delete s;
+        return nullptr;
+    }
+    // guarda o probe para a primeira leitura (evita segundo GET e garante magic bytes)
+    s->prefetch = std::move(tip);
+    s->prefetch_off = 0;
     return s;
 }
 static int64_t kickMpvRead(void *cookie, uint64_t offset, char *buf, uint64_t n) {
     auto *s = (KickMpvStream *)cookie;
     if (!s || !buf || n == 0) return -1;
+    // Serve bytes do probe inicial (garante ftyp/magic para o demuxer)
+    if (!s->prefetch.empty() && offset >= s->prefetch_off &&
+        offset < s->prefetch_off + s->prefetch.size()) {
+        size_t po = (size_t)(offset - s->prefetch_off);
+        size_t avail = s->prefetch.size() - po;
+        size_t copy = avail < (size_t)n ? avail : (size_t)n;
+        memcpy(buf, s->prefetch.data() + po, copy);
+        return (int64_t)copy;
+    }
     if (!s->opened) {
         if (!g_net.openSession(s->sess, s->url)) return -1;
         s->opened = true;
