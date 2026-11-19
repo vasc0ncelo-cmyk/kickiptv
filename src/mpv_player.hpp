@@ -1,8 +1,7 @@
 #pragma once
-// Player estilo GMCA/Switchfin: libmpv + FFmpeg (PacBrew). Saida limpa via mpv_terminate_destroy.
+// libmpv no PS4 (PacBrew). Rede via stream_cb + HTTP do app (sceHttp), nao via FFmpeg.
 #include <cstdint>
 #include <string>
-#include <vector>
 
 namespace mpv_player {
 
@@ -11,28 +10,35 @@ struct Status {
     bool paused = false;
     bool eof = false;
     bool failed = false;
-    bool buffering = false;      // mpv esta esperando a rede (paused-for-cache)
-    int bufferPct = 0;           // 0..100 enquanto buffering
+    bool buffering = false;
+    int bufferPct = 0;
     double positionSec = 0;
     double durationSec = 0;
     std::string error;
 };
 
+// Backend HTTP do app (preenchido em ps4_platform com g_net).
+// read_at: le ate 'n' bytes a partir de 'offset'. Devolve bytes lidos, 0 = EOF, -1 = erro.
+// size_out: tamanho total do recurso se conhecido (0 = desconhecido).
+struct StreamIo {
+    int64_t (*read_at)(void *ud, const char *url, uint64_t offset, char *buf, uint64_t n, uint64_t *size_out) = nullptr;
+    void *ud = nullptr;
+};
+
+void setStreamIo(const StreamIo &io);
+
 bool available();
 bool boot();
-bool play(const std::string &url);
+bool play(const std::string &url);   // usa khttp:// + stream_cb
 void pause(bool on);
 void setMute(bool on);
 bool seekSec(double sec);
 bool seekRelative(double deltaSec);
 void stop();
-void shutdown(); // quit + terminate_destroy (igual GMCA)
+void shutdown();
 Status status();
 bool isOpen();
 void poll();
-
-// Software render -> buffer BGRA/RGB0 para blit no VideoOut do Kick
-// width/height: tamanho do framebuffer (ex.: 1920x1080). Devolve true SO quando havia quadro novo e ele foi pintado em dst.
 bool renderToBgra(uint8_t *dst, int width, int height, int strideBytes);
 
 } // namespace mpv_player
