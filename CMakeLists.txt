@@ -9,10 +9,23 @@ set(OPENORBIS $ENV{OPENORBIS} CACHE PATH "OPENORBIS")
 set(CMAKE_TOOLCHAIN_FILE "${OPENORBIS}/cmake/ps4.cmake" CACHE PATH "toolchain file")
 
 project(KickIPTV C CXX)
-set(PSN_TITLE_ID "KICK00002")      # id diferente do app antigo (KICK00001): os dois podem ficar instalados
+# Variantes (o workflow monta varias para descobrir qual abre no console):
+#   KICK_MPV=OFF     -> sem libmpv/ffmpeg (usa o player antigo)         KICK_PIGLET=OFF -> sem ScePigletv2VSH/SceSysUtil
+option(KICK_MPV "liga o libmpv" ON)
+option(KICK_PIGLET "liga ScePigletv2VSH e SceSysUtil" ON)
+if (NOT DEFINED KICK_TITLE_ID)
+    set(KICK_TITLE_ID "KICK00002")
+endif ()
+if (NOT DEFINED KICK_NAME)
+    set(KICK_NAME "Kick IPTV mpv")
+endif ()
+set(PSN_TITLE_ID "${KICK_TITLE_ID}")   # id diferente do app antigo (KICK00001): os dois podem ficar instalados
 set(APP_VERSION "01.00")
 
-add_definitions(-DPS4 -D__PS4__ -DUSE_LIBMPV)
+add_definitions(-DPS4 -D__PS4__)
+if (KICK_MPV)
+    add_definitions(-DUSE_LIBMPV)
+endif ()
 
 file(GLOB APP_SRC ${CMAKE_SOURCE_DIR}/src/*.cpp)
 set(PS4_C_SRC ${CMAKE_SOURCE_DIR}/ps4c/cxa_guard.c ${CMAKE_SOURCE_DIR}/ps4c/clock_ids.c)
@@ -40,12 +53,16 @@ target_link_options(${PROJECT_NAME} PRIVATE "LINKER:--wrap=clock_gettime")
 target_link_directories(${PROJECT_NAME} PRIVATE ${OPENORBIS}/usr/lib)
 # Sem -Wl,--start-group aqui: o ld.lld e chamado direto (nao pelo clang) e nao entende '-Wl,'; o cmake do toolchain ja envolve tudo em --start-group/--end-group.
 # Ordem: o mpv puxa ffmpeg, mbedtls, SDL2 (audio), libass etc. (lista = Libs.private do mpv.pc do pacote)
-target_link_libraries(${PROJECT_NAME} PRIVATE
-    mpv avformat avcodec avfilter swscale swresample avutil dav1d mbedtls mbedx509 mbedcrypto
-    ass fribidi freetype bz2 png16 samplerate SDL2 z
-    SceVideoOut SceUserService SceSystemService SceSysUtil ScePad SceSysmodule SceNet SceSsl SceHttp SceAvPlayer SceAudioOut
-    ScePigletv2VSH SceLibcInternal rt pthread m
-)
+set(KICK_LIBS SceVideoOut SceUserService SceSystemService ScePad SceSysmodule SceNet SceSsl SceHttp SceAvPlayer SceAudioOut)
+if (KICK_MPV)
+    set(KICK_LIBS mpv avformat avcodec avfilter swscale swresample avutil dav1d mbedtls mbedx509 mbedcrypto
+        ass fribidi freetype bz2 png16 samplerate SDL2 z ${KICK_LIBS})
+endif ()
+if (KICK_PIGLET)
+    list(APPEND KICK_LIBS SceSysUtil ScePigletv2VSH)
+endif ()
+list(APPEND KICK_LIBS SceLibcInternal rt pthread m)
+target_link_libraries(${PROJECT_NAME} PRIVATE ${KICK_LIBS})
 
 # --- Empacotamento IGUAL ao do app antigo (que abre no seu PS4) ---
 # O add_self/add_pkg do toolchain usam o "paid" 0x35 + authinfo e um param.sfo (APP_TYPE 1, FORMAT obs, ATTRIBUTE 8388640, SYSTEM_VER 1020,
@@ -76,7 +93,7 @@ add_custom_command(
     COMMAND ${CMAKE_COMMAND} -E env ${DOTFIX} ${PKGTOOL} sfo_setentry ${SFO} CONTENT_ID --type Utf8 --maxsize 48 --value "${CONTENT_ID}"
     COMMAND ${CMAKE_COMMAND} -E env ${DOTFIX} ${PKGTOOL} sfo_setentry ${SFO} DOWNLOAD_DATA_SIZE --type Integer --maxsize 4 --value 0
     COMMAND ${CMAKE_COMMAND} -E env ${DOTFIX} ${PKGTOOL} sfo_setentry ${SFO} SYSTEM_VER --type Integer --maxsize 4 --value 0
-    COMMAND ${CMAKE_COMMAND} -E env ${DOTFIX} ${PKGTOOL} sfo_setentry ${SFO} TITLE --type Utf8 --maxsize 128 --value "Kick IPTV mpv"
+    COMMAND ${CMAKE_COMMAND} -E env ${DOTFIX} ${PKGTOOL} sfo_setentry ${SFO} TITLE --type Utf8 --maxsize 128 --value "${KICK_NAME}"
     COMMAND ${CMAKE_COMMAND} -E env ${DOTFIX} ${PKGTOOL} sfo_setentry ${SFO} TITLE_ID --type Utf8 --maxsize 12 --value "${PSN_TITLE_ID}"
     COMMAND ${CMAKE_COMMAND} -E env ${DOTFIX} ${PKGTOOL} sfo_setentry ${SFO} VERSION --type Utf8 --maxsize 8 --value "01.00"
     COMMAND "${OPENORBIS}/bin/linux/create-gp4" -out ${PKGDIR}/${PROJECT_NAME}.gp4 --content-id "${CONTENT_ID}" --path "${PKGDIR}"
