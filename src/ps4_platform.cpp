@@ -1730,21 +1730,29 @@ static int feedClose(void *) { return 0; }
 static int feedRead(void *, uint8_t *dst, uint64_t pos, uint32_t len) { g_feed.reads++; return g_feed.sb.read(dst, pos, len); }
 static std::atomic<unsigned long long> g_feedSize{1ULL << 40};
 static uint64_t feedSize(void *) { return g_feedSize.load(); }   // ao vivo: tamanho "infinito"; MP4 de teste: tamanho real
+static std::atomic<int> g_liveOpen{0};                          // quantas aberturas do kicklive:// estao vivas (o mpv sonda e reabre o stream)
 static void *kickLiveOpen(uint64_t *size_out) {
     if (g_kickLiveUrl.empty() || !g_net.init()) return nullptr;
-    g_feed.start(g_kickLiveUrl, false);                         // escolhe a variante (resolucao), baixa playlist + segmentos
-    trace("kicklive-feeder");
-    const int need = std::max(2, g_feed.wantSegs.load());
-    for (int i = 0; i < 500 && g_feed.segs.load() < need && !g_feed.failed.load() && g_feed.run.load(); i++) sceKernelUsleep(50000);   // ate 25 s
-    if (g_feed.failed.load() || g_feed.segs.load() == 0) { trace("kicklive-falhou"); g_feed.abort(); return nullptr; }
+    // Ja existe um alimentador rodando para esta URL (o mpv reabriu o stream): reaproveita, senao o close da 1a abertura matava a 2a.
+    const bool reuse = g_liveOpen.load() > 0 && g_feed.run.load() && !g_feed.failed.load() && g_feed.url == g_kickLiveUrl && g_feed.segs.load() > 0;
+    if (!reuse) {
+        g_feed.start(g_kickLiveUrl, false);                     // escolhe a variante (resolucao), baixa playlist + segmentos
+        trace("kicklive-feeder");
+        const int need = std::max(2, g_feed.wantSegs.load());
+        for (int i = 0; i < 500 && g_feed.segs.load() < need && !g_feed.failed.load() && g_feed.run.load(); i++) sceKernelUsleep(50000);   // ate 25 s
+        if (g_feed.failed.load() || g_feed.segs.load() == 0) { trace("kicklive-falhou"); g_feed.abort(); return nullptr; }
+    } else trace("kicklive-reabriu");
     auto *s = new KickMpvStream();
-    s->live = true; s->opened = false; s->size = 0; s->abs = 0;
+    s->live = true; s->opened = false; s->size = 0;
+    { std::lock_guard<std::mutex> l(g_feed.sb.m); s->abs = g_feed.sb.base; }    // comeca no inicio do que esta guardado
     if (size_out) *size_out = 0;                                // ao vivo: tamanho desconhecido
+    g_liveOpen++;
     trace("kicklive-aberto");
     return s;
 }
 static int64_t kickLiveRead(KickMpvStream *s, char *buf, uint64_t n) {
     if (n > (1u << 20)) n = 1u << 20;
+    static std::atomic<int> nrd{0};
     for (int i = 0; i < 40; i++) {                              // ate ~40 s esperando dados
         {   // o alimentador pode ressincronizar (zera o buffer): volta para o comeco do que existe
             std::lock_guard<std::mutex> l(g_feed.sb.m);
@@ -1752,12 +1760,19 @@ static int64_t kickLiveRead(KickMpvStream *s, char *buf, uint64_t n) {
             if (s->abs < g_feed.sb.base || s->abs > end) s->abs = g_feed.sb.base;
         }
         int r = g_feed.sb.read((uint8_t *)buf, s->abs, (uint32_t)n, 1000);
-        if (r > 0) { s->abs += (uint64_t)r; return r; }
-        if (!g_feed.run.load() || g_feed.failed.load() || g_feed.streamEnded.load()) return 0;
+        if (r > 0) { s->abs += (uint64_t)r; if (nrd.fetch_add(1) < 3) trace("kicklive-leu"); return r; }
+        if (!g_feed.run.load() || g_feed.failed.load() || g_feed.streamEnded.load()) {
+            trace(!g_feed.run.load() ? "kicklive-eof-parado" : g_feed.failed.load() ? "kicklive-eof-falha" : "kicklive-eof-fim");
+            return 0;
+        }
     }
+    trace("kicklive-eof-timeout");
     return 0;
 }
-static void kickLiveClose() { g_feed.abort(); }
+static void kickLiveClose() {
+    trace("kicklive-close");
+    if (g_liveOpen.fetch_sub(1) <= 1) { g_liveOpen = 0; g_feed.abort(); }   // so a ultima abertura derruba o alimentador
+}
 static void closeFeedFile() {                 // para o alimentador, fecha e apaga /data/live.ts
     g_feed.join();
     if (g_feed.outFile) { fclose(g_feed.outFile); g_feed.outFile = nullptr; remove("/data/live.ts"); }
