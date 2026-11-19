@@ -20,16 +20,23 @@ LDFLAGS  := -m elf_x86_64 -pie --script $(OO)/link.x --eh-frame-hdr -L$(OO)/lib
 LIBS     := -lc -lc++ -lkernel -lSceVideoOut -lSceUserService -lSceSystemService -lScePad \
             -lSceSysmodule -lSceNet -lSceSsl -lSceHttp -lSceAvPlayer -lSceAudioOut
 
+COBJS :=
 ifeq ($(USE_LIBMPV),1)
   ifeq ($(PACBREW),)
     $(error USE_LIBMPV=1 requer PACBREW= prefixo OpenOrbis PacBrew)
   endif
   CXXFLAGS += -DUSE_LIBMPV -I$(PACBREW)/usr/include
-  LDFLAGS  += -L$(PACBREW)/usr/lib
-  # Ordem importa: mpv puxa ffmpeg, mbedtls, sdl2, dav1d...
+  # As libs do PacBrew foram feitas com headers musl: o clock_gettime precisa do remendo do GMCA (ps4c/clock_ids.c) e o guard de statics (ps4c/cxa_guard.c)
+  LDFLAGS  += -L$(PACBREW)/usr/lib --wrap=clock_gettime
+  COBJS    := build/cxa_guard.o build/clock_ids.o
+  # Ordem importa: mpv puxa ffmpeg, mbedtls, sdl2, dav1d... (o --start-group abaixo resolve dependencias circulares)
   LIBS     += -lmpv -lavformat -lavcodec -lavfilter -lswscale -lswresample -lavutil \
               -ldav1d -lmbedtls -lmbedx509 -lmbedcrypto -lSDL2 -lass -lfribidi -lfreetype \
               -lpng16 -lbz2 -lz -lsamplerate -lm -lpthread
+  # Bibliotecas de sistema extras que o SDL2/ffmpeg importam; so entram se o toolchain tiver o stub
+  OPT_LIBS := $(foreach l,SceSysUtil ScePigletv2VSH SceLibcInternal rt,$(if $(wildcard $(OO)/lib/lib$(l).*),-l$(l)))
+  $(info libs de sistema extras encontradas: $(OPT_LIBS))
+  LIBS     += $(OPT_LIBS)
 endif
 
 all: build/$(CONTENT_ID).pkg
@@ -38,8 +45,12 @@ build/%.o: src/%.cpp $(wildcard src/*.hpp)
 > @mkdir -p build
 > clang++ $(CXXFLAGS) -o $@ $<
 
-build/app.elf: $(OBJS)
-> ld.lld $(LDFLAGS) $(OO)/lib/crt1.o $(OBJS) $(LIBS) -o $@
+build/%.o: ps4c/%.c
+> @mkdir -p build
+> clang --target=x86_64-pc-freebsd12-elf -D_GNU_SOURCE -fPIC -funwind-tables -c -isysroot $(OO) -isystem $(OO)/include -o $@ $<
+
+build/app.elf: $(OBJS) $(COBJS)
+> ld.lld $(LDFLAGS) $(OO)/lib/crt1.o $(OBJS) $(COBJS) --start-group $(LIBS) --end-group -o $@
 
 build/eboot.bin: build/app.elf
 > $(BIN)/create-fself -in=build/app.elf -out=build/app.oelf --eboot=build/eboot.bin --paid 0x3800000000000011
