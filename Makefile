@@ -37,6 +37,12 @@ ifeq ($(USE_LIBMPV),1)
   OPT_LIBS := $(foreach l,SceSysUtil ScePigletv2VSH SceLibcInternal rt,$(if $(wildcard $(OO)/lib/lib$(l).*),-l$(l)))
   $(info libs de sistema extras encontradas: $(OPT_LIBS))
   LIBS     += $(OPT_LIBS)
+  # Todas as outras bibliotecas estaticas do PacBrew (libass, freetype, harfbuzz, png, zlib...). Dentro do --start-group a ordem nao importa
+  # e o lld so puxa o que e usado. Fora da lista: as que o OpenOrbis ja fornece (libc, libm, pthread...) para nao misturar com a musl.
+  EXCL := c m pthread rt dl util crypt resolv xnet c++ c++abi unwind mpv avformat avcodec avfilter swscale swresample avutil dav1d mbedtls mbedx509 mbedcrypto SDL2 SDL2main
+  EXTRA_A := $(filter-out $(EXCL),$(patsubst lib%.a,%,$(notdir $(wildcard $(PACBREW)/usr/lib/lib*.a))))
+  $(info bibliotecas extras do PacBrew: $(EXTRA_A))
+  LIBS     += $(addprefix -l,$(EXTRA_A))
 endif
 
 all: build/$(CONTENT_ID).pkg
