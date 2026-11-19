@@ -349,19 +349,8 @@ bool play(const std::string &url) {
             // url relativa? ainda assim prefixa
             wrap = std::string("khttp://") + url;
         }
-        // Dica de formato pro lavf
+        // sem forcar formato: o lavf detecta sozinho (forcar "mp4" fez o app fechar)
         std::string opts = "force-seekable=yes";
-        auto lower = url;
-        for (char &c : lower) if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
-        if (lower.find(".mp4") != std::string::npos || lower.find("/movie/") != std::string::npos)
-            opts += ",demuxer-lavf-format=mp4";
-        else if (lower.find(".mkv") != std::string::npos)
-            opts += ",demuxer-lavf-format=matroska";
-        else if (lower.find(".m3u8") != std::string::npos || lower.find(".ts") != std::string::npos)
-            opts += ",demuxer-lavf-format=mpegts";
-        else
-            opts += ",demuxer-lavf-format=mp4"; // painel IPTV: maioria e mp4 progressivo
-
         const char *cmd[] = {"loadfile", wrap.c_str(), "replace", opts.c_str(), nullptr};  // mpv 0.36: sem o indice "0" (isso e da 0.38+)
         if (chk(mpv_command(g_mpv, cmd)) < 0) {
             // fallback sem opts

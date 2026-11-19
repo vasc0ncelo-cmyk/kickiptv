@@ -500,6 +500,7 @@ static const uint64_t kMpvAhead = 24ull * 1024 * 1024;
 static const uint64_t kMpvBehind = 4ull * 1024 * 1024;
 
 static void kickMpvWorker(std::shared_ptr<KickMpvStream> s) {
+    trace("mpv-worker-inicio");
     bool sessOpen = true;
     for (;;) {
         uint64_t from, gen;
@@ -577,6 +578,8 @@ static int64_t kickMpvRead(void *cookie, uint64_t offset, char *buf, uint64_t n)
     if (!cookie || !buf || n == 0) return -1;
     auto &sp = *(std::shared_ptr<KickMpvStream> *)cookie;
     KickMpvStream *s = sp.get();
+    static std::atomic<int> nrd{0};
+    if (nrd.fetch_add(1) < 6) { char t[96]; snprintf(t, sizeof t, "mpv-read off=%llu n=%llu", (unsigned long long)offset, (unsigned long long)n); trace(t); }
     std::unique_lock<std::mutex> lk(s->mx);
     if (offset < s->startOff || offset > s->endOff) {      // seek fora da janela: recomeca dali
         s->chunks.clear(); s->startOff = s->endOff = offset; s->gen++;
