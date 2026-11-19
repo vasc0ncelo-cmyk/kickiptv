@@ -30,6 +30,9 @@ void setStreamIo(const StreamIo &io);
 void setTrace(void (*fn)(const char *));   // passos em /data/kickiptv.log
 
 bool available();
+// Inicia em SEGUNDO PLANO (thread propria, sem bloquear ninguem) o teste do audio SDL. Chame cedo (ex.: ao abrir o menu):
+// quando o 1o video abrir o resultado ja esta pronto e o play() nao espera. Pode chamar varias vezes.
+void prewarm();
 bool boot();
 bool play(const std::string &url);
 void pause(bool on);
@@ -41,6 +44,8 @@ void shutdown();
 Status status();
 bool isOpen();
 void poll();
-bool renderToBgra(uint8_t *dst, int width, int height, int strideBytes);
+// Desenha o quadro atual do mpv em dst (BGRA). Sem 'force' so desenha se chegou quadro novo (false = nada novo).
+// force=true: redesenha o ULTIMO quadro mesmo sem quadro novo (OSD com o video pausado) - assim nao precisa guardar uma copia de 8 MB.
+bool renderToBgra(uint8_t *dst, int width, int height, int strideBytes, bool force = false);
 
 } // namespace mpv_player

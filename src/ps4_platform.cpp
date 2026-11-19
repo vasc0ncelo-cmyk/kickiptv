@@ -1794,7 +1794,6 @@ struct Player {
     bool useMpv = false;                   // true = libmpv (PacBrew, igual GMCA)
     bool mpvGot = false, mpvLastHud = false;  // ja chegou 1 quadro do mpv / estado do OSD no ultimo desenho
     double mpvT0 = 0, mpvLastOv = 0;
-    std::vector<uint32_t> mpvClean;        // copia do quadro puro (sem OSD) para redesenhar o OSD com o video pausado
     int mpvSeekAcc = 0;                    // segundos acumulados dos saltos L1/R1 (para o aviso central)
     std::string toastText; double toastUntil = 0;
     nativeplayer::Session native;
@@ -1986,7 +1985,7 @@ struct Player {
             if (mpv_player::play(url)) {
                 trace("mpv-play-ok");
                 useMpv = true;
-                mpvGot = false; mpvT0 = nowSec(); mpvLastOv = 0; mpvLastHud = false; mpvClean.clear(); mpvSeekAcc = 0; toastUntil = 0;
+                mpvGot = false; mpvT0 = nowSec(); mpvLastOv = 0; mpvLastHud = false; mpvSeekAcc = 0; toastUntil = 0;
                 paused = false; muted = false; failed = false;
                 active = true;
                 isVod = (url.find(".m3u8") == std::string::npos) && kickSlug.empty();
@@ -3909,6 +3908,16 @@ int main() {
         memcpy(bufs[back], shadow, (size_t)W * H * 4);          // copia sequencial (rapida)
         sceVideoOutSubmitFlip(vh, back, ORBIS_VIDEO_OUT_FLIP_VSYNC, 0); back = (back + 1) % 3;
     };
+    // Video do mpv SEM OSD: o mpv escreve o quadro direto na tela de video (bufs[back]) e aqui so se troca a tela.
+    // Antes cada quadro era escrito no rascunho, copiado para uma 2a copia (mpvClean) e copiado de novo para a tela: ~16 MB de memcpy por quadro.
+    // Com OSD visivel (so ~12 s apos apertar um botao) continua pelo rascunho, porque desenhar o OSD le pixels e a memoria de video so e rapida para escrita.
+    // Chave de seguranca: criar o arquivo /data/kickiptv_mpv_shadow volta ao caminho antigo (sempre pelo rascunho).
+    const bool mpvDirect = !fileExists("/data/kickiptv_mpv_shadow");
+    auto flipDirect = [&]() {
+        g_mainTick++;
+        menuPainter.invalidate();
+        sceVideoOutSubmitFlip(vh, back, ORBIS_VIDEO_OUT_FLIP_VSYNC, 0); back = (back + 1) % 3;
+    };
     ui.dbg = [](const char *st) { static int n = 0; if (n < 6) { n++; trace(st); } };      // so o 1o desenho do menu (nao enche o log)
     double animCost = 0.03;                              // custo do ultimo desenho do menu: define a taxa de quadros da animacao
     auto presentMenu = [&]() {
@@ -4032,6 +4041,9 @@ int main() {
         snprintf(pb, sizeof pb, "pad-status h=%d", pin.h);
         trace(pb);
     }
+    // Teste do audio SDL em segundo plano desde ja (nao bloqueia nada): quando o 1o video abrir o resultado ja esta pronto.
+    mpv_player::setTrace([](const char *st) { trace(st); });
+    mpv_player::prewarm();
     trace("loop-inicio");
     startWatchdog();
     double hbNext = monoSec() + 60, hbT0 = monoSec();
@@ -4332,26 +4344,25 @@ int main() {
                 } else if (tn - lastW > 0.12) { lastW = tn; presentWait(); }
                 else sceKernelUsleep(4000);
                 if (!player.mpvGot) continue;
-                std::vector<uint32_t> &C = player.mpvClean;
-                if (C.size() != (size_t)W * H) C.resize((size_t)W * H);
-                memcpy(C.data(), shadow, (size_t)W * H * 4);
                 if (player.hudActive() || tn < player.toastUntil) player.overlay(r);
                 flip(); player.mpvLastOv = tn; player.mpvLastHud = true;
                 continue;
             }
             {
-                FbRenderer r(shadow, W, H);
                 const bool hudNow = player.hudActive() || tn < player.toastUntil;
-                std::vector<uint32_t> &C = player.mpvClean;
-                if (C.size() != (size_t)W * H) C.resize((size_t)W * H);
-                if (mpv_player::renderToBgra((uint8_t *)shadow, W, H, W * 4)) {          // quadro novo
-                    memcpy(C.data(), shadow, (size_t)W * H * 4);                            // guarda o quadro puro (para redesenhar o OSD pausado)
-                    if (hudNow) player.overlay(r);
-                    flip(); player.mpvLastOv = tn; player.mpvLastHud = hudNow;
+                const bool direct = mpvDirect && !hudNow;                              // sem OSD: mpv -> tela, zero copias
+                uint8_t *dst = direct ? (uint8_t *)bufs[back] : (uint8_t *)shadow;
+                auto present = [&]() {
+                    if (direct) flipDirect();
+                    else { FbRenderer r(shadow, W, H); if (hudNow) player.overlay(r); flip(); }
+                    player.mpvLastOv = tn; player.mpvLastHud = hudNow;
+                };
+                if (mpv_player::renderToBgra(dst, W, H, W * 4)) {                      // quadro novo
+                    present();
                 } else if (pressed || hudNow != player.mpvLastHud || (hudNow && tn - player.mpvLastOv > 0.5)) {
-                    memcpy(shadow, C.data(), (size_t)W * H * 4);                            // sem quadro novo: OSD sobre o ultimo quadro
-                    if (hudNow) player.overlay(r);
-                    flip(); player.mpvLastOv = tn; player.mpvLastHud = hudNow;
+                    // sem quadro novo (video pausado): o mpv redesenha o ULTIMO quadro (force) para colocar/tirar o OSD.
+                    // Nao existe mais a copia de 8 MB do "quadro puro".
+                    if (mpv_player::renderToBgra(dst, W, H, W * 4, true)) present();
                 }
             }
             sceKernelUsleep(4000);

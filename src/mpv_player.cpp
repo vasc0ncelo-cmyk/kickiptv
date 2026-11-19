@@ -7,6 +7,7 @@
 #include <string>
 #include <thread>
 #include <chrono>
+#include <pthread.h>
 
 #ifndef USE_LIBMPV
 
@@ -14,6 +15,7 @@ namespace mpv_player {
 void setStreamIo(const StreamIo &) {}
 void setTrace(void (*)(const char *)) {}
 bool available() { return false; }
+void prewarm() {}
 bool boot() { return false; }
 bool play(const std::string &) { return false; }
 void pause(bool) {}
@@ -25,7 +27,7 @@ void shutdown() {}
 Status status() { return {}; }
 bool isOpen() { return false; }
 void poll() {}
-bool renderToBgra(uint8_t *, int, int, int) { return false; }
+bool renderToBgra(uint8_t *, int, int, int, bool) { return false; }
 }
 
 #else
@@ -166,36 +168,87 @@ static bool ensureRender() {
 static void (*g_trace)(const char *) = nullptr;
 static void tr(const char *s) { if (g_trace) g_trace(s); }
 
-// O SDL de audio travava dentro do mpv (log parava em "[ao/sdl] requested format"). Testa a abertura numa thread
-// separada com limite de tempo; se travar, o mpv usa ao=null (video sem som) em vez de ficar preso para sempre.
-static std::atomic<int> g_sdlTest{0};   // 0 nao rodou, 1 rodando, 2 ok, 3 falhou
-static bool sdlAudioPretest() {
+// ---------- Audio SDL: teste em segundo plano ----------
+// O SDL de audio do PS4 trava (o log parava em "sdl-pretest: SDL_InitSubSystem"). Antes o teste rodava DENTRO do boot do mpv,
+// bloqueando a abertura do video por 6 s e, se travasse, deixava o video sem som para sempre. Agora:
+//  1) o teste roda numa thread propria (pilha de 1 MiB: a padrao da musl tem so 128 KiB) iniciada CEDO pelo app (prewarm());
+//  2) o play() so espera um pouco (ate 2 s) e nunca fica preso: se o SDL nao estiver pronto, o video abre com ao=null;
+//  3) assim que o SDL ficar pronto, o ao e trocado para sdl em execucao (poll()/proximo play()): o som entra sem reabrir o video;
+//  4) o teste termina com SDL_QuitSubSystem: o ao_sdl do mpv RECUSA iniciar ("already initialized") se o audio do SDL ja
+//     estiver inicializado - o teste antigo nunca fechava, entao o ao=sdl nunca poderia funcionar.
+enum { SDL_ST_IDLE = 0, SDL_ST_RUN = 1, SDL_ST_OK = 2, SDL_ST_FAIL = 3 };
+static std::atomic<int> g_sdlState{SDL_ST_IDLE};
+static std::atomic<int> g_sdlTries{0};
+static std::atomic<bool> g_aoUpgrade{false};   // o video abriu com ao=null: trocar para sdl quando o teste passar
+
 #ifdef KICK_HAVE_SDL_PRETEST
-    static int cached = -1;
-    if (cached >= 0) return cached == 1;
-    g_sdlTest = 1;
-    std::thread([] {
-        tr("sdl-pretest: SDL_InitSubSystem");
-        if (SDL_InitSubSystem(SDL_INIT_AUDIO) != 0) { tr("sdl-pretest: init falhou"); g_sdlTest = 3; return; }
-        SDL_AudioSpec want, have;
-        SDL_zero(want); SDL_zero(have);
-        want.freq = 48000; want.format = AUDIO_F32SYS; want.channels = 2; want.samples = 1024;
-        tr("sdl-pretest: SDL_OpenAudioDevice");
-        SDL_AudioDeviceID d = SDL_OpenAudioDevice(nullptr, 0, &want, &have, 0);
-        if (d == 0) { tr("sdl-pretest: open falhou"); g_sdlTest = 3; return; }
-        tr("sdl-pretest: open ok");
-        SDL_CloseAudioDevice(d);
-        tr("sdl-pretest: close ok");
-        g_sdlTest = 2;
-    }).detach();
-    for (int i = 0; i < 60 && g_sdlTest.load() == 1; i++) std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    cached = (g_sdlTest.load() == 2) ? 1 : 0;
-    if (g_sdlTest.load() == 1) tr("sdl-pretest: TRAVOU (6 s)");
-    return cached == 1;
-#else
-    return true;
-#endif
+static void *sdlProbeMain(void *) {
+    SDL_SetMainReady();
+    tr("sdl-probe: SDL_InitSubSystem");
+    if (SDL_InitSubSystem(SDL_INIT_AUDIO) != 0) { tr("sdl-probe: init falhou"); g_sdlState = SDL_ST_FAIL; return nullptr; }
+    {
+        const char *drv = SDL_GetCurrentAudioDriver();
+        char b[96]; snprintf(b, sizeof b, "sdl-probe: init ok driver=%s", drv ? drv : "?"); tr(b);
+    }
+    SDL_AudioSpec want, have;
+    SDL_zero(want); SDL_zero(have);
+    want.freq = 48000; want.format = AUDIO_S16SYS; want.channels = 2; want.samples = 1024;
+    tr("sdl-probe: SDL_OpenAudioDevice");
+    SDL_AudioDeviceID d = SDL_OpenAudioDevice(nullptr, 0, &want, &have, 0);
+    if (d == 0) { tr("sdl-probe: open falhou"); SDL_QuitSubSystem(SDL_INIT_AUDIO); g_sdlState = SDL_ST_FAIL; return nullptr; }
+    tr("sdl-probe: open ok");
+    SDL_CloseAudioDevice(d);
+    tr("sdl-probe: close ok");
+    SDL_QuitSubSystem(SDL_INIT_AUDIO);          // obrigatorio: sem isso o ao_sdl do mpv diz "already initialized"
+    tr("sdl-probe: quit ok");
+    g_sdlState = SDL_ST_OK;
+    return nullptr;
 }
+static void sdlStartProbe() {
+    int st = g_sdlState.load();
+    if (st == SDL_ST_RUN || st == SDL_ST_OK) return;
+    if (st == SDL_ST_FAIL && g_sdlTries.load() >= 3) return;      // falhou (sem travar) 3 vezes: desiste
+    g_sdlTries++;
+    g_sdlState = SDL_ST_RUN;
+    pthread_attr_t at;
+    pthread_t th;
+    bool ok = false;
+    if (pthread_attr_init(&at) == 0) {
+        pthread_attr_setstacksize(&at, 1u << 20);
+        pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+        ok = pthread_create(&th, &at, sdlProbeMain, nullptr) == 0;
+        pthread_attr_destroy(&at);
+    }
+    if (!ok) {
+        try { std::thread([] { sdlProbeMain(nullptr); }).detach(); ok = true; } catch (...) {}
+    }
+    if (!ok) { tr("sdl-probe: nao conseguiu criar a thread"); g_sdlState = SDL_ST_FAIL; }
+}
+#else
+static void sdlStartProbe() { g_sdlState = SDL_ST_OK; }          // sem o header do SDL: como antes, assume que o ao=sdl abre
+#endif
+
+// Espera no maximo maxMs pelo teste (nunca indefinidamente). Devolve o estado.
+static int sdlAudioWait(int maxMs) {
+    sdlStartProbe();
+    for (int i = 0; i < maxMs / 50 && g_sdlState.load() == SDL_ST_RUN; i++) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    return g_sdlState.load();
+}
+
+// O video abriu sem som e o SDL ficou pronto depois: troca o ao em execucao (chamar com g_mx).
+static void applyAoUpgradeLocked() {
+    if (!g_aoUpgrade.load() || !g_mpv) return;
+    sdlStartProbe();                                   // se falhou (sem travar), tenta de novo (ate 3 vezes)
+    if (g_sdlState.load() != SDL_ST_OK) return;
+    g_aoUpgrade = false;
+    int r = mpv_set_property_string(g_mpv, "ao", "sdl,null");
+    tr(r >= 0 ? "mpv-ao: trocado para sdl (som ligado)" : "mpv-ao: nao foi possivel trocar para sdl");
+}
+
+// desempenho do desenho (aparece em mpv-perf): tempo medio de mpv_render_context_render
+static std::atomic<long long> g_renderUs{0};
+static std::atomic<int> g_renderN{0};
+static bool g_everRendered = false;     // ja desenhou um quadro desde o ultimo play (so entao 'force' faz sentido)
 
 static void drainEventsUnlocked(bool *gotLoaded, bool *gotFail) {
     while (true) {
@@ -256,6 +309,8 @@ void setStreamIo(const StreamIo &io) {
 
 bool available() { return true; }
 
+void prewarm() { sdlStartProbe(); }
+
 bool boot() {
     std::lock_guard<std::mutex> lk(g_mx);
     if (g_mpv) return true;
@@ -269,10 +324,18 @@ bool boot() {
     mpv_set_option_string(g_mpv, "msg-level", "ffmpeg=v,cplayer=v,stream=v,demux=v,ao=v,sdl=v,vo=v,vd=v");
     mpv_set_option_string(g_mpv, "ytdl", "no");
     mpv_set_option_string(g_mpv, "osd-level", "0");
+    mpv_set_option_string(g_mpv, "sid", "no");
+    mpv_set_option_string(g_mpv, "sub-auto", "no");
     mpv_set_option_string(g_mpv, "vo", "libmpv");
     mpv_set_option_string(g_mpv, "hwdec", "no");
     mpv_set_option_string(g_mpv, "vd-lavc-threads", "6");
-    // CPU fraca do PS4: tudo no modo mais barato (o decodificador e o escalonamento sao por software)
+    // ---- VIDEO ----
+    // O vo=libmpv por software converte (YUV->BGRA) e escala TODO quadro na CPU. O que pesava: o swscale padrao do mpv e o "bicubic"
+    // (~150 ms por quadro 1080p no PS4 => ~7 quadros/s). As opcoes de GPU (scale/cscale/dscale/dither/interpolation...) nao valem
+    // para este caminho; quem manda aqui sao as sws-*: bilinear rapido, sem zimg (mais lento nessa CPU).
+    mpv_set_option_string(g_mpv, "sws-scaler", "fast-bilinear");
+    mpv_set_option_string(g_mpv, "sws-fast", "yes");
+    mpv_set_option_string(g_mpv, "sws-allow-zimg", "no");
     mpv_set_option_string(g_mpv, "sw-fast", "yes");
     mpv_set_option_string(g_mpv, "scale", "bilinear");
     mpv_set_option_string(g_mpv, "cscale", "bilinear");
@@ -280,18 +343,35 @@ bool boot() {
     mpv_set_option_string(g_mpv, "correct-downscaling", "no");
     mpv_set_option_string(g_mpv, "dither-depth", "no");
     mpv_set_option_string(g_mpv, "interpolation", "no");
+    mpv_set_option_string(g_mpv, "video-sync", "audio");
     mpv_set_option_string(g_mpv, "vd-lavc-skiploopfilter", "all");
     mpv_set_option_string(g_mpv, "vd-lavc-dr", "no");
     mpv_set_option_string(g_mpv, "framedrop", "decoder+vo");
     mpv_set_option_string(g_mpv, "vd-lavc-fast", "yes");
+    // ---- CACHE ----
+    // Leitura em blocos grandes (o HTTP do app ja busca 1 MB por vez); a memoria "de tras" so precisa cobrir os saltos de +-10 s;
+    // pausa por falta de cache so depois de esvaziar de verdade e retoma com folga (menos "engasgos" curtos e repetidos).
     mpv_set_option_string(g_mpv, "cache", "yes");
     mpv_set_option_string(g_mpv, "demuxer-max-bytes", "96MiB");
-    mpv_set_option_string(g_mpv, "demuxer-max-back-bytes", "32MiB");
+    mpv_set_option_string(g_mpv, "demuxer-max-back-bytes", "16MiB");
+    mpv_set_option_string(g_mpv, "cache-secs", "120");
+    mpv_set_option_string(g_mpv, "stream-buffer-size", "1MiB");
+    mpv_set_option_string(g_mpv, "cache-pause", "yes");
+    mpv_set_option_string(g_mpv, "cache-pause-initial", "no");
+    mpv_set_option_string(g_mpv, "cache-pause-wait", "3");
     mpv_set_option_string(g_mpv, "force-seekable", "yes");
+    // ---- AUDIO ----
     mpv_set_option_string(g_mpv, "audio-channels", "stereo");
-    const bool sdlOk = sdlAudioPretest();
-    mpv_set_option_string(g_mpv, "ao", sdlOk ? "sdl,null" : "null");
-    tr(sdlOk ? "mpv-ao=sdl" : "mpv-ao=null (SDL travou: video sem som)");
+    mpv_set_option_string(g_mpv, "audio-samplerate", "48000");     // o mesmo formato que o teste do SDL abriu (s16 estereo 48 kHz)
+    mpv_set_option_string(g_mpv, "audio-format", "s16");
+    mpv_set_option_string(g_mpv, "audio-fallback-to-null", "yes");
+    {
+        // Nao trava a abertura: espera no maximo 2 s pelo teste (que ja deve ter rodado em segundo plano desde o inicio do app).
+        const bool sdlOk = sdlAudioWait(2000) == SDL_ST_OK;
+        mpv_set_option_string(g_mpv, "ao", sdlOk ? "sdl,null" : "null");
+        g_aoUpgrade = !sdlOk;      // sem som por enquanto: troca para sdl em execucao quando o teste passar
+        tr(sdlOk ? "mpv-ao=sdl" : "mpv-ao=null (SDL ainda nao pronto: o som liga sozinho quando ficar)");
+    }
     mpv_set_option_string(g_mpv, "demuxer-lavf-analyzeduration", "2");
     mpv_set_option_string(g_mpv, "demuxer-lavf-probesize", "3145728");
     mpv_set_option_string(g_mpv, "demuxer-lavf-probescore", "1");
@@ -352,6 +432,8 @@ bool play(const std::string &url) {
         g_pos = 0;
         g_dur = 0;
         g_err.clear();
+        g_everRendered = false;
+        applyAoUpgradeLocked();       // SDL ficou pronto depois do 1o boot: este video ja abre com som
         ensureRender();
 
         // Se esta linha nao aparecer no /data/kickiptv_mpv.log como khttp://... o PKG e velho
@@ -492,6 +574,7 @@ void poll() {
     std::lock_guard<std::mutex> lk(g_mx);
     if (!g_mpv) return;
     drainEventsUnlocked(nullptr, nullptr);
+    if (g_aoUpgrade.load()) applyAoUpgradeLocked();
     // a cada ~5 s grava fps real e quadros descartados em /data/kickiptv.log (para ver se o decodificador da conta)
     static auto last = std::chrono::steady_clock::now();
     auto now = std::chrono::steady_clock::now();
@@ -501,17 +584,18 @@ void poll() {
         mpv_get_property(g_mpv, "estimated-vf-fps", MPV_FORMAT_DOUBLE, &fps);
         mpv_get_property(g_mpv, "vo-drop-frame-count", MPV_FORMAT_INT64, &vo);
         mpv_get_property(g_mpv, "decoder-frame-drop-count", MPV_FORMAT_INT64, &dec);
-        char b[128]; snprintf(b, sizeof b, "mpv-perf fps=%.1f drop-vo=%lld drop-dec=%lld pos=%.0f", fps, (long long)vo, (long long)dec, g_pos);
+        int rn = g_renderN.exchange(0); long long ru = g_renderUs.exchange(0);
+        char b[160]; snprintf(b, sizeof b, "mpv-perf fps=%.1f drop-vo=%lld drop-dec=%lld pos=%.0f render=%.0fms(n=%d)", fps, (long long)vo, (long long)dec, g_pos, rn ? ru / 1000.0 / rn : 0.0, rn);
         tr(b);
     }
 }
 
-bool renderToBgra(uint8_t *dst, int width, int height, int strideBytes) {
+bool renderToBgra(uint8_t *dst, int width, int height, int strideBytes, bool force) {
     std::lock_guard<std::mutex> lk(g_mx);
     if (!g_mpv || !g_open || !dst || width <= 0 || height <= 0) return false;
     if (!ensureRender()) return false;
     uint64_t flags = mpv_render_context_update(g_rr);
-    if (!(flags & MPV_RENDER_UPDATE_FRAME)) return false;
+    if (!(flags & MPV_RENDER_UPDATE_FRAME) && !(force && g_everRendered)) return false;
     int size[2] = {width, height};
     mpv_render_param params[] = {
         {MPV_RENDER_PARAM_SW_SIZE, size},
@@ -520,10 +604,16 @@ bool renderToBgra(uint8_t *dst, int width, int height, int strideBytes) {
         {MPV_RENDER_PARAM_SW_POINTER, dst},
         {MPV_RENDER_PARAM_INVALID, nullptr}
     };
+    auto t0 = std::chrono::steady_clock::now();
     int r = mpv_render_context_render(g_rr, params);
     if (r < 0) {
         params[1].data = (void *)"rgb0";
         r = mpv_render_context_render(g_rr, params);
+    }
+    if (r >= 0) {
+        g_everRendered = true;
+        g_renderUs += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+        g_renderN++;
     }
     return r >= 0;
 }
