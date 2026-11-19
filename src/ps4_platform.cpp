@@ -453,13 +453,19 @@ struct NetClient {
 static NetClient &g_net = *new NetClient;
 
 // HTTP do app -> libmpv stream_cb (khttp://). Sessao HTTP reaproveitada por stream.
+// Leitura antecipada: uma thread propria baixa blocos de 1 MB (Range) na frente da posicao do mpv, numa janela de ~24 MB.
+// (antes: 1 requisicao HTTP por leitura de 128 KB => ~350 KB/s e 19 s so para abrir)
 struct KickMpvStream {
     std::string url;
-    NetClient::Session sess;
-    uint64_t size = 0;
-    bool opened = false;
-    std::string prefetch;      // primeiros bytes ja baixados no open
-    uint64_t prefetch_off = 0; // offset correspondente (sempre 0)
+    NetClient::Session sess;       // usada SO pela thread leitora
+    std::mutex mx;
+    std::condition_variable cv;
+    std::deque<std::pair<uint64_t, std::string>> chunks;   // blocos contiguos: (offset, bytes)
+    uint64_t startOff = 0, endOff = 0;                    // janela em memoria = [startOff, endOff)
+    uint64_t want = 0;                                    // posicao pedida pelo mpv
+    uint64_t size = 0;                                    // 0 = desconhecido
+    uint64_t gen = 0;                                     // sobe a cada seek fora da janela
+    bool stop = false, err = false, started = false;
 };
 static bool kickLooksLikeMedia(const std::string &b) {
     if (b.size() < 4) return false;
@@ -489,106 +495,125 @@ static bool kickLooksLikeHtml(const std::string &b) {
     }
     return false;
 }
+static const uint64_t kMpvChunk = 1024 * 1024;
+static const uint64_t kMpvAhead = 24ull * 1024 * 1024;
+static const uint64_t kMpvBehind = 4ull * 1024 * 1024;
+
+static void kickMpvWorker(std::shared_ptr<KickMpvStream> s) {
+    bool sessOpen = true;
+    for (;;) {
+        uint64_t from, gen;
+        {
+            std::unique_lock<std::mutex> lk(s->mx);
+            for (;;) {
+                if (s->stop) goto done;
+                // solta o que ficou muito para tras
+                while (s->chunks.size() > 1 && s->chunks.front().first + s->chunks.front().second.size() + kMpvBehind < s->want) {
+                    s->startOff = s->chunks.front().first + s->chunks.front().second.size();
+                    s->chunks.pop_front();
+                }
+                bool eof = s->size > 0 && s->endOff >= s->size;
+                if (!eof && s->endOff < s->want + kMpvAhead) break;
+                s->cv.wait_for(lk, std::chrono::milliseconds(500));
+            }
+            from = s->endOff; gen = s->gen;
+        }
+        std::string body; int st = 0; uint64_t total = 0; bool ok = false;
+        for (int attempt = 0; attempt < 3 && !ok; attempt++) {
+            {
+                std::lock_guard<std::mutex> lk(s->mx);
+                if (s->stop) goto done;
+                if (s->gen != gen) break;
+            }
+            if (!sessOpen) { if (!g_net.openSession(s->sess, s->url)) { sessOpen = false; continue; } sessOpen = true; }
+            body.clear(); st = 0; total = 0;
+            if (g_net.getRange(s->sess, s->url, from, from + kMpvChunk - 1, body, st, &total) && (st == 206 || st == 200 || st == 416)) { ok = true; break; }
+            g_net.closeSession(s->sess); sessOpen = false;
+        }
+        std::lock_guard<std::mutex> lk(s->mx);
+        if (s->stop) break;
+        if (s->gen != gen) continue;          // houve seek: descarta
+        if (!ok) { s->err = true; s->cv.notify_all(); break; }
+        if (total > 0) s->size = total;
+        if (st == 416) { if (s->size == 0) s->size = from; s->cv.notify_all(); continue; }
+        if (st == 200) {                      // servidor ignorou Range: so aceitamos quando veio do comeco
+            if (from != 0) { s->err = true; s->cv.notify_all(); break; }
+            s->size = body.size();
+        }
+        if (body.empty()) { if (s->size == 0) s->size = from; s->cv.notify_all(); continue; }
+        s->endOff = from + body.size();
+        s->chunks.emplace_back(from, std::move(body));
+        s->cv.notify_all();
+    }
+done:
+    if (sessOpen) g_net.closeSession(s->sess);
+    std::lock_guard<std::mutex> lk(s->mx);
+    s->started = false;
+    s->cv.notify_all();
+}
+
 static void *kickMpvOpen(void * /*ud*/, const char *url, uint64_t *size_out) {
     if (!url || !*url) return nullptr;
     if (!g_net.init()) return nullptr;
-    auto *s = new KickMpvStream();
+    auto sp = std::make_shared<KickMpvStream>();
+    KickMpvStream *s = sp.get();
     s->url = url;
-    if (!g_net.openSession(s->sess, s->url)) {
-        delete s;
-        return nullptr;
-    }
-    s->opened = true;
-    // Le os primeiros 64 KB: valida se e midia de verdade (nao HTML de erro)
-    std::string tip;
-    int st = 0;
-    uint64_t total = 0;
-    const uint64_t probeTo = 64 * 1024 - 1;
-    if (!g_net.getRange(s->sess, s->url, 0, probeTo, tip, st, &total)) {
-        g_net.closeSession(s->sess);
-        s->opened = false;
-        delete s;
-        return nullptr;
-    }
-    if (total > 0) {
-        s->size = total;
-        if (size_out) *size_out = total;
-    } else if (size_out) {
-        *size_out = 0;
-    }
-    if (st != 206 && st != 200) {
-        delete s;
-        return nullptr;
-    }
-    // Se veio 200 com arquivo inteiro numa "range", ainda usamos o comeco
-    if (kickLooksLikeHtml(tip)) {
-        // painel devolveu pagina HTML — mpv reportaria "unrecognized file format"
-        delete s;
-        return nullptr;
-    }
-    // guarda o probe para a primeira leitura (evita segundo GET e garante magic bytes)
-    s->prefetch = std::move(tip);
-    s->prefetch_off = 0;
-    return s;
+    if (!g_net.openSession(s->sess, s->url)) return nullptr;
+    // primeiro bloco (64 KB): valida se e midia de verdade (nao HTML de erro)
+    std::string tip; int st = 0; uint64_t total = 0;
+    if (!g_net.getRange(s->sess, s->url, 0, 64 * 1024 - 1, tip, st, &total)) { g_net.closeSession(s->sess); return nullptr; }
+    if ((st != 206 && st != 200) || kickLooksLikeHtml(tip)) { g_net.closeSession(s->sess); return nullptr; }
+    if (st == 200) total = tip.size();          // veio inteiro
+    s->size = total;
+    if (size_out) *size_out = total;
+    s->startOff = 0; s->endOff = tip.size();
+    s->chunks.emplace_back(0, std::move(tip));
+    s->started = true;
+    std::thread(kickMpvWorker, sp).detach();
+    trace("mpv-stream-aberto");
+    return new std::shared_ptr<KickMpvStream>(sp);
 }
 static int64_t kickMpvRead(void *cookie, uint64_t offset, char *buf, uint64_t n) {
-    auto *s = (KickMpvStream *)cookie;
-    if (!s || !buf || n == 0) return -1;
-    // Serve bytes do probe inicial (garante ftyp/magic para o demuxer)
-    if (!s->prefetch.empty() && offset >= s->prefetch_off &&
-        offset < s->prefetch_off + s->prefetch.size()) {
-        size_t po = (size_t)(offset - s->prefetch_off);
-        size_t avail = s->prefetch.size() - po;
-        size_t copy = avail < (size_t)n ? avail : (size_t)n;
-        memcpy(buf, s->prefetch.data() + po, copy);
-        return (int64_t)copy;
+    if (!cookie || !buf || n == 0) return -1;
+    auto &sp = *(std::shared_ptr<KickMpvStream> *)cookie;
+    KickMpvStream *s = sp.get();
+    std::unique_lock<std::mutex> lk(s->mx);
+    if (offset < s->startOff || offset > s->endOff) {      // seek fora da janela: recomeca dali
+        s->chunks.clear(); s->startOff = s->endOff = offset; s->gen++;
     }
-    if (!s->opened) {
-        if (!g_net.openSession(s->sess, s->url)) return -1;
-        s->opened = true;
+    s->want = offset;
+    s->cv.notify_all();
+    if (s->size > 0 && offset >= s->size) return 0;
+    for (int w = 0; w < 600 && !s->stop; w++) {             // ate ~60 s
+        if (s->endOff > offset) break;
+        if (s->size > 0 && offset >= s->size) return 0;
+        if (s->err) return -1;
+        s->cv.wait_for(lk, std::chrono::milliseconds(100));
     }
-    std::string body;
-    int status = 0;
-    uint64_t total = 0;
-    const uint64_t to = offset + n - 1;
-    for (int attempt = 0; attempt < 3; attempt++) {
-        body.clear(); status = 0; total = 0;
-        if (!g_net.getRange(s->sess, s->url, offset, to, body, status, &total)) {
-            g_net.closeSession(s->sess);
-            s->opened = false;
-            if (!g_net.openSession(s->sess, s->url)) return -1;
-            s->opened = true;
-            continue;
-        }
-        if (total > 0) s->size = total;
-        if (status == 416) return 0; // past EOF
-        if (status == 206) {
-            size_t copy = body.size() < (size_t)n ? body.size() : (size_t)n;
-            if (copy) memcpy(buf, body.data(), copy);
-            return (int64_t)copy;
-        }
-        if (status == 200) {
-            // servidor ignorou Range
-            if (offset >= body.size()) return 0;
-            size_t avail = body.size() - (size_t)offset;
-            size_t copy = avail < (size_t)n ? avail : (size_t)n;
-            if (copy) memcpy(buf, body.data() + (size_t)offset, copy);
-            if (s->size == 0) s->size = (uint64_t)body.size();
-            return (int64_t)copy;
-        }
-        // status estranho: reconecta
-        g_net.closeSession(s->sess);
-        s->opened = false;
-        if (!g_net.openSession(s->sess, s->url)) return -1;
-        s->opened = true;
+    if (s->endOff <= offset) return s->err ? -1 : (s->size > 0 && offset >= s->size ? 0 : -1);
+    uint64_t done = 0;
+    for (auto &c : s->chunks) {
+        uint64_t co = c.first, ce = c.first + c.second.size();
+        if (ce <= offset + done) continue;
+        if (co > offset + done) break;
+        uint64_t from = offset + done - co;
+        uint64_t take = ce - (offset + done);
+        if (take > n - done) take = n - done;
+        memcpy(buf + done, c.second.data() + from, (size_t)take);
+        done += take;
+        if (done >= n) break;
     }
-    return -1;
+    return (int64_t)done;
 }
 static void kickMpvClose(void *cookie) {
-    auto *s = (KickMpvStream *)cookie;
-    if (!s) return;
-    if (s->opened) g_net.closeSession(s->sess);
-    delete s;
+    if (!cookie) return;
+    auto *sp = (std::shared_ptr<KickMpvStream> *)cookie;
+    {
+        std::lock_guard<std::mutex> lk((*sp)->mx);
+        (*sp)->stop = true;
+        (*sp)->cv.notify_all();
+    }
+    delete sp;     // a thread leitora tem a propria referencia e encerra sozinha
 }
 static void kickMpvRegisterIo() {
     mpv_player::StreamIo io;
@@ -597,6 +622,7 @@ static void kickMpvRegisterIo() {
     io.close = &kickMpvClose;
     io.ud = nullptr;
     mpv_player::setStreamIo(io);
+    mpv_player::setTrace([](const char *st) { trace(st); });
 }
 
 static ImgCache &g_covers = *new ImgCache;

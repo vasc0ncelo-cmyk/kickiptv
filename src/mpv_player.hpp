@@ -27,6 +27,7 @@ struct StreamIo {
 };
 
 void setStreamIo(const StreamIo &io);
+void setTrace(void (*fn)(const char *));   // passos em /data/kickiptv.log
 
 bool available();
 bool boot();

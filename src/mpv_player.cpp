@@ -5,11 +5,14 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <thread>
+#include <chrono>
 
 #ifndef USE_LIBMPV
 
 namespace mpv_player {
 void setStreamIo(const StreamIo &) {}
+void setTrace(void (*)(const char *)) {}
 bool available() { return false; }
 bool boot() { return false; }
 bool play(const std::string &) { return false; }
@@ -32,6 +35,13 @@ extern "C" {
 #include <mpv/render.h>
 #include <mpv/stream_cb.h>
 }
+#if defined(__has_include)
+#if __has_include(<SDL2/SDL.h>)
+#define KICK_HAVE_SDL_PRETEST 1
+#define SDL_MAIN_HANDLED
+#include <SDL2/SDL.h>
+#endif
+#endif
 
 namespace mpv_player {
 namespace {
@@ -152,6 +162,41 @@ static bool ensureRender() {
     return true;
 }
 
+
+static void (*g_trace)(const char *) = nullptr;
+static void tr(const char *s) { if (g_trace) g_trace(s); }
+
+// O SDL de audio travava dentro do mpv (log parava em "[ao/sdl] requested format"). Testa a abertura numa thread
+// separada com limite de tempo; se travar, o mpv usa ao=null (video sem som) em vez de ficar preso para sempre.
+static std::atomic<int> g_sdlTest{0};   // 0 nao rodou, 1 rodando, 2 ok, 3 falhou
+static bool sdlAudioPretest() {
+#ifdef KICK_HAVE_SDL_PRETEST
+    static int cached = -1;
+    if (cached >= 0) return cached == 1;
+    g_sdlTest = 1;
+    std::thread([] {
+        tr("sdl-pretest: SDL_InitSubSystem");
+        if (SDL_InitSubSystem(SDL_INIT_AUDIO) != 0) { tr("sdl-pretest: init falhou"); g_sdlTest = 3; return; }
+        SDL_AudioSpec want, have;
+        SDL_zero(want); SDL_zero(have);
+        want.freq = 48000; want.format = AUDIO_F32SYS; want.channels = 2; want.samples = 1024;
+        tr("sdl-pretest: SDL_OpenAudioDevice");
+        SDL_AudioDeviceID d = SDL_OpenAudioDevice(nullptr, 0, &want, &have, 0);
+        if (d == 0) { tr("sdl-pretest: open falhou"); g_sdlTest = 3; return; }
+        tr("sdl-pretest: open ok");
+        SDL_CloseAudioDevice(d);
+        tr("sdl-pretest: close ok");
+        g_sdlTest = 2;
+    }).detach();
+    for (int i = 0; i < 60 && g_sdlTest.load() == 1; i++) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    cached = (g_sdlTest.load() == 2) ? 1 : 0;
+    if (g_sdlTest.load() == 1) tr("sdl-pretest: TRAVOU (6 s)");
+    return cached == 1;
+#else
+    return true;
+#endif
+}
+
 static void drainEventsUnlocked(bool *gotLoaded, bool *gotFail) {
     while (true) {
         mpv_event *ev = mpv_wait_event(g_mpv, 0);
@@ -202,6 +247,8 @@ static void drainEventsUnlocked(bool *gotLoaded, bool *gotFail) {
 
 } // namespace
 
+void setTrace(void (*fn)(const char *)) { g_trace = fn; }
+
 void setStreamIo(const StreamIo &io) {
     std::lock_guard<std::mutex> lk(g_mx);
     g_io = io;
@@ -219,7 +266,7 @@ bool boot() {
     }
 
     mpv_set_option_string(g_mpv, "log-file", "/data/kickiptv_mpv.log");
-    mpv_set_option_string(g_mpv, "msg-level", "ffmpeg=v,cplayer=v,stream=v,demux=v");
+    mpv_set_option_string(g_mpv, "msg-level", "ffmpeg=v,cplayer=v,stream=v,demux=v,ao=v,sdl=v,vo=v,vd=v");
     mpv_set_option_string(g_mpv, "ytdl", "no");
     mpv_set_option_string(g_mpv, "osd-level", "0");
     mpv_set_option_string(g_mpv, "vo", "libmpv");
@@ -231,9 +278,11 @@ bool boot() {
     mpv_set_option_string(g_mpv, "demuxer-max-back-bytes", "32MiB");
     mpv_set_option_string(g_mpv, "force-seekable", "yes");
     mpv_set_option_string(g_mpv, "audio-channels", "stereo");
-    mpv_set_option_string(g_mpv, "ao", "sdl,null");
-    mpv_set_option_string(g_mpv, "demuxer-lavf-analyzeduration", "5");
-    mpv_set_option_string(g_mpv, "demuxer-lavf-probesize", "5242880");
+    const bool sdlOk = sdlAudioPretest();
+    mpv_set_option_string(g_mpv, "ao", sdlOk ? "sdl,null" : "null");
+    tr(sdlOk ? "mpv-ao=sdl" : "mpv-ao=null (SDL travou: video sem som)");
+    mpv_set_option_string(g_mpv, "demuxer-lavf-analyzeduration", "2");
+    mpv_set_option_string(g_mpv, "demuxer-lavf-probesize", "3145728");
     mpv_set_option_string(g_mpv, "demuxer-lavf-probescore", "1");
     // stream_cb e tratado como arquivo: evita lavf tentar reabrir como http
     mpv_set_option_string(g_mpv, "demuxer", "lavf");
@@ -313,7 +362,7 @@ bool play(const std::string &url) {
         else
             opts += ",demuxer-lavf-format=mp4"; // painel IPTV: maioria e mp4 progressivo
 
-        const char *cmd[] = {"loadfile", wrap.c_str(), "replace", "0", opts.c_str(), nullptr};
+        const char *cmd[] = {"loadfile", wrap.c_str(), "replace", opts.c_str(), nullptr};  // mpv 0.36: sem o indice "0" (isso e da 0.38+)
         if (chk(mpv_command(g_mpv, cmd)) < 0) {
             // fallback sem opts
             const char *cmd2[] = {"loadfile", wrap.c_str(), "replace", nullptr};
