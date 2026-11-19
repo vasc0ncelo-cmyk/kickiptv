@@ -501,7 +501,7 @@ static const uint64_t kMpvBehind = 4ull * 1024 * 1024;
 
 static void kickMpvWorker(std::shared_ptr<KickMpvStream> s) {
     trace("mpv-worker-inicio");
-    bool sessOpen = true;
+    bool sessOpen = false;     // a sessao e aberta aqui, na propria thread (a do open ja foi fechada)
     for (;;) {
         uint64_t from, gen;
         {
@@ -535,6 +535,7 @@ static void kickMpvWorker(std::shared_ptr<KickMpvStream> s) {
         if (s->stop) break;
         if (s->gen != gen) continue;          // houve seek: descarta
         if (!ok) { s->err = true; s->cv.notify_all(); break; }
+        { char t[96]; snprintf(t, sizeof t, "mpv-worker-bloco from=%llu st=%d n=%zu", (unsigned long long)from, st, body.size()); static int k = 0; if (k++ < 5) trace(t); }
         if (total > 0) s->size = total;
         if (st == 416) { if (s->size == 0) s->size = from; s->cv.notify_all(); continue; }
         if (st == 200) {                      // servidor ignorou Range: so aceitamos quando veio do comeco
@@ -563,14 +564,16 @@ static void *kickMpvOpen(void * /*ud*/, const char *url, uint64_t *size_out) {
     // primeiro bloco (64 KB): valida se e midia de verdade (nao HTML de erro)
     std::string tip; int st = 0; uint64_t total = 0;
     if (!g_net.getRange(s->sess, s->url, 0, 64 * 1024 - 1, tip, st, &total)) { g_net.closeSession(s->sess); return nullptr; }
-    if ((st != 206 && st != 200) || kickLooksLikeHtml(tip)) { g_net.closeSession(s->sess); return nullptr; }
+    g_net.closeSession(s->sess);
+    if ((st != 206 && st != 200) || kickLooksLikeHtml(tip)) return nullptr;
     if (st == 200) total = tip.size();          // veio inteiro
     s->size = total;
     if (size_out) *size_out = total;
     s->startOff = 0; s->endOff = tip.size();
     s->chunks.emplace_back(0, std::move(tip));
     s->started = true;
-    std::thread(kickMpvWorker, sp).detach();
+    try { std::thread(kickMpvWorker, sp).detach(); }
+    catch (...) { trace("mpv-worker-FALHOU-criar-thread"); return nullptr; }
     trace("mpv-stream-aberto");
     return new std::shared_ptr<KickMpvStream>(sp);
 }
