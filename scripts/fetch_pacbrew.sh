@@ -24,6 +24,35 @@ for p in "${PKGS[@]}"; do
   echo "extraindo $f"
   tar -xzf "$f"
 done
+# Dependencias extras (libass, freetype, fribidi, harfbuzz, libpng, zlib, bzip2, libsamplerate...): o libmpv.a e estatico e precisa delas.
+# Em vez de adivinhar nomes/versoes, le a lista de pacotes da release e baixa os que ainda nao vieram (a versao mais nova de cada).
+if command -v gh >/dev/null 2>&1; then
+  have=" ${PKGS[*]} "
+  gh api repos/dragonflylee/switchfin/releases/tags/pacbrew --paginate --jq '.assets[].name' 2>/dev/null \
+    | grep -E '^ps4-openorbis-.*-any\.pkg\.tar\.gz$' | sort -V > extra_list.txt || true
+  echo "pacotes ps4-openorbis na release: $(wc -l < extra_list.txt)"
+  cp extra_list.txt "$ROOT/pacbrew-assets.txt" 2>/dev/null || true
+  declare -A newest
+  while read -r f; do
+    base=$(echo "$f" | sed -E 's/^ps4-openorbis-(.*)-[0-9][^-]*-[0-9]+-any\.pkg\.tar\.gz$/\1/')
+    newest[$base]="$f"
+  done < extra_list.txt
+  for base in "${!newest[@]}"; do
+    f="${newest[$base]}"
+    # pula o que ja foi baixado pela lista fixa (mesmo nome base)
+    skip=0
+    for p in "${PKGS[@]}"; do
+      pb=$(echo "$p" | sed -E 's/-[0-9][^-]*-[0-9]+$//')
+      [ "$pb" = "$base" ] && skip=1
+    done
+    [ "$skip" = 1 ] && continue
+    if [ ! -f "$f" ]; then
+      echo "baixando extra $f"
+      curl -fsSL -o "$f" "$BASE_URL/$f" || { echo "falhou $f (ignorado)"; continue; }
+    fi
+    tar -xzf "$f" || true
+  done
+fi
 # Layout: opt/pacbrew/ps4/openorbis/usr/{lib,include}
 if [ -d opt/pacbrew/ps4/openorbis ]; then
   echo "PACBREW_PREFIX=$DEST/opt/pacbrew/ps4/openorbis"
