@@ -233,6 +233,7 @@ bool boot() {
     mpv_set_option_string(g_mpv, "ao", "sdl,null");
     mpv_set_option_string(g_mpv, "demuxer-lavf-analyzeduration", "5");
     mpv_set_option_string(g_mpv, "demuxer-lavf-probesize", "5242880");
+    mpv_set_option_string(g_mpv, "demuxer-lavf-probescore", "1");
     // stream_cb e tratado como arquivo: evita lavf tentar reabrir como http
     mpv_set_option_string(g_mpv, "demuxer", "lavf");
 
@@ -293,10 +294,27 @@ bool play(const std::string &url) {
         ensureRender();
 
         std::string wrap = std::string("khttp://") + url;
-        const char *cmd[] = {"loadfile", wrap.c_str(), "replace", nullptr};
+        // Dica de formato pro lavf (sem isso o probe do stream_cb as vezes da "unrecognized file format")
+        std::string opts = "force-seekable=yes";
+        auto lower = url;
+        for (char &c : lower) if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        if (lower.find(".mp4") != std::string::npos || lower.find("/movie/") != std::string::npos)
+            opts += ",demuxer-lavf-format=mp4";
+        else if (lower.find(".mkv") != std::string::npos)
+            opts += ",demuxer-lavf-format=matroska";
+        else if (lower.find(".m3u8") != std::string::npos || lower.find(".ts") != std::string::npos)
+            opts += ",demuxer-lavf-format=mpegts";
+        else
+            opts += ",demuxer-lavf-format=mp4"; // painel IPTV: maioria e mp4 progressivo
+
+        const char *cmd[] = {"loadfile", wrap.c_str(), "replace", "0", opts.c_str(), nullptr};
         if (chk(mpv_command(g_mpv, cmd)) < 0) {
-            g_open = false;
-            return false;
+            // fallback sem opts
+            const char *cmd2[] = {"loadfile", wrap.c_str(), "replace", nullptr};
+            if (chk(mpv_command(g_mpv, cmd2)) < 0) {
+                g_open = false;
+                return false;
+            }
         }
     }
     // IMPORTANTE: nao segurar g_mx enquanto o demuxer le via stream_cb
