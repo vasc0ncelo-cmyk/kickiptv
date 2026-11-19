@@ -96,6 +96,9 @@ bool boot() {
     }
 
     // Opcoes alinhadas ao GMCA (PS4)
+    mpv_set_option_string(g_mpv, "log-file", "/data/kickiptv_mpv.log");
+    mpv_set_option_string(g_mpv, "msg-level", "all=v");
+    mpv_set_option_string(g_mpv, "tls-verify", "no");
     mpv_set_option_string(g_mpv, "ytdl", "no");
     mpv_set_option_string(g_mpv, "osd-level", "0");
     mpv_set_option_string(g_mpv, "video-timing-offset", "0");
@@ -225,7 +228,7 @@ void poll() {
             if (e && e->reason == MPV_END_FILE_REASON_EOF) g_eof = true;
             if (e && e->reason == MPV_END_FILE_REASON_ERROR) {
                 g_failed = true;
-                g_err = "end-file error";
+                g_err = std::string("end-file: ") + mpv_error_string(e->error);
             }
             break;
         }
