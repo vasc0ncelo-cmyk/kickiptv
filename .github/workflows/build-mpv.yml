@@ -83,30 +83,36 @@ jobs:
           else
             echo "sem segredos KICK_CLIENT_ID/KICK_CLIENT_SECRET: a tela Lives agora fica indisponivel"
           fi
-      - name: Compilar
+      - name: Compilar (3 variantes, para descobrir qual abre no PS4)
         shell: bash
         run: |
-          set -o pipefail
-          { cmake -B build -DCMAKE_BUILD_TYPE=Release && make -C build -j$(nproc) VERBOSE=1; } 2>&1 | tee build-log.txt
-      - name: Resumo dos erros do compilador (se a compilacao falhou)
-        if: failure()
-        run: |
-          echo "===== ERROS ====="
-          grep -n -E "error:|fatal error:|undefined reference|undefined symbol" build-log.txt | head -80 || true
-      - name: Conferir o PKG
-        if: success()
-        run: |
-          ls -l build/*.pkg
-          { echo '== conteudo de build/ps4 (o que entra no PKG)'; find build/ps4 -type f | xargs ls -l; } | tee -a pkg-contents.txt
-          mv build/*.pkg build/Kick-IPTV-mpv.pkg
-      - name: Publicar numa Release (PKG e log)
+          set +e
+          mkdir -p out
+          variant() {   # pasta  mpv  piglet  title-id  nome  arquivo
+            { cmake -B "$1" -DCMAKE_BUILD_TYPE=Release -DKICK_MPV=$2 -DKICK_PIGLET=$3 -DKICK_TITLE_ID=$4 -DKICK_NAME="$5" \
+              && make -C "$1" -j$(nproc) VERBOSE=1; } > "log-$1.txt" 2>&1
+            rc=$?
+            if ls "$1"/*.pkg >/dev/null 2>&1; then
+              mv "$1"/*.pkg "out/$6"; echo "OK     $6"
+            else
+              echo "FALHOU $6 (rc=$rc)"; grep -n -E "error:|undefined reference|undefined symbol" "log-$1.txt" | head -30
+            fi
+          }
+          variant build-a OFF OFF KICK00003 "Kick IPTV teste A" "A-sem-mpv.pkg"
+          variant build-b ON  OFF KICK00004 "Kick IPTV teste B" "B-mpv-sem-piglet.pkg"
+          variant build-c ON  ON  KICK00002 "Kick IPTV mpv"     "C-mpv-completo.pkg"
+          ls -l out
+          cat log-build-*.txt > build-log.txt
+          { echo '== conteudo de build-a/ps4'; find build-a/ps4 -type f | xargs ls -l; } | tee -a pkg-contents.txt
+          [ -n "$(ls out)" ] || { echo "nenhuma variante gerou PKG"; exit 1; }
+      - name: Publicar numa Release (PKGs e logs)
         if: always()
         uses: softprops/action-gh-release@v2
         with:
           tag_name: mpv-${{ github.run_number }}
           name: Kick IPTV mpv - build ${{ github.run_number }}
           files: |
-            build/Kick-IPTV-mpv.pkg
+            out/*.pkg
             build-log.txt
             toolchain-info.txt
             pkg-contents.txt
