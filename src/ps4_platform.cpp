@@ -1913,7 +1913,9 @@ struct Player {
         useMpv = false;
 #ifdef USE_LIBMPV
         if (mpv_player::available()) {
-            log.push_back("abrindo com libmpv...");
+            kickMpvRegisterIo();   // obrigatorio: stream_cb usa o HTTP do app
+            g_net.init();
+            log.push_back("abrindo com libmpv (stream_cb/khttp)...");
             trace("mpv-tentando");
             if (mpv_player::play(url)) {
                 trace("mpv-play-ok");
