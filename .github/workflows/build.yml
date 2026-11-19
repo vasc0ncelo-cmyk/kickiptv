@@ -13,6 +13,8 @@ jobs:
       DOTNET_SYSTEM_GLOBALIZATION_INVARIANT: "1"
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # traz as tags (build-707 = ultima versao que abria) para os testes de bisseccao abaixo
       - name: Corrigir nome de pasta com caractere invisivel (src)
         run: |
           # Pelo celular e facil criar a pasta com um caractere INVISIVEL na frente do nome (ex.: U+2060): na tela parece "src",
@@ -143,6 +145,26 @@ jobs:
           make TITLE="Kick IPTV teste hello" TITLE_ID=KICK00009 CONTENT_ID=IV0000-KICK00009_00-KICKIPTV00000000 2>&1 | tee -a hello-build-log.txt
           if ls build/*.pkg >/dev/null 2>&1; then mv build/*.pkg out/Teste-Hello.pkg; echo "OK hello"; else echo "hello FALHOU (veja hello-build-log.txt)"; grep -n -E "error|undefined|cannot|unable" hello-build-log.txt | head -20; fi
           rm -rf src && mv /tmp/full/src src && make clean
+          # B) BISSECCAO: variantes do codigo para achar o que faz o app fechar. Usa os arquivos da tag build-707 (a versao que abria).
+          GOOD=build-707
+          if git rev-parse -q --verify "refs/tags/$GOOD" >/dev/null; then
+            bis() {   # id  nome  arquivo  comandos...
+              id=$1; nome=$2; arq=$3; shift 3
+              rm -rf /tmp/srcbak && cp -r src /tmp/srcbak
+              ( set -e; "$@" ) > "bis-$id.log" 2>&1
+              make TITLE="$nome" TITLE_ID=KICK000$id CONTENT_ID=IV0000-KICK000${id}_00-KICKIPTV00000000 >> "bis-$id.log" 2>&1
+              if ls build/*.pkg >/dev/null 2>&1; then mv build/*.pkg "out/$arq"; echo "OK     $arq"; else echo "FALHOU $arq"; tail -5 "bis-$id.log"; fi
+              rm -rf src && cp -r /tmp/srcbak src && make clean >/dev/null 2>&1
+            }
+            bis 11 "Kick teste 1" "T1-atual-sem-bootmark.pkg"      rm -f src/bootmark.cpp
+            bis 12 "Kick teste 2" "T2-plataforma-707.pkg"          bash -c "rm -f src/bootmark.cpp; git show $GOOD:src/ps4_platform.cpp > src/ps4_platform.cpp"
+            bis 13 "Kick teste 3" "T3-img-hw-thr-707.pkg"          bash -c "rm -f src/bootmark.cpp; for f in imgcache.cpp imgcache.hpp hwplayer.cpp hwplayer.hpp thrprio.hpp; do git show $GOOD:src/\$f > src/\$f 2>/dev/null || true; done"
+            bis 14 "Kick teste 4" "T4-tudo-707.pkg"                bash -c "rm -rf src && git checkout $GOOD -- src"
+            git checkout HEAD -- src 2>/dev/null || true
+            git status --short | head -5
+          else
+            echo "tag $GOOD nao encontrada: pulando as variantes de bisseccao"
+          fi
           # 1) PKG normal (sem mpv)
           make TITLE="Kick IPTV" && mv build/*.pkg out/Kick-IPTV.pkg || { echo "ERRO: build sem mpv falhou"; exit 1; }
           make clean
@@ -169,6 +191,7 @@ jobs:
             out/*.pkg
             mpv-build-log.txt
             hello-build-log.txt
+            bis-*.log
           make_latest: true
       - uses: actions/upload-artifact@v4
         if: always()
