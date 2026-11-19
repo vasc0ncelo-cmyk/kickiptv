@@ -452,37 +452,98 @@ struct NetClient {
 // (exit), os destrutores nao ficam esperando thread presa em rede (travava o fechamento) nem chamam std::terminate com thread ativa.
 static NetClient &g_net = *new NetClient;
 
-// HTTP do app -> libmpv stream_cb (khttp://). O FFmpeg do mpv NAO baixa a URL; quem baixa e o sceHttp do Kick.
-static int64_t kickMpvReadAt(void * /*ud*/, const char *url, uint64_t offset, char *buf, uint64_t n, uint64_t *size_out) {
-    if (!url || !buf || n == 0) return -1;
-    if (!g_net.init()) return -1;
+// HTTP do app -> libmpv stream_cb (khttp://). Sessao HTTP reaproveitada por stream.
+struct KickMpvStream {
+    std::string url;
     NetClient::Session sess;
-    if (!g_net.openSession(sess, url)) return -1;
+    uint64_t size = 0;
+    bool opened = false;
+};
+static void *kickMpvOpen(void * /*ud*/, const char *url, uint64_t *size_out) {
+    if (!url || !*url) return nullptr;
+    if (!g_net.init()) return nullptr;
+    auto *s = new KickMpvStream();
+    s->url = url;
+    if (!g_net.openSession(s->sess, s->url)) {
+        delete s;
+        return nullptr;
+    }
+    s->opened = true;
+    // Probe: 1 byte Range para descobrir tamanho total
+    std::string tip;
+    int st = 0;
+    uint64_t total = 0;
+    if (g_net.getRange(s->sess, s->url, 0, 0, tip, st, &total) && total > 0) {
+        s->size = total;
+        if (size_out) *size_out = total;
+    } else {
+        // tenta 0-15 (alguns servidores nao gostam de bytes=0-0)
+        tip.clear(); st = 0; total = 0;
+        if (g_net.getRange(s->sess, s->url, 0, 15, tip, st, &total) && total > 0) {
+            s->size = total;
+            if (size_out) *size_out = total;
+        } else if (size_out) {
+            *size_out = 0;
+        }
+        // mesmo sem tamanho conhecido, segue (live / server sem Content-Range)
+    }
+    return s;
+}
+static int64_t kickMpvRead(void *cookie, uint64_t offset, char *buf, uint64_t n) {
+    auto *s = (KickMpvStream *)cookie;
+    if (!s || !buf || n == 0) return -1;
+    if (!s->opened) {
+        if (!g_net.openSession(s->sess, s->url)) return -1;
+        s->opened = true;
+    }
     std::string body;
     int status = 0;
     uint64_t total = 0;
-    const uint64_t to = offset + (n ? n - 1 : 0);
-    const bool ok = g_net.getRange(sess, url, offset, to, body, status, &total);
-    g_net.closeSession(sess);
-    if (size_out && total > 0) *size_out = total;
-    if (!ok) return -1;
-    if (status != 206 && status != 200) return -1;
-    if (status == 200) {
-        // Servidor ignorou Range: devolve so o pedaco [offset, offset+n)
-        if (offset >= body.size()) return 0;
-        size_t avail = body.size() - (size_t)offset;
-        size_t copy = avail < (size_t)n ? avail : (size_t)n;
-        memcpy(buf, body.data() + (size_t)offset, copy);
-        if (size_out && !*size_out) *size_out = (uint64_t)body.size();
-        return (int64_t)copy;
+    const uint64_t to = offset + n - 1;
+    for (int attempt = 0; attempt < 3; attempt++) {
+        body.clear(); status = 0; total = 0;
+        if (!g_net.getRange(s->sess, s->url, offset, to, body, status, &total)) {
+            g_net.closeSession(s->sess);
+            s->opened = false;
+            if (!g_net.openSession(s->sess, s->url)) return -1;
+            s->opened = true;
+            continue;
+        }
+        if (total > 0) s->size = total;
+        if (status == 416) return 0; // past EOF
+        if (status == 206) {
+            size_t copy = body.size() < (size_t)n ? body.size() : (size_t)n;
+            if (copy) memcpy(buf, body.data(), copy);
+            return (int64_t)copy;
+        }
+        if (status == 200) {
+            // servidor ignorou Range
+            if (offset >= body.size()) return 0;
+            size_t avail = body.size() - (size_t)offset;
+            size_t copy = avail < (size_t)n ? avail : (size_t)n;
+            if (copy) memcpy(buf, body.data() + (size_t)offset, copy);
+            if (s->size == 0) s->size = (uint64_t)body.size();
+            return (int64_t)copy;
+        }
+        // status estranho: reconecta
+        g_net.closeSession(s->sess);
+        s->opened = false;
+        if (!g_net.openSession(s->sess, s->url)) return -1;
+        s->opened = true;
     }
-    size_t copy = body.size() < (size_t)n ? body.size() : (size_t)n;
-    if (copy) memcpy(buf, body.data(), copy);
-    return (int64_t)copy;
+    return -1;
+}
+static void kickMpvClose(void *cookie) {
+    auto *s = (KickMpvStream *)cookie;
+    if (!s) return;
+    if (s->opened) g_net.closeSession(s->sess);
+    delete s;
 }
 static void kickMpvRegisterIo() {
     mpv_player::StreamIo io;
-    io.read_at = &kickMpvReadAt;
+    io.open = &kickMpvOpen;
+    io.read = &kickMpvRead;
+    io.close = &kickMpvClose;
     io.ud = nullptr;
     mpv_player::setStreamIo(io);
 }
