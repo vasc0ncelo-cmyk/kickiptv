@@ -97,7 +97,7 @@ static int64_t cb_seek(void *cookie, int64_t offset) {
 
 static int64_t cb_size(void *cookie) {
     auto *st = (StreamState *)cookie;
-    if (!st || !st->size_known || st->size == 0) return -1; // unknown
+    if (!st || !st->size_known || st->size == 0) return MPV_ERROR_UNSUPPORTED;
     return (int64_t)st->size;
 }
 
@@ -250,7 +250,7 @@ bool boot() {
 
     // Protocolo custom: loadfile khttp://<url real>
     if (!g_cb_registered) {
-        if (mpv_stream_cb_add_ro(g_mpv, "khttp", cb_open) < 0) {
+        if (mpv_stream_cb_add_ro(g_mpv, "khttp", nullptr, cb_open) < 0) {
             setErr("stream_cb_add_ro falhou");
             // segue mesmo assim (pode tentar URL direta)
         } else {
