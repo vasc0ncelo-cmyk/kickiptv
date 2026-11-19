@@ -42,6 +42,11 @@ extern "C" {
 #define KICK_HAVE_SDL_PRETEST 1
 #define SDL_MAIN_HANDLED
 #include <SDL2/SDL.h>
+#if __has_include(<orbis/AudioOut.h>)
+#include <orbis/AudioOut.h>
+#include <vector>
+#define KICK_SDL_SHIM 1      // audio do mpv via backend proprio (sceAudioOut): o SDL_InitSubSystem(AUDIO) real trava no PS4
+#endif
 #endif
 #endif
 
@@ -205,6 +210,10 @@ static void *sdlProbeMain(void *) {
     return nullptr;
 }
 static void sdlStartProbe() {
+#ifdef KICK_SDL_SHIM
+    g_sdlState = SDL_ST_OK;      // backend proprio no fim do arquivo: nao chama o SDL real (que trava no init)
+    return;
+#endif
     int st = g_sdlState.load();
     if (st == SDL_ST_RUN || st == SDL_ST_OK) return;
     if (st == SDL_ST_FAIL && g_sdlTries.load() >= 3) return;      // falhou (sem travar) 3 vezes: desiste
@@ -635,5 +644,92 @@ Status status() {
 bool isOpen() { return g_open.load(); }
 
 } // namespace mpv_player
+
+#ifdef KICK_SDL_SHIM
+// ---------- Backend de audio SDL -> sceAudioOut ----------
+// O SDL_InitSubSystem(SDL_INIT_AUDIO) do SDL2 do PacBrew nunca retorna no PS4 (o log para em "sdl-probe: SDL_InitSubSystem"),
+// entao o mpv ficava em ao=null (sem som). Estas funcoes substituem as do SDL (o link usa --allow-multiple-definition e o nosso
+// objeto vem antes da libSDL2.a): o ao_sdl do mpv continua igual, mas o PCM sai direto pela porta do sceAudioOut.
+// Formato fixo: s16 estereo 48 kHz, blocos de 1024 quadros (o mpv ja esta configurado para isso: audio-format/samplerate/channels).
+namespace {
+const int kShGrain = 1024;
+std::mutex g_shCtl;                         // abrir/fechar uma por vez
+std::mutex g_shCb;                          // SDL_LockAudio: protege o callback do mpv
+std::atomic<bool> g_shInit{false}, g_shRun{false}, g_shPause{true};
+pthread_t g_shTh;
+int g_shPort = -1;
+SDL_AudioCallback g_shFn = nullptr;
+void *g_shUd = nullptr;
+
+void *shAudioMain(void *) {
+    std::vector<int16_t> buf((size_t)kShGrain * 2);
+    while (g_shRun.load()) {
+        std::memset(buf.data(), 0, buf.size() * sizeof(int16_t));              // pausado/sem dados = silencio
+        if (!g_shPause.load() && g_shFn) {
+            std::lock_guard<std::mutex> l(g_shCb);
+            g_shFn(g_shUd, (Uint8 *)buf.data(), kShGrain * 4);
+        }
+        sceAudioOutOutput(g_shPort, buf.data());                               // bloqueia ate o bloco tocar: e o relogio do audio
+    }
+    return nullptr;
+}
+bool shOpen(const SDL_AudioSpec *want, SDL_AudioSpec *got) {
+    std::lock_guard<std::mutex> cl(g_shCtl);
+    if (g_shRun.load() || !want || !want->callback) return false;
+    int p = sceAudioOutOpen(0xFF /*usuario do sistema*/, ORBIS_AUDIO_OUT_PORT_TYPE_MAIN, 0, kShGrain, 48000, ORBIS_AUDIO_OUT_PARAM_FORMAT_S16_STEREO);
+    if (p <= 0) { char b[80]; snprintf(b, sizeof b, "sdl-shim: sceAudioOutOpen falhou rc=%d", p); mpv_player::tr(b); return false; }
+    g_shPort = p; g_shFn = want->callback; g_shUd = want->userdata;
+    g_shPause.store(true); g_shRun.store(true);
+    pthread_attr_t at; bool ok = false;
+    if (pthread_attr_init(&at) == 0) {
+        pthread_attr_setstacksize(&at, 1u << 19);
+        ok = pthread_create(&g_shTh, &at, shAudioMain, nullptr) == 0;
+        pthread_attr_destroy(&at);
+    }
+    if (!ok) { g_shRun.store(false); sceAudioOutClose(p); g_shPort = -1; g_shFn = nullptr; mpv_player::tr("sdl-shim: nao criou a thread"); return false; }
+    if (got) {
+        *got = *want;
+        got->freq = 48000; got->format = AUDIO_S16SYS; got->channels = 2; got->silence = 0;
+        got->samples = kShGrain; got->size = kShGrain * 4;
+    }
+    char b[80]; snprintf(b, sizeof b, "sdl-shim: audio aberto port=%d (s16 2ch 48000)", p); mpv_player::tr(b);
+    return true;
+}
+void shClose() {
+    std::lock_guard<std::mutex> cl(g_shCtl);
+    if (!g_shRun.load()) return;
+    g_shRun.store(false);
+    pthread_join(g_shTh, nullptr);
+    if (g_shPort > 0) sceAudioOutClose(g_shPort);
+    g_shPort = -1; g_shFn = nullptr;
+    mpv_player::tr("sdl-shim: audio fechado");
+}
+}  // namespace
+
+extern "C" {
+int SDL_InitSubSystem(Uint32 flags) { if (flags & SDL_INIT_AUDIO) g_shInit.store(true); return 0; }
+void SDL_QuitSubSystem(Uint32 flags) { if (flags & SDL_INIT_AUDIO) { shClose(); g_shInit.store(false); } }
+Uint32 SDL_WasInit(Uint32 flags) { return g_shInit.load() && (flags == 0 || (flags & SDL_INIT_AUDIO)) ? SDL_INIT_AUDIO : 0; }
+int SDL_GetNumAudioDrivers(void) { return 1; }
+const char *SDL_GetAudioDriver(int i) { return i == 0 ? "ps4" : nullptr; }
+const char *SDL_GetCurrentAudioDriver(void) { return g_shInit.load() ? "ps4" : nullptr; }
+int SDL_GetNumAudioDevices(int cap) { return cap ? 0 : 1; }
+const char *SDL_GetAudioDeviceName(int i, int cap) { return !cap && i == 0 ? "PS4" : nullptr; }
+int SDL_OpenAudio(SDL_AudioSpec *desired, SDL_AudioSpec *obtained) { return shOpen(desired, obtained) ? 0 : -1; }
+SDL_AudioDeviceID SDL_OpenAudioDevice(const char *, int cap, const SDL_AudioSpec *desired, SDL_AudioSpec *obtained, int) {
+    return !cap && shOpen(desired, obtained) ? 2 : 0;
+}
+void SDL_PauseAudio(int on) { g_shPause.store(on != 0); }
+void SDL_PauseAudioDevice(SDL_AudioDeviceID, int on) { g_shPause.store(on != 0); }
+SDL_AudioStatus SDL_GetAudioStatus(void) { return !g_shRun.load() ? SDL_AUDIO_STOPPED : g_shPause.load() ? SDL_AUDIO_PAUSED : SDL_AUDIO_PLAYING; }
+SDL_AudioStatus SDL_GetAudioDeviceStatus(SDL_AudioDeviceID) { return SDL_GetAudioStatus(); }
+void SDL_LockAudio(void) { g_shCb.lock(); }
+void SDL_UnlockAudio(void) { g_shCb.unlock(); }
+void SDL_LockAudioDevice(SDL_AudioDeviceID) { g_shCb.lock(); }
+void SDL_UnlockAudioDevice(SDL_AudioDeviceID) { g_shCb.unlock(); }
+void SDL_CloseAudio(void) { shClose(); }
+void SDL_CloseAudioDevice(SDL_AudioDeviceID) { shClose(); }
+}
+#endif
 
 #endif
