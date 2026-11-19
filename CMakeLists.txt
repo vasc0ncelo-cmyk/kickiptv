@@ -49,7 +49,7 @@ set_target_properties(${PROJECT_NAME} PROPERTIES CXX_STANDARD 17)
 target_include_directories(${PROJECT_NAME} PRIVATE ${OPENORBIS}/usr/include)
 target_compile_options(${PROJECT_NAME} PRIVATE
     -O2 -fno-strict-aliasing -fno-omit-frame-pointer -funwind-tables -D_GNU_SOURCE)
-target_link_options(${PROJECT_NAME} PRIVATE "LINKER:--wrap=clock_gettime")
+target_link_options(${PROJECT_NAME} PRIVATE "LINKER:--wrap=clock_gettime" "LINKER:--allow-multiple-definition")
 target_link_directories(${PROJECT_NAME} PRIVATE ${OPENORBIS}/usr/lib)
 # Sem -Wl,--start-group aqui: o ld.lld e chamado direto (nao pelo clang) e nao entende '-Wl,'; o cmake do toolchain ja envolve tudo em --start-group/--end-group.
 # Ordem: o mpv puxa ffmpeg, mbedtls, SDL2 (audio), libass etc. (lista = Libs.private do mpv.pc do pacote)
