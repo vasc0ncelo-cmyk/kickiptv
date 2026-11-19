@@ -133,6 +133,10 @@ static const char *streamUserAgent(const std::string &url) {
     return "VLC/3.0.20 LibVLC/3.0.20";
 }
 
+static bool isKickCdn(const std::string &url) {
+    return url.find("kick.com") != std::string::npos || url.find("live-video.net") != std::string::npos || url.find("kick-") != std::string::npos;
+}
+
 struct NetClient {
     std::vector<std::string> *log = nullptr;
     bool ready = false, failed = false;
@@ -371,6 +375,10 @@ struct NetClient {
             bool ok = false, clean = false;
             if (req >= 0) {
                 sceHttpAddRequestHeader(req, "Accept", "*/*", 0);
+                if (isKickCdn(url)) {                      // CDN da Kick: manda os cabecalhos do player web (Referer/Origin da Kick)
+                    sceHttpAddRequestHeader(req, "Referer", "https://kick.com/", 0);
+                    sceHttpAddRequestHeader(req, "Origin", "https://kick.com", 0);
+                }
                 if (sceHttpSendRequest(req, NULL, 0) >= 0) {
                     sceHttpGetStatusCode(req, &status);
                     std::vector<char> buf(64 * 1024);
@@ -462,7 +470,15 @@ struct KickMpvStream {
     bool opened = false;
     std::string cache;         // bytes [cacheOff, cacheOff + cache.size())
     uint64_t cacheOff = 0;
+    bool live = false;         // live Kick via HlsFeeder (kicklive://)
+    uint64_t abs = 0;          // posicao propria no StreamBuf do alimentador
 };
+// Live da Kick: a URL .m3u8 NAO vai para o mpv (ele recebia o TEXTO da playlist como se fosse o video: "unrecognized file format").
+// O HlsFeeder (mais abaixo) escolhe a resolucao, baixa os segmentos .ts e o mpv le o fluxo MPEG-TS continuo por "kicklive://live.ts".
+static std::string g_kickLiveUrl;
+static void *kickLiveOpen(uint64_t *size_out);
+static int64_t kickLiveRead(KickMpvStream *s, char *buf, uint64_t n);
+static void kickLiveClose();
 static bool kickLooksLikeMedia(const std::string &b) {
     if (b.size() < 4) return false;
     // ISO BMFF / MP4: ....ftyp
@@ -495,6 +511,7 @@ static const uint64_t kMpvChunk = 1024 * 1024;
 
 static void *kickMpvOpen(void * /*ud*/, const char *url, uint64_t *size_out) {
     if (!url || !*url) return nullptr;
+    if (!strncmp(url, "kicklive://", 11)) return kickLiveOpen(size_out);
     if (!g_net.init()) return nullptr;
     auto *s = new KickMpvStream();
     s->url = url;
@@ -513,6 +530,7 @@ static void *kickMpvOpen(void * /*ud*/, const char *url, uint64_t *size_out) {
 static int64_t kickMpvRead(void *cookie, uint64_t offset, char *buf, uint64_t n) {
     auto *s = (KickMpvStream *)cookie;
     if (!s || !buf || n == 0) return -1;
+    if (s->live) return kickLiveRead(s, buf, n);
     static std::atomic<int> nrd{0};
     if (nrd.fetch_add(1) < 6) { char t[96]; snprintf(t, sizeof t, "mpv-read off=%llu n=%llu", (unsigned long long)offset, (unsigned long long)n); trace(t); }
     if (s->size > 0 && offset >= s->size) return 0;
@@ -540,6 +558,7 @@ static int64_t kickMpvRead(void *cookie, uint64_t offset, char *buf, uint64_t n)
 static void kickMpvClose(void *cookie) {
     auto *s = (KickMpvStream *)cookie;
     if (!s) return;
+    if (s->live) { kickLiveClose(); delete s; return; }
     if (s->opened) g_net.closeSession(s->sess);
     delete s;
 }
@@ -1711,6 +1730,34 @@ static int feedClose(void *) { return 0; }
 static int feedRead(void *, uint8_t *dst, uint64_t pos, uint32_t len) { g_feed.reads++; return g_feed.sb.read(dst, pos, len); }
 static std::atomic<unsigned long long> g_feedSize{1ULL << 40};
 static uint64_t feedSize(void *) { return g_feedSize.load(); }   // ao vivo: tamanho "infinito"; MP4 de teste: tamanho real
+static void *kickLiveOpen(uint64_t *size_out) {
+    if (g_kickLiveUrl.empty() || !g_net.init()) return nullptr;
+    g_feed.start(g_kickLiveUrl, false);                         // escolhe a variante (resolucao), baixa playlist + segmentos
+    trace("kicklive-feeder");
+    const int need = std::max(2, g_feed.wantSegs.load());
+    for (int i = 0; i < 500 && g_feed.segs.load() < need && !g_feed.failed.load() && g_feed.run.load(); i++) sceKernelUsleep(50000);   // ate 25 s
+    if (g_feed.failed.load() || g_feed.segs.load() == 0) { trace("kicklive-falhou"); g_feed.abort(); return nullptr; }
+    auto *s = new KickMpvStream();
+    s->live = true; s->opened = false; s->size = 0; s->abs = 0;
+    if (size_out) *size_out = 0;                                // ao vivo: tamanho desconhecido
+    trace("kicklive-aberto");
+    return s;
+}
+static int64_t kickLiveRead(KickMpvStream *s, char *buf, uint64_t n) {
+    if (n > (1u << 20)) n = 1u << 20;
+    for (int i = 0; i < 40; i++) {                              // ate ~40 s esperando dados
+        {   // o alimentador pode ressincronizar (zera o buffer): volta para o comeco do que existe
+            std::lock_guard<std::mutex> l(g_feed.sb.m);
+            uint64_t end = g_feed.sb.base + g_feed.sb.buf.size();
+            if (s->abs < g_feed.sb.base || s->abs > end) s->abs = g_feed.sb.base;
+        }
+        int r = g_feed.sb.read((uint8_t *)buf, s->abs, (uint32_t)n, 1000);
+        if (r > 0) { s->abs += (uint64_t)r; return r; }
+        if (!g_feed.run.load() || g_feed.failed.load() || g_feed.streamEnded.load()) return 0;
+    }
+    return 0;
+}
+static void kickLiveClose() { g_feed.abort(); }
 static void closeFeedFile() {                 // para o alimentador, fecha e apaga /data/live.ts
     g_feed.join();
     if (g_feed.outFile) { fclose(g_feed.outFile); g_feed.outFile = nullptr; remove("/data/live.ts"); }
@@ -1982,7 +2029,9 @@ struct Player {
             g_net.init();
             log.push_back("abrindo com libmpv (stream_cb/khttp)...");
             trace("mpv-tentando");
-            if (mpv_player::play(url)) {
+            const bool kickLive = !kickSlug.empty() && url.find(".m3u8") != std::string::npos;
+            if (kickLive) { g_kickLiveUrl = url; log.push_back("Kick: resolucao/segmentos pelo alimentador HLS"); }
+            if (mpv_player::play(kickLive ? std::string("kicklive://live.ts") : url)) {
                 trace("mpv-play-ok");
                 useMpv = true;
                 mpvGot = false; mpvT0 = nowSec(); mpvLastOv = 0; mpvLastHud = false; mpvSeekAcc = 0; toastUntil = 0;
