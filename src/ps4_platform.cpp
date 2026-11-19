@@ -451,6 +451,42 @@ struct NetClient {
 // Objetos globais com threads/rede ficam "vazados" de proposito (nunca destruidos): se o PS4 encerrar o processo pelo caminho normal
 // (exit), os destrutores nao ficam esperando thread presa em rede (travava o fechamento) nem chamam std::terminate com thread ativa.
 static NetClient &g_net = *new NetClient;
+
+// HTTP do app -> libmpv stream_cb (khttp://). O FFmpeg do mpv NAO baixa a URL; quem baixa e o sceHttp do Kick.
+static int64_t kickMpvReadAt(void * /*ud*/, const char *url, uint64_t offset, char *buf, uint64_t n, uint64_t *size_out) {
+    if (!url || !buf || n == 0) return -1;
+    if (!g_net.init()) return -1;
+    NetClient::Session sess;
+    if (!g_net.openSession(sess, url)) return -1;
+    std::string body;
+    int status = 0;
+    uint64_t total = 0;
+    const uint64_t to = offset + (n ? n - 1 : 0);
+    const bool ok = g_net.getRange(sess, url, offset, to, body, status, &total);
+    g_net.closeSession(sess);
+    if (size_out && total > 0) *size_out = total;
+    if (!ok) return -1;
+    if (status != 206 && status != 200) return -1;
+    if (status == 200) {
+        // Servidor ignorou Range: devolve so o pedaco [offset, offset+n)
+        if (offset >= body.size()) return 0;
+        size_t avail = body.size() - (size_t)offset;
+        size_t copy = avail < (size_t)n ? avail : (size_t)n;
+        memcpy(buf, body.data() + (size_t)offset, copy);
+        if (size_out && !*size_out) *size_out = (uint64_t)body.size();
+        return (int64_t)copy;
+    }
+    size_t copy = body.size() < (size_t)n ? body.size() : (size_t)n;
+    if (copy) memcpy(buf, body.data(), copy);
+    return (int64_t)copy;
+}
+static void kickMpvRegisterIo() {
+    mpv_player::StreamIo io;
+    io.read_at = &kickMpvReadAt;
+    io.ud = nullptr;
+    mpv_player::setStreamIo(io);
+}
+
 static ImgCache &g_covers = *new ImgCache;
 static NetGate g_coverGate(3, 2);                // no maximo 3 capas baixando juntas; o lote de fundo usa no maximo 2 (sempre sobra vaga para a tela)
 static std::atomic<bool> g_quitting{false};
@@ -1873,11 +1909,11 @@ struct Player {
             while (!kickSlug.empty() && (kickSlug.back()==' '||kickSlug.back()=='\n')) kickSlug.pop_back();
         }
 
-        // --- Player ÚNICO: libmpv (igual GMCA/Switchfin). O player antigo (AvPlayer/HLS proprio) foi DESLIGADO: sem fallback. ---
+        // --- SOMENTE libmpv (sem AvPlayer). Se falhar, mostra o erro e nao abre o player antigo. ---
         useMpv = false;
 #ifdef USE_LIBMPV
         if (mpv_player::available()) {
-            log.push_back("abrindo com libmpv (PacBrew)...");
+            log.push_back("abrindo com libmpv...");
             trace("mpv-tentando");
             if (mpv_player::play(url)) {
                 trace("mpv-play-ok");
@@ -1890,19 +1926,23 @@ struct Player {
                 return true;
             }
             std::string e = mpv_player::status().error;
+            if (e.empty()) e = "loading failed";
             log.push_back("ERRO libmpv: " + e);
-            { std::string t = "mpv-erro: " + e; trace(t.c_str()); }
+            { std::string tr = "mpv-erro: " + e; trace(tr.c_str()); }
             try { mpv_player::stop(); } catch (...) {}
-        } else {
-            log.push_back("ERRO: libmpv indisponivel neste build");
-            trace("mpv-indisponivel");
+            failed = true; active = false;
+            return false;
         }
+        log.push_back("ERRO: libmpv indisponivel neste build");
+        trace("mpv-indisponivel");
 #else
-        log.push_back("ERRO: este PKG foi compilado SEM libmpv (o download/link do PacBrew falhou no GitHub Actions)");
+        log.push_back("ERRO: PKG compilado SEM libmpv");
         trace("mpv-nao-compilado");
 #endif
         failed = true; active = false;
         return false;
+
+        // ---- codigo AvPlayer abaixo fica inalcançavel de proposito (sem fallback) ----
 
         // titulo "@slug" = live Kick: guarda slug para renovar o m3u8 na reconexao
         kickSlug.clear(); nextKickUrl.clear(); kickUrlAt = nowSec();
