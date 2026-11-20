@@ -1,5 +1,4 @@
 #pragma once
-// Favoritos, historico, timer de sono e PIN — arquivo simples em /data
 #include <string>
 #include <vector>
 #include <fstream>
@@ -9,7 +8,6 @@
 namespace feat {
 
 inline std::string path(const char *name) { return std::string("/data/kickiptv_") + name + ".txt"; }
-
 inline std::vector<std::string> loadLines(const char *name) {
     std::vector<std::string> out;
     std::ifstream f(path(name));
@@ -25,7 +23,6 @@ inline void saveLines(const char *name, const std::vector<std::string> &lines) {
     for (auto &l : lines) f << l << "\n";
 }
 
-// Favoritos: uma linha por item (url|titulo)
 inline bool isFav(const std::string &url) {
     for (auto &l : loadLines("favs")) if (l.compare(0, url.size(), url) == 0 && (l.size() == url.size() || l[url.size()] == '|')) return true;
     return false;
@@ -53,7 +50,6 @@ inline std::vector<std::pair<std::string,std::string>> favs() {
     return out;
 }
 
-// Historico recente (url|titulo|epoch)
 inline void addHistory(const std::string &url, const std::string &title) {
     auto lines = loadLines("hist");
     std::string key = url + "|";
@@ -77,12 +73,49 @@ inline std::vector<std::pair<std::string,std::string>> history() {
     return out;
 }
 
-// PIN (4 digitos, vazio = desligado)
+// Tema: 0=verde 1=azul 2=roxo
+inline int theme() {
+    auto v = loadLines("theme");
+    return v.empty() ? 0 : atoi(v[0].c_str()) % 3;
+}
+inline void setTheme(int t) { saveLines("theme", {std::to_string(t % 3)}); }
+inline unsigned themeColor() {
+    static const unsigned c[3] = {0xFF53FC18u, 0xFF3B82F6u, 0xFFA855F7u};
+    return c[theme()];
+}
+
+// Velocidade: 0=0.5 1=1.0 2=1.25 3=1.5 4=2.0
+inline int speed() {
+    auto v = loadLines("speed");
+    return v.empty() ? 1 : atoi(v[0].c_str()) % 5;
+}
+inline void setSpeed(int s) { saveLines("speed", {std::to_string(s % 5)}); }
+inline double speedValue() {
+    static const double v[5] = {0.5, 1.0, 1.25, 1.5, 2.0};
+    return v[speed()];
+}
+inline const char *speedName() {
+    static const char *n[5] = {"0.5x", "1x", "1.25x", "1.5x", "2x"};
+    return n[speed()];
+}
+
+// PIN
 inline std::string pin() {
     auto v = loadLines("pin");
     return v.empty() ? "" : v[0];
 }
 inline void setPin(const std::string &p) { saveLines("pin", {p}); }
 inline bool pinOk(const std::string &try_) { auto p = pin(); return p.empty() || p == try_; }
+
+// Estatisticas simples
+inline void addWatchTime(int sec) {
+    auto v = loadLines("stats");
+    long cur = v.empty() ? 0 : atol(v[0].c_str());
+    saveLines("stats", {std::to_string(cur + sec)});
+}
+inline long watchTime() {
+    auto v = loadLines("stats");
+    return v.empty() ? 0 : atol(v[0].c_str());
+}
 
 } // namespace feat
