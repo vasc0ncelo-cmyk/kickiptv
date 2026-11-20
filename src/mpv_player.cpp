@@ -333,22 +333,6 @@ void prewarm() { sdlStartProbe(); }
 bool boot() {
     std::lock_guard<std::mutex> lk(g_mx);
     if (g_mpv) return true;
-    // Diagnostico: tamanho de pilha que uma thread comum recebe (ps4c/pthread_stack.c deve garantir >= 2 MiB; a padrao da musl e 128 KiB)
-    {
-        static std::atomic<size_t> stackSz{0};
-        auto probe = [](void *) -> void * {
-            pthread_attr_t a; size_t s = 0; void *p = nullptr;
-            if (pthread_getattr_np(pthread_self(), &a) == 0) { pthread_attr_getstack(&a, &p, &s); pthread_attr_destroy(&a); }
-            stackSz = s;
-            return nullptr;
-        };
-        pthread_t th;
-        if (pthread_create(&th, nullptr, probe, nullptr) == 0) {
-            pthread_join(th, nullptr);
-            char b[96]; snprintf(b, sizeof b, "stack-das-threads=%u KiB%s", (unsigned)(stackSz.load() / 1024), stackSz.load() >= (1u << 20) ? " (ok)" : " (BAIXA: wrap do pthread_create nao ativo)");
-            tr(b);
-        }
-    }
     g_mpv = mpv_create();
     if (!g_mpv) {
         setErr("mpv_create falhou");
