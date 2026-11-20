@@ -4900,34 +4900,15 @@ int main() {
 
         if (bgloadClearAt > 0 && nowSec() >= bgloadClearAt) { pf.saveSetting("bgload", ""); bgloadClearAt = 0; trace("bgload-ok"); }
 
-        // Lista: cache LOCAL na hora. Rede so se nao houver cache (ou se o usuario pedir ATUALIZAR).
+        // Lista: caminho original (loadM3U) — API do painel primeiro, depois cache.
         if (autoLoadList && mode == Mode::Menu && ++autoLoadFrames >= 1) {
             autoLoadList = false;
             presentMenu();
-            trace("lista-cache-inicio");
-            bool hadCache = false;
-            if (!ui.m3uUrl.empty()) {
-                int r = app.loadCached(ui.m3uUrl);
-                if (r == 1) { hadCache = true; trace("lista-cache-ok"); }
-                else trace("lista-cache-vazio");
-            }
-            // So baixa da rede se NAO houver cache valido
-            if (!hadCache && !ui.m3uUrl.empty()) {
-                pf.saveSetting("bgload", "1");
-                startLoader(ui.m3uUrl);
-                trace("lista-bg-disparada");
-                bgloadClearAt = nowSec() + 4.0;
-            } else if (hadCache) {
-                // Pre-carrega capas do disco (ja baixadas antes) para aparecerem na hora
-                try {
-                    std::vector<std::string> urls;
-                    for (auto &m : app.list.movies) if (!m.logo.empty()) urls.push_back(m.logo);
-                    for (auto &c : app.list.channels) if (!c.logo.empty()) urls.push_back(c.logo);
-                    for (auto &kv : app.list.seriesTree) if (!kv.second.logo.empty()) urls.push_back(kv.second.logo);
-                    if (!urls.empty()) { ui.coverBackground(std::move(urls)); trace("capas-preload"); }
-                } catch (...) {}
-            }
-            trace(hadCache ? "lista-pronta-cache" : "lista-pronta-aguardando-rede");
+            pf.saveSetting("bgload", "1");
+            trace("lista-auto-inicio");
+            ui.loadSavedList();
+            bgloadClearAt = nowSec() + 4.0;
+            trace("lista-auto-fim");
             dirty = true;
         }
 
