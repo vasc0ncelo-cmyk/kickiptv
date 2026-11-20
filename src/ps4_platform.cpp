@@ -507,7 +507,7 @@ static bool kickLooksLikeHtml(const std::string &b) {
     }
     return false;
 }
-static const uint64_t kMpvChunk = 1024 * 1024;
+static const uint64_t kMpvChunk = 2 * 1024 * 1024;   // 2 MB por pedido: menos idas a rede
 
 static void *kickMpvOpen(void * /*ud*/, const char *url, uint64_t *size_out) {
     if (!url || !*url) return nullptr;
@@ -2022,7 +2022,7 @@ struct Player {
     bool start(const std::string &url, const std::string &title) {
         log.clear(); frames = 0; vw = vh = 0; fps = 0; fpsFrames = 0; failed = false; addRc = 0; chunkMode = false; chunkIdx = 0; inactiveSince = 0;
         cancelled = false; restarts = switchesOk = 0; lastGapMs = 0; gapStartT = switchedAt = 0; curDur = 0; chunkT0 = 0; blitMs = 0;
-        paused = false; isVod = false; lastPtsMs = 0; maxPtsMs = 0; durationMs = 0; seekPendingMs = -1; waitNote.clear(); waitLabel.clear(); showOpts = false; optCur = 0;
+        paused = false; isVod = false; lastPtsMs = 0; maxPtsMs = 0; durationMs = 0; seekPendingMs = -1; waitNote.clear(); showOpts = false; optCur = 0;
         scrubMode = false; scrubMs = -1; seekSkip = false; seekTargetMs = 0;
         trigScrub = false; trigDir = 0; trigBlock = true;       // trigBlock: um L2/R2 ainda apertado do menu nao vira seek
         pendJumpMs = -1; pendJumpNeed = 0; jumpPct = 0; jumpTargetMs = -1; jumpSettleUntil = 0; jumpErrors = 0;
@@ -3043,8 +3043,12 @@ struct Player {
 
         // libmpv: seek real so no fim do preview (L2/R2 solto)
         if (useMpv) {
+            // sem quadro ainda: nao busca (buscava no meio do probe e fechava o app)
+            if (!mpvGot) { scrubMode = false; scrubMs = -1; return; }
             double sec = (double)targetMs / 1000.0;
             if (sec < 0) sec = 0;
+            // perto do inicio e ainda em 0: nao forca seek absoluto (deixa o demuxer terminar)
+            if (sec < 1.0 && lastPtsMs < 500) { scrubMode = false; scrubMs = -1; return; }
             if (mpv_player::seekSec(sec)) {
                 lastPtsMs = lastGoodPtsMs = (uint64_t)targetMs;
                 playedMs = (uint64_t)targetMs;
@@ -3181,18 +3185,18 @@ struct Player {
             }
             trigScrub = true; trigDir = dir; trigStart = trigLast = t;
             scrubMode = true;
-            scrubMs += (int64_t)dir * 10000;
+            // toque curto: 5 s (antes pulava 10 de uma vez)
+            scrubMs += (int64_t)dir * 5000;
             clampTime(scrubMs);
             focusCtrl = dir < 0 ? 1 : 3;
         } else {
             double held = t - trigStart, dt = t - trigLast;
             trigLast = t;
-            if (dt > 0.25) dt = 0.25;
-            if (held > 0.35) {
-                double rate = held < 1.5 ? 20.0 : held < 3.0 ? 60.0 : held < 5.0 ? 150.0 : 300.0;
-                scrubMs += (int64_t)((double)dir * rate * dt * 1000.0);
-                clampTime(scrubMs);
-            }
+            if (dt > 0.05) dt = 0.05;   // fatia curta = movimento suave
+            // acelera continuo desde o inicio (sem o pulo a cada 0,35 s)
+            double rate = held < 0.6 ? 8.0 : held < 1.5 ? 20.0 : held < 3.0 ? 50.0 : held < 5.0 ? 120.0 : 240.0;
+            scrubMs += (int64_t)((double)dir * rate * dt * 1000.0);
+            clampTime(scrubMs);
         }
         hudUntil = t + 4;
     }
@@ -3941,6 +3945,7 @@ int main() {
         if (player.url.empty() && player.kickSlug.empty()) return;
         trace((std::string("safe-restart:") + why).c_str());
         player.quietWait = true;
+        player.waitLabel = "Reconectando...";
         player.showOpts = false;
         player.showInfo = false;
         player.scrubMode = false;
@@ -4404,13 +4409,25 @@ int main() {
                 mode = Mode::Menu; dirty = true; sceKernelUsleep(16000); continue;
             }
             if (st.failed || (st.eof && !st.paused)) {
-                // Canal curto (0:01 / 0:04): nao reabre nem troca qualidade. Volta pro inicio e segue.
-                const bool shortLive = !player.hasEpisodes() && st.durationSec > 0 && st.durationSec < 15.0;
-                if (st.eof && shortLive) {
+                // Canal (curto ou ao vivo): nao reabre, nao troca qualidade. Volta pro inicio e segue.
+                // Canal = nao e filme/serie (URL sem /movie/ ou /series/) OU duracao curta.
+                const bool looksLikeChannel = player.url.find("/movie/") == std::string::npos
+                    && player.url.find("/series/") == std::string::npos
+                    && (player.url.find(".m3u8") != std::string::npos || st.durationSec < 30.0 || !player.isVod);
+                if (st.eof && looksLikeChannel && !player.canNextEp()) {
+                    // canal unico: loop silencioso
                     mpv_player::seekSec(0);
                     player.lastPtsMs = 0; player.playedMs = 0; player.maxPtsMs = 0;
                     player.playStartWall = nowSec();
-                    sceKernelUsleep(8000); continue;
+                    sceKernelUsleep(4000); continue;
+                }
+                if (st.eof && looksLikeChannel && player.canNextEp()) {
+                    // canal com lista: NAO avanca sozinho. So o usuario troca com L1/R1.
+                    // Loop no mesmo canal.
+                    mpv_player::seekSec(0);
+                    player.lastPtsMs = 0; player.playedMs = 0; player.maxPtsMs = 0;
+                    player.playStartWall = nowSec();
+                    sceKernelUsleep(4000); continue;
                 }
                 if (st.eof && player.canNextEp()) {
                     player.epIndex++;
@@ -4451,8 +4468,9 @@ int main() {
             if (!player.mpvGot) {                                    // ate o 1o quadro: tela de espera com o spinner
                 static double lastW = 0;
                 FbRenderer r(shadow, W, H);
-                if (mpv_player::renderToBgra((uint8_t *)shadow, W, H, W * 4)) {
+                if (mpv_player::renderToBgra((uint8_t *)shadow, W, H, W * 4, true)) {  // force: pega o 1o quadro mesmo se o mpv achar que nao mudou
                     player.mpvGot = true; player.hudUntil = tn + 8; gotFrame = true;
+                    player.lastPtsMs = (int64_t)(st.positionSec * 1000.0);
                     trace("mpv-1o-quadro");
                 } else if (tn - lastW > 0.12) { lastW = tn; presentWait(); }
                 else sceKernelUsleep(4000);
@@ -4460,6 +4478,11 @@ int main() {
                 if (player.hudActive() || tn < player.toastUntil) player.overlay(r);
                 flip(); player.mpvLastOv = tn; player.mpvLastHud = true;
                 continue;
+            }
+            // preso em 0 s com quadro: um empurrãozinho de 0,2 s destravar sem fechar
+            if (player.isVod && st.positionSec < 0.05 && tn - player.mpvT0 > 4.0 && !player.trigScrub) {
+                static double lastNudge = 0;
+                if (tn - lastNudge > 5.0) { lastNudge = tn; mpv_player::seekSec(0.2); trace("mpv-nudge"); }
             }
             {
                 const bool hudNow = player.hudActive() || tn < player.toastUntil;
@@ -4475,9 +4498,8 @@ int main() {
                     if (nfr < 6) { char tb[48]; snprintf(tb, sizeof tb, "mpv-quadro-%d-%s", ++nfr, direct ? "direto" : "rascunho"); trace(tb); }
                     present();
                     if (nfr > 0 && nfr <= 6) trace("mpv-quadro-apresentado");
-                } else if (pressed || hudNow != player.mpvLastHud || (hudNow && tn - player.mpvLastOv > 0.5)) {
-                    // sem quadro novo (video pausado): o mpv redesenha o ULTIMO quadro (force) para colocar/tirar o OSD.
-                    // Nao existe mais a copia de 8 MB do "quadro puro".
+                } else if (player.trigScrub || pressed || hudNow != player.mpvLastHud || (hudNow && tn - player.mpvLastOv > 0.03)) {
+                    // scrub: redesenha todo quadro (~30 fps) para a barra andar suave
                     if (mpv_player::renderToBgra(dst, W, H, W * 4, true)) present();
                 }
             }
