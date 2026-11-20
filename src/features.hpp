@@ -77,15 +77,6 @@ inline std::vector<std::pair<std::string,std::string>> history() {
     return out;
 }
 
-// Timer de sono (minutos, 0 = desligado)
-inline int sleepMin() {
-    auto v = loadLines("sleep");
-    return v.empty() ? 0 : atoi(v[0].c_str());
-}
-inline void setSleepMin(int m) {
-    saveLines("sleep", {std::to_string(m)});
-}
-
 // PIN (4 digitos, vazio = desligado)
 inline std::string pin() {
     auto v = loadLines("pin");
