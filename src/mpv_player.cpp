@@ -142,9 +142,7 @@ static int cb_open(void * /*user_data*/, char *uri, mpv_stream_cb_info *info) {
 
     info->cookie = st;
     info->read_fn = cb_read;
-    // Live da Kick (kicklive://): fluxo continuo SEM posicao. Antes o cb_seek dizia "ok" para qualquer seek, mas a leitura ignorava o
-    // offset: o mpv achava que tinha voltado no arquivo e recebia bytes do ponto errado. Sem seek_fn o mpv trata como transmissao ao vivo.
-    info->seek_fn = !strncmp(u, "kicklive://", 11) ? nullptr : cb_seek;
+    info->seek_fn = cb_seek;
     info->size_fn = cb_size;
     info->close_fn = cb_close;
     info->cancel_fn = nullptr;
@@ -175,13 +173,6 @@ static bool ensureRender() {
 
 static void (*g_trace)(const char *) = nullptr;
 static void tr(const char *s) { if (g_trace) g_trace(s); }
-
-// Aceita o arquivo com ou sem ".txt" no fim (alguns apps de arquivo do PS4 acrescentam .txt sozinhos e nao deixam criar vazio).
-static bool markerFile(const char *path) {
-    std::string a = path, b = a + ".txt";
-    for (const std::string &n : {a, b}) { FILE *f = fopen(n.c_str(), "rb"); if (f) { fclose(f); return true; } }
-    return false;
-}
 
 // ---------- Audio SDL: teste em segundo plano ----------
 // O SDL de audio do PS4 trava (o log parava em "sdl-pretest: SDL_InitSubSystem"). Antes o teste rodava DENTRO do boot do mpv,
@@ -347,15 +338,7 @@ bool boot() {
     mpv_set_option_string(g_mpv, "sub-auto", "no");
     mpv_set_option_string(g_mpv, "vo", "libmpv");
     mpv_set_option_string(g_mpv, "hwdec", "no");
-    {   // Chaves de diagnostico (crie o arquivo vazio em /data pelo FTP; apague para desligar). Servem para descobrir o que derruba a live.
-        if (markerFile("/data/kickiptv_hwdec")) {     // teste: H.264 pelo hardware do PS4 (videodec2); se nao abrir, o mpv cai para o software
-            mpv_set_option_string(g_mpv, "vd", "lavc:h264_videodec2,lavc");
-            tr("diag: /data/kickiptv_hwdec -> tentando h264_videodec2");
-        }
-        const bool dec2 = markerFile("/data/kickiptv_dec2");
-        mpv_set_option_string(g_mpv, "vd-lavc-threads", dec2 ? "2" : "6");
-        if (dec2) tr("diag: /data/kickiptv_dec2 -> 2 threads de decodificacao");
-    }
+    mpv_set_option_string(g_mpv, "vd-lavc-threads", "6");
     // ---- VIDEO ----
     // O vo=libmpv por software converte (YUV->BGRA) e escala TODO quadro na CPU. O que pesava: o swscale padrao do mpv e o "bicubic"
     // (~150 ms por quadro 1080p no PS4 => ~7 quadros/s). As opcoes de GPU (scale/cscale/dscale/dither/interpolation...) nao valem
@@ -398,11 +381,9 @@ bool boot() {
     mpv_set_option_string(g_mpv, "audio-fallback-to-null", "yes");
     {
         // Nao trava a abertura: espera no maximo 2 s pelo teste (que ja deve ter rodado em segundo plano desde o inicio do app).
-        const bool noAudio = markerFile("/data/kickiptv_sem_audio");
-        if (noAudio) tr("diag: /data/kickiptv_sem_audio -> sem audio (ao=null)");
-        const bool sdlOk = !noAudio && sdlAudioWait(2000) == SDL_ST_OK;
+        const bool sdlOk = sdlAudioWait(2000) == SDL_ST_OK;
         mpv_set_option_string(g_mpv, "ao", sdlOk ? "sdl,null" : "null");
-        g_aoUpgrade = !sdlOk && !noAudio;      // sem som por enquanto: troca para sdl em execucao quando o teste passar
+        g_aoUpgrade = !sdlOk;      // sem som por enquanto: troca para sdl em execucao quando o teste passar
         tr(sdlOk ? "mpv-ao=sdl" : "mpv-ao=null (SDL ainda nao pronto: o som liga sozinho quando ficar)");
     }
     mpv_set_option_string(g_mpv, "demuxer-lavf-analyzeduration", "2");
@@ -476,13 +457,7 @@ bool play(const std::string &url) {
             wrap = std::string("khttp://") + url;
         }
         // sem forcar formato: o lavf detecta sozinho (forcar "mp4" fez o app fechar)
-        // Live da Kick: sem force-seekable (nao e arquivo) e decodificacao conservadora (sem os atalhos "skiploopfilter=all"/"fast", menos threads,
-        // cache pequeno). Filmes e canais continuam exatamente como antes.
-        const bool kickLive = url.compare(0, 11, "kicklive://") == 0;
-        std::string opts = kickLive
-            ? "force-seekable=no,vd-lavc-threads=3,vd-lavc-skiploopfilter=default,vd-lavc-fast=no,demuxer-max-bytes=24MiB,demuxer-max-back-bytes=1MiB"
-            : "force-seekable=yes";
-        if (kickLive) tr("mpv-live: opcoes conservadoras (sem seek, 3 threads, sem atalhos de decodificacao)");
+        std::string opts = "force-seekable=yes";
         const char *cmd[] = {"loadfile", wrap.c_str(), "replace", opts.c_str(), nullptr};  // mpv 0.36: sem o indice "0" (isso e da 0.38+)
         if (chk(mpv_command(g_mpv, cmd)) < 0) {
             // fallback sem opts
