@@ -37,6 +37,7 @@ bool boot();
 bool play(const std::string &url);
 void pause(bool on);
 void setMute(bool on);
+void setSpeed(double rate);
 bool seekSec(double sec);
 bool seekRelative(double deltaSec);
 void stop();
