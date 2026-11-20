@@ -364,10 +364,11 @@ bool boot() {
     // escalador MMXEXT que GERA CODIGO em memoria executavel (mmap + mprotect PROT_EXEC). No PS4 isso derruba o app (SIGBUS) logo no
     // 1o quadro desenhado: o mpv_kickiptv.log parava em "starting audio playback" ~1 s depois de abrir. O "bilinear" normal usa so
     // as rotinas SIMD fixas (sem gerar codigo) e e bem mais leve que o bicubic padrao.
-    mpv_set_option_string(g_mpv, "sws-scaler", "bilinear");
-    mpv_set_option_string(g_mpv, "sws-fast", "no");
+    // Filmes/series/canais: valores do build 778 (testado: abre e roda sem erro). A live da Kick troca para "bilinear" so no loadfile (abaixo).
+    mpv_set_option_string(g_mpv, "sws-scaler", "fast-bilinear");
+    mpv_set_option_string(g_mpv, "sws-fast", "yes");
     mpv_set_option_string(g_mpv, "sws-allow-zimg", "no");
-    mpv_set_option_string(g_mpv, "sw-fast", "no");
+    mpv_set_option_string(g_mpv, "sw-fast", "yes");
     mpv_set_option_string(g_mpv, "scale", "bilinear");
     mpv_set_option_string(g_mpv, "cscale", "bilinear");
     mpv_set_option_string(g_mpv, "dscale", "bilinear");
@@ -480,7 +481,7 @@ bool play(const std::string &url) {
         // cache pequeno). Filmes e canais continuam exatamente como antes.
         const bool kickLive = url.compare(0, 11, "kicklive://") == 0;
         std::string opts = kickLive
-            ? "force-seekable=no,vd-lavc-threads=3,vd-lavc-skiploopfilter=default,vd-lavc-fast=no,demuxer-max-bytes=24MiB,demuxer-max-back-bytes=1MiB"
+            ? "force-seekable=no,sws-scaler=bilinear,sws-fast=no,sw-fast=no,vd-lavc-threads=3,vd-lavc-skiploopfilter=default,vd-lavc-fast=no,demuxer-max-bytes=24MiB,demuxer-max-back-bytes=1MiB"
             : "force-seekable=yes";
         if (kickLive) tr("mpv-live: opcoes conservadoras (sem seek, 3 threads, sem atalhos de decodificacao)");
         const char *cmd[] = {"loadfile", wrap.c_str(), "replace", opts.c_str(), nullptr};  // mpv 0.36: sem o indice "0" (isso e da 0.38+)
@@ -692,11 +693,7 @@ SDL_AudioCallback g_shFn = nullptr;
 void *g_shUd = nullptr;
 
 void *shAudioMain(void *) {
-    // buffer alinhado em 256 bytes: o sceAudioOutOutput le por DMA e um ponteiro mal alinhado pode derrubar o app
-    int16_t *abuf = nullptr;
-    if (posix_memalign((void **)&abuf, 256, (size_t)kShGrain * 2 * sizeof(int16_t)) != 0 || !abuf) return nullptr;
-    struct Fr { int16_t *p; ~Fr() { free(p); } } frAbuf{abuf};
-    struct V { int16_t *p; size_t n; int16_t *data() { return p; } size_t size() const { return n; } } buf{abuf, (size_t)kShGrain * 2};
+    std::vector<int16_t> buf((size_t)kShGrain * 2);
     while (g_shRun.load()) {
         std::memset(buf.data(), 0, buf.size() * sizeof(int16_t));              // pausado/sem dados = silencio
         if (!g_shPause.load() && g_shFn) {
