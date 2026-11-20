@@ -125,12 +125,29 @@ jobs:
       - name: PacBrew libs (libmpv/ffmpeg - mesmo do GMCA/Switchfin)
         continue-on-error: true
         run: |
-          bash scripts/fetch_pacbrew.sh || echo "pacbrew download falhou; build sem mpv"
+          bash scripts/fetch_pacbrew.sh || echo "pacbrew download falhou; tentando espelho GMCA"
+          # Fallback: pacotes do GMCA (ci-deps) se o Switchfin nao tiver libmpv
+          if [ ! -f third_party/pacbrew/opt/pacbrew/ps4/openorbis/usr/lib/libmpv.a ]; then
+            echo "fallback GMCA ci-deps"
+            mkdir -p third_party/pacbrew
+            cd third_party/pacbrew
+            BASE=https://github.com/thcolin/gamepad-media-center-aggregator/releases/download/ci-deps
+            for pkg in musl-1.5-3 mbedtls-2.28.10-2 sdl2-2.0.18-19 libcurl-7.80.0-5 dav1d-1.5.4-1 ffmpeg-7.1.5-3 libmpv-0.36.0-2; do
+              f="ps4-openorbis-${pkg}-any.pkg.tar.gz"
+              curl -fsSL -o "$f" "$BASE/$f" && tar -xzf "$f" || echo "falhou $f"
+            done
+            if [ -d opt/pacbrew/ps4/openorbis ]; then
+              echo "$(pwd)/opt/pacbrew/ps4/openorbis" > PREFIX
+            fi
+            cd "$GITHUB_WORKSPACE"
+          fi
           if [ -f third_party/pacbrew/PREFIX ]; then
             echo "PACBREW=$(cat third_party/pacbrew/PREFIX)" >> $GITHUB_ENV
             echo "HAVE_PACBREW=1" >> $GITHUB_ENV
+            echo "PACBREW OK: $(cat third_party/pacbrew/PREFIX)"
           else
             echo "HAVE_PACBREW=0" >> $GITHUB_ENV
+            echo "PACBREW ausente"
           fi
       - name: Completar libs do mpv (libass, freetype, png, z... vindas do container do GMCA)
         continue-on-error: true
