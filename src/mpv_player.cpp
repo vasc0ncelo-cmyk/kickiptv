@@ -450,22 +450,14 @@ bool play(const std::string &url) {
         applyAoUpgradeLocked();       // SDL ficou pronto depois do 1o boot: este video ja abre com som
         ensureRender();
 
-        // Se esta linha nao aparecer no /data/kickiptv_mpv.log como khttp://... o PKG e velho
+        // khttp:// = HTTP do app (sceHttp). Nao passar http:// cru (FFmpeg DNS no PS4 falha).
         std::string wrap = std::string("khttp://") + url;
-        if (wrap.find("khttp://http://") != 0 && wrap.find("khttp://https://") != 0) {
-            // url relativa? ainda assim prefixa
-            wrap = std::string("khttp://") + url;
-        }
-        // sem forcar formato: o lavf detecta sozinho (forcar "mp4" fez o app fechar)
-        std::string opts = "force-seekable=yes";
-        const char *cmd[] = {"loadfile", wrap.c_str(), "replace", opts.c_str(), nullptr};  // mpv 0.36: sem o indice "0" (isso e da 0.38+)
+        // NAO usar force-seekable=yes aqui: o mpv vai no fim do arquivo e muitos paineis IPTV
+        // recusam o Range grande -> end-file: loading failed. Seek e feito depois, sob demanda.
+        const char *cmd[] = {"loadfile", wrap.c_str(), "replace", nullptr};
         if (chk(mpv_command(g_mpv, cmd)) < 0) {
-            // fallback sem opts
-            const char *cmd2[] = {"loadfile", wrap.c_str(), "replace", nullptr};
-            if (chk(mpv_command(g_mpv, cmd2)) < 0) {
-                g_open = false;
-                return false;
-            }
+            g_open = false;
+            return false;
         }
     }
     // IMPORTANTE: nao segurar g_mx enquanto o demuxer le via stream_cb
