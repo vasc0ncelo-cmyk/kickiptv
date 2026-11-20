@@ -174,25 +174,6 @@ static bool ensureRender() {
 static void (*g_trace)(const char *) = nullptr;
 static void tr(const char *s) { if (g_trace) g_trace(s); }
 
-// ---------- Pilha das threads ----------
-// A pilha PADRAO de uma thread na musl do PS4 e de so 128 KiB. O ffmpeg cria 6 threads de decodificacao (vd-lavc-threads) e o mpv cria as
-// dele com essa pilha padrao: decodificar H.264 720p60 por SOFTWARE (a live da Kick) estoura 128 KiB de vez em quando e o app cai sem aviso
-// ~1 s depois do 1o quadro (o registro de falha sai com valores sem sentido, tipico de pilha estourada). O GMCA nao sofre isso porque
-// decodifica por hardware. Aqui aumentamos o padrao para 2 MiB antes de criar qualquer thread do mpv/ffmpeg.
-// Funcao "fraca": se a libc do toolchain nao tiver, nada acontece (e o log avisa).
-extern "C" int pthread_setattr_default_np(const pthread_attr_t *) __attribute__((weak));
-static void bumpDefaultStack() {
-    static bool done = false;
-    if (done) return;
-    done = true;
-    if (!pthread_setattr_default_np) { tr("stack-padrao: pthread_setattr_default_np indisponivel (pilha continua 128 KiB)"); return; }
-    pthread_attr_t a;
-    if (pthread_attr_init(&a) != 0) return;
-    int r1 = pthread_attr_setstacksize(&a, 2u << 20);
-    int r2 = pthread_setattr_default_np(&a);
-    pthread_attr_destroy(&a);
-    char b[96]; snprintf(b, sizeof b, "stack-padrao: 2 MiB (set=%d default=%d)", r1, r2); tr(b);
-}
 static bool markerFile(const char *path) { FILE *f = fopen(path, "rb"); if (!f) return false; fclose(f); return true; }
 
 // ---------- Audio SDL: teste em segundo plano ----------
@@ -340,12 +321,11 @@ void setStreamIo(const StreamIo &io) {
 
 bool available() { return true; }
 
-void prewarm() { bumpDefaultStack(); sdlStartProbe(); }
+void prewarm() { sdlStartProbe(); }
 
 bool boot() {
     std::lock_guard<std::mutex> lk(g_mx);
     if (g_mpv) return true;
-    bumpDefaultStack();
     g_mpv = mpv_create();
     if (!g_mpv) {
         setErr("mpv_create falhou");
