@@ -2,6 +2,7 @@
 #include "mpv_player.hpp"
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -342,10 +343,14 @@ bool boot() {
     // O vo=libmpv por software converte (YUV->BGRA) e escala TODO quadro na CPU. O que pesava: o swscale padrao do mpv e o "bicubic"
     // (~150 ms por quadro 1080p no PS4 => ~7 quadros/s). As opcoes de GPU (scale/cscale/dscale/dither/interpolation...) nao valem
     // para este caminho; quem manda aqui sao as sws-*: bilinear rapido, sem zimg (mais lento nessa CPU).
-    mpv_set_option_string(g_mpv, "sws-scaler", "fast-bilinear");
-    mpv_set_option_string(g_mpv, "sws-fast", "yes");
+    // ATENCAO (queda da live Kick): NAO usar "fast-bilinear". Com o video menor que a tela (live 720p -> tela 1080p) o swscale liga o
+    // escalador MMXEXT que GERA CODIGO em memoria executavel (mmap + mprotect PROT_EXEC). No PS4 isso derruba o app (SIGBUS) logo no
+    // 1o quadro desenhado: o mpv_kickiptv.log parava em "starting audio playback" ~1 s depois de abrir. O "bilinear" normal usa so
+    // as rotinas SIMD fixas (sem gerar codigo) e e bem mais leve que o bicubic padrao.
+    mpv_set_option_string(g_mpv, "sws-scaler", "bilinear");
+    mpv_set_option_string(g_mpv, "sws-fast", "no");
     mpv_set_option_string(g_mpv, "sws-allow-zimg", "no");
-    mpv_set_option_string(g_mpv, "sw-fast", "yes");
+    mpv_set_option_string(g_mpv, "sw-fast", "no");
     mpv_set_option_string(g_mpv, "scale", "bilinear");
     mpv_set_option_string(g_mpv, "cscale", "bilinear");
     mpv_set_option_string(g_mpv, "dscale", "bilinear");
@@ -662,7 +667,11 @@ SDL_AudioCallback g_shFn = nullptr;
 void *g_shUd = nullptr;
 
 void *shAudioMain(void *) {
-    std::vector<int16_t> buf((size_t)kShGrain * 2);
+    // buffer alinhado em 256 bytes: o sceAudioOutOutput le por DMA e um ponteiro mal alinhado pode derrubar o app
+    int16_t *abuf = nullptr;
+    if (posix_memalign((void **)&abuf, 256, (size_t)kShGrain * 2 * sizeof(int16_t)) != 0 || !abuf) return nullptr;
+    struct Fr { int16_t *p; ~Fr() { free(p); } } frAbuf{abuf};
+    struct V { int16_t *p; size_t n; int16_t *data() { return p; } size_t size() const { return n; } } buf{abuf, (size_t)kShGrain * 2};
     while (g_shRun.load()) {
         std::memset(buf.data(), 0, buf.size() * sizeof(int16_t));              // pausado/sem dados = silencio
         if (!g_shPause.load() && g_shFn) {
