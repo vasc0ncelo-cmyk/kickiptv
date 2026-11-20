@@ -4867,7 +4867,7 @@ int main() {
             if (loader.take(pl, lst)) {
                 bgloadClearAt = nowSec() + 4.0;           // o menu ja vai desenhar a lista nova (capas etc.): so depois disso e que "deu certo"
                 // nao substitui um cache bom por uma lista menor/parcial
-                if (pl && (app.list.empty() || pl->count() >= app.list.count() * 8 / 10)) {
+                if (pl && (app.list.empty() || true)) {   // aceita a lista nova
                     app.list = std::move(*pl);
                     for (int i = 0; i < 4; i++) ui.cursor[i] = ui.scroll[i] = ui.catCur[i] = ui.catScroll[i] = 0;
                     ui.level = 0; ui.inItems = false;
@@ -4876,7 +4876,10 @@ int main() {
                     if (ui.coverBackground) {
                         std::vector<std::string> urls;
                         for (auto &c : app.list.movieCats) for (auto i : c.items) if (i < app.list.movies.size()) urls.push_back(app.list.movies[i].logo);
-                        for (auto &c : app.list.seriesCats) for (auto &s : c.series) urls.push_back(app.seriesLogo(s));
+                        for (auto &c : app.list.seriesCats) for (auto &s : c.series) {
+                            auto it = app.list.seriesInfo.find(s);
+                            if (it != app.list.seriesInfo.end() && !it->second.cover.empty()) urls.push_back(it->second.cover);
+                        }
                         for (auto &c : app.list.channelCats) for (auto i : c.items) if (i < app.list.channels.size()) urls.push_back(app.list.channels[i].logo);
                         if (!urls.empty()) ui.coverBackground(std::move(urls));
                     }
