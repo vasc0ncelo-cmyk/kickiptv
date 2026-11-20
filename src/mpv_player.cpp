@@ -174,7 +174,12 @@ static bool ensureRender() {
 static void (*g_trace)(const char *) = nullptr;
 static void tr(const char *s) { if (g_trace) g_trace(s); }
 
-static bool markerFile(const char *path) { FILE *f = fopen(path, "rb"); if (!f) return false; fclose(f); return true; }
+// Aceita o arquivo com ou sem ".txt" no fim (alguns apps de arquivo do PS4 acrescentam .txt sozinhos e nao deixam criar vazio).
+static bool markerFile(const char *path) {
+    std::string a = path, b = a + ".txt";
+    for (const std::string &n : {a, b}) { FILE *f = fopen(n.c_str(), "rb"); if (f) { fclose(f); return true; } }
+    return false;
+}
 
 // ---------- Audio SDL: teste em segundo plano ----------
 // O SDL de audio do PS4 trava (o log parava em "sdl-pretest: SDL_InitSubSystem"). Antes o teste rodava DENTRO do boot do mpv,
