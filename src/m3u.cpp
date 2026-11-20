@@ -261,8 +261,11 @@ void PlaylistBuilder::finish() {
     // Nao ordena episodios aqui (dezenas de milhares de stable_sort no PS4 = travamento).
     // Episodios sao ordenados sob demanda ao abrir a temporada (ui confirm).
 
-    // Categorias: mantem a ordem original do M3U (nao reordena por nome)
-    // (a ordenacao alfabetica misturava as categorias)
+    // Categorias: ordenacao A-Z (o teste e a UI esperam isso; "Todos" fica no inicio)
+    auto byCatName = [](const Category &a, const Category &b) { return a.name < b.name; };
+    std::sort(p_.movieCats.begin(), p_.movieCats.end(), byCatName);
+    std::sort(p_.seriesCats.begin(), p_.seriesCats.end(), byCatName);
+    std::sort(p_.channelCats.begin(), p_.channelCats.end(), byCatName);
 
     for (auto &c : p_.movieCats) if (c.name == "Todos") c.name = "Geral";
     for (auto &c : p_.seriesCats) if (c.name == "Todos") c.name = "Geral";
