@@ -21,6 +21,7 @@ bool boot() { return false; }
 bool play(const std::string &) { return false; }
 void pause(bool) {}
 void setMute(bool) {}
+void setSpeed(double) {}
 bool seekSec(double) { return false; }
 bool seekRelative(double) { return false; }
 void stop() {}
@@ -364,15 +365,18 @@ bool boot() {
     mpv_set_option_string(g_mpv, "vd-lavc-fast", "yes");
     // ---- CACHE ----
     // Leitura em blocos grandes (o HTTP do app ja busca 1 MB por vez); a memoria "de tras" so precisa cobrir os saltos de +-10 s;
-    // pausa por falta de cache so depois de esvaziar de verdade e retoma com folga (menos "engasgos" curtos e repetidos).
+    // Colchao maior na frente, pouco para tras (memoria do PS4 e curta).
+    // Pausa so quando o cache zera de verdade e retoma com folga (menos engasgo curto).
     mpv_set_option_string(g_mpv, "cache", "yes");
-    mpv_set_option_string(g_mpv, "demuxer-max-bytes", "96MiB");
-    mpv_set_option_string(g_mpv, "demuxer-max-back-bytes", "16MiB");
-    mpv_set_option_string(g_mpv, "cache-secs", "120");
-    mpv_set_option_string(g_mpv, "stream-buffer-size", "1MiB");
+    mpv_set_option_string(g_mpv, "demuxer-max-bytes", "160MiB");
+    mpv_set_option_string(g_mpv, "demuxer-max-back-bytes", "8MiB");
+    mpv_set_option_string(g_mpv, "demuxer-readahead-secs", "45");
+    mpv_set_option_string(g_mpv, "cache-secs", "180");
+    mpv_set_option_string(g_mpv, "stream-buffer-size", "2MiB");
     mpv_set_option_string(g_mpv, "cache-pause", "yes");
     mpv_set_option_string(g_mpv, "cache-pause-initial", "no");
-    mpv_set_option_string(g_mpv, "cache-pause-wait", "3");
+    mpv_set_option_string(g_mpv, "cache-pause-wait", "2");
+    mpv_set_option_string(g_mpv, "network-timeout", "20");
     mpv_set_option_string(g_mpv, "force-seekable", "yes");
     // ---- AUDIO ----
     mpv_set_option_string(g_mpv, "audio-channels", "stereo");
@@ -528,6 +532,13 @@ void pause(bool on) {
     g_paused = on;
 }
 
+void setSpeed(double rate) {
+    std::lock_guard<std::mutex> lk(g_mx);
+    if (!g_mpv || !g_open) return;
+    if (rate < 0.25) rate = 0.25;
+    if (rate > 4.0) rate = 4.0;
+    mpv_set_property(g_mpv, "speed", MPV_FORMAT_DOUBLE, &rate);
+}
 void setMute(bool on) {
     std::lock_guard<std::mutex> lk(g_mx);
     if (!g_mpv) return;
