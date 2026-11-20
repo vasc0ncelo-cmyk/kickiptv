@@ -3551,10 +3551,11 @@ struct Player {
                 "Qualidade do video",
                 "Proporcao da tela",
                 "Audio",
+                "Favorito",
                 "Informacoes",
                 "Voltar"
             };
-            const int nOpt = 5;
+            const int nOpt = 6;
             for (int i = 0; i < nOpt; i++) {
                 int iy = oy + 72 + i * 56;
                 bool sel = (i == optCur);
@@ -3568,7 +3569,8 @@ struct Player {
                 if (i == 0) val = kQualityName[g_quality.load() % kQualityCount];
                 else if (i == 1) val = aspectName(aspectMode);
                 else if (i == 2) val = muted ? "Mudo" : "Ativo";
-                else if (i == 3) val = showInfo ? "Abrir" : "";
+                else if (i == 3) val = feat::isFav(url) ? "Sim" : "Nao";
+                else if (i == 4) val = showInfo ? "Abrir" : "";
                 if (val && val[0]) {
                     int vw2 = r.textWidth(val, 18);
                     uiText(r, ox + ow - 28 - vw2, iy + 12, val, MUTED, 18);
@@ -3960,6 +3962,8 @@ int main() {
     // isso era a causa do CE ao apertar △/OPTIONS na Kick.
     auto safeRestartLive = [&](const std::string &why) {
         if (player.url.empty() && player.kickSlug.empty()) return;
+        // nao reinicia nos primeiros 8 s (evita crash ao abrir canal)
+        if (nowSec() - player.mpvT0 < 8.0 && player.useMpv) return;
         trace((std::string("safe-restart:") + why).c_str());
         player.quietWait = true;
         player.waitLabel = "Reconectando...";
@@ -4406,20 +4410,6 @@ int main() {
                     WatchProgress::Instance().Update(player.url, (int64_t)st.positionSec, (int64_t)st.durationSec, player.title);
                 }
             }
-            // timer de sono
-            {
-                static double sleepStart = 0;
-                int sm = feat::sleepMin();
-                if (sm > 0) {
-                    if (sleepStart < 1) sleepStart = tn;
-                    if (tn - sleepStart > sm * 60.0) {
-                        feat::setSleepMin(0);
-                        player.stop(); mode = Mode::Menu; dirty = true;
-                        app.say("Timer de sono: app pausado");
-                        continue;
-                    }
-                } else sleepStart = 0;
-            }
             player.paused = st.paused;
             player.bufPaused = st.buffering && player.mpvGot;
             player.bufPct = st.bufferPct;
@@ -4454,20 +4444,10 @@ int main() {
                 const bool looksLikeChannel = player.url.find("/movie/") == std::string::npos
                     && player.url.find("/series/") == std::string::npos
                     && (player.url.find(".m3u8") != std::string::npos || st.durationSec < 30.0 || !player.isVod);
-                if (st.eof && looksLikeChannel && !player.canNextEp()) {
-                    // canal unico: loop silencioso
-                    mpv_player::seekSec(0);
-                    player.lastPtsMs = 0; player.playedMs = 0; player.maxPtsMs = 0;
-                    player.playStartWall = nowSec();
-                    sceKernelUsleep(4000); continue;
-                }
-                if (st.eof && looksLikeChannel && player.canNextEp()) {
-                    // canal com lista: NAO avanca sozinho. So o usuario troca com L1/R1.
-                    // Loop no mesmo canal.
-                    mpv_player::seekSec(0);
-                    player.lastPtsMs = 0; player.playedMs = 0; player.maxPtsMs = 0;
-                    player.playStartWall = nowSec();
-                    sceKernelUsleep(4000); continue;
+                if (st.eof && looksLikeChannel) {
+                    // Canal: nao faz seek (derrubava o app) e nao reabre.
+                    // So espera o proximo quadro. O usuario troca com L1/R1.
+                    sceKernelUsleep(8000); continue;
                 }
                 if (st.eof && player.canNextEp()) {
                     player.epIndex++;
@@ -4601,8 +4581,12 @@ int main() {
                         player.muted = !player.muted;
                         player.audio.muted = player.paused || player.muted;
                     } else if (player.optCur == 3) {
-                        player.showInfo = true; player.showOpts = false;
+                        feat::toggleFav(player.url, player.title);
+                        player.toastText = feat::isFav(player.url) ? "Adicionado aos favoritos" : "Removido dos favoritos";
+                        player.toastUntil = nowSec() + 1.5;
                     } else if (player.optCur == 4) {
+                        player.showInfo = true; player.showOpts = false;
+                    } else if (player.optCur == 5) {
                         player.showOpts = false;
                     }
                 }
