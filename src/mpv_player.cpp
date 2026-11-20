@@ -144,7 +144,8 @@ static int cb_open(void * /*user_data*/, char *uri, mpv_stream_cb_info *info) {
     info->read_fn = cb_read;
     // Live da Kick (kicklive://): fluxo continuo SEM posicao. Antes o cb_seek dizia "ok" para qualquer seek, mas a leitura ignorava o
     // offset: o mpv achava que tinha voltado no arquivo e recebia bytes do ponto errado. Sem seek_fn o mpv trata como transmissao ao vivo.
-    info->seek_fn = !strncmp(u, "kicklive://", 11) ? nullptr : cb_seek;
+    if (!strncmp(u, "kicklive://", 11)) info->seek_fn = nullptr;
+    else info->seek_fn = cb_seek;
     info->size_fn = cb_size;
     info->close_fn = cb_close;
     info->cancel_fn = nullptr;
@@ -178,9 +179,13 @@ static void tr(const char *s) { if (g_trace) g_trace(s); }
 
 // Aceita o arquivo com ou sem ".txt" no fim (alguns apps de arquivo do PS4 acrescentam .txt sozinhos e nao deixam criar vazio).
 static bool markerFile(const char *path) {
-    std::string a = path, b = a + ".txt";
-    for (const std::string &n : {a, b}) { FILE *f = fopen(n.c_str(), "rb"); if (f) { fclose(f); return true; } }
-    return false;
+    char p2[160];
+    snprintf(p2, sizeof p2, "%s.txt", path);
+    FILE *f = fopen(path, "rb");
+    if (!f) f = fopen(p2, "rb");
+    if (!f) return false;
+    fclose(f);
+    return true;
 }
 
 // ---------- Audio SDL: teste em segundo plano ----------
