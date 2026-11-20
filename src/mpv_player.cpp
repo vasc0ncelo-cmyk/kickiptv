@@ -142,7 +142,9 @@ static int cb_open(void * /*user_data*/, char *uri, mpv_stream_cb_info *info) {
 
     info->cookie = st;
     info->read_fn = cb_read;
-    info->seek_fn = cb_seek;
+    // Live da Kick (kicklive://): fluxo continuo SEM posicao. Antes o cb_seek dizia "ok" para qualquer seek, mas a leitura ignorava o
+    // offset: o mpv achava que tinha voltado no arquivo e recebia bytes do ponto errado. Sem seek_fn o mpv trata como transmissao ao vivo.
+    info->seek_fn = !strncmp(u, "kicklive://", 11) ? nullptr : cb_seek;
     info->size_fn = cb_size;
     info->close_fn = cb_close;
     info->cancel_fn = nullptr;
@@ -346,6 +348,10 @@ bool boot() {
     mpv_set_option_string(g_mpv, "vo", "libmpv");
     mpv_set_option_string(g_mpv, "hwdec", "no");
     {   // Chaves de diagnostico (crie o arquivo vazio em /data pelo FTP; apague para desligar). Servem para descobrir o que derruba a live.
+        if (markerFile("/data/kickiptv_hwdec")) {     // teste: H.264 pelo hardware do PS4 (videodec2); se nao abrir, o mpv cai para o software
+            mpv_set_option_string(g_mpv, "vd", "lavc:h264_videodec2,lavc");
+            tr("diag: /data/kickiptv_hwdec -> tentando h264_videodec2");
+        }
         const bool dec2 = markerFile("/data/kickiptv_dec2");
         mpv_set_option_string(g_mpv, "vd-lavc-threads", dec2 ? "2" : "6");
         if (dec2) tr("diag: /data/kickiptv_dec2 -> 2 threads de decodificacao");
@@ -470,7 +476,13 @@ bool play(const std::string &url) {
             wrap = std::string("khttp://") + url;
         }
         // sem forcar formato: o lavf detecta sozinho (forcar "mp4" fez o app fechar)
-        std::string opts = "force-seekable=yes";
+        // Live da Kick: sem force-seekable (nao e arquivo) e decodificacao conservadora (sem os atalhos "skiploopfilter=all"/"fast", menos threads,
+        // cache pequeno). Filmes e canais continuam exatamente como antes.
+        const bool kickLive = url.compare(0, 11, "kicklive://") == 0;
+        std::string opts = kickLive
+            ? "force-seekable=no,vd-lavc-threads=3,vd-lavc-skiploopfilter=default,vd-lavc-fast=no,demuxer-max-bytes=24MiB,demuxer-max-back-bytes=1MiB"
+            : "force-seekable=yes";
+        if (kickLive) tr("mpv-live: opcoes conservadoras (sem seek, 3 threads, sem atalhos de decodificacao)");
         const char *cmd[] = {"loadfile", wrap.c_str(), "replace", opts.c_str(), nullptr};  // mpv 0.36: sem o indice "0" (isso e da 0.38+)
         if (chk(mpv_command(g_mpv, cmd)) < 0) {
             // fallback sem opts
