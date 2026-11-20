@@ -32,6 +32,8 @@
 #include "aes128.hpp"
 #include "nativeplayer.hpp"
 #include "mpv_player.hpp"
+#include "features.hpp"
+#include "WatchProgress.hpp"
 #include "streambuf.hpp"
 #include "netstream.hpp"
 #include "httpfile.hpp"
@@ -1748,10 +1750,13 @@ static void *kickLiveOpen(uint64_t *size_out) {
     // Ja existe um alimentador rodando para esta URL (o mpv reabriu o stream): reaproveita, senao o close da 1a abertura matava a 2a.
     const bool reuse = g_liveOpen.load() > 0 && g_feed.run.load() && !g_feed.failed.load() && g_feed.url == g_kickLiveUrl && g_feed.segs.load() > 0;
     if (!reuse) {
-        g_feed.start(g_kickLiveUrl, false);                     // escolhe a variante (resolucao), baixa playlist + segmentos
+        // Live: buffer menor (8 MB) para nao estourar a RAM com o mpv junto
+        g_feed.sb.softCap = 8u << 20;
+        g_feed.sb.hardCap = 12u << 20;
+        g_feed.start(g_kickLiveUrl, false);
         trace("kicklive-feeder");
         const int need = std::max(2, g_feed.wantSegs.load());
-        for (int i = 0; i < 500 && g_feed.segs.load() < need && !g_feed.failed.load() && g_feed.run.load(); i++) sceKernelUsleep(50000);   // ate 25 s
+        for (int i = 0; i < 500 && g_feed.segs.load() < need && !g_feed.failed.load() && g_feed.run.load(); i++) sceKernelUsleep(50000);
         if (g_feed.failed.load() || g_feed.segs.load() == 0) { trace("kicklive-falhou"); g_feed.abort(); return nullptr; }
     } else trace("kicklive-reabriu");
     auto *s = new KickMpvStream();
@@ -1771,8 +1776,10 @@ static int64_t kickLiveRead(KickMpvStream *s, char *buf, uint64_t n) {
             uint64_t end = g_feed.sb.base + g_feed.sb.buf.size();
             if (s->abs < g_feed.sb.base || s->abs > end) s->abs = g_feed.sb.base;
         }
-        int r = g_feed.sb.read((uint8_t *)buf, s->abs, (uint32_t)n, 1000);
+        int r = 0;
+        try { r = g_feed.sb.read((uint8_t *)buf, s->abs, (uint32_t)n, 1000); } catch (...) { r = -1; }
         if (r > 0) { s->abs += (uint64_t)r; if (nrd.fetch_add(1) < 3) trace("kicklive-leu"); return r; }
+        if (r < 0) { trace("kicklive-read-erro"); return -1; }
         if (!g_feed.run.load() || g_feed.failed.load() || g_feed.streamEnded.load()) {
             trace(!g_feed.run.load() ? "kicklive-eof-parado" : g_feed.failed.load() ? "kicklive-eof-falha" : "kicklive-eof-fim");
             return 0;
@@ -2067,6 +2074,16 @@ struct Player {
                 active = true;
                 isVod = (url.find(".m3u8") == std::string::npos) && kickSlug.empty();
                 log.push_back("player: libmpv OK");
+                if (isVod) {
+                    feat::addHistory(url, title);
+                    int64_t resume = 0;
+                    if (WatchProgress::Instance().GetResumePoint(url, resume) && resume > 15) {
+                        mpv_player::seekSec((double)resume);
+                        lastPtsMs = (uint64_t)resume * 1000;
+                        playedMs = lastPtsMs;
+                        log.push_back("retomando de " + std::to_string(resume) + "s");
+                    }
+                }
                 return true;
             }
             std::string e = mpv_player::status().error;
@@ -4142,7 +4159,8 @@ int main() {
     // Teste do audio SDL em segundo plano desde ja (nao bloqueia nada): quando o 1o video abrir o resultado ja esta pronto.
     mpv_player::setTrace([](const char *st) { trace(st); });
     mpv_player::prewarm();
-    trace("loop-inicio");
+    WatchProgress::Instance().Init("/data/kickiptv_progress.json");
+        trace("loop-inicio");
     startWatchdog();
     double hbNext = monoSec() + 60, hbT0 = monoSec();
     bool sysExit = false;                       // true = saindo porque o sistema (menu do PS) esta fechando/trocando o app
@@ -4380,6 +4398,28 @@ int main() {
             const double tn = nowSec();
             player.lastPtsMs = (int64_t)(st.positionSec * 1000.0);
             if (st.durationSec > 0) player.durationMs = (int64_t)(st.durationSec * 1000.0);
+            // salva progresso a cada ~10 s (so VOD)
+            if (player.isVod && st.positionSec > 15 && (int)st.positionSec % 10 == 0) {
+                static double lastSave = 0;
+                if (tn - lastSave > 9.0) {
+                    lastSave = tn;
+                    WatchProgress::Instance().Update(player.url, (int64_t)st.positionSec, (int64_t)st.durationSec, player.title);
+                }
+            }
+            // timer de sono
+            {
+                static double sleepStart = 0;
+                int sm = feat::sleepMin();
+                if (sm > 0) {
+                    if (sleepStart < 1) sleepStart = tn;
+                    if (tn - sleepStart > sm * 60.0) {
+                        feat::setSleepMin(0);
+                        player.stop(); mode = Mode::Menu; dirty = true;
+                        app.say("Timer de sono: app pausado");
+                        continue;
+                    }
+                } else sleepStart = 0;
+            }
             player.paused = st.paused;
             player.bufPaused = st.buffering && player.mpvGot;
             player.bufPct = st.bufferPct;
