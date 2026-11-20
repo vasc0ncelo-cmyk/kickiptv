@@ -32,8 +32,6 @@
 #include "aes128.hpp"
 #include "nativeplayer.hpp"
 #include "mpv_player.hpp"
-#include "features.hpp"
-#include "WatchProgress.hpp"
 #include "streambuf.hpp"
 #include "netstream.hpp"
 #include "httpfile.hpp"
@@ -1750,13 +1748,10 @@ static void *kickLiveOpen(uint64_t *size_out) {
     // Ja existe um alimentador rodando para esta URL (o mpv reabriu o stream): reaproveita, senao o close da 1a abertura matava a 2a.
     const bool reuse = g_liveOpen.load() > 0 && g_feed.run.load() && !g_feed.failed.load() && g_feed.url == g_kickLiveUrl && g_feed.segs.load() > 0;
     if (!reuse) {
-        // Live: buffer bem menor (4 MB) para nao estourar a RAM com o mpv junto
-        g_feed.sb.softCap = 4u << 20;
-        g_feed.sb.hardCap = 6u << 20;
-        g_feed.start(g_kickLiveUrl, false);
+        g_feed.start(g_kickLiveUrl, false);                     // escolhe a variante (resolucao), baixa playlist + segmentos
         trace("kicklive-feeder");
         const int need = std::max(2, g_feed.wantSegs.load());
-        for (int i = 0; i < 500 && g_feed.segs.load() < need && !g_feed.failed.load() && g_feed.run.load(); i++) sceKernelUsleep(50000);
+        for (int i = 0; i < 500 && g_feed.segs.load() < need && !g_feed.failed.load() && g_feed.run.load(); i++) sceKernelUsleep(50000);   // ate 25 s
         if (g_feed.failed.load() || g_feed.segs.load() == 0) { trace("kicklive-falhou"); g_feed.abort(); return nullptr; }
     } else trace("kicklive-reabriu");
     auto *s = new KickMpvStream();
@@ -1776,10 +1771,8 @@ static int64_t kickLiveRead(KickMpvStream *s, char *buf, uint64_t n) {
             uint64_t end = g_feed.sb.base + g_feed.sb.buf.size();
             if (s->abs < g_feed.sb.base || s->abs > end) s->abs = g_feed.sb.base;
         }
-        int r = 0;
-        try { r = g_feed.sb.read((uint8_t *)buf, s->abs, (uint32_t)n, 1000); } catch (...) { r = -1; }
+        int r = g_feed.sb.read((uint8_t *)buf, s->abs, (uint32_t)n, 1000);
         if (r > 0) { s->abs += (uint64_t)r; if (nrd.fetch_add(1) < 3) trace("kicklive-leu"); return r; }
-        if (r < 0) { trace("kicklive-read-erro"); return -1; }
         if (!g_feed.run.load() || g_feed.failed.load() || g_feed.streamEnded.load()) {
             trace(!g_feed.run.load() ? "kicklive-eof-parado" : g_feed.failed.load() ? "kicklive-eof-falha" : "kicklive-eof-fim");
             return 0;
@@ -2072,22 +2065,8 @@ struct Player {
                 mpvGot = false; mpvT0 = nowSec(); mpvLastOv = 0; mpvLastHud = false; mpvSeekAcc = 0; toastUntil = 0;
                 paused = false; muted = false; failed = false;
                 active = true;
-                // Canal = nao e filme/serie. Canal nao tem seek, nao tem continuar assistindo, nao congela no fim.
-                const bool isMovieOrSeries = url.find("/movie/") != std::string::npos
-                    || url.find("/series/") != std::string::npos
-                    || (urlIsVod(url) && url.find("/live/") == std::string::npos && url.find(".m3u8") == std::string::npos && kickSlug.empty());
-                isVod = isMovieOrSeries;   // canal e live: isVod = false
+                isVod = (url.find(".m3u8") == std::string::npos) && kickSlug.empty();
                 log.push_back("player: libmpv OK");
-                if (isMovieOrSeries) {
-                    feat::addHistory(url, title);
-                    int64_t resume = 0;
-                    if (kick::WatchProgress::Instance().GetResumePoint(url, resume) && resume > 15) {
-                        mpv_player::seekSec((double)resume);
-                        lastPtsMs = (uint64_t)resume * 1000;
-                        playedMs = lastPtsMs;
-                        log.push_back("retomando de " + std::to_string(resume) + "s");
-                    }
-                }
                 return true;
             }
             std::string e = mpv_player::status().error;
@@ -3554,14 +3533,11 @@ struct Player {
             const char *items[] = {
                 "Qualidade do video",
                 "Proporcao da tela",
-                "Velocidade",
                 "Audio",
-                "Favorito",
-                "Tema",
                 "Informacoes",
                 "Voltar"
             };
-            const int nOpt = 8;
+            const int nOpt = 5;
             for (int i = 0; i < nOpt; i++) {
                 int iy = oy + 72 + i * 56;
                 bool sel = (i == optCur);
@@ -3574,11 +3550,8 @@ struct Player {
                 char tmp[32];
                 if (i == 0) val = kQualityName[g_quality.load() % kQualityCount];
                 else if (i == 1) val = aspectName(aspectMode);
-                else if (i == 2) val = feat::speedName();
-                else if (i == 3) val = muted ? "Mudo" : "Ativo";
-                else if (i == 4) val = feat::isFav(url) ? "Sim" : "Nao";
-                else if (i == 5) val = feat::theme() == 0 ? "Verde" : feat::theme() == 1 ? "Azul" : "Roxo";
-                else if (i == 6) val = showInfo ? "Abrir" : "";
+                else if (i == 2) val = muted ? "Mudo" : "Ativo";
+                else if (i == 3) val = showInfo ? "Abrir" : "";
                 if (val && val[0]) {
                     int vw2 = r.textWidth(val, 18);
                     uiText(r, ox + ow - 28 - vw2, iy + 12, val, MUTED, 18);
@@ -3890,13 +3863,10 @@ int main() {
             return ok;
         } catch (...) { return false; }
     });
-    ui.coverBackground = [](std::vector<std::string> urls) {  // automatico: baixa as que faltam em segundo plano
+    ui.coverBackground = [](std::vector<std::string>) {};     // (nada automatico: o lote so roda quando voce aperta TRIANGULO)
+    ui.coverBulk = [](std::vector<std::string> urls) {        // TRIANGULO: todas as capas, ate 15 mil NOVAS por vez (~1 GB); apertar de novo continua de onde parou
         if (!kCoversOn) return;
-        try { g_covers.setBackground(std::move(urls), 50000); } catch (...) {}
-    };
-    ui.coverBulk = [](std::vector<std::string> urls) {        // TRIANGULO: continua o lote
-        if (!kCoversOn) return;
-        try { g_covers.setBackground(std::move(urls), 50000); } catch (...) {}
+        try { g_covers.setBackground(std::move(urls), 15000); } catch (...) {}
     };
     ui.coverBulkStop = []() { g_covers.cancelBackground(); };
     ui.coverBulkActive = []() -> bool { return g_covers.backgroundActive(); };
@@ -3973,8 +3943,6 @@ int main() {
     // isso era a causa do CE ao apertar △/OPTIONS na Kick.
     auto safeRestartLive = [&](const std::string &why) {
         if (player.url.empty() && player.kickSlug.empty()) return;
-        // nao reinicia nos primeiros 8 s (evita crash ao abrir canal)
-        if (nowSec() - player.mpvT0 < 8.0 && player.useMpv) return;
         trace((std::string("safe-restart:") + why).c_str());
         player.quietWait = true;
         player.waitLabel = "Reconectando...";
@@ -4174,8 +4142,7 @@ int main() {
     // Teste do audio SDL em segundo plano desde ja (nao bloqueia nada): quando o 1o video abrir o resultado ja esta pronto.
     mpv_player::setTrace([](const char *st) { trace(st); });
     mpv_player::prewarm();
-    kick::WatchProgress::Instance().Init("/data/kickiptv_progress.json");
-        trace("loop-inicio");
+    trace("loop-inicio");
     startWatchdog();
     double hbNext = monoSec() + 60, hbT0 = monoSec();
     bool sysExit = false;                       // true = saindo porque o sistema (menu do PS) esta fechando/trocando o app
@@ -4235,24 +4202,6 @@ int main() {
             auto stopAllNow = [&](const char *why) {
                 trace(why);
                 g_quitting = true;                 // workers de rede/capas param
-                // Filme/serie: guarda o ponto para retomar ao voltar (nao vai para a tela do titulo)
-                if (mode == Mode::Play && player.isVod && !player.url.empty()) {
-                    const bool movieOrSeries = player.url.find("/movie/") != std::string::npos
-                        || player.url.find("/series/") != std::string::npos
-                        || (player.url.find("/live/") == std::string::npos && player.url.find(".m3u8") == std::string::npos);
-                    if (movieOrSeries) {
-                        int64_t pos = (int64_t)player.realPosMs() / 1000;
-                        if (pos > 5) {
-                            kick::WatchProgress::Instance().Update(player.url, pos, (int64_t)player.durationMs / 1000, true);
-                            pf.pendingPlayUrl = player.url;
-                            pf.pendingPlayTitle = player.title;
-                            pf.pendingEpUrls = player.epUrls;
-                            pf.pendingEpTitles = player.epTitles;
-                            pf.pendingEpIndex = player.epIndex;
-                            trace("bg-resume-salvo");
-                        }
-                    }
-                }
                 if (mode == Mode::Play || player.h) {
                     try { player.stop(); } catch (...) {}
                     mode = Mode::Menu;
@@ -4312,8 +4261,6 @@ int main() {
                     g_quitting = false;
                     g_covers.setPaused(false);
                     dirty = true;
-                    // se salvamos um filme/serie, o pendingPlayUrl ja esta setado e o loop vai reabrir
-                    if (!pf.pendingPlayUrl.empty()) trace("bg-resume-retomando");
                 }
                 wasBg = bg;
                 // Enquanto estiver em background: nao toca video nem redesenha menu pesado
@@ -4433,17 +4380,6 @@ int main() {
             const double tn = nowSec();
             player.lastPtsMs = (int64_t)(st.positionSec * 1000.0);
             if (st.durationSec > 0) player.durationMs = (int64_t)(st.durationSec * 1000.0);
-            // salva progresso a cada ~10 s (so filme/serie, nao canal)
-            const bool saveable = player.url.find("/movie/") != std::string::npos
-                || player.url.find("/series/") != std::string::npos
-                || (player.isVod && player.url.find("/live/") == std::string::npos && player.url.find(".m3u8") == std::string::npos);
-            if (saveable && st.positionSec > 15 && (int)st.positionSec % 10 == 0) {
-                static double lastSave = 0;
-                if (tn - lastSave > 9.0) {
-                    lastSave = tn;
-                    kick::WatchProgress::Instance().Update(player.url, (int64_t)st.positionSec, (int64_t)st.durationSec);
-                }
-            }
             player.paused = st.paused;
             player.bufPaused = st.buffering && player.mpvGot;
             player.bufPct = st.bufferPct;
@@ -4478,21 +4414,20 @@ int main() {
                 const bool looksLikeChannel = player.url.find("/movie/") == std::string::npos
                     && player.url.find("/series/") == std::string::npos
                     && (player.url.find(".m3u8") != std::string::npos || st.durationSec < 30.0 || !player.isVod);
-                if (st.eof && looksLikeChannel) {
-                    // Canal chegou no fim do segmento: reabre o mesmo canal sem mensagem e sem seek
-                    // (seek derrubava; so esperar congelava a imagem).
-                    pf.pendingPlayUrl = player.url;
-                    pf.pendingPlayTitle = player.title;
-                    pf.pendingEpUrls = player.epUrls;
-                    pf.pendingEpTitles = player.epTitles;
-                    pf.pendingEpIndex = player.epIndex;
-                    player.quietWait = false;
-                    player.waitLabel.clear();
-                    try { mpv_player::stop(); } catch (...) {}
-                    player.stop();
-                    sceKernelUsleep(80000);
-                    mode = Mode::Menu; dirty = true;
-                    sceKernelUsleep(8000); continue;
+                if (st.eof && looksLikeChannel && !player.canNextEp()) {
+                    // canal unico: loop silencioso
+                    mpv_player::seekSec(0);
+                    player.lastPtsMs = 0; player.playedMs = 0; player.maxPtsMs = 0;
+                    player.playStartWall = nowSec();
+                    sceKernelUsleep(4000); continue;
+                }
+                if (st.eof && looksLikeChannel && player.canNextEp()) {
+                    // canal com lista: NAO avanca sozinho. So o usuario troca com L1/R1.
+                    // Loop no mesmo canal.
+                    mpv_player::seekSec(0);
+                    player.lastPtsMs = 0; player.playedMs = 0; player.maxPtsMs = 0;
+                    player.playStartWall = nowSec();
+                    sceKernelUsleep(4000); continue;
                 }
                 if (st.eof && player.canNextEp()) {
                     player.epIndex++;
@@ -4527,15 +4462,6 @@ int main() {
                 if (pressed & B_SQUARE) {
                     player.muted = !player.muted; mpv_player::setMute(player.muted);
                     player.toastText = player.muted ? "Mudo" : "Som ligado"; player.toastUntil = tn + 1.2;
-                }
-                if (pressed & B_L3) {
-                    feat::toggleFav(player.url, player.title);
-                    player.toastText = feat::isFav(player.url) ? "Favorito" : "Removido";
-                    player.toastUntil = tn + 1.2;
-                }
-                if (pressed & B_R3) {
-                    player.showInfo = !player.showInfo;
-                    player.hudUntil = tn + 12;
                 }
                 if (pressed & B_TRIANGLE) player.hudUntil = (tn <= player.hudUntil && !player.paused) ? 0 : tn + 12;
             }
@@ -4634,27 +4560,9 @@ int main() {
                     } else if (player.optCur == 2) {
                         player.muted = !player.muted;
                         player.audio.muted = player.paused || player.muted;
-                    } else if (player.optCur == 2) {
-                        int s = (feat::speed() + 1) % 5;
-                        feat::setSpeed(s);
-                        mpv_player::setSpeed(feat::speedValue());
-                        player.toastText = std::string("Velocidade: ") + feat::speedName();
-                        player.toastUntil = nowSec() + 1.2;
                     } else if (player.optCur == 3) {
-                        player.muted = !player.muted;
-                        player.audio.muted = player.paused || player.muted;
-                        mpv_player::setMute(player.muted);
-                    } else if (player.optCur == 4) {
-                        feat::toggleFav(player.url, player.title);
-                        player.toastText = feat::isFav(player.url) ? "Adicionado aos favoritos" : "Removido dos favoritos";
-                        player.toastUntil = nowSec() + 1.5;
-                    } else if (player.optCur == 5) {
-                        feat::setTheme((feat::theme() + 1) % 3);
-                        player.toastText = feat::theme() == 0 ? "Tema: Verde" : feat::theme() == 1 ? "Tema: Azul" : "Tema: Roxo";
-                        player.toastUntil = nowSec() + 1.2;
-                    } else if (player.optCur == 6) {
                         player.showInfo = true; player.showOpts = false;
-                    } else if (player.optCur == 7) {
+                    } else if (player.optCur == 4) {
                         player.showOpts = false;
                     }
                 }
@@ -4866,23 +4774,10 @@ int main() {
             std::shared_ptr<Playlist> pl; ListLoader::State lst = ListLoader::Idle;
             if (loader.take(pl, lst)) {
                 bgloadClearAt = nowSec() + 4.0;           // o menu ja vai desenhar a lista nova (capas etc.): so depois disso e que "deu certo"
-                // nao substitui um cache bom por uma lista menor/parcial
-                if (pl && (app.list.empty() || true)) {   // aceita a lista nova
+                if (pl) {
                     app.list = std::move(*pl);
                     for (int i = 0; i < 4; i++) ui.cursor[i] = ui.scroll[i] = ui.catCur[i] = ui.catScroll[i] = 0;
                     ui.level = 0; ui.inItems = false;
-                    // dispara preload de capas em segundo plano (as que ja estao no disco aparecem na hora)
-                    try { ui.kickPrefetch(); } catch (...) {}
-                    if (ui.coverBackground) {
-                        std::vector<std::string> urls;
-                        for (auto &c : app.list.movieCats) for (auto i : c.items) if (i < app.list.movies.size()) urls.push_back(app.list.movies[i].logo);
-                        for (auto &c : app.list.seriesCats) for (auto &s : c.series) {
-                            auto it = app.list.seriesInfo.find(s);
-                            if (it != app.list.seriesInfo.end() && !it->second.cover.empty()) urls.push_back(it->second.cover);
-                        }
-                        for (auto &c : app.list.channelCats) for (auto i : c.items) if (i < app.list.channels.size()) urls.push_back(app.list.channels[i].logo);
-                        if (!urls.empty()) ui.coverBackground(std::move(urls));
-                    }
                     std::string src = loader.fromNet() ? "  |  baixada e salva" : "  |  lista salva";
                     if (pl->truncated) app.say("Aviso: lista enorme - so os primeiros itens cabem na memoria do PS4 - " + app.summary());
                     else if (lst == ListLoader::Partial) app.say("Aviso: lista incompleta (" + std::string(loader.outOfMemory() ? "acabou a memoria" : "a conexao caiu") + ") - " + app.summary());
@@ -4903,13 +4798,14 @@ int main() {
 
         if (bgloadClearAt > 0 && nowSec() >= bgloadClearAt) { pf.saveSetting("bgload", ""); bgloadClearAt = 0; trace("bgload-ok"); }
 
-        // Lista: espera uns quadros para o menu aparecer, depois carrega em segundo plano.
-        if (autoLoadList && mode == Mode::Menu && ++autoLoadFrames >= 30) {
+        // Lista salva: carrega do arquivo guardado no console (nao baixa), mas so depois de o menu ja ter aparecido uns quadros.
+        // Marca "bgload" antes: se o app cair aqui, a proxima abertura NAO repete (abre normal e avisa).
+        if (autoLoadList && mode == Mode::Menu && ++autoLoadFrames >= 20) {
             autoLoadList = false;
             presentMenu();
             pf.saveSetting("bgload", "1");
             trace("lista-auto-inicio");
-            if (!ui.m3uUrl.empty()) startLoader(ui.m3uUrl);
+            ui.loadSavedList();                      // copia salva; so baixa se nao houver copia desta lista
             bgloadClearAt = nowSec() + 4.0;
             trace("lista-auto-fim");
             dirty = true;
