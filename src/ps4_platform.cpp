@@ -2074,10 +2074,14 @@ struct Player {
                 active = true;
                 isVod = (url.find(".m3u8") == std::string::npos) && kickSlug.empty();
                 log.push_back("player: libmpv OK");
-                if (isVod) {
+                // Continuar assistindo: SO filmes e series (nao canais)
+                const bool isMovieOrSeries = url.find("/movie/") != std::string::npos
+                    || url.find("/series/") != std::string::npos
+                    || (urlIsVod(url) && url.find("/live/") == std::string::npos && url.find(".m3u8") == std::string::npos);
+                if (isMovieOrSeries) {
                     feat::addHistory(url, title);
                     int64_t resume = 0;
-                    if (WatchProgress::Instance().GetResumePoint(url, resume) && resume > 15) {
+                    if (kick::WatchProgress::Instance().GetResumePoint(url, resume) && resume > 15) {
                         mpv_player::seekSec((double)resume);
                         lastPtsMs = (uint64_t)resume * 1000;
                         playedMs = lastPtsMs;
@@ -4163,7 +4167,7 @@ int main() {
     // Teste do audio SDL em segundo plano desde ja (nao bloqueia nada): quando o 1o video abrir o resultado ja esta pronto.
     mpv_player::setTrace([](const char *st) { trace(st); });
     mpv_player::prewarm();
-    WatchProgress::Instance().Init("/data/kickiptv_progress.json");
+    kick::WatchProgress::Instance().Init("/data/kickiptv_progress.json");
         trace("loop-inicio");
     startWatchdog();
     double hbNext = monoSec() + 60, hbT0 = monoSec();
@@ -4402,12 +4406,15 @@ int main() {
             const double tn = nowSec();
             player.lastPtsMs = (int64_t)(st.positionSec * 1000.0);
             if (st.durationSec > 0) player.durationMs = (int64_t)(st.durationSec * 1000.0);
-            // salva progresso a cada ~10 s (so VOD)
-            if (player.isVod && st.positionSec > 15 && (int)st.positionSec % 10 == 0) {
+            // salva progresso a cada ~10 s (so filme/serie, nao canal)
+            const bool saveable = player.url.find("/movie/") != std::string::npos
+                || player.url.find("/series/") != std::string::npos
+                || (player.isVod && player.url.find("/live/") == std::string::npos && player.url.find(".m3u8") == std::string::npos);
+            if (saveable && st.positionSec > 15 && (int)st.positionSec % 10 == 0) {
                 static double lastSave = 0;
                 if (tn - lastSave > 9.0) {
                     lastSave = tn;
-                    WatchProgress::Instance().Update(player.url, (int64_t)st.positionSec, (int64_t)st.durationSec, player.title);
+                    kick::WatchProgress::Instance().Update(player.url, (int64_t)st.positionSec, (int64_t)st.durationSec);
                 }
             }
             player.paused = st.paused;
