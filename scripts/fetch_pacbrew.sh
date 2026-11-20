@@ -9,7 +9,7 @@ PKGS=(
   mbedtls-2.28.10-2
   sdl2-2.0.18-19
   libcurl-8.4.0-1
-  dav1d-1.5.4-1
+  dav1d-1.5.5-1
   ffmpeg-7.1.5-4
   libmpv-0.36.0-3
 )
@@ -19,10 +19,14 @@ for p in "${PKGS[@]}"; do
   f="ps4-openorbis-${p}-any.pkg.tar.gz"
   if [ ! -f "$f" ]; then
     echo "baixando $f"
-    curl -fsSL -o "$f" "$BASE_URL/$f"
+    if ! curl -fsSL -o "$f" "$BASE_URL/$f"; then
+      echo "AVISO: falhou baixar $f (seguindo)"
+      rm -f "$f"
+      continue
+    fi
   fi
   echo "extraindo $f"
-  tar -xzf "$f"
+  tar -xzf "$f" || echo "AVISO: falhou extrair $f"
 done
 # Dependencias extras (libass, freetype, fribidi, harfbuzz, libpng, zlib, bzip2, libsamplerate...): o libmpv.a e estatico e precisa delas.
 # Em vez de adivinhar nomes/versoes, le a lista de pacotes da release e baixa os que ainda nao vieram (a versao mais nova de cada).
@@ -58,4 +62,4 @@ if [ -d opt/pacbrew/ps4/openorbis ]; then
   echo "PACBREW_PREFIX=$DEST/opt/pacbrew/ps4/openorbis"
   echo "$DEST/opt/pacbrew/ps4/openorbis" > "$DEST/PREFIX"
 fi
-ls -la opt/pacbrew/ps4/openorbis/usr/lib/libmpv.a
+if [ -f opt/pacbrew/ps4/openorbis/usr/lib/libmpv.a ]; then ls -la opt/pacbrew/ps4/openorbis/usr/lib/libmpv.a; else echo "AVISO: libmpv.a nao encontrado"; fi
