@@ -1872,6 +1872,7 @@ struct Player {
     uint64_t bufAheadMs = 0;               // quanto do filme ja esta baixado a frente do ponto atual (barra cinza clara)
     bool bufKnown = false;
     bool quietWait = false;                // true = nao mostra o cartao de diagnostico ao conectar (qualidade/reconexao)
+    std::string waitLabel;                 // texto do spinner: "Proximo episodio..." etc. Vazio = padrao
     uint64_t lastPtsMs = 0;                // posicao atual (ms) do ultimo quadro
     uint64_t maxPtsMs = 0;                 // maior pts visto (estima duracao minima)
     uint64_t durationMs = 0;               // duracao conhecida/estimada (ms)
@@ -2009,7 +2010,7 @@ struct Player {
     bool start(const std::string &url, const std::string &title) {
         log.clear(); frames = 0; vw = vh = 0; fps = 0; fpsFrames = 0; failed = false; addRc = 0; chunkMode = false; chunkIdx = 0; inactiveSince = 0;
         cancelled = false; restarts = switchesOk = 0; lastGapMs = 0; gapStartT = switchedAt = 0; curDur = 0; chunkT0 = 0; blitMs = 0;
-        paused = false; isVod = false; lastPtsMs = 0; maxPtsMs = 0; durationMs = 0; seekPendingMs = -1; waitNote.clear(); showOpts = false; optCur = 0;
+        paused = false; isVod = false; lastPtsMs = 0; maxPtsMs = 0; durationMs = 0; seekPendingMs = -1; waitNote.clear(); waitLabel.clear(); showOpts = false; optCur = 0;
         scrubMode = false; scrubMs = -1; seekSkip = false; seekTargetMs = 0;
         trigScrub = false; trigDir = 0; trigBlock = true;       // trigBlock: um L2/R2 ainda apertado do menu nao vira seek
         pendJumpMs = -1; pendJumpNeed = 0; jumpPct = 0; jumpTargetMs = -1; jumpSettleUntil = 0; jumpErrors = 0;
@@ -3587,7 +3588,7 @@ struct Player {
             uiGlow(r, cx - 60, cy - 61, 120, 122, 8, GREEN, 18 + pulse * 3, 120);
             uiKMark(r, cx - 60, cy - 61, 120, 122, GREEN);
             uiCenterHeavy(r, cx, cy + 130, uiFit(r, title, 38, r.W - 300), TEXT, 38);
-            uiCenter(r, cx, cy + 180, quietWait ? "Trocando qualidade..." : isVod ? "Abrindo o vídeo..." : "Abrindo a transmissão...", MUTED, 24);
+            uiCenter(r, cx, cy + 180, !waitLabel.empty() ? waitLabel.c_str() : (quietWait ? "Trocando qualidade..." : isVod ? "Abrindo o vídeo..." : "Abrindo a transmissão..."), MUTED, 24);
             if (!waitNote.empty()) uiCenter(r, cx, cy + 222, uiFit(r, waitNote, 20, r.W - 200), DIM, 20);
             uiHints(r, r.W - 73, r.H - 50, {{"O", "Cancelar"}});
             return;
@@ -4353,8 +4354,13 @@ int main() {
             auto requeue = [&](const std::string &u, const std::string &t, int ep) {
                 pf.pendingPlayUrl = u; pf.pendingPlayTitle = t; pf.pendingEpIndex = ep;
                 pf.pendingEpUrls = player.epUrls; pf.pendingEpTitles = player.epTitles;
-                player.quietWait = true;
-                player.stop(); mode = Mode::Menu; dirty = true;
+                // Nao e troca de qualidade: mantem g_quality e mostra texto de episodio
+                player.quietWait = false;
+                player.waitLabel = "Próximo episódio...";
+                try { mpv_player::stop(); } catch (...) {}
+                player.stop();
+                sceKernelUsleep(120000);   // deixa o mpv/stream_cb soltar antes do proximo start
+                mode = Mode::Menu; dirty = true;
             };
             if (pressed & B_CIRCLE) {
                 player.stop(); player.quietWait = false;
@@ -4370,12 +4376,20 @@ int main() {
                 mode = Mode::Menu; dirty = true; sceKernelUsleep(16000); continue;
             }
             if (st.failed || (st.eof && !st.paused)) {
+                // Canal curto (0:01 / 0:04): nao reabre nem troca qualidade. Volta pro inicio e segue.
+                const bool shortLive = !player.hasEpisodes() && st.durationSec > 0 && st.durationSec < 15.0;
+                if (st.eof && shortLive) {
+                    mpv_player::seekSec(0);
+                    player.lastPtsMs = 0; player.playedMs = 0; player.maxPtsMs = 0;
+                    player.playStartWall = nowSec();
+                    sceKernelUsleep(8000); continue;
+                }
                 if (st.eof && player.canNextEp()) {
                     player.epIndex++;
                     requeue(player.epUrls[player.epIndex], player.epTitles[player.epIndex], player.epIndex);
                 } else {
                     if (st.failed) app.say("Falha na reprodução: " + st.error);
-                    player.stop(); player.quietWait = false;
+                    player.stop(); player.quietWait = false; player.waitLabel.clear();
                     player.epUrls.clear(); player.epTitles.clear(); player.epIndex = -1;
                     mode = Mode::Menu; dirty = true;
                 }
@@ -4508,7 +4522,8 @@ int main() {
                     pf.pendingPlayTitle = player.epTitles[player.epIndex];
                     pf.pendingEpIndex = player.epIndex;
                     pf.pendingEpUrls = player.epUrls; pf.pendingEpTitles = player.epTitles;
-                    player.quietWait = true;
+                    player.quietWait = false;
+                    player.waitLabel = "Trocando canal...";
                     player.stop(); mode = Mode::Menu; dirty = true; sceKernelUsleep(8000); continue;
                 }
                 if (!player.isVod && (pressed & B_R1) && player.canNextEp()) {
@@ -4517,7 +4532,8 @@ int main() {
                     pf.pendingPlayTitle = player.epTitles[player.epIndex];
                     pf.pendingEpIndex = player.epIndex;
                     pf.pendingEpUrls = player.epUrls; pf.pendingEpTitles = player.epTitles;
-                    player.quietWait = true;
+                    player.quietWait = false;
+                    player.waitLabel = "Trocando canal...";
                     player.stop(); mode = Mode::Menu; dirty = true; sceKernelUsleep(8000); continue;
                 }
                 // SQUARE = mute rapido
@@ -4828,7 +4844,7 @@ int main() {
             };
             trace("player-start");
             player.start(url, title);
-            player.quietWait = false;   // so vale para esta abertura (qualidade/reconexao/episodio)
+            player.quietWait = false; player.waitLabel.clear();   // so vale para esta abertura
             if (player.cancelled) { player.cancelled = false; mode = Mode::Menu; dirty = true; trace("player-cancelado"); continue; }
             trace(player.failed ? "player-falhou" : "player-aberto");
             if (player.failed) {
