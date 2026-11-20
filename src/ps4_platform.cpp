@@ -4903,13 +4903,13 @@ int main() {
 
         if (bgloadClearAt > 0 && nowSec() >= bgloadClearAt) { pf.saveSetting("bgload", ""); bgloadClearAt = 0; trace("bgload-ok"); }
 
-        // Lista: caminho original (loadM3U) — API do painel primeiro, depois cache.
-        if (autoLoadList && mode == Mode::Menu && ++autoLoadFrames >= 1) {
+        // Lista: espera uns quadros para o menu aparecer, depois carrega em segundo plano.
+        if (autoLoadList && mode == Mode::Menu && ++autoLoadFrames >= 30) {
             autoLoadList = false;
             presentMenu();
             pf.saveSetting("bgload", "1");
             trace("lista-auto-inicio");
-            ui.loadSavedList();
+            if (!ui.m3uUrl.empty()) startLoader(ui.m3uUrl);
             bgloadClearAt = nowSec() + 4.0;
             trace("lista-auto-fim");
             dirty = true;
