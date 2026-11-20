@@ -4414,7 +4414,7 @@ int main() {
             }
             {
                 const bool hudNow = player.hudActive() || tn < player.toastUntil;
-                const bool direct = mpvDirect && !hudNow && player.kickSlug.empty();      // sem OSD: mpv -> tela, zero copias (live Kick: sempre pelo rascunho em RAM; a queda era logo apos o 1o quadro)
+                const bool direct = mpvDirect && !hudNow;                              // sem OSD: mpv -> tela, zero copias
                 uint8_t *dst = direct ? (uint8_t *)bufs[back] : (uint8_t *)shadow;
                 auto present = [&]() {
                     if (direct) flipDirect();
@@ -4422,10 +4422,7 @@ int main() {
                     player.mpvLastOv = tn; player.mpvLastHud = hudNow;
                 };
                 if (mpv_player::renderToBgra(dst, W, H, W * 4)) {                      // quadro novo
-                    static int nfr = 0;
-                    if (nfr < 6) { char tb[48]; snprintf(tb, sizeof tb, "mpv-quadro-%d-%s", ++nfr, direct ? "direto" : "rascunho"); trace(tb); }
                     present();
-                    if (nfr > 0 && nfr <= 6) trace("mpv-quadro-apresentado");
                 } else if (pressed || hudNow != player.mpvLastHud || (hudNow && tn - player.mpvLastOv > 0.5)) {
                     // sem quadro novo (video pausado): o mpv redesenha o ULTIMO quadro (force) para colocar/tirar o OSD.
                     // Nao existe mais a copia de 8 MB do "quadro puro".
