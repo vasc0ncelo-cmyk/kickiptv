@@ -29,12 +29,6 @@ endif ()
 
 file(GLOB APP_SRC ${CMAKE_SOURCE_DIR}/src/*.cpp)
 set(PS4_C_SRC ${CMAKE_SOURCE_DIR}/ps4c/cxa_guard.c ${CMAKE_SOURCE_DIR}/ps4c/clock_ids.c)
-# Pilha minima para TODAS as threads (ps4c/pthread_stack.c). DESLIGADO por padrao: a versao que ligava isso fez filmes e a live fecharem o app.
-# Para testar: cmake -DKICK_THREAD_STACK_WRAP=ON
-option(KICK_THREAD_STACK_WRAP "Aumenta a pilha de todas as threads (teste)" OFF)
-if (KICK_THREAD_STACK_WRAP)
-    list(APPEND PS4_C_SRC ${CMAKE_SOURCE_DIR}/ps4c/pthread_stack.c)
-endif ()
 
 # O link.x do OpenOrbis junta `.data` mas nao `.data.*`; com -fdata-sections isso zera globais no console.
 # Mesmo remendo do GMCA: usa uma copia do link.x que junta os dois.
@@ -56,9 +50,6 @@ target_include_directories(${PROJECT_NAME} PRIVATE ${OPENORBIS}/usr/include)
 target_compile_options(${PROJECT_NAME} PRIVATE
     -O2 -fno-strict-aliasing -fno-omit-frame-pointer -funwind-tables -D_GNU_SOURCE)
 target_link_options(${PROJECT_NAME} PRIVATE "LINKER:--wrap=clock_gettime" "LINKER:--allow-multiple-definition")
-if (KICK_THREAD_STACK_WRAP)
-    target_link_options(${PROJECT_NAME} PRIVATE "LINKER:--wrap=pthread_create")
-endif ()
 target_link_directories(${PROJECT_NAME} PRIVATE ${OPENORBIS}/usr/lib)
 # Sem -Wl,--start-group aqui: o ld.lld e chamado direto (nao pelo clang) e nao entende '-Wl,'; o cmake do toolchain ja envolve tudo em --start-group/--end-group.
 # Ordem: o mpv puxa ffmpeg, mbedtls, SDL2 (audio), libass etc. (lista = Libs.private do mpv.pc do pacote)
