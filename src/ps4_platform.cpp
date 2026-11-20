@@ -3554,12 +3554,14 @@ struct Player {
             const char *items[] = {
                 "Qualidade do video",
                 "Proporcao da tela",
+                "Velocidade",
                 "Audio",
                 "Favorito",
+                "Tema",
                 "Informacoes",
                 "Voltar"
             };
-            const int nOpt = 6;
+            const int nOpt = 8;
             for (int i = 0; i < nOpt; i++) {
                 int iy = oy + 72 + i * 56;
                 bool sel = (i == optCur);
@@ -3572,9 +3574,11 @@ struct Player {
                 char tmp[32];
                 if (i == 0) val = kQualityName[g_quality.load() % kQualityCount];
                 else if (i == 1) val = aspectName(aspectMode);
-                else if (i == 2) val = muted ? "Mudo" : "Ativo";
-                else if (i == 3) val = feat::isFav(url) ? "Sim" : "Nao";
-                else if (i == 4) val = showInfo ? "Abrir" : "";
+                else if (i == 2) val = feat::speedName();
+                else if (i == 3) val = muted ? "Mudo" : "Ativo";
+                else if (i == 4) val = feat::isFav(url) ? "Sim" : "Nao";
+                else if (i == 5) val = feat::theme() == 0 ? "Verde" : feat::theme() == 1 ? "Azul" : "Roxo";
+                else if (i == 6) val = showInfo ? "Abrir" : "";
                 if (val && val[0]) {
                     int vw2 = r.textWidth(val, 18);
                     uiText(r, ox + ow - 28 - vw2, iy + 12, val, MUTED, 18);
@@ -3886,10 +3890,13 @@ int main() {
             return ok;
         } catch (...) { return false; }
     });
-    ui.coverBackground = [](std::vector<std::string>) {};     // (nada automatico: o lote so roda quando voce aperta TRIANGULO)
-    ui.coverBulk = [](std::vector<std::string> urls) {        // TRIANGULO: todas as capas, ate 15 mil NOVAS por vez (~1 GB); apertar de novo continua de onde parou
+    ui.coverBackground = [](std::vector<std::string> urls) {  // automatico: baixa as que faltam em segundo plano
         if (!kCoversOn) return;
-        try { g_covers.setBackground(std::move(urls), 15000); } catch (...) {}
+        try { g_covers.setBackground(std::move(urls), 50000); } catch (...) {}
+    };
+    ui.coverBulk = [](std::vector<std::string> urls) {        // TRIANGULO: continua o lote
+        if (!kCoversOn) return;
+        try { g_covers.setBackground(std::move(urls), 50000); } catch (...) {}
     };
     ui.coverBulkStop = []() { g_covers.cancelBackground(); };
     ui.coverBulkActive = []() -> bool { return g_covers.backgroundActive(); };
@@ -4521,6 +4528,15 @@ int main() {
                     player.muted = !player.muted; mpv_player::setMute(player.muted);
                     player.toastText = player.muted ? "Mudo" : "Som ligado"; player.toastUntil = tn + 1.2;
                 }
+                if (pressed & B_L3) {
+                    feat::toggleFav(player.url, player.title);
+                    player.toastText = feat::isFav(player.url) ? "Favorito" : "Removido";
+                    player.toastUntil = tn + 1.2;
+                }
+                if (pressed & B_R3) {
+                    player.showInfo = !player.showInfo;
+                    player.hudUntil = tn + 12;
+                }
                 if (pressed & B_TRIANGLE) player.hudUntil = (tn <= player.hudUntil && !player.paused) ? 0 : tn + 12;
             }
             if (!player.mpvGot) {                                    // ate o 1o quadro: tela de espera com o spinner
@@ -4618,13 +4634,27 @@ int main() {
                     } else if (player.optCur == 2) {
                         player.muted = !player.muted;
                         player.audio.muted = player.paused || player.muted;
+                    } else if (player.optCur == 2) {
+                        int s = (feat::speed() + 1) % 5;
+                        feat::setSpeed(s);
+                        mpv_player::setSpeed(feat::speedValue());
+                        player.toastText = std::string("Velocidade: ") + feat::speedName();
+                        player.toastUntil = nowSec() + 1.2;
                     } else if (player.optCur == 3) {
+                        player.muted = !player.muted;
+                        player.audio.muted = player.paused || player.muted;
+                        mpv_player::setMute(player.muted);
+                    } else if (player.optCur == 4) {
                         feat::toggleFav(player.url, player.title);
                         player.toastText = feat::isFav(player.url) ? "Adicionado aos favoritos" : "Removido dos favoritos";
                         player.toastUntil = nowSec() + 1.5;
-                    } else if (player.optCur == 4) {
-                        player.showInfo = true; player.showOpts = false;
                     } else if (player.optCur == 5) {
+                        feat::setTheme((feat::theme() + 1) % 3);
+                        player.toastText = feat::theme() == 0 ? "Tema: Verde" : feat::theme() == 1 ? "Tema: Azul" : "Tema: Roxo";
+                        player.toastUntil = nowSec() + 1.2;
+                    } else if (player.optCur == 6) {
+                        player.showInfo = true; player.showOpts = false;
+                    } else if (player.optCur == 7) {
                         player.showOpts = false;
                     }
                 }
@@ -4836,10 +4866,20 @@ int main() {
             std::shared_ptr<Playlist> pl; ListLoader::State lst = ListLoader::Idle;
             if (loader.take(pl, lst)) {
                 bgloadClearAt = nowSec() + 4.0;           // o menu ja vai desenhar a lista nova (capas etc.): so depois disso e que "deu certo"
-                if (pl) {
+                // nao substitui um cache bom por uma lista menor/parcial
+                if (pl && (app.list.empty() || pl->count() >= app.list.count() * 8 / 10)) {
                     app.list = std::move(*pl);
                     for (int i = 0; i < 4; i++) ui.cursor[i] = ui.scroll[i] = ui.catCur[i] = ui.catScroll[i] = 0;
                     ui.level = 0; ui.inItems = false;
+                    // dispara preload de capas em segundo plano (as que ja estao no disco aparecem na hora)
+                    try { ui.kickPrefetch(); } catch (...) {}
+                    if (ui.coverBackground) {
+                        std::vector<std::string> urls;
+                        for (auto &c : app.list.movieCats) for (auto i : c.items) if (i < app.list.movies.size()) urls.push_back(app.list.movies[i].logo);
+                        for (auto &c : app.list.seriesCats) for (auto &s : c.series) urls.push_back(app.seriesLogo(s));
+                        for (auto &c : app.list.channelCats) for (auto i : c.items) if (i < app.list.channels.size()) urls.push_back(app.list.channels[i].logo);
+                        if (!urls.empty()) ui.coverBackground(std::move(urls));
+                    }
                     std::string src = loader.fromNet() ? "  |  baixada e salva" : "  |  lista salva";
                     if (pl->truncated) app.say("Aviso: lista enorme - so os primeiros itens cabem na memoria do PS4 - " + app.summary());
                     else if (lst == ListLoader::Partial) app.say("Aviso: lista incompleta (" + std::string(loader.outOfMemory() ? "acabou a memoria" : "a conexao caiu") + ") - " + app.summary());
@@ -4860,26 +4900,33 @@ int main() {
 
         if (bgloadClearAt > 0 && nowSec() >= bgloadClearAt) { pf.saveSetting("bgload", ""); bgloadClearAt = 0; trace("bgload-ok"); }
 
-        // Lista salva: le o cache LOCAL na hora (1o quadro) e mostra as categorias sem esperar rede.
-        // Depois dispara atualizacao em segundo plano (ListLoader) que so troca a lista quando termina.
+        // Lista: cache LOCAL na hora. Rede so se nao houver cache (ou se o usuario pedir ATUALIZAR).
         if (autoLoadList && mode == Mode::Menu && ++autoLoadFrames >= 1) {
             autoLoadList = false;
             presentMenu();
-            pf.saveSetting("bgload", "1");
             trace("lista-cache-inicio");
-            // 1) cache local imediato (nao bloqueia: le arquivo e parseia)
             bool hadCache = false;
             if (!ui.m3uUrl.empty()) {
                 int r = app.loadCached(ui.m3uUrl);
                 if (r == 1) { hadCache = true; trace("lista-cache-ok"); }
                 else trace("lista-cache-vazio");
             }
-            // 2) atualizacao de rede em segundo plano (so se houver url)
-            if (!ui.m3uUrl.empty()) {
-                startLoader(ui.m3uUrl);          // thread propria: baixa, grava cache, take() na main
+            // So baixa da rede se NAO houver cache valido
+            if (!hadCache && !ui.m3uUrl.empty()) {
+                pf.saveSetting("bgload", "1");
+                startLoader(ui.m3uUrl);
                 trace("lista-bg-disparada");
+                bgloadClearAt = nowSec() + 4.0;
+            } else if (hadCache) {
+                // Pre-carrega capas do disco (ja baixadas antes) para aparecerem na hora
+                try {
+                    std::vector<std::string> urls;
+                    for (auto &m : app.list.movies) if (!m.logo.empty()) urls.push_back(m.logo);
+                    for (auto &c : app.list.channels) if (!c.logo.empty()) urls.push_back(c.logo);
+                    for (auto &kv : app.list.seriesTree) if (!kv.second.logo.empty()) urls.push_back(kv.second.logo);
+                    if (!urls.empty()) { ui.coverBackground(std::move(urls)); trace("capas-preload"); }
+                } catch (...) {}
             }
-            bgloadClearAt = nowSec() + 4.0;
             trace(hadCache ? "lista-pronta-cache" : "lista-pronta-aguardando-rede");
             dirty = true;
         }
