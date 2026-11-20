@@ -1750,9 +1750,9 @@ static void *kickLiveOpen(uint64_t *size_out) {
     // Ja existe um alimentador rodando para esta URL (o mpv reabriu o stream): reaproveita, senao o close da 1a abertura matava a 2a.
     const bool reuse = g_liveOpen.load() > 0 && g_feed.run.load() && !g_feed.failed.load() && g_feed.url == g_kickLiveUrl && g_feed.segs.load() > 0;
     if (!reuse) {
-        // Live: buffer menor (8 MB) para nao estourar a RAM com o mpv junto
-        g_feed.sb.softCap = 8u << 20;
-        g_feed.sb.hardCap = 12u << 20;
+        // Live: buffer bem menor (4 MB) para nao estourar a RAM com o mpv junto
+        g_feed.sb.softCap = 4u << 20;
+        g_feed.sb.hardCap = 6u << 20;
         g_feed.start(g_kickLiveUrl, false);
         trace("kicklive-feeder");
         const int need = std::max(2, g_feed.wantSegs.load());
@@ -2072,12 +2072,12 @@ struct Player {
                 mpvGot = false; mpvT0 = nowSec(); mpvLastOv = 0; mpvLastHud = false; mpvSeekAcc = 0; toastUntil = 0;
                 paused = false; muted = false; failed = false;
                 active = true;
-                isVod = (url.find(".m3u8") == std::string::npos) && kickSlug.empty();
-                log.push_back("player: libmpv OK");
-                // Continuar assistindo: SO filmes e series (nao canais)
+                // Canal = nao e filme/serie. Canal nao tem seek, nao tem continuar assistindo, nao congela no fim.
                 const bool isMovieOrSeries = url.find("/movie/") != std::string::npos
                     || url.find("/series/") != std::string::npos
-                    || (urlIsVod(url) && url.find("/live/") == std::string::npos && url.find(".m3u8") == std::string::npos);
+                    || (urlIsVod(url) && url.find("/live/") == std::string::npos && url.find(".m3u8") == std::string::npos && kickSlug.empty());
+                isVod = isMovieOrSeries;   // canal e live: isVod = false
+                log.push_back("player: libmpv OK");
                 if (isMovieOrSeries) {
                     feat::addHistory(url, title);
                     int64_t resume = 0;
@@ -4228,6 +4228,24 @@ int main() {
             auto stopAllNow = [&](const char *why) {
                 trace(why);
                 g_quitting = true;                 // workers de rede/capas param
+                // Filme/serie: guarda o ponto para retomar ao voltar (nao vai para a tela do titulo)
+                if (mode == Mode::Play && player.isVod && !player.url.empty()) {
+                    const bool movieOrSeries = player.url.find("/movie/") != std::string::npos
+                        || player.url.find("/series/") != std::string::npos
+                        || (player.url.find("/live/") == std::string::npos && player.url.find(".m3u8") == std::string::npos);
+                    if (movieOrSeries) {
+                        int64_t pos = (int64_t)player.realPosMs() / 1000;
+                        if (pos > 5) {
+                            kick::WatchProgress::Instance().Update(player.url, pos, (int64_t)player.durationMs / 1000, true);
+                            pf.pendingPlayUrl = player.url;
+                            pf.pendingPlayTitle = player.title;
+                            pf.pendingEpUrls = player.epUrls;
+                            pf.pendingEpTitles = player.epTitles;
+                            pf.pendingEpIndex = player.epIndex;
+                            trace("bg-resume-salvo");
+                        }
+                    }
+                }
                 if (mode == Mode::Play || player.h) {
                     try { player.stop(); } catch (...) {}
                     mode = Mode::Menu;
@@ -4287,6 +4305,8 @@ int main() {
                     g_quitting = false;
                     g_covers.setPaused(false);
                     dirty = true;
+                    // se salvamos um filme/serie, o pendingPlayUrl ja esta setado e o loop vai reabrir
+                    if (!pf.pendingPlayUrl.empty()) trace("bg-resume-retomando");
                 }
                 wasBg = bg;
                 // Enquanto estiver em background: nao toca video nem redesenha menu pesado
@@ -4452,8 +4472,19 @@ int main() {
                     && player.url.find("/series/") == std::string::npos
                     && (player.url.find(".m3u8") != std::string::npos || st.durationSec < 30.0 || !player.isVod);
                 if (st.eof && looksLikeChannel) {
-                    // Canal: nao faz seek (derrubava o app) e nao reabre.
-                    // So espera o proximo quadro. O usuario troca com L1/R1.
+                    // Canal chegou no fim do segmento: reabre o mesmo canal sem mensagem e sem seek
+                    // (seek derrubava; so esperar congelava a imagem).
+                    pf.pendingPlayUrl = player.url;
+                    pf.pendingPlayTitle = player.title;
+                    pf.pendingEpUrls = player.epUrls;
+                    pf.pendingEpTitles = player.epTitles;
+                    pf.pendingEpIndex = player.epIndex;
+                    player.quietWait = false;
+                    player.waitLabel.clear();
+                    try { mpv_player::stop(); } catch (...) {}
+                    player.stop();
+                    sceKernelUsleep(80000);
+                    mode = Mode::Menu; dirty = true;
                     sceKernelUsleep(8000); continue;
                 }
                 if (st.eof && player.canNextEp()) {
@@ -4829,16 +4860,27 @@ int main() {
 
         if (bgloadClearAt > 0 && nowSec() >= bgloadClearAt) { pf.saveSetting("bgload", ""); bgloadClearAt = 0; trace("bgload-ok"); }
 
-        // Lista salva: carrega do arquivo guardado no console (nao baixa), mas so depois de o menu ja ter aparecido uns quadros.
-        // Marca "bgload" antes: se o app cair aqui, a proxima abertura NAO repete (abre normal e avisa).
-        if (autoLoadList && mode == Mode::Menu && ++autoLoadFrames >= 20) {
+        // Lista salva: le o cache LOCAL na hora (1o quadro) e mostra as categorias sem esperar rede.
+        // Depois dispara atualizacao em segundo plano (ListLoader) que so troca a lista quando termina.
+        if (autoLoadList && mode == Mode::Menu && ++autoLoadFrames >= 1) {
             autoLoadList = false;
             presentMenu();
             pf.saveSetting("bgload", "1");
-            trace("lista-auto-inicio");
-            ui.loadSavedList();                      // copia salva; so baixa se nao houver copia desta lista
+            trace("lista-cache-inicio");
+            // 1) cache local imediato (nao bloqueia: le arquivo e parseia)
+            bool hadCache = false;
+            if (!ui.m3uUrl.empty()) {
+                int r = app.loadCached(ui.m3uUrl);
+                if (r == 1) { hadCache = true; trace("lista-cache-ok"); }
+                else trace("lista-cache-vazio");
+            }
+            // 2) atualizacao de rede em segundo plano (so se houver url)
+            if (!ui.m3uUrl.empty()) {
+                startLoader(ui.m3uUrl);          // thread propria: baixa, grava cache, take() na main
+                trace("lista-bg-disparada");
+            }
             bgloadClearAt = nowSec() + 4.0;
-            trace("lista-auto-fim");
+            trace(hadCache ? "lista-pronta-cache" : "lista-pronta-aguardando-rede");
             dirty = true;
         }
 
