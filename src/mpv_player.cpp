@@ -174,6 +174,27 @@ static bool ensureRender() {
 static void (*g_trace)(const char *) = nullptr;
 static void tr(const char *s) { if (g_trace) g_trace(s); }
 
+// ---------- Pilha das threads ----------
+// A pilha PADRAO de uma thread na musl do PS4 e de so 128 KiB. O ffmpeg cria 6 threads de decodificacao (vd-lavc-threads) e o mpv cria as
+// dele com essa pilha padrao: decodificar H.264 720p60 por SOFTWARE (a live da Kick) estoura 128 KiB de vez em quando e o app cai sem aviso
+// ~1 s depois do 1o quadro (o registro de falha sai com valores sem sentido, tipico de pilha estourada). O GMCA nao sofre isso porque
+// decodifica por hardware. Aqui aumentamos o padrao para 2 MiB antes de criar qualquer thread do mpv/ffmpeg.
+// Funcao "fraca": se a libc do toolchain nao tiver, nada acontece (e o log avisa).
+extern "C" int pthread_setattr_default_np(const pthread_attr_t *) __attribute__((weak));
+static void bumpDefaultStack() {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    if (!pthread_setattr_default_np) { tr("stack-padrao: pthread_setattr_default_np indisponivel (pilha continua 128 KiB)"); return; }
+    pthread_attr_t a;
+    if (pthread_attr_init(&a) != 0) return;
+    int r1 = pthread_attr_setstacksize(&a, 2u << 20);
+    int r2 = pthread_setattr_default_np(&a);
+    pthread_attr_destroy(&a);
+    char b[96]; snprintf(b, sizeof b, "stack-padrao: 2 MiB (set=%d default=%d)", r1, r2); tr(b);
+}
+static bool markerFile(const char *path) { FILE *f = fopen(path, "rb"); if (!f) return false; fclose(f); return true; }
+
 // ---------- Audio SDL: teste em segundo plano ----------
 // O SDL de audio do PS4 trava (o log parava em "sdl-pretest: SDL_InitSubSystem"). Antes o teste rodava DENTRO do boot do mpv,
 // bloqueando a abertura do video por 6 s e, se travasse, deixava o video sem som para sempre. Agora:
@@ -319,11 +340,12 @@ void setStreamIo(const StreamIo &io) {
 
 bool available() { return true; }
 
-void prewarm() { sdlStartProbe(); }
+void prewarm() { bumpDefaultStack(); sdlStartProbe(); }
 
 bool boot() {
     std::lock_guard<std::mutex> lk(g_mx);
     if (g_mpv) return true;
+    bumpDefaultStack();
     g_mpv = mpv_create();
     if (!g_mpv) {
         setErr("mpv_create falhou");
@@ -338,7 +360,11 @@ bool boot() {
     mpv_set_option_string(g_mpv, "sub-auto", "no");
     mpv_set_option_string(g_mpv, "vo", "libmpv");
     mpv_set_option_string(g_mpv, "hwdec", "no");
-    mpv_set_option_string(g_mpv, "vd-lavc-threads", "6");
+    {   // Chaves de diagnostico (crie o arquivo vazio em /data pelo FTP; apague para desligar). Servem para descobrir o que derruba a live.
+        const bool dec2 = markerFile("/data/kickiptv_dec2");
+        mpv_set_option_string(g_mpv, "vd-lavc-threads", dec2 ? "2" : "6");
+        if (dec2) tr("diag: /data/kickiptv_dec2 -> 2 threads de decodificacao");
+    }
     // ---- VIDEO ----
     // O vo=libmpv por software converte (YUV->BGRA) e escala TODO quadro na CPU. O que pesava: o swscale padrao do mpv e o "bicubic"
     // (~150 ms por quadro 1080p no PS4 => ~7 quadros/s). As opcoes de GPU (scale/cscale/dscale/dither/interpolation...) nao valem
@@ -381,9 +407,11 @@ bool boot() {
     mpv_set_option_string(g_mpv, "audio-fallback-to-null", "yes");
     {
         // Nao trava a abertura: espera no maximo 2 s pelo teste (que ja deve ter rodado em segundo plano desde o inicio do app).
-        const bool sdlOk = sdlAudioWait(2000) == SDL_ST_OK;
+        const bool noAudio = markerFile("/data/kickiptv_sem_audio");
+        if (noAudio) tr("diag: /data/kickiptv_sem_audio -> sem audio (ao=null)");
+        const bool sdlOk = !noAudio && sdlAudioWait(2000) == SDL_ST_OK;
         mpv_set_option_string(g_mpv, "ao", sdlOk ? "sdl,null" : "null");
-        g_aoUpgrade = !sdlOk;      // sem som por enquanto: troca para sdl em execucao quando o teste passar
+        g_aoUpgrade = !sdlOk && !noAudio;      // sem som por enquanto: troca para sdl em execucao quando o teste passar
         tr(sdlOk ? "mpv-ao=sdl" : "mpv-ao=null (SDL ainda nao pronto: o som liga sozinho quando ficar)");
     }
     mpv_set_option_string(g_mpv, "demuxer-lavf-analyzeduration", "2");
