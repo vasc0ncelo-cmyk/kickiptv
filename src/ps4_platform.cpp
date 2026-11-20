@@ -518,9 +518,21 @@ static void *kickMpvOpen(void * /*ud*/, const char *url, uint64_t *size_out) {
     if (!g_net.openSession(s->sess, s->url)) { delete s; return nullptr; }
     s->opened = true;
     std::string tip; int st = 0; uint64_t total = 0;
-    if (!g_net.getRange(s->sess, s->url, 0, kMpvChunk - 1, tip, st, &total)) { g_net.closeSession(s->sess); delete s; return nullptr; }
-    if ((st != 206 && st != 200) || kickLooksLikeHtml(tip)) { g_net.closeSession(s->sess); delete s; return nullptr; }
-    if (st == 200) total = tip.size();
+    bool got = g_net.getRange(s->sess, s->url, 0, kMpvChunk - 1, tip, st, &total);
+    // alguns paineis recusam Range: tenta GET simples se o Range falhou
+    if (!got || (st != 206 && st != 200) || tip.empty()) {
+        g_net.closeSession(s->sess); s->opened = false;
+        if (!g_net.openSession(s->sess, s->url)) { delete s; return nullptr; }
+        s->opened = true;
+        tip.clear(); st = 0; total = 0;
+        // GET sem Range: le so o comeco (o getRange com from=0 ainda manda Range; se falhar de novo, desiste)
+        got = g_net.getRange(s->sess, s->url, 0, 64 * 1024 - 1, tip, st, &total);
+        if (!got || tip.empty() || (st != 206 && st != 200)) {
+            g_net.closeSession(s->sess); delete s; return nullptr;
+        }
+    }
+    if (kickLooksLikeHtml(tip)) { g_net.closeSession(s->sess); delete s; return nullptr; }
+    if (st == 200 && total == 0) total = tip.size();
     s->size = total;
     if (size_out) *size_out = total;
     s->cache = std::move(tip); s->cacheOff = 0;
@@ -3029,6 +3041,22 @@ struct Player {
         int64_t cur = (int64_t)realPosMs();
         hudUntil = nowSec() + 10;
 
+        // libmpv: seek real so no fim do preview (L2/R2 solto)
+        if (useMpv) {
+            double sec = (double)targetMs / 1000.0;
+            if (sec < 0) sec = 0;
+            if (mpv_player::seekSec(sec)) {
+                lastPtsMs = lastGoodPtsMs = (uint64_t)targetMs;
+                playedMs = (uint64_t)targetMs;
+                lastPtsWall = nowSec();
+                playStartWall = nowSec() - sec;
+                pauseAccum = 0; pauseStartedAt = 0;
+                scrubMode = false; scrubMs = -1; seekSkip = false; pendJumpMs = -1;
+                trace("mpv-seek");
+            }
+            return;
+        }
+
         if (jumpUsable()) {
             scrubMode = false; scrubMs = -1; seekSkip = false;
             if (!forceJump && targetMs + 400 > cur && targetMs < cur + 400) { pendJumpMs = -1; return; }   // praticamente no mesmo ponto
@@ -4399,9 +4427,16 @@ int main() {
             if (pressed) player.hudUntil = tn + 12;
             if (player.mpvGot) {
                 if (pressed & B_CROSS) { mpv_player::pause(!st.paused); player.paused = !st.paused; player.hudUntil = tn + 12; }
-                if (player.isVod && (pressed & (B_L1 | B_R1 | B_LEFT | B_RIGHT))) {
+                // L2/R2: preview continuo (estilo YouTube). Seek real so ao soltar.
+                if (player.isVod && !player.showOpts) {
+                    int dir = 0;
+                    if (pin.held & B_L2) dir = -1;
+                    else if (pin.held & B_R2) dir = 1;
+                    player.triggerScrub(dir, tn);
+                }
+                if (player.isVod && (pressed & (B_L1 | B_R1 | B_LEFT | B_RIGHT)) && !player.trigScrub) {
                     const int d = (pressed & (B_L1 | B_LEFT)) ? -10 : 10;
-                    if (tn - player.toastUntil > 0.6) player.mpvSeekAcc = 0;       // aviso anterior ja sumiu: recomeca a soma
+                    if (tn - player.toastUntil > 0.6) player.mpvSeekAcc = 0;
                     player.mpvSeekAcc += d;
                     mpv_player::seekRelative((double)d);
                     char b[32]; snprintf(b, sizeof b, "%+d s", player.mpvSeekAcc);
