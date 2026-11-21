@@ -472,6 +472,14 @@ struct KickMpvStream {
     uint64_t cacheOff = 0;
     bool live = false;         // live Kick via HlsFeeder (kicklive://)
     uint64_t abs = 0;          // posicao propria no StreamBuf do alimentador
+    std::shared_ptr<struct LiveHttp> lh;   // canal ao vivo (MPEG-TS cru): conexao continua, sem tamanho e sem seek
+};
+// Canal ao vivo: UMA conexao GET sem Range que fica aberta e enche um buffer deslizante; o mpv le em sequencia. Antes o canal era aberto como
+// arquivo (Range 0-2MB): a resposta "200" com so os primeiros KB virava o "tamanho do arquivo" (~4 s de video) e a transmissao congelava no fim.
+struct LiveHttp {
+    StreamBuf sb;
+    std::string url;
+    std::atomic<bool> stop{false}, failed{false}, ended{false};
 };
 // Live da Kick: a URL .m3u8 NAO vai para o mpv (ele recebia o TEXTO da playlist como se fosse o video: "unrecognized file format").
 // O HlsFeeder (mais abaixo) escolhe a resolucao, baixa os segmentos .ts e o mpv le o fluxo MPEG-TS continuo por "kicklive://live.ts".
@@ -513,6 +521,30 @@ static void *kickMpvOpen(void * /*ud*/, const char *url, uint64_t *size_out) {
     if (!url || !*url) return nullptr;
     if (!strncmp(url, "kicklive://", 11)) return kickLiveOpen(size_out);
     if (!g_net.init()) return nullptr;
+    if (!urlIsVodMedia(url)) {                                   // canal ao vivo
+        auto lh = std::make_shared<LiveHttp>();
+        lh->url = url; lh->sb.softCap = 12u << 20; lh->sb.hardCap = 20u << 20;
+        std::thread([lh] {                                       // solta sozinha quando o stop chega (a leitura de rede volta ou da timeout)
+            int fails = 0;
+            while (!lh->stop.load()) {
+                uint64_t pos = 0; int status = 0;
+                int r = g_net.streamGet(lh->url, pos, [&](const char *d, size_t n) { if (lh->stop.load()) return false; lh->sb.append((const uint8_t *)d, n); return true; }, status, 15, false);
+                if (lh->stop.load() || r == -2) break;
+                if (r == -1) { lh->failed = true; break; }       // servidor recusou
+                if (pos > 0) fails = 0; else if (++fails > 6) { lh->failed = true; break; }
+                for (int i = 0; i < 5 && !lh->stop.load(); i++) sceKernelUsleep(100000);   // caiu: reconecta (ao vivo continua de onde esta)
+            }
+            lh->ended = true;
+        }).detach();
+        for (int i = 0; i < 400 && lh->sb.total() == 0 && !lh->failed.load(); i++) sceKernelUsleep(50000);      // ate 20 s pelo 1o dado
+        if (lh->sb.total() == 0) { lh->stop = true; lh->sb.abort(); return nullptr; }
+        auto *s = new KickMpvStream();
+        s->url = url; s->lh = lh; s->size = 0;
+        { std::lock_guard<std::mutex> l(lh->sb.m); s->abs = lh->sb.base; }
+        if (size_out) *size_out = 0;                             // ao vivo: tamanho desconhecido
+        trace("mpv-canal-aberto");
+        return s;
+    }
     auto *s = new KickMpvStream();
     s->url = url;
     if (!g_net.openSession(s->sess, s->url)) { delete s; return nullptr; }
@@ -543,6 +575,17 @@ static int64_t kickMpvRead(void *cookie, uint64_t offset, char *buf, uint64_t n)
     auto *s = (KickMpvStream *)cookie;
     if (!s || !buf || n == 0) return -1;
     if (s->live) return kickLiveRead(s, buf, n);
+    if (s->lh) {                                                 // canal ao vivo: leitura em sequencia (o offset do mpv e ignorado)
+        LiveHttp &L = *s->lh;
+        if (n > (1u << 20)) n = 1u << 20;
+        for (int i = 0; i < 40; i++) {                           // ate ~40 s esperando dados
+            { std::lock_guard<std::mutex> l(L.sb.m); uint64_t end = L.sb.base + L.sb.buf.size(); if (s->abs < L.sb.base || s->abs > end) s->abs = L.sb.base; }
+            int r = L.sb.read((uint8_t *)buf, s->abs, (uint32_t)n, 1000);
+            if (r > 0) { s->abs += (uint64_t)r; return r; }
+            if (L.stop.load() || L.failed.load() || L.ended.load()) return 0;
+        }
+        return 0;
+    }
     static std::atomic<int> nrd{0};
     if (nrd.fetch_add(1) < 6) { char t[96]; snprintf(t, sizeof t, "mpv-read off=%llu n=%llu", (unsigned long long)offset, (unsigned long long)n); trace(t); }
     if (s->size > 0 && offset >= s->size) return 0;
@@ -571,6 +614,7 @@ static void kickMpvClose(void *cookie) {
     auto *s = (KickMpvStream *)cookie;
     if (!s) return;
     if (s->live) { kickLiveClose(); delete s; return; }
+    if (s->lh) { s->lh->stop = true; s->lh->sb.abort(); delete s; return; }
     if (s->opened) g_net.closeSession(s->sess);
     delete s;
 }
@@ -2065,7 +2109,7 @@ struct Player {
                 mpvGot = false; mpvT0 = nowSec(); mpvLastOv = 0; mpvLastHud = false; mpvSeekAcc = 0; toastUntil = 0;
                 paused = false; muted = false; failed = false;
                 active = true;
-                isVod = (url.find(".m3u8") == std::string::npos) && kickSlug.empty();
+                isVod = kickSlug.empty() && urlIsVodMedia(url);          // canal ao vivo (.ts/.m3u8/sem extensao): sem pausa, seek nem barra de tempo
                 log.push_back("player: libmpv OK");
                 return true;
             }
@@ -3458,8 +3502,10 @@ struct Player {
         // ---- BASE: botao play/pause + barra + tempo + icones ----
         const int cyBar = H - 118;
         const int btnCx = 86;
-        osdCircle(r, btnCx, cyBar, 76, BTN);
-        if (paused) osdIconPlay(r, btnCx + 2, cyBar, 34, WHITE); else osdIconPause(r, btnCx, cyBar, 30, WHITE);
+        if (!(useMpv && !isVod)) {                                // canal ao vivo (mpv): sem botao de pausa
+            osdCircle(r, btnCx, cyBar, 76, BTN);
+            if (paused) osdIconPlay(r, btnCx + 2, cyBar, 34, WHITE); else osdIconPause(r, btnCx, cyBar, 30, WHITE);
+        }
 
         const std::string qn = kQualityName[g_quality.load() % kQualityCount];
         const std::string an = aspectName(aspectMode);
@@ -3518,7 +3564,7 @@ struct Player {
 
         // dica dos botoes (pequena, embaixo)
         uiText(r, 48, H - 40,
-               useMpv ? std::string(isVod ? "X = pausar     L1/R1 = -10/+10 s     " : "X = pausar     ") + "Quadrado = mudo     Triângulo = mostrar/ocultar     O = sair" :
+               useMpv ? std::string(isVod ? "X = pausar     L1/R1 = -10/+10 s     " : "") + "Quadrado = mudo     Triângulo = mostrar/ocultar     O = sair" :
                isVod ? "Quadrado = mudo     Triângulo = opções     O = sair"
                      : (hasEpisodes() ? "L1/R1 = canal anterior/próximo     Quadrado = mudo     Triângulo = opções     O = sair" : "Quadrado = mudo     Triângulo = opções     O = sair"),
                0xFF9A9A9Au, 16);
@@ -4414,6 +4460,11 @@ int main() {
                 const bool looksLikeChannel = player.url.find("/movie/") == std::string::npos
                     && player.url.find("/series/") == std::string::npos
                     && (player.url.find(".m3u8") != std::string::npos || st.durationSec < 30.0 || !player.isVod);
+                if (st.eof && !player.isVod && player.kickSlug.empty()) {
+                    // canal ao vivo acabou (conexao caiu por muito tempo): reabre o mesmo canal; nunca "volta ao 0" (nao existe em ao vivo)
+                    requeue(player.url, player.title, player.epIndex);
+                    sceKernelUsleep(16000); continue;
+                }
                 if (st.eof && looksLikeChannel && !player.canNextEp()) {
                     // canal unico: loop silencioso
                     mpv_player::seekSec(0);
@@ -4443,7 +4494,7 @@ int main() {
             // ---- controles (como no GMCA): X pausa, L1/R1 saltam, quadrado muda o som, triangulo mostra/oculta o OSD ----
             if (pressed) player.hudUntil = tn + 12;
             if (player.mpvGot) {
-                if (pressed & B_CROSS) { mpv_player::pause(!st.paused); player.paused = !st.paused; player.hudUntil = tn + 12; }
+                if ((pressed & B_CROSS) && player.isVod) { mpv_player::pause(!st.paused); player.paused = !st.paused; player.hudUntil = tn + 12; }     // pausar: so filme/serie
                 // L2/R2: preview continuo (estilo YouTube). Seek real so ao soltar.
                 if (player.isVod && !player.showOpts) {
                     int dir = 0;

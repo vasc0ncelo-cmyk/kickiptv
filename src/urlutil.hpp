@@ -86,3 +86,8 @@ inline std::string vodContainerExt(const std::string &head, const std::string &u
     if (x == "mkv" || x == "avi") return x;
     return "mp4";
 }
+
+// Filme/serie (arquivo com inicio e fim; pausa e seek fazem sentido) x canal ao vivo (fluxo continuo, sem pausa/seek).
+// Canal: ".ts", ".m3u8" ou sem extensao fora de /movie/ e /series/.
+inline bool urlIsVodMedia(const std::string &url) { return urlIsVideoFile(url) || urlIsXtreamVod(url); }
+
