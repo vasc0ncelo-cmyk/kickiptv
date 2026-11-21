@@ -2148,8 +2148,8 @@ struct Player {
         return true;
     }
 
-    // Tudo toca no libmpv. Padrao: lives por software; com o arquivo vazio /data/kickiptv_hwdec o mpv tenta o decodificador de hardware
-    // (h264_videodec2) nas lives e canais. Opcional (opt-in): /data/kickiptv_live_av manda as lives para o AvPlayer; se ele falhar, cai no libmpv.
+    // Tudo toca no libmpv. Lives da Kick e canais ao vivo tentam o decodificador de hardware (h264_videodec2); filme/serie em software.
+    // Arquivo vazio /data/kickiptv_nohwdec = tudo em software. Opcional (opt-in): /data/kickiptv_live_av manda as lives para o AvPlayer; se ele falhar, cai no libmpv.
     bool start(const std::string &url, const std::string &title) {
         const bool liveUrl = (!title.empty() && title[0] == '@') || !urlIsVodMedia(url);
         bool mpvOk = false;
@@ -2209,7 +2209,9 @@ struct Player {
             const bool kickLive = !kickSlug.empty() && url.find(".m3u8") != std::string::npos;
             if (kickLive) { g_kickLiveUrl = url; log.push_back("Kick: resolucao/segmentos pelo alimentador HLS"); }
             kickAbortAllIo();   // troca de midia: corta TODA leitura de rede da midia anterior (canal, Kick, VOD) antes de o mpv abrir a nova; o mpv_player::play confirma a parada e recria o render
-            if (mpv_player::play(kickLive ? std::string("kicklive://live.ts") : url)) {
+            // Hardware (h264_videodec2) SO em live da Kick e canal ao vivo do IPTV; filme/serie/VOD: software.
+            const bool hwLive = kickLive || (kickSlug.empty() && !urlIsVodMedia(url));
+            if (mpv_player::play(kickLive ? std::string("kicklive://live.ts") : url, hwLive)) {
                 trace("mpv-play-ok");
                 useMpv = true;
                 mpvGot = false; mpvT0 = nowSec(); mpvLastOv = 0; mpvLastHud = false; mpvSeekAcc = 0; toastUntil = 0;
@@ -4563,6 +4565,15 @@ int main() {
                 player.stop(); player.quietWait = false;
                 player.epUrls.clear(); player.epTitles.clear(); player.epIndex = -1;
                 mode = Mode::Menu; dirty = true; sceKernelUsleep(16000); continue;
+            }
+            // videodec2 abriu mas nao entregou video: o mpv_player ja bloqueou o hardware; reabre o canal/live (volta em software).
+            if (!player.isVod && mpv_player::hwFallbackRequested()) {
+                trace("mpv-hwdec: sem video no hardware -> reabrindo em software");
+                app.say("Decodificador de hardware falhou — reabrindo em software");
+                g_reconnectNote = "decodificador de hardware sem video";
+                safeRestartLive("hardware sem video");
+                sceKernelUsleep(50000);
+                continue;
             }
             // ---- Live da Kick (libmpv): reconecta SOZINHA se a rede/stream cair ou a imagem parar ----
             // Antes so o caminho antigo (AvPlayer) tinha isso; no mpv qualquer EOF/falha do alimentador (link expirado, rede oscilando,

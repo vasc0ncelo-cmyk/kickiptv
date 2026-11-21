@@ -36,7 +36,11 @@ bool available();
 // quando o 1o video abrir o resultado ja esta pronto e o play() nao espera. Pode chamar varias vezes.
 void prewarm();
 bool boot();
-bool play(const std::string &url);
+// live=true: live da Kick ou canal ao vivo do IPTV -> tenta o decodificador de HARDWARE (h264_videodec2).
+// live=false (filme/serie/VOD): sempre software. O pedido e refeito a cada play, nada vaza de um video para o outro.
+bool play(const std::string &url, bool live = false);
+// true UMA vez quando o videodec2 abriu mas nao entregou video: o app deve reabrir o canal (ja volta em software, ate fechar o app).
+bool hwFallbackRequested();
 void pause(bool on);
 void setMute(bool on);
 void setSpeed(double rate);

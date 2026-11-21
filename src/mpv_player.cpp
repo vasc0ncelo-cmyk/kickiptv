@@ -20,7 +20,8 @@ void setTrace(void (*)(const char *)) {}
 bool available() { return false; }
 void prewarm() {}
 bool boot() { return false; }
-bool play(const std::string &) { return false; }
+bool play(const std::string &, bool) { return false; }
+bool hwFallbackRequested() { return false; }
 void pause(bool) {}
 void setMute(bool) {}
 void setSpeed(double) {}
@@ -290,6 +291,47 @@ static std::atomic<long long> g_renderUs{0};
 static std::atomic<int> g_renderN{0};
 static bool g_everRendered = false;     // ja desenhou um quadro desde o ultimo play (so entao 'force' faz sentido)
 
+// ---------- Decodificador de HARDWARE (h264_videodec2): so lives da Kick e canais ao vivo ----------
+static bool g_hwWanted = false;                    // ESTE play pediu o videodec2
+static bool g_hwChecked = false;                   // o decoder REAL deste play ja foi conferido e logado
+static bool g_hwBad = false;                       // videodec2 abriu mas nao deu video: software ate fechar o app
+static std::atomic<bool> g_hwFallbackAsk{false};   // pedido (1 vez) para o app reabrir o canal em software
+static std::chrono::steady_clock::time_point g_hwT0 = std::chrono::steady_clock::now();
+
+static bool fileThere(const char *p) { FILE *f = fopen(p, "rb"); if (!f) return false; fclose(f); return true; }
+
+static std::string propStr(const char *name) {     // propriedade do mpv como texto ("-" se nao existe); chamar com g_mx
+    char *s = g_mpv ? mpv_get_property_string(g_mpv, name) : nullptr;
+    std::string r = s ? s : "-";
+    if (s) mpv_free(s);
+    return r;
+}
+
+// Grava no /data/kickiptv.log (tr) E no /data/kickiptv_mpv.log (print-text do mpv). Prefixo fixo: grep "\[kick-hw\]".
+static void logBoth(const char *msg) {
+    tr(msg);
+    if (g_mpv) { const char *c[] = {"print-text", msg, nullptr}; mpv_command_async(g_mpv, 0, c); }
+}
+
+// Quem DE FATO decodifica. "No hardware decoding requested" / "Using software decoding" do mpv so falam do hwaccel (--hwdec) e saem
+// mesmo com o videodec2 rodando; hwdec-current tambem fica "no". A prova e current-tracks/video/decoder.
+static std::string logDecoderLocked(const char *tag) {
+    const std::string dec = propStr("current-tracks/video/decoder");
+    const bool isHw = dec.find("videodec2") != std::string::npos;
+    char b[320];
+    snprintf(b, sizeof b, "[kick-hw] %s: decoder-real=%s => %s | hwdec-current=%s | options: vd=%s hwdec=%s threads=%s",
+             tag, dec.c_str(), isHw ? "HARDWARE" : "SOFTWARE", propStr("hwdec-current").c_str(), propStr("options/vd").c_str(),
+             propStr("options/hwdec").c_str(), propStr("options/vd-lavc-threads").c_str());
+    logBoth(b);
+    snprintf(b, sizeof b, "[kick-hw] %s: %s | codec=%s | fmt=%s hw-fmt=%s | %sx%s | fps=%s drop-dec=%s",
+             tag, propStr("current-tracks/video/decoder-desc").c_str(), propStr("video-codec").c_str(),
+             propStr("video-params/pixelformat").c_str(), propStr("video-params/hw-pixelformat").c_str(),
+             propStr("video-params/w").c_str(), propStr("video-params/h").c_str(), propStr("estimated-vf-fps").c_str(),
+             propStr("decoder-frame-drop-count").c_str());
+    logBoth(b);
+    return dec;
+}
+
 static void handleEvent(mpv_event *ev, bool *gotLoaded, bool *gotFail) {
     switch (ev->event_id) {
     case MPV_EVENT_SHUTDOWN:
@@ -494,7 +536,7 @@ bool boot() {
     return true;
 }
 
-bool play(const std::string &url) {
+bool play(const std::string &url, bool live) {
     if (!boot()) return false;
     if (url.empty()) {
         setErr("URL vazia");
@@ -536,18 +578,26 @@ bool play(const std::string &url) {
         // Live da Kick: memoria curta (o PS4 fechava o app depois de alguns minutos: 160 MiB de demuxer + 45 s de readahead + buffers do
         // alimentador somavam mais do que o app pode ter) e sem force-seekable (nao e arquivo).
         const bool kickLive = url.compare(0, 11, "kicklive://") == 0;
-        {   // Decodificacao por HARDWARE (so lives e canais; filme/serie ficam em software). Opt-in: arquivo vazio /data/kickiptv_hwdec.
-            // Se o ffmpeg deste build nao tiver o decodificador, o mpv usa o software sozinho (veja "vd" em /data/kickiptv_mpv.log).
-            auto ends = [&](const char *e) { size_t n = strlen(e); return url.size() >= n && url.compare(url.size() - n, n, e) == 0; };
-            const bool vodLike = url.find("/movie/") != std::string::npos || url.find("/series/") != std::string::npos ||
-                                 ends(".mp4") || ends(".mkv") || ends(".avi") || ends(".mov") || ends(".m4v");
-            bool marker = false;
-            for (const char *mp : {"/data/kickiptv_hwdec", "/data/kickiptv_hwdec.txt"}) { FILE *mf = fopen(mp, "rb"); if (mf) { fclose(mf); marker = true; } }
-            const bool hw = marker && (kickLive || !vodLike);
-            mpv_set_property_string(g_mpv, "vd", hw ? "lavc:h264_videodec2,lavc" : "");
-            tr(hw ? "mpv-hwdec: tentando h264_videodec2 (live/canal)" : "mpv-hwdec: software");
+        // ---- Decodificacao por HARDWARE: SO lives da Kick e canais ao vivo (live=true). Filme/serie/VOD: software. ----
+        // (1) Por que caia em software: em mpv 0.36 "vd" e uma lista de NOMES de decoder ("h264_videodec2"). O prefixo "lavc:" (sintaxe
+        //     antiga) nao casa com nenhum decoder e e ignorado em silencio -> ordem padrao (h264 por software vem primeiro).
+        //     Sem "+": se o videodec2 nao abrir, o mpv cai sozinho no h264 (fallback seguro, mesmo arquivo, sem reabrir).
+        // (2) hwdec fica "no": o videodec2 e um decoder proprio do ffmpeg (como h264_cuvid), nao um hwaccel do mpv. Por isso o mpv
+        //     escreve "No hardware decoding requested / Using software decoding" MESMO com ele ativo. Vale "Selected codec:" e [kick-hw].
+        // (3) vd e threads sao reaplicados A CADA play (live: videodec2 + 1 thread; o resto: padrao) -> nada vaza para filme/serie.
+        const bool hwOff = fileThere("/data/kickiptv_nohwdec");                // chave de seguranca: arquivo vazio = tudo em software
+        const bool hw = live && !g_hwBad && !hwOff;
+        mpv_set_property_string(g_mpv, "hwdec", "no");
+        const int vdRc = mpv_set_property_string(g_mpv, "vd", hw ? "h264_videodec2" : "");
+        mpv_set_property_string(g_mpv, "vd-lavc-threads", hw ? "1" : "6");
+        {
+            char b[240];
+            snprintf(b, sizeof b, "[kick-hw] play: live=%d pedido=%s set-rc=%d vd(lido)=%s%s%s", live ? 1 : 0, hw ? "h264_videodec2" : "software",
+                     vdRc, propStr("options/vd").c_str(), g_hwBad ? " [bloqueado: falhou antes]" : "", hwOff ? " [/data/kickiptv_nohwdec]" : "");
+            logBoth(b);
         }
-        std::string liveOpts = "force-seekable=no,demuxer-max-bytes=24MiB,demuxer-max-back-bytes=1MiB,demuxer-readahead-secs=15,vd-lavc-threads=4";
+        g_hwWanted = hw; g_hwChecked = false; g_hwT0 = std::chrono::steady_clock::now();
+        std::string liveOpts = std::string("force-seekable=no,demuxer-max-bytes=24MiB,demuxer-max-back-bytes=1MiB,demuxer-readahead-secs=15,vd-lavc-threads=") + (hw ? "1" : "4");
         const char *cmd[] = {"loadfile", wrap.c_str(), "replace", kickLive ? liveOpts.c_str() : nullptr, nullptr};   // mpv 0.36: sem o indice "0"
         int lrc = mpv_command(g_mpv, cmd);
         if (lrc < 0 && kickLive) {                                  // opcao nao aceita nesta versao: abre sem elas
@@ -590,6 +640,11 @@ bool play(const std::string &url) {
     g_buffering = false;
     g_failed = false;
     g_err.clear();
+    {
+        std::lock_guard<std::mutex> lk(g_mx);
+        g_hwT0 = std::chrono::steady_clock::now();         // o relogio do "sem video" conta a partir de agora (abertura ja terminou)
+        if (g_mpv) logDecoderLocked("carregado");          // o decoder definitivo e conferido de novo no 1o quadro (poll)
+    }
     return true;
 }
 
@@ -666,6 +721,22 @@ void poll() {
     if (!g_mpv) return;
     drainEventsUnlocked(nullptr, nullptr);
     if (g_aoUpgrade.load()) applyAoUpgradeLocked();
+    // Confere o decoder REAL no 1o quadro e vigia o videodec2: se abriu mas nao entregou video em 12 s, trava o hardware (software ate
+    // fechar o app) e pede ao app para reabrir o canal (hwFallbackRequested). Se o mpv ja caiu sozinho no h264 (nao abriu), so avisa.
+    if (g_open && !g_hwChecked) {
+        if (g_everRendered) {
+            g_hwChecked = true;
+            const std::string dec = logDecoderLocked("1o-quadro");
+            if (g_hwWanted && dec.find("videodec2") == std::string::npos)
+                logBoth("[kick-hw] ATENCAO: pediu hardware mas o decoder real e software. Veja no mpv.log: 'Codec list:' (videodec2 deve ser o 1o), "
+                        "'Opening decoder' e as linhas de erro logo depois (Could not open codec / Failed to open / profile nao suportado).");
+        } else if (g_hwWanted &&
+                   std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - g_hwT0).count() > 12000) {
+            g_hwChecked = true; g_hwBad = true; g_hwFallbackAsk = true;
+            logDecoderLocked("sem-quadro-12s");
+            logBoth("[kick-hw] videodec2 ativo mas sem video em 12 s: hardware desligado ate fechar o app, reabrindo em software");
+        }
+    }
     // imagem parada: tocando (nao pausado, sem esperar rede) mas nenhum quadro novo ha 2 s. O video segue o RELOGIO DO AUDIO ("video-sync=audio");
     // se o dispositivo de audio nao entrega amostras o relogio para (pos=0, imagem congelada). Entao: 1) passa o video para o relogio do
     // sistema ("desync": a imagem volta na hora), 2) empurra 0,2 s. A proxima midia volta ao "audio".
@@ -824,6 +895,8 @@ Status status() {
 }
 
 bool isOpen() { return g_open.load(); }
+
+bool hwFallbackRequested() { return g_hwFallbackAsk.exchange(false); }
 
 } // namespace mpv_player
 
