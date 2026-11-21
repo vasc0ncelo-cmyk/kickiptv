@@ -16,7 +16,7 @@
 #include <stdint.h>
 
 #ifndef KICK_MIN_STACK_BYTES
-#define KICK_MIN_STACK_BYTES (2u * 1024u * 1024u)
+#define KICK_MIN_STACK_BYTES (1u * 1024u * 1024u)
 #endif
 
 int __real_pthread_create(pthread_t *t, const pthread_attr_t *attr, void *(*fn)(void *), void *arg);
@@ -25,11 +25,7 @@ int __wrap_pthread_create(pthread_t *t, const pthread_attr_t *attr, void *(*fn)(
     pthread_attr_t local;
     int haveLocal = 0;
     if (attr) {
-        void *addr = NULL;
         size_t sz = 0;
-        /* pilha propria: na musl getstack so devolve 0 se o chamador deu o endereco; na glibc devolve 0 com addr = 0 - tamanho (sem pilha propria) */
-        if (pthread_attr_getstack(attr, &addr, &sz) == 0 && addr != NULL && ((uintptr_t)addr + sz) != 0) return __real_pthread_create(t, attr, fn, arg);
-        sz = 0;
         if (pthread_attr_getstacksize(attr, &sz) == 0 && sz >= KICK_MIN_STACK_BYTES) return __real_pthread_create(t, attr, fn, arg);
         local = *attr;                                   /* copia: mantem detached, prioridade, etc. */
         haveLocal = 1;
