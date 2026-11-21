@@ -9,6 +9,7 @@
 #include <thread>
 #include <chrono>
 #include <pthread.h>
+#include <vector>
 
 #ifndef USE_LIBMPV
 
@@ -24,8 +25,94 @@ void setMute(bool) {}
 void setSpeed(double) {}
 bool seekSec(double) { return false; }
 bool seekRelative(double) { return false; }
-void stop() {}
+void stop() {
+    // NAO bloqueia: o "stop" sincrono esperava o demuxer do mpv sair de uma leitura de rede (ate dezenas de segundos) com g_mx preso,
+    // travando a thread principal (poll/render pedem g_mx) -> vigia derrubava o app. Assincrono: o mpv encerra em segundo plano.
+    std::lock_guard<std::mutex> lk(g_mx);
+    if (!g_mpv) return;
+    const char *cmd[] = {"stop", nullptr};
+    mpv_command_async(g_mpv, 0, cmd);
+    g_open = false;
+    g_paused = false;
+    g_buffering = false;
+    g_everRendered = false;
+}
+
 void shutdown() {}
+Status status() { return {}; }
+bool isOpen() { return false; }
+void poll() {}
+// Render interno em no maximo 1280 de largura (a CPU Jaguar do PS4 gasta ~48 ms por quadro convertendo/escalando 1080p) e
+// ampliacao barata por vizinho mais proximo para o buffer da tela. Quadros repetidos ('force') reaproveitam o ultimo quadro pronto.
+static std::vector<uint32_t> g_lo;
+static int g_loW = 0, g_loH = 0;
+static std::vector<int> g_xmap;
+static int g_xmapW = 0, g_xmapLw = 0;
+
+static void upscaleLo(uint8_t *dst, int w, int h, int stride) {
+    if (g_loW == w && g_loH == h) {
+        for (int y = 0; y < h; y++) memcpy(dst + (size_t)y * stride, &g_lo[(size_t)y * g_loW], (size_t)w * 4);
+        return;
+    }
+    if (g_xmapW != w || g_xmapLw != g_loW) {
+        g_xmap.resize((size_t)w);
+        for (int x = 0; x < w; x++) g_xmap[(size_t)x] = (int)((long long)x * g_loW / w);
+        g_xmapW = w; g_xmapLw = g_loW;
+    }
+    int prevSy = -1;
+    for (int y = 0; y < h; y++) {
+        int sy = (int)((long long)y * g_loH / h);
+        uint32_t *d = (uint32_t *)(dst + (size_t)y * stride);
+        if (sy == prevSy && y > 0) { memcpy(d, dst + (size_t)(y - 1) * stride, (size_t)w * 4); continue; }
+        const uint32_t *src = &g_lo[(size_t)sy * g_loW];
+        const int *xm = g_xmap.data();
+        for (int x = 0; x < w; x++) d[x] = src[xm[x]];
+        prevSy = sy;
+    }
+}
+
+bool renderToBgra(uint8_t *dst, int width, int height, int strideBytes, bool force) {
+    std::lock_guard<std::mutex> lk(g_mx);
+    if (!g_mpv || !g_open || !dst || width <= 0 || height <= 0) return false;
+    if (!ensureRender()) return false;
+    uint64_t flags = mpv_render_context_update(g_rr);
+    const bool newFrame = (flags & MPV_RENDER_UPDATE_FRAME) != 0;
+    if (!newFrame && !(force && g_everRendered)) return false;
+    int lw = width, lh = height;
+    if (width > 1280) { lw = 1280; lh = (int)((long long)height * lw / width); if (lh < 2) lh = 2; }
+    const bool scaled = (lw != width || lh != height);
+    if (!newFrame && force && g_everRendered && scaled && g_loW == lw && g_loH == lh && !g_lo.empty()) {
+        upscaleLo(dst, width, height, strideBytes);       // so repinta o ultimo quadro (OSD mudou): custo minimo
+        return true;
+    }
+    uint8_t *target = dst; int tstride = strideBytes;
+    if (scaled) {
+        if (g_loW != lw || g_loH != lh || g_lo.size() < (size_t)lw * lh) { g_lo.assign((size_t)lw * lh, 0); g_loW = lw; g_loH = lh; }
+        target = (uint8_t *)g_lo.data(); tstride = lw * 4;
+    }
+    int size[2] = {lw, lh};
+    mpv_render_param params[] = {
+        {MPV_RENDER_PARAM_SW_SIZE, size},
+        {MPV_RENDER_PARAM_SW_FORMAT, (void *)"bgr0"},
+        {MPV_RENDER_PARAM_SW_STRIDE, &tstride},
+        {MPV_RENDER_PARAM_SW_POINTER, target},
+        {MPV_RENDER_PARAM_INVALID, nullptr}
+    };
+    auto t0 = std::chrono::steady_clock::now();
+    int r = mpv_render_context_render(g_rr, params);
+    if (r < 0) {
+        params[1].data = (void *)"rgb0";
+        r = mpv_render_context_render(g_rr, params);
+    }
+    if (r >= 0) {
+        g_everRendered = true;
+        g_renderUs += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+        g_renderN++;
+        if (scaled) upscaleLo(dst, width, height, strideBytes);
+    }
+    return r >= 0;
+}
+
 Status status() { return {}; }
 bool isOpen() { return false; }
 void poll() {}
@@ -46,7 +133,7 @@ extern "C" {
 #include <SDL2/SDL.h>
 #if __has_include(<orbis/AudioOut.h>)
 #include <orbis/AudioOut.h>
-#include <vector>
+#include <orbis/libkernel.h>
 #define KICK_SDL_SHIM 1      // audio do mpv via backend proprio (sceAudioOut): o SDL_InitSubSystem(AUDIO) real trava no PS4
 #endif
 #endif
@@ -666,44 +753,58 @@ bool isOpen() { return g_open.load(); }
 // Formato fixo: s16 estereo 48 kHz, blocos de 1024 quadros (o mpv ja esta configurado para isso: audio-format/samplerate/channels).
 namespace {
 const int kShGrain = 1024;
-std::mutex g_shCtl;                         // abrir/fechar uma por vez
-std::mutex g_shCb;                          // SDL_LockAudio: protege o callback do mpv
-std::atomic<bool> g_shInit{false}, g_shRun{false}, g_shPause{true};
-pthread_t g_shTh;
-int g_shPort = -1;
-SDL_AudioCallback g_shFn = nullptr;
-void *g_shUd = nullptr;
+// Instancia do audio: pertence a thread (se o fechamento nao conseguir juntar a thread a tempo, ela e solta e se apaga sozinha).
+struct ShInst {
+    std::atomic<bool> run{true}, done{false}, orphan{false};
+    int port = -1;
+    SDL_AudioCallback fn = nullptr;
+    void *ud = nullptr;
+    pthread_t th;
+};
+std::mutex g_shCtl;                         // abrir/fechar uma por vez (nunca segurado enquanto espera o callback)
+std::recursive_mutex g_shCb;                // SDL_LockAudio: RECURSIVO como no SDL real (o std::mutex do PS4 e "errorcheck": relock = EDEADLK = terminate)
+std::atomic<bool> g_shInit{false}, g_shPause{true};
+ShInst *g_shCur = nullptr;
 
-void *shAudioMain(void *) {
+void *shAudioMain(void *arg) {
+    ShInst *in = (ShInst *)arg;
     // buffer alinhado em 256 bytes: o sceAudioOutOutput le por DMA e um ponteiro mal alinhado pode derrubar o app
     int16_t *abuf = nullptr;
-    if (posix_memalign((void **)&abuf, 256, (size_t)kShGrain * 2 * sizeof(int16_t)) != 0 || !abuf) return nullptr;
-    struct Fr { int16_t *p; ~Fr() { free(p); } } frAbuf{abuf};
-    struct V { int16_t *p; size_t n; int16_t *data() { return p; } size_t size() const { return n; } } buf{abuf, (size_t)kShGrain * 2};
-    while (g_shRun.load()) {
-        std::memset(buf.data(), 0, buf.size() * sizeof(int16_t));              // pausado/sem dados = silencio
-        if (!g_shPause.load() && g_shFn) {
-            std::lock_guard<std::mutex> l(g_shCb);
-            g_shFn(g_shUd, (Uint8 *)buf.data(), kShGrain * 4);
+    if (posix_memalign((void **)&abuf, 256, (size_t)kShGrain * 2 * sizeof(int16_t)) != 0 || !abuf) abuf = nullptr;
+    if (abuf) {
+        while (in->run.load()) {
+            std::memset(abuf, 0, (size_t)kShGrain * 2 * sizeof(int16_t));              // pausado/sem dados = silencio
+            if (!g_shPause.load() && in->fn) {
+                // try_lock: se o mpv esta com o SDL_LockAudio (ex.: fechando o ao) NAO fica esperando (isso travava o fechamento)
+                if (g_shCb.try_lock()) {
+                    if (in->run.load()) in->fn(in->ud, (Uint8 *)abuf, kShGrain * 4);
+                    g_shCb.unlock();
+                }
+            }
+            sceAudioOutOutput(in->port, abuf);                                         // bloqueia ate o bloco tocar: e o relogio do audio
         }
-        sceAudioOutOutput(g_shPort, buf.data());                               // bloqueia ate o bloco tocar: e o relogio do audio
+        free(abuf);
     }
+    in->done.store(true);
+    if (in->orphan.exchange(true)) delete in;      // fechamento ja desistiu de esperar: quem apaga e a thread
     return nullptr;
 }
 bool shOpen(const SDL_AudioSpec *want, SDL_AudioSpec *got) {
     std::lock_guard<std::mutex> cl(g_shCtl);
-    if (g_shRun.load() || !want || !want->callback) return false;
+    if (g_shCur || !want || !want->callback) return false;
     int p = sceAudioOutOpen(0xFF /*usuario do sistema*/, ORBIS_AUDIO_OUT_PORT_TYPE_MAIN, 0, kShGrain, 48000, ORBIS_AUDIO_OUT_PARAM_FORMAT_S16_STEREO);
     if (p <= 0) { char b[80]; snprintf(b, sizeof b, "sdl-shim: sceAudioOutOpen falhou rc=%d", p); mpv_player::tr(b); return false; }
-    g_shPort = p; g_shFn = want->callback; g_shUd = want->userdata;
-    g_shPause.store(true); g_shRun.store(true);
+    ShInst *in = new ShInst;
+    in->port = p; in->fn = want->callback; in->ud = want->userdata;
+    g_shPause.store(true);
     pthread_attr_t at; bool ok = false;
     if (pthread_attr_init(&at) == 0) {
         pthread_attr_setstacksize(&at, 1u << 19);
-        ok = pthread_create(&g_shTh, &at, shAudioMain, nullptr) == 0;
+        ok = pthread_create(&in->th, &at, shAudioMain, in) == 0;
         pthread_attr_destroy(&at);
     }
-    if (!ok) { g_shRun.store(false); sceAudioOutClose(p); g_shPort = -1; g_shFn = nullptr; mpv_player::tr("sdl-shim: nao criou a thread"); return false; }
+    if (!ok) { sceAudioOutClose(p); delete in; mpv_player::tr("sdl-shim: nao criou a thread"); return false; }
+    g_shCur = in;
     if (got) {
         *got = *want;
         got->freq = 48000; got->format = AUDIO_S16SYS; got->channels = 2; got->silence = 0;
@@ -713,12 +814,26 @@ bool shOpen(const SDL_AudioSpec *want, SDL_AudioSpec *got) {
     return true;
 }
 void shClose() {
-    std::lock_guard<std::mutex> cl(g_shCtl);
-    if (!g_shRun.load()) return;
-    g_shRun.store(false);
-    pthread_join(g_shTh, nullptr);
-    if (g_shPort > 0) sceAudioOutClose(g_shPort);
-    g_shPort = -1; g_shFn = nullptr;
+    ShInst *in = nullptr;
+    { std::lock_guard<std::mutex> cl(g_shCtl); in = g_shCur; g_shCur = nullptr; }
+    if (!in) return;
+    in->run.store(false);
+    in->fn = nullptr;
+    // espera ate ~1,5 s a thread sair. Antes: pthread_join sem limite -> se o callback do mpv estava preso em um lock que quem fecha
+    // segurava, os dois esperavam um pelo outro (deadlock no fechamento/troca de canal).
+    for (int i = 0; i < 150 && !in->done.load(); i++) sceKernelUsleep(10000);
+    const int port = in->port;
+    if (in->done.load()) {
+        pthread_join(in->th, nullptr);
+        sceAudioOutClose(port);
+        delete in;
+    } else {
+        pthread_detach(in->th);
+        mpv_player::tr("sdl-shim: thread de audio demorou a sair (solta)");
+        // a porta so fecha quando a thread sair do sceAudioOutOutput: fecha agora (desbloqueia a saida) e a thread se apaga
+        sceAudioOutClose(port);
+        if (in->orphan.exchange(true)) delete in;
+    }
     mpv_player::tr("sdl-shim: audio fechado");
 }
 }  // namespace
@@ -738,7 +853,7 @@ SDL_AudioDeviceID SDL_OpenAudioDevice(const char *, int cap, const SDL_AudioSpec
 }
 void SDL_PauseAudio(int on) { g_shPause.store(on != 0); }
 void SDL_PauseAudioDevice(SDL_AudioDeviceID, int on) { g_shPause.store(on != 0); }
-SDL_AudioStatus SDL_GetAudioStatus(void) { return !g_shRun.load() ? SDL_AUDIO_STOPPED : g_shPause.load() ? SDL_AUDIO_PAUSED : SDL_AUDIO_PLAYING; }
+SDL_AudioStatus SDL_GetAudioStatus(void) { return !g_shCur ? SDL_AUDIO_STOPPED : g_shPause.load() ? SDL_AUDIO_PAUSED : SDL_AUDIO_PLAYING; }
 SDL_AudioStatus SDL_GetAudioDeviceStatus(SDL_AudioDeviceID) { return SDL_GetAudioStatus(); }
 void SDL_LockAudio(void) { g_shCb.lock(); }
 void SDL_UnlockAudio(void) { g_shCb.unlock(); }

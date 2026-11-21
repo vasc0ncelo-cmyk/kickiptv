@@ -492,6 +492,7 @@ static std::string g_kickLiveUrl;
 static void *kickLiveOpen(uint64_t *size_out);
 static int64_t kickLiveRead(KickMpvStream *s, char *buf, uint64_t n);
 static void kickLiveClose();
+static void kickAbortAllIo();   // acorda/cancela TODA leitura de rede do mpv (canal, Kick, VOD) antes de pedir stop ao mpv
 static bool kickLooksLikeMedia(const std::string &b) {
     if (b.size() < 4) return false;
     // ISO BMFF / MP4: ....ftyp
@@ -540,6 +541,7 @@ static void *kickMpvOpen(void * /*ud*/, const char *url, uint64_t *size_out) {
                     int fails = 0, cycles = 0; bool first = true;
                     while (!lh->stop.load()) {
                         uint64_t pos = 0; int status = 0;
+                        const double tConn = monoSec();
                         int r = g_net.streamGet(lh->url, pos, [&](const char *d, size_t n) {
                             if (lh->stop.load()) return false;
                             if (first && n > 0) {                       // 1o dado: tem que ser MPEG-TS (0x47); pagina de erro do painel = recusou
@@ -554,7 +556,11 @@ static void *kickMpvOpen(void * /*ud*/, const char *url, uint64_t *size_out) {
                         if (r == -1) { lh->failed = true; break; }       // servidor recusou
                         cycles++;
                         if (pos > 0) fails = 0; else if (++fails > 6) { lh->failed = true; break; }
-                        for (int i = 0; i < 5 && !lh->stop.load(); i++) sceKernelUsleep(100000);   // caiu: reconecta (ao vivo continua de onde esta)
+                        // caiu: reconecta (ao vivo continua de onde esta). Se a conexao durou bem (o painel so fecha de tempos em tempos),
+                        // volta quase na hora para nao abrir buraco no fluxo; se caiu logo, espera mais (evita martelar o painel).
+                        const double up = monoSec() - tConn;
+                        const int waitMs = up > 8.0 ? 150 : (fails <= 1 ? 500 : 1500);
+                        for (int i = 0; i < waitMs / 50 && !lh->stop.load(); i++) sceKernelUsleep(50000);
                     }
                     lh->ended = true;
                     trace("canal-thread-fim");
@@ -620,6 +626,7 @@ static int64_t kickMpvRead(void *cookie, uint64_t offset, char *buf, uint64_t n)
     }
     static std::atomic<int> nrd{0};
     if (nrd.fetch_add(1) < 6) { char t[96]; snprintf(t, sizeof t, "mpv-read off=%llu n=%llu", (unsigned long long)offset, (unsigned long long)n); trace(t); }
+    if (s->cancelled.load()) return -1;
     if (s->size > 0 && offset >= s->size) return 0;
     if (offset < s->cacheOff || offset >= s->cacheOff + s->cache.size()) {
         if (!s->opened) { if (!g_net.openSession(s->sess, s->url)) return -1; s->opened = true; }
@@ -1643,8 +1650,12 @@ struct HlsFeeder {
     std::string getStatus() { std::lock_guard<std::mutex> l(lm); return status; }
     void fail(const std::string &t) { setStatus("ERRO: " + t); failed = 1; }
 
+    std::mutex jm;                                           // start/join vem de varias threads (mpv, desmontagem, principal): std::thread::join
+                                                             // concorrente = EDEADLK/terminate ("Resource deadlock would occur")
+    void joinLocked() { abort(); if (th.joinable()) { try { th.join(); } catch (...) {} } }
     void start(const std::string &u, bool rawTs = false) {
-        join(); sb.reset();
+        std::lock_guard<std::mutex> jl(jm);
+        joinLocked(); sb.reset();
         { std::lock_guard<std::mutex> l(rm); recent.clear(); }
         raw = rawTs; keyCache.clear();
         url = u; segs = opens = reads = failed = 0; localId = 0; streamEnded = false; run = true; discardBuf = false; dlMs = dlMsMax = 0; setStatus("iniciando");
@@ -1652,7 +1663,7 @@ struct HlsFeeder {
         th = std::thread([this] { loop(); g_net.closeSession(sess); });
     }
     void abort() { run = false; sb.abort(); }                // libera leituras bloqueadas do player
-    void join() { abort(); if (th.joinable()) th.join(); }
+    void join() { std::lock_guard<std::mutex> jl(jm); joinLocked(); }
 
     static void sleepMs(int ms, std::atomic<bool> &run) { for (int i = 0; i < ms / 50 && run; i++) sceKernelUsleep(50000); }
 
@@ -1849,13 +1860,14 @@ static void *kickLiveOpen(uint64_t *size_out) {
 static int64_t kickLiveRead(KickMpvStream *s, char *buf, uint64_t n) {
     if (n > (1u << 20)) n = 1u << 20;
     static std::atomic<int> nrd{0};
-    for (int i = 0; i < 40; i++) {                              // ate ~40 s esperando dados
+    for (int i = 0; i < 160; i++) {                             // ate ~40 s esperando dados
+        if (s->cancelled.load()) return 0;
         {   // o alimentador pode ressincronizar (zera o buffer): volta para o comeco do que existe
             std::lock_guard<std::mutex> l(g_feed.sb.m);
             uint64_t end = g_feed.sb.base + g_feed.sb.buf.size();
             if (s->abs < g_feed.sb.base || s->abs > end) s->abs = g_feed.sb.base;
         }
-        int r = g_feed.sb.read((uint8_t *)buf, s->abs, (uint32_t)n, 1000);
+        int r = g_feed.sb.read((uint8_t *)buf, s->abs, (uint32_t)n, 250);
         if (r > 0) { s->abs += (uint64_t)r; if (nrd.fetch_add(1) < 3) trace("kicklive-leu"); return r; }
         if (!g_feed.run.load() || g_feed.failed.load() || g_feed.streamEnded.load()) {
             trace(!g_feed.run.load() ? "kicklive-eof-parado" : g_feed.failed.load() ? "kicklive-eof-falha" : "kicklive-eof-fim");
@@ -1868,6 +1880,12 @@ static int64_t kickLiveRead(KickMpvStream *s, char *buf, uint64_t n) {
 static void kickLiveClose() {
     trace("kicklive-close");
     if (g_liveOpen.fetch_sub(1) <= 1) { g_liveOpen = 0; g_feed.abort(); }   // so a ultima abertura derruba o alimentador
+}
+static void kickAbortAllIo() {
+    g_feed.abort();                                           // Kick ao vivo (HlsFeeder): leituras bloqueadas voltam com EOF
+    std::shared_ptr<LiveHttp> lh;
+    { std::lock_guard<std::mutex> lk(g_liveHttpM); lh = g_liveHttp; }
+    if (lh) { lh->stop = true; lh->sb.abort(); }              // canal MPEG-TS: a thread de rede encerra no proximo dado/timeout
 }
 static void closeFeedFile() {                 // para o alimentador, fecha e apaga /data/live.ts
     g_feed.join();
@@ -2655,6 +2673,7 @@ struct Player {
     // Desmonta TUDO em segundo plano: o botao O volta ao menu na hora (antes travava ate a rede responder).
     void stop() {
         if (useMpv) {
+            kickAbortAllIo();                                // 1o corta a rede: o stop do mpv nao pode ficar esperando uma leitura
             try { mpv_player::stop(); } catch (...) {}
             useMpv = false;
             active = false;
@@ -4042,6 +4061,7 @@ int main() {
         try { g_feed.abort(); } catch (...) {}
         sceKernelUsleep(50000);
         std::string u = player.url, ti = player.title, slug = player.kickSlug;
+        try { kickAbortAllIo(); } catch (...) {}
         try { mpv_player::shutdown(); } catch (...) {}
                 try { player.stop(); } catch (...) {}
         Player::waitTeardown(0.6);
@@ -4476,7 +4496,6 @@ int main() {
                 // Nao e troca de qualidade: mantem g_quality e mostra texto de episodio
                 player.quietWait = false;
                 player.waitLabel = "Próximo episódio...";
-                try { mpv_player::stop(); } catch (...) {}
                 player.stop();
                 sceKernelUsleep(120000);   // deixa o mpv/stream_cb soltar antes do proximo start
                 mode = Mode::Menu; dirty = true;
