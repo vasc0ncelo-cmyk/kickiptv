@@ -17,5 +17,7 @@ int main() {
     assert(vodContainerExt(std::string("RIFF\0\0\0\0AVI LIST", 16), "http://h/x") == "avi");
     assert(vodContainerExt(std::string("\x47\x40\x00\x10", 4), "http://h/x") == "ts");
     assert(vodContainerExt("", "http://h/movie/u/p/1.mkv") == "mkv" && vodContainerExt("", "http://h/movie/u/p/1") == "mp4");
+    assert(!urlIsVodMedia("http://h/live/u/p/12.ts") && !urlIsVodMedia("http://h/u/p/12") && !urlIsVodMedia("http://h/x.m3u8"));      // canal: sem pausa/seek
+    assert(urlIsVodMedia("http://h/movie/u/p/1.mkv") && urlIsVodMedia("http://h/series/u/p/5") && urlIsVodMedia("http://h/get.mp4"));
     std::cout << "OK\n";
 }
