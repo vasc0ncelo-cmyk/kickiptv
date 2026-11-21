@@ -30,8 +30,8 @@ ifeq ($(USE_LIBMPV),1)
   endif
   CXXFLAGS += -DUSE_LIBMPV -I$(PACBREW)/usr/include
   # As libs do PacBrew foram feitas com headers musl: o clock_gettime precisa do remendo do GMCA (ps4c/clock_ids.c) e o guard de statics (ps4c/cxa_guard.c)
-  LDFLAGS  += -L$(PACBREW)/usr/lib --wrap=clock_gettime --allow-multiple-definition
-  COBJS    := build/cxa_guard.o build/clock_ids.o
+  LDFLAGS  += -L$(PACBREW)/usr/lib --wrap=clock_gettime --wrap=pthread_create --allow-multiple-definition
+  COBJS    := build/cxa_guard.o build/clock_ids.o build/pthread_stack.o   # pthread_stack: pilha minima das threads (mpv/ffmpeg)
   # Ordem importa: mpv puxa ffmpeg, mbedtls, sdl2, dav1d... (o --start-group abaixo resolve dependencias circulares)
   LIBS     += -lmpv -lavformat -lavcodec -lavfilter -lswscale -lswresample -lavutil \
               -ldav1d -lmbedtls -lmbedx509 -lmbedcrypto -lSDL2 -lass -lfribidi -lfreetype \
