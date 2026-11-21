@@ -23,6 +23,8 @@ struct StreamIo {
     // Le a partir de offset (seek absoluto por leitura). n bytes no maximo.
     int64_t (*read)(void *cookie, uint64_t offset, char *buf, uint64_t n) = nullptr;
     void (*close)(void *cookie) = nullptr;
+    // Opcional: o mpv pede para abortar (stop/trocar de video) com uma leitura bloqueada em outra thread. Deve fazer o read voltar logo.
+    void (*cancel)(void *cookie) = nullptr;
     void *ud = nullptr;
 };
 

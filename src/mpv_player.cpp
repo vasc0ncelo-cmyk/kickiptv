@@ -113,6 +113,11 @@ static int64_t cb_size(void *cookie) {
     return (int64_t)st->size;
 }
 
+static void cb_cancel(void *cookie) {
+    auto *st = (StreamState *)cookie;
+    if (st && st->io_cookie && g_io.cancel) g_io.cancel(st->io_cookie);
+}
+
 static void cb_close(void *cookie) {
     auto *st = (StreamState *)cookie;
     if (st) {
@@ -146,7 +151,7 @@ static int cb_open(void * /*user_data*/, char *uri, mpv_stream_cb_info *info) {
     info->seek_fn = cb_seek;
     info->size_fn = cb_size;
     info->close_fn = cb_close;
-    info->cancel_fn = nullptr;
+    info->cancel_fn = g_io.cancel ? cb_cancel : nullptr;
     return 0;
 }
 

@@ -473,6 +473,7 @@ struct KickMpvStream {
     bool live = false;         // live Kick via HlsFeeder (kicklive://)
     uint64_t abs = 0;          // posicao propria no StreamBuf do alimentador
     std::shared_ptr<struct LiveHttp> lh;   // canal ao vivo (MPEG-TS cru): conexao continua, sem tamanho e sem seek
+    std::atomic<bool> cancelled{false};    // o mpv pediu para abortar: a leitura bloqueada volta na hora
 };
 // Canal ao vivo: UMA conexao GET sem Range que fica aberta e enche um buffer deslizante; o mpv le em sequencia. Antes o canal era aberto como
 // arquivo (Range 0-2MB): a resposta "200" com so os primeiros KB virava o "tamanho do arquivo" (~4 s de video) e a transmissao congelava no fim.
@@ -480,7 +481,11 @@ struct LiveHttp {
     StreamBuf sb;
     std::string url;
     std::atomic<bool> stop{false}, failed{false}, ended{false};
+    std::atomic<int> users{0};                 // quantas aberturas do mpv usam esta conexao (o mpv abre o stream mais de uma vez: sonda e reabre)
+    std::atomic<uint64_t> total{0};
 };
+static std::mutex g_liveHttpM;
+static std::shared_ptr<LiveHttp> g_liveHttp;       // a conexao do canal atual (so existe UMA: os paineis limitam conexoes por usuario)
 // Live da Kick: a URL .m3u8 NAO vai para o mpv (ele recebia o TEXTO da playlist como se fosse o video: "unrecognized file format").
 // O HlsFeeder (mais abaixo) escolhe a resolucao, baixa os segmentos .ts e o mpv le o fluxo MPEG-TS continuo por "kicklive://live.ts".
 static std::string g_kickLiveUrl;
@@ -522,22 +527,47 @@ static void *kickMpvOpen(void * /*ud*/, const char *url, uint64_t *size_out) {
     if (!strncmp(url, "kicklive://", 11)) return kickLiveOpen(size_out);
     if (!g_net.init()) return nullptr;
     if (!urlIsVodMedia(url)) {                                   // canal ao vivo
-        auto lh = std::make_shared<LiveHttp>();
-        lh->url = url; lh->sb.softCap = 12u << 20; lh->sb.hardCap = 20u << 20;
-        std::thread([lh] {                                       // solta sozinha quando o stop chega (a leitura de rede volta ou da timeout)
-            int fails = 0;
-            while (!lh->stop.load()) {
-                uint64_t pos = 0; int status = 0;
-                int r = g_net.streamGet(lh->url, pos, [&](const char *d, size_t n) { if (lh->stop.load()) return false; lh->sb.append((const uint8_t *)d, n); return true; }, status, 15, false);
-                if (lh->stop.load() || r == -2) break;
-                if (r == -1) { lh->failed = true; break; }       // servidor recusou
-                if (pos > 0) fails = 0; else if (++fails > 6) { lh->failed = true; break; }
-                for (int i = 0; i < 5 && !lh->stop.load(); i++) sceKernelUsleep(100000);   // caiu: reconecta (ao vivo continua de onde esta)
+        std::shared_ptr<LiveHttp> lh;
+        {
+            std::lock_guard<std::mutex> lk(g_liveHttpM);
+            if (g_liveHttp && g_liveHttp->url == url && !g_liveHttp->stop.load() && !g_liveHttp->failed.load() && !g_liveHttp->ended.load() && g_liveHttp->total.load() > 0) {
+                lh = g_liveHttp; trace("canal-reaproveita");       // o mpv reabriu o stream: NAO abre outra conexao (o painel recusa a 2a)
+            } else {
+                if (g_liveHttp) { g_liveHttp->stop = true; g_liveHttp->sb.abort(); }
+                lh = std::make_shared<LiveHttp>(); g_liveHttp = lh;
+                lh->url = url; lh->sb.softCap = 12u << 20; lh->sb.hardCap = 20u << 20;
+                std::thread([lh] {                                   // solta sozinha quando o stop chega (a leitura de rede volta ou da timeout)
+                    int fails = 0, cycles = 0; bool first = true;
+                    while (!lh->stop.load()) {
+                        uint64_t pos = 0; int status = 0;
+                        int r = g_net.streamGet(lh->url, pos, [&](const char *d, size_t n) {
+                            if (lh->stop.load()) return false;
+                            if (first && n > 0) {                       // 1o dado: tem que ser MPEG-TS (0x47); pagina de erro do painel = recusou
+                                first = false;
+                                char hb[96]; snprintf(hb, sizeof hb, "canal-1o-dado n=%zu b0=%02X b1=%02X b2=%02X", n, (unsigned char)d[0], n > 1 ? (unsigned char)d[1] : 0, n > 2 ? (unsigned char)d[2] : 0); trace(hb);
+                                if (kickLooksLikeHtml(std::string(d, n < 64 ? n : 64))) { trace("canal-recusado-html"); lh->failed = true; return false; }
+                            }
+                            lh->sb.append((const uint8_t *)d, n); lh->total += n; return true;
+                        }, status, 15, false);
+                        { char rb[96]; snprintf(rb, sizeof rb, "canal-conexao-fim r=%d http=%d bytes=%llu ciclo=%d", r, status, (unsigned long long)lh->total.load(), cycles); trace(rb); }
+                        if (lh->stop.load() || r == -2) break;
+                        if (r == -1) { lh->failed = true; break; }       // servidor recusou
+                        cycles++;
+                        if (pos > 0) fails = 0; else if (++fails > 6) { lh->failed = true; break; }
+                        for (int i = 0; i < 5 && !lh->stop.load(); i++) sceKernelUsleep(100000);   // caiu: reconecta (ao vivo continua de onde esta)
+                    }
+                    lh->ended = true;
+                    trace("canal-thread-fim");
+                }).detach();
             }
-            lh->ended = true;
-        }).detach();
-        for (int i = 0; i < 400 && lh->sb.total() == 0 && !lh->failed.load(); i++) sceKernelUsleep(50000);      // ate 20 s pelo 1o dado
-        if (lh->sb.total() == 0) { lh->stop = true; lh->sb.abort(); return nullptr; }
+            lh->users++;
+        }
+        for (int i = 0; i < 400 && lh->total.load() == 0 && !lh->failed.load(); i++) sceKernelUsleep(50000);      // ate 20 s pelo 1o dado
+        if (lh->total.load() == 0 || lh->failed.load()) {
+            std::lock_guard<std::mutex> lk(g_liveHttpM);
+            if (--lh->users <= 0) { lh->stop = true; lh->sb.abort(); if (g_liveHttp == lh) g_liveHttp.reset(); }
+            return nullptr;
+        }
         auto *s = new KickMpvStream();
         s->url = url; s->lh = lh; s->size = 0;
         { std::lock_guard<std::mutex> l(lh->sb.m); s->abs = lh->sb.base; }
@@ -578,12 +608,14 @@ static int64_t kickMpvRead(void *cookie, uint64_t offset, char *buf, uint64_t n)
     if (s->lh) {                                                 // canal ao vivo: leitura em sequencia (o offset do mpv e ignorado)
         LiveHttp &L = *s->lh;
         if (n > (1u << 20)) n = 1u << 20;
-        for (int i = 0; i < 40; i++) {                           // ate ~40 s esperando dados
+        for (int i = 0; i < 100; i++) {                          // ate ~30 s esperando dados (volta na hora se o mpv cancelar)
+            if (s->cancelled.load()) return 0;
             { std::lock_guard<std::mutex> l(L.sb.m); uint64_t end = L.sb.base + L.sb.buf.size(); if (s->abs < L.sb.base || s->abs > end) s->abs = L.sb.base; }
-            int r = L.sb.read((uint8_t *)buf, s->abs, (uint32_t)n, 1000);
+            int r = L.sb.read((uint8_t *)buf, s->abs, (uint32_t)n, 300);
             if (r > 0) { s->abs += (uint64_t)r; return r; }
-            if (L.stop.load() || L.failed.load() || L.ended.load()) return 0;
+            if (L.stop.load() || L.failed.load() || L.ended.load()) { trace("canal-leitura-eof"); return 0; }
         }
+        trace("canal-leitura-timeout");
         return 0;
     }
     static std::atomic<int> nrd{0};
@@ -614,15 +646,23 @@ static void kickMpvClose(void *cookie) {
     auto *s = (KickMpvStream *)cookie;
     if (!s) return;
     if (s->live) { kickLiveClose(); delete s; return; }
-    if (s->lh) { s->lh->stop = true; s->lh->sb.abort(); delete s; return; }
+    if (s->lh) {
+        std::shared_ptr<LiveHttp> lh = s->lh;
+        delete s;
+        std::lock_guard<std::mutex> lk(g_liveHttpM);
+        if (--lh->users <= 0) { lh->stop = true; lh->sb.abort(); if (g_liveHttp == lh) g_liveHttp.reset(); trace("canal-fechado"); }   // so o ultimo fecha a conexao
+        return;
+    }
     if (s->opened) g_net.closeSession(s->sess);
     delete s;
 }
+static void kickMpvCancel(void *cookie) { if (auto *s = (KickMpvStream *)cookie) s->cancelled = true; }
 static void kickMpvRegisterIo() {
     mpv_player::StreamIo io;
     io.open = &kickMpvOpen;
     io.read = &kickMpvRead;
     io.close = &kickMpvClose;
+    io.cancel = &kickMpvCancel;
     io.ud = nullptr;
     mpv_player::setStreamIo(io);
     mpv_player::setTrace([](const char *st) { trace(st); });
