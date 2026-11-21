@@ -25,94 +25,8 @@ void setMute(bool) {}
 void setSpeed(double) {}
 bool seekSec(double) { return false; }
 bool seekRelative(double) { return false; }
-void stop() {
-    // NAO bloqueia: o "stop" sincrono esperava o demuxer do mpv sair de uma leitura de rede (ate dezenas de segundos) com g_mx preso,
-    // travando a thread principal (poll/render pedem g_mx) -> vigia derrubava o app. Assincrono: o mpv encerra em segundo plano.
-    std::lock_guard<std::mutex> lk(g_mx);
-    if (!g_mpv) return;
-    const char *cmd[] = {"stop", nullptr};
-    mpv_command_async(g_mpv, 0, cmd);
-    g_open = false;
-    g_paused = false;
-    g_buffering = false;
-    g_everRendered = false;
-}
-
+void stop() {}
 void shutdown() {}
-Status status() { return {}; }
-bool isOpen() { return false; }
-void poll() {}
-// Render interno em no maximo 1280 de largura (a CPU Jaguar do PS4 gasta ~48 ms por quadro convertendo/escalando 1080p) e
-// ampliacao barata por vizinho mais proximo para o buffer da tela. Quadros repetidos ('force') reaproveitam o ultimo quadro pronto.
-static std::vector<uint32_t> g_lo;
-static int g_loW = 0, g_loH = 0;
-static std::vector<int> g_xmap;
-static int g_xmapW = 0, g_xmapLw = 0;
-
-static void upscaleLo(uint8_t *dst, int w, int h, int stride) {
-    if (g_loW == w && g_loH == h) {
-        for (int y = 0; y < h; y++) memcpy(dst + (size_t)y * stride, &g_lo[(size_t)y * g_loW], (size_t)w * 4);
-        return;
-    }
-    if (g_xmapW != w || g_xmapLw != g_loW) {
-        g_xmap.resize((size_t)w);
-        for (int x = 0; x < w; x++) g_xmap[(size_t)x] = (int)((long long)x * g_loW / w);
-        g_xmapW = w; g_xmapLw = g_loW;
-    }
-    int prevSy = -1;
-    for (int y = 0; y < h; y++) {
-        int sy = (int)((long long)y * g_loH / h);
-        uint32_t *d = (uint32_t *)(dst + (size_t)y * stride);
-        if (sy == prevSy && y > 0) { memcpy(d, dst + (size_t)(y - 1) * stride, (size_t)w * 4); continue; }
-        const uint32_t *src = &g_lo[(size_t)sy * g_loW];
-        const int *xm = g_xmap.data();
-        for (int x = 0; x < w; x++) d[x] = src[xm[x]];
-        prevSy = sy;
-    }
-}
-
-bool renderToBgra(uint8_t *dst, int width, int height, int strideBytes, bool force) {
-    std::lock_guard<std::mutex> lk(g_mx);
-    if (!g_mpv || !g_open || !dst || width <= 0 || height <= 0) return false;
-    if (!ensureRender()) return false;
-    uint64_t flags = mpv_render_context_update(g_rr);
-    const bool newFrame = (flags & MPV_RENDER_UPDATE_FRAME) != 0;
-    if (!newFrame && !(force && g_everRendered)) return false;
-    int lw = width, lh = height;
-    if (width > 1280) { lw = 1280; lh = (int)((long long)height * lw / width); if (lh < 2) lh = 2; }
-    const bool scaled = (lw != width || lh != height);
-    if (!newFrame && force && g_everRendered && scaled && g_loW == lw && g_loH == lh && !g_lo.empty()) {
-        upscaleLo(dst, width, height, strideBytes);       // so repinta o ultimo quadro (OSD mudou): custo minimo
-        return true;
-    }
-    uint8_t *target = dst; int tstride = strideBytes;
-    if (scaled) {
-        if (g_loW != lw || g_loH != lh || g_lo.size() < (size_t)lw * lh) { g_lo.assign((size_t)lw * lh, 0); g_loW = lw; g_loH = lh; }
-        target = (uint8_t *)g_lo.data(); tstride = lw * 4;
-    }
-    int size[2] = {lw, lh};
-    mpv_render_param params[] = {
-        {MPV_RENDER_PARAM_SW_SIZE, size},
-        {MPV_RENDER_PARAM_SW_FORMAT, (void *)"bgr0"},
-        {MPV_RENDER_PARAM_SW_STRIDE, &tstride},
-        {MPV_RENDER_PARAM_SW_POINTER, target},
-        {MPV_RENDER_PARAM_INVALID, nullptr}
-    };
-    auto t0 = std::chrono::steady_clock::now();
-    int r = mpv_render_context_render(g_rr, params);
-    if (r < 0) {
-        params[1].data = (void *)"rgb0";
-        r = mpv_render_context_render(g_rr, params);
-    }
-    if (r >= 0) {
-        g_everRendered = true;
-        g_renderUs += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
-        g_renderN++;
-        if (scaled) upscaleLo(dst, width, height, strideBytes);
-    }
-    return r >= 0;
-}
-
 Status status() { return {}; }
 bool isOpen() { return false; }
 void poll() {}
@@ -657,13 +571,16 @@ bool seekRelative(double delta) {
 }
 
 void stop() {
+    // NAO bloqueia: o "stop" sincrono esperava o demuxer do mpv sair de uma leitura de rede (ate dezenas de segundos) com g_mx preso,
+    // travando a thread principal (poll/render pedem g_mx) -> vigia derrubava o app. Assincrono: o mpv encerra em segundo plano.
     std::lock_guard<std::mutex> lk(g_mx);
     if (!g_mpv) return;
     const char *cmd[] = {"stop", nullptr};
-    mpv_command(g_mpv, cmd);
+    mpv_command_async(g_mpv, 0, cmd);
     g_open = false;
     g_paused = false;
     g_buffering = false;
+    g_everRendered = false;
 }
 
 void shutdown() {
@@ -699,18 +616,60 @@ void poll() {
     }
 }
 
+// Render interno em no maximo 1280 de largura (a CPU Jaguar do PS4 gasta ~48 ms por quadro convertendo/escalando 1080p) e
+// ampliacao barata por vizinho mais proximo para o buffer da tela. Quadros repetidos ('force') reaproveitam o ultimo quadro pronto.
+static std::vector<uint32_t> g_lo;
+static int g_loW = 0, g_loH = 0;
+static std::vector<int> g_xmap;
+static int g_xmapW = 0, g_xmapLw = 0;
+
+static void upscaleLo(uint8_t *dst, int w, int h, int stride) {
+    if (g_loW == w && g_loH == h) {
+        for (int y = 0; y < h; y++) memcpy(dst + (size_t)y * stride, &g_lo[(size_t)y * g_loW], (size_t)w * 4);
+        return;
+    }
+    if (g_xmapW != w || g_xmapLw != g_loW) {
+        g_xmap.resize((size_t)w);
+        for (int x = 0; x < w; x++) g_xmap[(size_t)x] = (int)((long long)x * g_loW / w);
+        g_xmapW = w; g_xmapLw = g_loW;
+    }
+    int prevSy = -1;
+    for (int y = 0; y < h; y++) {
+        int sy = (int)((long long)y * g_loH / h);
+        uint32_t *d = (uint32_t *)(dst + (size_t)y * stride);
+        if (sy == prevSy && y > 0) { memcpy(d, dst + (size_t)(y - 1) * stride, (size_t)w * 4); continue; }
+        const uint32_t *src = &g_lo[(size_t)sy * g_loW];
+        const int *xm = g_xmap.data();
+        for (int x = 0; x < w; x++) d[x] = src[xm[x]];
+        prevSy = sy;
+    }
+}
+
 bool renderToBgra(uint8_t *dst, int width, int height, int strideBytes, bool force) {
     std::lock_guard<std::mutex> lk(g_mx);
     if (!g_mpv || !g_open || !dst || width <= 0 || height <= 0) return false;
     if (!ensureRender()) return false;
     uint64_t flags = mpv_render_context_update(g_rr);
-    if (!(flags & MPV_RENDER_UPDATE_FRAME) && !(force && g_everRendered)) return false;
-    int size[2] = {width, height};
+    const bool newFrame = (flags & MPV_RENDER_UPDATE_FRAME) != 0;
+    if (!newFrame && !(force && g_everRendered)) return false;
+    int lw = width, lh = height;
+    if (width > 1280) { lw = 1280; lh = (int)((long long)height * lw / width); if (lh < 2) lh = 2; }
+    const bool scaled = (lw != width || lh != height);
+    if (!newFrame && force && g_everRendered && scaled && g_loW == lw && g_loH == lh && !g_lo.empty()) {
+        upscaleLo(dst, width, height, strideBytes);       // so repinta o ultimo quadro (OSD mudou): custo minimo
+        return true;
+    }
+    uint8_t *target = dst; int tstride = strideBytes;
+    if (scaled) {
+        if (g_loW != lw || g_loH != lh || g_lo.size() < (size_t)lw * lh) { g_lo.assign((size_t)lw * lh, 0); g_loW = lw; g_loH = lh; }
+        target = (uint8_t *)g_lo.data(); tstride = lw * 4;
+    }
+    int size[2] = {lw, lh};
     mpv_render_param params[] = {
         {MPV_RENDER_PARAM_SW_SIZE, size},
         {MPV_RENDER_PARAM_SW_FORMAT, (void *)"bgr0"},
-        {MPV_RENDER_PARAM_SW_STRIDE, &strideBytes},
-        {MPV_RENDER_PARAM_SW_POINTER, dst},
+        {MPV_RENDER_PARAM_SW_STRIDE, &tstride},
+        {MPV_RENDER_PARAM_SW_POINTER, target},
         {MPV_RENDER_PARAM_INVALID, nullptr}
     };
     auto t0 = std::chrono::steady_clock::now();
@@ -723,6 +682,7 @@ bool renderToBgra(uint8_t *dst, int width, int height, int strideBytes, bool for
         g_everRendered = true;
         g_renderUs += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
         g_renderN++;
+        if (scaled) upscaleLo(dst, width, height, strideBytes);
     }
     return r >= 0;
 }
