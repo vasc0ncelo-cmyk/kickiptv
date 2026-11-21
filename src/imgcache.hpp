@@ -8,6 +8,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include "cvwait.hpp"
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -189,10 +190,10 @@ private:
                 if (stop_) return;
                 if (bgPos_ >= bg_.size() || bgNew_.load() >= bgMaxNew_) {      // acabou (ou chegou no limite): so marca "parado" quando ninguem esta no meio de uma capa
                     if (bgBusy_ == 0) bgActive_ = false;
-                    cv_.wait_for(l, std::chrono::milliseconds(300)); continue;
+                    cvWaitFor(cv_, l, std::chrono::milliseconds(300)); continue;
                 }
                 bool busy = !pending_.empty() || !inflight_.empty() || paused_.load();   // a tela e o video tem prioridade
-                if (busy) { cv_.wait_for(l, std::chrono::milliseconds(300)); continue; }
+                if (busy) { cvWaitFor(cv_, l, std::chrono::milliseconds(300)); continue; }
                 url = bg_[bgPos_++]; bgBusy_++;
             }
             bool downloaded = false;

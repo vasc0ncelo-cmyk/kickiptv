@@ -7,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include "cvwait.hpp"
 #include <mutex>
 
 class NetGate {
@@ -18,7 +19,7 @@ public:
         for (;;) {
             if (quit && quit->load()) return false;
             if (used_ < total_ && (!bg || bgUsed_ < bgMax_)) { used_++; if (bg) bgUsed_++; return true; }
-            cv_.wait_for(l, std::chrono::milliseconds(50));
+            cvWaitFor(cv_, l, std::chrono::milliseconds(50));
         }
     }
     void release(bool bg) {

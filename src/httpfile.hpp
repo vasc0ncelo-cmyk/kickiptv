@@ -10,6 +10,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include "cvwait.hpp"
 #include <functional>
 #include <map>
 #include <memory>
@@ -103,7 +104,7 @@ public:
         std::unique_lock<std::mutex> l(m_);
         auto t0 = std::chrono::steady_clock::now();
         auto timedOut = [&] { return std::chrono::steady_clock::now() - t0 > std::chrono::milliseconds(timeoutMs); };
-        while (state_ == 0 && !stop_) { cv_.wait_for(l, std::chrono::milliseconds(100)); if (timedOut()) return 0; }
+        while (state_ == 0 && !stop_) { cvWaitFor(cv_, l, std::chrono::milliseconds(100)); if (timedOut()) return 0; }
         if (state_ != 1 || stop_) return 0;
         if (pos >= size_) return 0;
         if ((uint64_t)len > size_ - pos) len = (uint32_t)(size_ - pos);
@@ -117,7 +118,7 @@ public:
                 cv_.notify_all();
                 {   // espera no maximo o que resta do timeout (leitura com timeout curto nao pode prender a tela por 100 ms)
                     auto left = (long)timeoutMs - (long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-                    cv_.wait_for(l, std::chrono::milliseconds(std::max<long>(1, std::min<long>(100, left))));
+                    cvWaitFor(cv_, l, std::chrono::milliseconds(std::max<long>(1, std::min<long>(100, left))));
                 }
                 if (stop_ || state_ != 1 || timedOut()) return 0;
                 continue;
@@ -150,7 +151,7 @@ private:
             cv_.notify_all();
         } else {
             std::unique_lock<std::mutex> l(m_);
-            while (state_ == 0 && !stop_) cv_.wait_for(l, std::chrono::milliseconds(100));
+            while (state_ == 0 && !stop_) cvWaitFor(cv_, l, std::chrono::milliseconds(100));
             if (state_ != 1 || stop_) return;
         }
         uint64_t sz; { std::lock_guard<std::mutex> l(m_); sz = size_; }
@@ -171,7 +172,7 @@ private:
                         if (c < nBlocks && !blocks_.count(c) && !inflight_.count(c)) { idx = c; have = true; break; }
                     }
                     if (have) break;
-                    cv_.wait_for(l, std::chrono::milliseconds(200));
+                    cvWaitFor(cv_, l, std::chrono::milliseconds(200));
                 }
                 inflight_.insert(idx);
             }

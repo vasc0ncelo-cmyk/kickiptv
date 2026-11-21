@@ -6,6 +6,7 @@
 //  - Independente de plataforma: a rede (sceHttp no PS4) entra pelo parametro 'fetch'.
 #include <chrono>
 #include <condition_variable>
+#include "cvwait.hpp"
 #include <deque>
 #include <functional>
 #include <memory>
@@ -83,7 +84,7 @@ inline bool run(Fetch fetch, const std::function<bool(const char *, size_t)> &si
         bool done = false, ok = false;
         {
             std::unique_lock<std::mutex> lk(sh->m);
-            sh->cv.wait_for(lk, std::chrono::milliseconds(tickMs / 3 > 10 ? tickMs / 3 : 10), [&] { return !sh->q.empty() || sh->done; });
+            cvWaitFor(sh->cv, lk, std::chrono::milliseconds(tickMs / 3 > 10 ? tickMs / 3 : 10), [&] { return !sh->q.empty() || sh->done; });
             batch.swap(sh->q);
             sh->queued = 0;
             done = sh->done && batch.empty(); ok = sh->ok; status = sh->status;

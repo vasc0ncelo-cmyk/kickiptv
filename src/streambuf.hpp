@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include "cvwait.hpp"
 #include <mutex>
 #include <vector>
 
@@ -61,7 +62,7 @@ struct StreamBuf {
             }
             // sondagem muito a frente
             if (pos - end > (1u << 20)) return 0;
-            cv.wait_for(l, std::chrono::milliseconds(150));
+            cvWaitFor(cv, l, std::chrono::milliseconds(150));
             if (std::chrono::steady_clock::now() - t0 > std::chrono::milliseconds(timeoutMs)) return 0;
         }
     }
