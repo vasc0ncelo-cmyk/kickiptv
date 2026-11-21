@@ -2,6 +2,8 @@
 // Grava em /data/kickiptv_crash.log o endereco de quem chamou abort()/assert/stack-check e alguns enderecos da pilha de chamadas.
 // Os enderecos sao resolvidos depois com o arquivo mpv-symbols.txt que o build publica na Release (nm do app.elf).
 // So usa open/write (nada de malloc/stdio): pode rodar dentro do abort().
+// So no build com mpv (USE_LIBMPV): os --wrap=abort etc. do Makefile so existem la. No build normal este arquivo fica vazio.
+#ifdef USE_LIBMPV
 #include <exception>
 #include <fcntl.h>
 #include <stdint.h>
@@ -75,3 +77,4 @@ void __wrap___stack_chk_fail(void) {
     __real_abort();
 }
 }
+#endif  // USE_LIBMPV
