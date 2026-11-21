@@ -75,6 +75,9 @@ bool g_cb_registered = false;
 std::atomic<int64_t> g_curEntry{-1};
 std::atomic<bool> g_startSeen{false};
 bool g_started = false;                                  // um arquivo foi aberto e a parada ainda nao foi confirmada (mpv "idle")
+std::atomic<unsigned> g_audCb{0};                        // vezes que o backend de audio chamou o callback do mpv (diagnostico)
+std::atomic<int> g_audPause{1};                          // estado de pausa que o mpv pediu ao audio (1 = pausado)
+unsigned g_audCbLast = 0;
 int g_stallKicks = 0;                                    // tentativas de destravar o video nesta reproducao
 std::chrono::steady_clock::time_point g_lastFrameT = std::chrono::steady_clock::now();
 // quadro reduzido (render interno <= 1280 de largura) e mapa da ampliacao: zerados a cada troca de midia
@@ -518,6 +521,7 @@ bool play(const std::string &url) {
         g_everRendered = false;
         g_startSeen = false; g_curEntry = -1;              // eventos do arquivo antigo (fim/erro/eof) nao valem para este
         g_stallKicks = 0; g_lastFrameT = std::chrono::steady_clock::now();
+        mpv_set_property_string(g_mpv, "video-sync", "audio");     // a anterior pode ter caido para "desync" (relogio de audio parado)
         resetFrameState();
         applyAoUpgradeLocked();       // SDL ficou pronto depois do 1o boot: este video ja abre com som
         ensureRender();
@@ -639,14 +643,17 @@ void poll() {
     if (!g_mpv) return;
     drainEventsUnlocked(nullptr, nullptr);
     if (g_aoUpgrade.load()) applyAoUpgradeLocked();
-    // imagem parada: tocando (nao pausado, sem esperar rede) mas nenhum quadro novo ha 6 s -> reinicia o audio (o relogio de video
-    // segue o audio; com o dispositivo de audio morto o video congela em pos=0) e, se nao adiantar, empurra 0,2 s.
+    // imagem parada: tocando (nao pausado, sem esperar rede) mas nenhum quadro novo ha 3 s. O video segue o RELOGIO DO AUDIO ("video-sync=audio");
+    // se o dispositivo de audio nao entrega amostras o relogio para (pos=0, imagem congelada). Entao: 1) passa o video para o relogio do
+    // sistema ("desync": a imagem volta na hora), 2) empurra 0,2 s. A proxima midia volta ao "audio".
     if (g_open && !g_paused && !g_buffering && g_stallKicks < 3) {
         const auto nw = std::chrono::steady_clock::now();
-        if (std::chrono::duration_cast<std::chrono::seconds>(nw - g_lastFrameT).count() >= 6) {
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(nw - g_lastFrameT).count() >= 3000) {
             g_stallKicks++; g_lastFrameT = nw;
-            if (g_stallKicks == 1) { const char *c[] = {"ao-reload", nullptr}; mpv_command_async(g_mpv, 0, c); tr("mpv-travado: ao-reload"); }
-            else { const char *c[] = {"seek", "0.2", "relative", nullptr}; mpv_command_async(g_mpv, 0, c); tr("mpv-travado: seek 0.2"); }
+            char tb[120]; snprintf(tb, sizeof tb, "mpv-travado #%d: audio cb=%u (+%u) pausa=%d", g_stallKicks, g_audCb.load(), g_audCb.load() - g_audCbLast, g_audPause.load());
+            tr(tb);
+            if (g_stallKicks == 1) mpv_set_property_string(g_mpv, "video-sync", "desync");
+            else { const char *c[] = {"seek", "0.2", "relative", nullptr}; mpv_command_async(g_mpv, 0, c); }
         }
     }
     // a cada ~5 s grava fps real e quadros descartados em /data/kickiptv.log (para ver se o decodificador da conta)
@@ -659,7 +666,9 @@ void poll() {
         mpv_get_property(g_mpv, "vo-drop-frame-count", MPV_FORMAT_INT64, &vo);
         mpv_get_property(g_mpv, "decoder-frame-drop-count", MPV_FORMAT_INT64, &dec);
         int rn = g_renderN.exchange(0); long long ru = g_renderUs.exchange(0);
-        char b[160]; snprintf(b, sizeof b, "mpv-perf fps=%.1f drop-vo=%lld drop-dec=%lld pos=%.0f render=%.0fms(n=%d)", fps, (long long)vo, (long long)dec, g_pos, rn ? ru / 1000.0 / rn : 0.0, rn);
+        unsigned cb = g_audCb.load();
+        char b[200]; snprintf(b, sizeof b, "mpv-perf fps=%.1f drop-vo=%lld drop-dec=%lld pos=%.0f render=%.0fms(n=%d) audio-cb=%u pausa=%d", fps, (long long)vo, (long long)dec, g_pos, rn ? ru / 1000.0 / rn : 0.0, rn, cb - g_audCbLast, g_audPause.load());
+        g_audCbLast = cb;
         tr(b);
     }
 }
@@ -781,7 +790,7 @@ void *shAudioMain(void *arg) {
             if (!g_shPause.load() && in->fn) {
                 // try_lock: se o mpv esta com o SDL_LockAudio (ex.: fechando o ao) NAO fica esperando (isso travava o fechamento)
                 if (g_shCb.try_lock()) {
-                    if (in->run.load()) in->fn(in->ud, (Uint8 *)abuf, kShGrain * 4);
+                    if (in->run.load()) { in->fn(in->ud, (Uint8 *)abuf, kShGrain * 4); mpv_player::g_audCb++; }
                     g_shCb.unlock();
                 }
             }
@@ -855,8 +864,8 @@ int SDL_OpenAudio(SDL_AudioSpec *desired, SDL_AudioSpec *obtained) { return shOp
 SDL_AudioDeviceID SDL_OpenAudioDevice(const char *, int cap, const SDL_AudioSpec *desired, SDL_AudioSpec *obtained, int) {
     return !cap && shOpen(desired, obtained) ? 2 : 0;
 }
-void SDL_PauseAudio(int on) { g_shPause.store(on != 0); }
-void SDL_PauseAudioDevice(SDL_AudioDeviceID, int on) { g_shPause.store(on != 0); }
+void SDL_PauseAudio(int on) { g_shPause.store(on != 0); mpv_player::g_audPause = on != 0; }
+void SDL_PauseAudioDevice(SDL_AudioDeviceID, int on) { g_shPause.store(on != 0); mpv_player::g_audPause = on != 0; }
 SDL_AudioStatus SDL_GetAudioStatus(void) { return !g_shCur ? SDL_AUDIO_STOPPED : g_shPause.load() ? SDL_AUDIO_PAUSED : SDL_AUDIO_PLAYING; }
 SDL_AudioStatus SDL_GetAudioDeviceStatus(SDL_AudioDeviceID) { return SDL_GetAudioStatus(); }
 void SDL_LockAudio(void) { g_shCb.lock(); }
