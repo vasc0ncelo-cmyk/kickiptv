@@ -313,6 +313,53 @@ static void logBoth(const char *msg) {
     if (g_mpv) { const char *c[] = {"print-text", msg, nullptr}; mpv_command_async(g_mpv, 0, c); }
 }
 
+// ---- Protecao contra queda do app ----
+// O decoder h264_videodec2 do ffmpeg carrega 5 modulos do sistema e, se eles NAO carregam, segue em frente e chama funcoes que nao
+// existem: o app INTEIRO cai (nao e erro de codec, entao o mpv nem chega a cair no h264 por software). Foi o que o log mostrou:
+// "videodec2: LoadStartModule(/system/common/lib/libSceVdecCore.sprx) => 0x80020002" (ENOENT) e o log parou ali.
+// Por isso: (1) conferimos os MESMOS modulos antes (so le o codigo de retorno); (2) um marcador em disco liga o modo seguro se
+// mesmo assim cair.
+extern "C" int mpvhw_LoadStartModule(const char *path, size_t args, const void *argp, uint32_t flags, void *opt, int *res) __asm__("sceKernelLoadStartModule");
+
+static bool hwModulesOk(std::string &why) {
+    static int s_state = -1;                      // o resultado nao muda durante a execucao: confere uma vez so
+    static std::string s_why;
+    if (s_state >= 0) { why = s_why; return s_state == 1; }
+    static const char *kMods[] = {"/system/common/lib/libSceVdecCore.sprx", "/system/common/lib/libSceVdecSavc.sprx",
+                                  "/system/common/lib/libSceVdecSavc2.sprx", "/system/common/lib/libSceVdecwrap.sprx",
+                                  "/system/common/lib/libSceVideodec2.sprx"};
+    bool ok = true;
+    char b[220];
+    for (const char *p : kMods) {
+        int res = 0;
+        int rc = mpvhw_LoadStartModule(p, 0, nullptr, 0, nullptr, &res);
+        snprintf(b, sizeof b, "[kick-hw] preflight: %s rc=0x%08x res=%d", p, (unsigned)rc, res);
+        logBoth(b);
+        if (rc < 0) {                             // 2a chance: pelo nome (pode ja estar carregado) e depois repete o caminho completo
+            const char *base = strrchr(p, '/'); base = base ? base + 1 : p;
+            const int rc2 = mpvhw_LoadStartModule(base, 0, nullptr, 0, nullptr, &res);
+            snprintf(b, sizeof b, "[kick-hw] preflight: %s (pelo nome) rc=0x%08x", base, (unsigned)rc2);
+            logBoth(b);
+            if (rc2 >= 0) {
+                rc = mpvhw_LoadStartModule(p, 0, nullptr, 0, nullptr, &res);
+                snprintf(b, sizeof b, "[kick-hw] preflight: %s (de novo) rc=0x%08x", p, (unsigned)rc);
+                logBoth(b);
+            }
+        }
+        if (rc < 0) { ok = false; if (s_why.empty()) s_why = std::string("nao carregou ") + p; }
+    }
+    s_state = ok ? 1 : 0;
+    why = s_why;
+    logBoth(ok ? "[kick-hw] preflight OK: modulos do videodec2 carregam"
+               : "[kick-hw] preflight FALHOU: lives ficam em SOFTWARE (com estes modulos ausentes o ffmpeg derruba o app)");
+    return ok;
+}
+
+static const char *kHwGuard = "/data/kickiptv_hwdec_guard";      // existe = o ultimo videodec2 derrubou o app
+static const char *kHwOffFile = "/data/kickiptv_nohwdec";        // existe = tudo em software (manual ou automatico)
+static void guardSet() { FILE *f = fopen(kHwGuard, "wb"); if (f) { fputs("tentando videodec2", f); fclose(f); } }
+static void guardClear() { remove(kHwGuard); }
+
 // Quem DE FATO decodifica. "No hardware decoding requested" / "Using software decoding" do mpv so falam do hwaccel (--hwdec) e saem
 // mesmo com o videodec2 rodando; hwdec-current tambem fica "no". A prova e current-tracks/video/decoder.
 static std::string logDecoderLocked(const char *tag) {
@@ -437,6 +484,13 @@ void prewarm() { sdlStartProbe(); }
 bool boot() {
     std::lock_guard<std::mutex> lk(g_mx);
     if (g_mpv) return true;
+    if (fileThere(kHwGuard)) {       // a execucao anterior caiu DENTRO do videodec2: nunca mais tenta (ate apagar o arquivo abaixo)
+        g_hwBad = true;
+        guardClear();
+        FILE *f = fopen(kHwOffFile, "wb");
+        if (f) { fputs("automatico: o videodec2 derrubou o app. Apague este arquivo para tentar o hardware de novo.", f); fclose(f); }
+        tr("[kick-hw] a execucao anterior caiu no videodec2: hardware desligado (criado /data/kickiptv_nohwdec)");
+    }
     g_mpv = mpv_create();
     if (!g_mpv) {
         setErr("mpv_create falhou");
@@ -585,15 +639,17 @@ bool play(const std::string &url, bool live) {
         // (2) hwdec fica "no": o videodec2 e um decoder proprio do ffmpeg (como h264_cuvid), nao um hwaccel do mpv. Por isso o mpv
         //     escreve "No hardware decoding requested / Using software decoding" MESMO com ele ativo. Vale "Selected codec:" e [kick-hw].
         // (3) vd e threads sao reaplicados A CADA play (live: videodec2 + 1 thread; o resto: padrao) -> nada vaza para filme/serie.
-        const bool hwOff = fileThere("/data/kickiptv_nohwdec");                // chave de seguranca: arquivo vazio = tudo em software
-        const bool hw = live && !g_hwBad && !hwOff;
+        const bool hwOff = fileThere(kHwOffFile);                              // chave de seguranca: arquivo vazio = tudo em software
+        std::string hwWhyNot;
+        const bool hw = live && !g_hwBad && !hwOff && hwModulesOk(hwWhyNot);   // so lives chegam a tocar nos modulos do sistema
+        if (hw) guardSet(); else guardClear();                                 // marcador em disco: se o app cair daqui ate o 1o quadro, o proximo start vai em software
         mpv_set_property_string(g_mpv, "hwdec", "no");
         const int vdRc = mpv_set_property_string(g_mpv, "vd", hw ? "h264_videodec2" : "");
         mpv_set_property_string(g_mpv, "vd-lavc-threads", hw ? "1" : "6");
         {
             char b[240];
             snprintf(b, sizeof b, "[kick-hw] play: live=%d pedido=%s set-rc=%d vd(lido)=%s%s%s", live ? 1 : 0, hw ? "h264_videodec2" : "software",
-                     vdRc, propStr("options/vd").c_str(), g_hwBad ? " [bloqueado: falhou antes]" : "", hwOff ? " [/data/kickiptv_nohwdec]" : "");
+                     vdRc, propStr("options/vd").c_str(), g_hwBad ? " [bloqueado: falhou antes]" : "", hwOff ? " [/data/kickiptv_nohwdec]" : (!hwWhyNot.empty() && live ? (" [" + hwWhyNot + "]").c_str() : ""));
             logBoth(b);
         }
         g_hwWanted = hw; g_hwChecked = false; g_hwT0 = std::chrono::steady_clock::now();
@@ -606,6 +662,7 @@ bool play(const std::string &url, bool live) {
         }
         if (chk(lrc) < 0) {
             g_open = false;
+            guardClear();
             return false;
         }
         g_started = true;
@@ -627,6 +684,7 @@ bool play(const std::string &url, bool live) {
     if (gotFail || g_failed || !gotLoaded) {
         std::lock_guard<std::mutex> lk(g_mx);
         g_open = false;
+        guardClear();
         if (g_err.empty()) setErr("loading failed (stream_cb)");
         if (g_mpv) {
             const char *stopc[] = {"stop", nullptr};
@@ -692,6 +750,7 @@ void stop() {
     // NAO bloqueia: o "stop" sincrono esperava o demuxer do mpv sair de uma leitura de rede (ate dezenas de segundos) com g_mx preso,
     // travando a thread principal (poll/render pedem g_mx) -> vigia derrubava o app. Assincrono: o mpv encerra em segundo plano.
     std::lock_guard<std::mutex> lk(g_mx);
+    guardClear();                                  // parada normal: nao foi queda
     if (!g_mpv) return;
     const char *cmd[] = {"stop", nullptr};
     mpv_command_async(g_mpv, 0, cmd);
@@ -703,6 +762,7 @@ void stop() {
 
 void shutdown() {
     std::lock_guard<std::mutex> lk(g_mx);
+    guardClear();
     if (!g_mpv) return;
     mpv_command_string(g_mpv, "quit");
     destroyRender();
@@ -726,6 +786,7 @@ void poll() {
     if (g_open && !g_hwChecked) {
         if (g_everRendered) {
             g_hwChecked = true;
+            guardClear();                                  // chegou video: o decoder nao derrubou o app
             const std::string dec = logDecoderLocked("1o-quadro");
             if (g_hwWanted && dec.find("videodec2") == std::string::npos)
                 logBoth("[kick-hw] ATENCAO: pediu hardware mas o decoder real e software. Veja no mpv.log: 'Codec list:' (videodec2 deve ser o 1o), "
@@ -733,6 +794,7 @@ void poll() {
         } else if (g_hwWanted &&
                    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - g_hwT0).count() > 12000) {
             g_hwChecked = true; g_hwBad = true; g_hwFallbackAsk = true;
+            guardClear();
             logDecoderLocked("sem-quadro-12s");
             logBoth("[kick-hw] videodec2 ativo mas sem video em 12 s: hardware desligado ate fechar o app, reabrindo em software");
         }
