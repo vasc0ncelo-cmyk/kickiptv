@@ -169,7 +169,10 @@ static int cb_open(void * /*user_data*/, char *uri, mpv_stream_cb_info *info) {
 
     info->cookie = st;
     info->read_fn = cb_read;
-    info->seek_fn = cb_seek;
+    // Live da Kick (kicklive://): fluxo continuo SEM posicao. O cb_seek dizia "ok" para qualquer seek, mas a leitura ignora o offset
+    // (le sempre o proximo byte do alimentador): o mpv achava que tinha voltado no arquivo e recebia bytes do ponto errado.
+    // Sem seek_fn o mpv trata como transmissao ao vivo (e nunca tenta voltar no cache).
+    info->seek_fn = !strncmp(u, "kicklive://", 11) ? nullptr : cb_seek;
     info->size_fn = cb_size;
     info->close_fn = cb_close;
     info->cancel_fn = g_io.cancel ? cb_cancel : nullptr;
@@ -530,8 +533,17 @@ bool play(const std::string &url) {
         std::string wrap = std::string("khttp://") + url;
         // NAO usar force-seekable=yes aqui: o mpv vai no fim do arquivo e muitos paineis IPTV
         // recusam o Range grande -> end-file: loading failed. Seek e feito depois, sob demanda.
-        const char *cmd[] = {"loadfile", wrap.c_str(), "replace", nullptr};
-        if (chk(mpv_command(g_mpv, cmd)) < 0) {
+        // Live da Kick: memoria curta (o PS4 fechava o app depois de alguns minutos: 160 MiB de demuxer + 45 s de readahead + buffers do
+        // alimentador somavam mais do que o app pode ter) e sem force-seekable (nao e arquivo).
+        const bool kickLive = url.compare(0, 11, "kicklive://") == 0;
+        std::string liveOpts = "force-seekable=no,demuxer-max-bytes=24MiB,demuxer-max-back-bytes=1MiB,demuxer-readahead-secs=15,vd-lavc-threads=4";
+        const char *cmd[] = {"loadfile", wrap.c_str(), "replace", kickLive ? liveOpts.c_str() : nullptr, nullptr};   // mpv 0.36: sem o indice "0"
+        int lrc = mpv_command(g_mpv, cmd);
+        if (lrc < 0 && kickLive) {                                  // opcao nao aceita nesta versao: abre sem elas
+            const char *cmd2[] = {"loadfile", wrap.c_str(), "replace", nullptr};
+            lrc = mpv_command(g_mpv, cmd2);
+        }
+        if (chk(lrc) < 0) {
             g_open = false;
             return false;
         }

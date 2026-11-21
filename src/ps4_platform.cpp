@@ -664,11 +664,21 @@ static void kickMpvClose(void *cookie) {
     delete s;
 }
 static void kickMpvCancel(void *cookie) { if (auto *s = (KickMpvStream *)cookie) s->cancelled = true; }
+// Os callbacks rodam em threads do mpv (codigo C): excecao C++ que escapa aqui = std::terminate = app fecha. Tudo protegido.
+static void *kickMpvOpenSafe(void *ud, const char *url, uint64_t *sz) {
+    try { return kickMpvOpen(ud, url, sz); } catch (...) { trace("mpv-open-excecao"); return nullptr; }
+}
+static int64_t kickMpvReadSafe(void *c, uint64_t off, char *buf, uint64_t n) {
+    try { return kickMpvRead(c, off, buf, n); } catch (...) { trace("mpv-read-excecao"); return -1; }
+}
+static void kickMpvCloseSafe(void *c) {
+    try { kickMpvClose(c); } catch (...) { trace("mpv-close-excecao"); }
+}
 static void kickMpvRegisterIo() {
     mpv_player::StreamIo io;
-    io.open = &kickMpvOpen;
-    io.read = &kickMpvRead;
-    io.close = &kickMpvClose;
+    io.open = &kickMpvOpenSafe;
+    io.read = &kickMpvReadSafe;
+    io.close = &kickMpvCloseSafe;
     io.cancel = &kickMpvCancel;
     io.ud = nullptr;
     mpv_player::setStreamIo(io);
@@ -1634,6 +1644,7 @@ struct HlsFeeder {
     FILE *outFile = nullptr;                    // modo "arquivo que cresce": segmentos vao para /data/live.ts
     std::atomic<unsigned long long> outBytes{0};
     std::atomic<bool> discardBuf{false};        // modo "pedacos": ninguem le o StreamBuf, entao nao acumula (antes crescia ate 48 MB)
+    std::atomic<bool> noRecent{false};          // libmpv le so o StreamBuf: nao guarda copia dos ultimos segmentos em 'recent' (eram ~12 copias, dezenas de MB a toa)
     bool raw = false;                           // canal em MPEG-TS cru (sem playlist): o fluxo continuo e cortado em pedacos de ~2 s (tschunk.hpp)
     NetClient::Session sess;                    // conexao HTTP reaproveitada (so a thread do alimentador usa)
     std::mutex lm;
@@ -1657,10 +1668,20 @@ struct HlsFeeder {
         std::lock_guard<std::mutex> jl(jm);
         joinLocked(); sb.reset();
         { std::lock_guard<std::mutex> l(rm); recent.clear(); }
+        if (noRecent.load()) {                         // memoria previsivel: tamanho do buffer fixo, sem realocar/dobrar o vector durante a live
+            std::lock_guard<std::mutex> l(sb.m);
+            sb.buf.reserve(sb.hardCap + (4u << 20));
+        }
         raw = rawTs; keyCache.clear();
         url = u; segs = opens = reads = failed = 0; localId = 0; streamEnded = false; run = true; discardBuf = false; dlMs = dlMsMax = 0; setStatus("iniciando");
         wantSegs = rawTs ? livebuf::startSegs(2.0, livebuf::kStartSecsRaw) : 3;
-        th = std::thread([this] { loop(); g_net.closeSession(sess); });
+        th = std::thread([this] {
+            // Excecao solta numa std::thread = std::terminate = o app fecha sozinho. Qualquer erro vira "falha" (o app reconecta a live).
+            try { loop(); }
+            catch (const std::exception &e) { fail(std::string("excecao no alimentador: ") + e.what()); trace("feeder-excecao"); }
+            catch (...) { fail("excecao no alimentador"); trace("feeder-excecao"); }
+            try { g_net.closeSession(sess); } catch (...) {}
+        });
     }
     void abort() { run = false; sb.abort(); }                // libera leituras bloqueadas do player
     void join() { std::lock_guard<std::mutex> jl(jm); joinLocked(); }
@@ -1738,7 +1759,8 @@ struct HlsFeeder {
             }
             if (!g_net.getKA(sess, mediaUrl, body, st) || st < 200 || st >= 300) {
                 g_net.closeSession(sess);
-                if (++errs > 40) { fail("playlist de midia HTTP " + std::to_string(st)); return; }
+                // link expirado/recusado (401/403/404/410): insistir nao adianta, falha logo para o app pegar um link novo e reconectar
+                if (++errs > 40 || (errs >= 3 && (st == 401 || st == 403 || st == 404 || st == 410))) { fail("playlist de midia HTTP " + std::to_string(st)); return; }
                 setStatus("playlist: tentando de novo (" + std::to_string(st) + ")");
                 sleepMs(livebuf::backoffMs(errs), run); continue;
             }
@@ -1815,7 +1837,8 @@ struct HlsFeeder {
                 } else if (!discardBuf.load()) sb.append((const uint8_t *)seg.data(), seg.size());
                 { double dm = (nowSecF() - d0) * 1000.0; dlMs = dm; if (dm > dlMsMax.load()) dlMsMax = dm; }
                 lastSegDur = sg.dur;
-                { std::lock_guard<std::mutex> l(rm); recent.push_back({++localId, seg}); while ((int)recent.size() > livebuf::kWindowHls) recent.pop_front(); }
+                if (!noRecent.load()) { std::lock_guard<std::mutex> l(rm); recent.push_back({++localId, seg}); while ((int)recent.size() > livebuf::kWindowHls) recent.pop_front(); }
+                else ++localId;
                 next = sg.seq + 1; segs++; got = true; downloaded++;
                 setStatus("ao vivo: segmento " + std::to_string(sg.seq) + " (" + std::to_string(seg.size() / 1024) + " KB)");
             }
@@ -1843,6 +1866,8 @@ static void *kickLiveOpen(uint64_t *size_out) {
     // Ja existe um alimentador rodando para esta URL (o mpv reabriu o stream): reaproveita, senao o close da 1a abertura matava a 2a.
     const bool reuse = g_liveOpen.load() > 0 && g_feed.run.load() && !g_feed.failed.load() && g_feed.url == g_kickLiveUrl && g_feed.segs.load() > 0;
     if (!reuse) {
+        g_feed.noRecent = true;                                 // so o mpv le (via StreamBuf): sem copias extras dos segmentos
+        g_feed.sb.softCap = 10u << 20; g_feed.sb.hardCap = 16u << 20;     // antes 24/40 MB (o mpv ja guarda o seu proprio cache)
         g_feed.start(g_kickLiveUrl, false);                     // escolhe a variante (resolucao), baixa playlist + segmentos
         trace("kicklive-feeder");
         const int need = std::max(2, g_feed.wantSegs.load());
@@ -4513,6 +4538,38 @@ int main() {
                 player.stop(); player.quietWait = false;
                 player.epUrls.clear(); player.epTitles.clear(); player.epIndex = -1;
                 mode = Mode::Menu; dirty = true; sceKernelUsleep(16000); continue;
+            }
+            // ---- Live da Kick (libmpv): reconecta SOZINHA se a rede/stream cair ou a imagem parar ----
+            // Antes so o caminho antigo (AvPlayer) tinha isso; no mpv qualquer EOF/falha do alimentador (link expirado, rede oscilando,
+            // streamer reconectando) devolvia o app ao menu: parecia que ele "fechava sozinho".
+            if (!player.isVod && !player.kickSlug.empty() && !st.paused) {
+                static double seenT0 = 0, lastPosWall = 0, lastPos = -1;
+                if (seenT0 != player.mpvT0) { seenT0 = player.mpvT0; lastPosWall = tn; lastPos = -1; player.lastFeedSegs = 0; player.lastFeedSegWall = 0; }
+                if (st.positionSec != lastPos) { lastPos = st.positionSec; lastPosWall = tn; }
+                const unsigned sg = (unsigned)g_feed.segs.load();
+                if (sg > player.lastFeedSegs) { player.lastFeedSegs = sg; player.lastFeedSegWall = tn; }
+                if (player.lastFeedSegWall < 1.0) player.lastFeedSegWall = tn;
+                std::string why;
+                if (st.failed || st.eof) why = std::string("a transmissao terminou/caiu (") + (st.failed ? st.error : std::string("fim")) + ")";
+                else if (player.mpvGot && tn - lastPosWall > (st.buffering ? 20.0 : 8.0)) why = "video sem avancar ha " + std::to_string((int)(tn - lastPosWall)) + " s";
+                else if (player.mpvGot && tn - player.lastFeedSegWall > 25.0) why = "sem segmentos novos ha " + std::to_string((int)(tn - player.lastFeedSegWall)) + " s";
+                if (g_feed.streamEnded.load() && (st.eof || st.failed) && !why.empty()) { why.clear(); app.say("A live terminou."); }   // playlist com ENDLIST: acabou de verdade
+                if (!why.empty() && player.mpvGot && liveRecentStalls() < 8) {          // 8 quedas em 5 min: desiste (volta ao menu com o motivo)
+                    trace((std::string("mpv-live-reconecta: ") + why).c_str());
+                    app.say("Live instável — reconectando...");
+                    g_autoRestarts++;
+                    g_stallT[g_stallI++ % 8] = monoNow();                  // a proxima abertura fica mais conservadora (menos resolucao/fps)
+                    g_reconnectNote = why;
+                    safeRestartLive(why);
+                    sceKernelUsleep(50000);
+                    continue;
+                }
+                if (st.failed || st.eof) {                                  // acabou ou desistiu de reconectar: volta ao menu (nunca "loop de canal" numa live morta)
+                    if (st.failed) app.say("Falha na reprodução: " + st.error);
+                    player.stop(); player.quietWait = false; player.waitLabel.clear();
+                    player.epUrls.clear(); player.epTitles.clear(); player.epIndex = -1;
+                    mode = Mode::Menu; dirty = true; sceKernelUsleep(16000); continue;
+                }
             }
             if (st.failed || (st.eof && !st.paused)) {
                 // Canal (curto ou ao vivo): nao reabre, nao troca qualidade. Volta pro inicio e segue.
