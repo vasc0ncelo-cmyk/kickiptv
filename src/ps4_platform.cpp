@@ -538,6 +538,7 @@ static void *kickMpvOpen(void * /*ud*/, const char *url, uint64_t *size_out) {
                 lh = std::make_shared<LiveHttp>(); g_liveHttp = lh;
                 lh->url = url; lh->sb.softCap = 12u << 20; lh->sb.hardCap = 20u << 20;
                 std::thread([lh] {                                   // solta sozinha quando o stop chega (a leitura de rede volta ou da timeout)
+                  try {                                                // excecao solta numa thread = terminate = app fecha: vira "falha" e o app reabre o canal
                     int fails = 0, cycles = 0; bool first = true;
                     while (!lh->stop.load()) {
                         uint64_t pos = 0; int status = 0;
@@ -562,6 +563,7 @@ static void *kickMpvOpen(void * /*ud*/, const char *url, uint64_t *size_out) {
                         const int waitMs = up > 8.0 ? 150 : (fails <= 1 ? 500 : 1500);
                         for (int i = 0; i < waitMs / 50 && !lh->stop.load(); i++) sceKernelUsleep(50000);
                     }
+                  } catch (...) { lh->failed = true; trace("canal-thread-excecao"); }
                     lh->ended = true;
                     trace("canal-thread-fim");
                 }).detach();
@@ -2146,7 +2148,26 @@ struct Player {
         return true;
     }
 
+    // Tudo toca no libmpv. Padrao: lives por software; com o arquivo vazio /data/kickiptv_hwdec o mpv tenta o decodificador de hardware
+    // (h264_videodec2) nas lives e canais. Opcional (opt-in): /data/kickiptv_live_av manda as lives para o AvPlayer; se ele falhar, cai no libmpv.
     bool start(const std::string &url, const std::string &title) {
+        const bool liveUrl = (!title.empty() && title[0] == '@') || !urlIsVodMedia(url);
+        bool mpvOk = false;
+#ifdef USE_LIBMPV
+        mpvOk = mpv_player::available();
+#endif
+        const bool useAv = fileExists("/data/kickiptv_live_av");      // opt-in: lives pelo AvPlayer em vez do libmpv
+        if (!liveUrl || !useAv) return startImpl(url, title, false);
+        const bool ok = startImpl(url, title, true);
+        if (!ok && !cancelled && mpvOk) {
+            trace("live-hardware-falhou: tentando libmpv");
+            try { stop(); } catch (...) {}
+            failed = false; cancelled = false;
+            return startImpl(url, title, false);
+        }
+        return ok;
+    }
+    bool startImpl(const std::string &url, const std::string &title, bool allowHw) {
         log.clear(); frames = 0; vw = vh = 0; fps = 0; fpsFrames = 0; failed = false; addRc = 0; chunkMode = false; chunkIdx = 0; inactiveSince = 0;
         cancelled = false; restarts = switchesOk = 0; lastGapMs = 0; gapStartT = switchedAt = 0; curDur = 0; chunkT0 = 0; blitMs = 0;
         paused = false; isVod = false; lastPtsMs = 0; maxPtsMs = 0; durationMs = 0; seekPendingMs = -1; waitNote.clear(); showOpts = false; optCur = 0;
@@ -2176,8 +2197,9 @@ struct Player {
             while (!kickSlug.empty() && (kickSlug.back()==' '||kickSlug.back()=='\n')) kickSlug.pop_back();
         }
 
-        // --- SOMENTE libmpv (sem AvPlayer). Se falhar, mostra o erro e nao abre o player antigo. ---
+        // --- libmpv: filmes/series (e as lives quando o hardware falha). Se falhar, mostra o erro. ---
         useMpv = false;
+        if (!allowHw) {
 #ifdef USE_LIBMPV
         if (mpv_player::available()) {
             kickMpvRegisterIo();   // obrigatorio: stream_cb usa o HTTP do app
@@ -2213,8 +2235,11 @@ struct Player {
 #endif
         failed = true; active = false;
         return false;
+        }   // fim do bloco libmpv
 
-        // ---- codigo AvPlayer abaixo fica inalcançavel de proposito (sem fallback) ----
+        // ---- Live pelo hardware do PS4 (AvPlayer): so chega aqui com allowHw ----
+        g_feed.noRecent = false;                                    // o caminho do AvPlayer precisa das copias dos segmentos ('recent')
+        g_feed.sb.softCap = 24u << 20; g_feed.sb.hardCap = 40u << 20;
 
         // titulo "@slug" = live Kick: guarda slug para renovar o m3u8 na reconexao
         kickSlug.clear(); nextKickUrl.clear(); kickUrlAt = nowSec();
@@ -4542,18 +4567,20 @@ int main() {
             // ---- Live da Kick (libmpv): reconecta SOZINHA se a rede/stream cair ou a imagem parar ----
             // Antes so o caminho antigo (AvPlayer) tinha isso; no mpv qualquer EOF/falha do alimentador (link expirado, rede oscilando,
             // streamer reconectando) devolvia o app ao menu: parecia que ele "fechava sozinho".
-            if (!player.isVod && !player.kickSlug.empty() && !st.paused) {
+            // Canais IPTV ao vivo (sem slug) usam a mesma vigia: queda, imagem parada ou falha -> reabre o canal sozinho.
+            const bool liveKick = !player.kickSlug.empty();
+            if (!player.isVod && !st.paused) {
                 static double seenT0 = 0, lastPosWall = 0, lastPos = -1;
                 if (seenT0 != player.mpvT0) { seenT0 = player.mpvT0; lastPosWall = tn; lastPos = -1; player.lastFeedSegs = 0; player.lastFeedSegWall = 0; }
                 if (st.positionSec != lastPos) { lastPos = st.positionSec; lastPosWall = tn; }
-                const unsigned sg = (unsigned)g_feed.segs.load();
+                const unsigned sg = liveKick ? (unsigned)g_feed.segs.load() : 0u;
                 if (sg > player.lastFeedSegs) { player.lastFeedSegs = sg; player.lastFeedSegWall = tn; }
                 if (player.lastFeedSegWall < 1.0) player.lastFeedSegWall = tn;
                 std::string why;
                 if (st.failed || st.eof) why = std::string("a transmissao terminou/caiu (") + (st.failed ? st.error : std::string("fim")) + ")";
-                else if (player.mpvGot && tn - lastPosWall > (st.buffering ? 20.0 : 8.0)) why = "video sem avancar ha " + std::to_string((int)(tn - lastPosWall)) + " s";
-                else if (player.mpvGot && tn - player.lastFeedSegWall > 25.0) why = "sem segmentos novos ha " + std::to_string((int)(tn - player.lastFeedSegWall)) + " s";
-                if (g_feed.streamEnded.load() && (st.eof || st.failed) && !why.empty()) { why.clear(); app.say("A live terminou."); }   // playlist com ENDLIST: acabou de verdade
+                else if (player.mpvGot && tn - lastPosWall > (st.buffering ? 45.0 : 30.0)) why = "video sem avancar ha " + std::to_string((int)(tn - lastPosWall)) + " s";
+                else if (liveKick && player.mpvGot && tn - player.lastFeedSegWall > 60.0) why = "sem segmentos novos ha " + std::to_string((int)(tn - player.lastFeedSegWall)) + " s";
+                if (liveKick && g_feed.streamEnded.load() && (st.eof || st.failed) && !why.empty()) { why.clear(); app.say("A live terminou."); }   // playlist com ENDLIST: acabou de verdade
                 if (!why.empty() && player.mpvGot && liveRecentStalls() < 8) {          // 8 quedas em 5 min: desiste (volta ao menu com o motivo)
                     trace((std::string("mpv-live-reconecta: ") + why).c_str());
                     app.say("Live instável — reconectando...");
@@ -4564,7 +4591,7 @@ int main() {
                     sceKernelUsleep(50000);
                     continue;
                 }
-                if (st.failed || st.eof) {                                  // acabou ou desistiu de reconectar: volta ao menu (nunca "loop de canal" numa live morta)
+                if (liveKick && (st.failed || st.eof)) {                    // acabou ou desistiu de reconectar: volta ao menu (nunca "loop de canal" numa live morta)
                     if (st.failed) app.say("Falha na reprodução: " + st.error);
                     player.stop(); player.quietWait = false; player.waitLabel.clear();
                     player.epUrls.clear(); player.epTitles.clear(); player.epIndex = -1;

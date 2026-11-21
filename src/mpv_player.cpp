@@ -536,6 +536,17 @@ bool play(const std::string &url) {
         // Live da Kick: memoria curta (o PS4 fechava o app depois de alguns minutos: 160 MiB de demuxer + 45 s de readahead + buffers do
         // alimentador somavam mais do que o app pode ter) e sem force-seekable (nao e arquivo).
         const bool kickLive = url.compare(0, 11, "kicklive://") == 0;
+        {   // Decodificacao por HARDWARE (so lives e canais; filme/serie ficam em software). Opt-in: arquivo vazio /data/kickiptv_hwdec.
+            // Se o ffmpeg deste build nao tiver o decodificador, o mpv usa o software sozinho (veja "vd" em /data/kickiptv_mpv.log).
+            auto ends = [&](const char *e) { size_t n = strlen(e); return url.size() >= n && url.compare(url.size() - n, n, e) == 0; };
+            const bool vodLike = url.find("/movie/") != std::string::npos || url.find("/series/") != std::string::npos ||
+                                 ends(".mp4") || ends(".mkv") || ends(".avi") || ends(".mov") || ends(".m4v");
+            bool marker = false;
+            for (const char *mp : {"/data/kickiptv_hwdec", "/data/kickiptv_hwdec.txt"}) { FILE *mf = fopen(mp, "rb"); if (mf) { fclose(mf); marker = true; } }
+            const bool hw = marker && (kickLive || !vodLike);
+            mpv_set_property_string(g_mpv, "vd", hw ? "lavc:h264_videodec2,lavc" : "");
+            tr(hw ? "mpv-hwdec: tentando h264_videodec2 (live/canal)" : "mpv-hwdec: software");
+        }
         std::string liveOpts = "force-seekable=no,demuxer-max-bytes=24MiB,demuxer-max-back-bytes=1MiB,demuxer-readahead-secs=15,vd-lavc-threads=4";
         const char *cmd[] = {"loadfile", wrap.c_str(), "replace", kickLive ? liveOpts.c_str() : nullptr, nullptr};   // mpv 0.36: sem o indice "0"
         int lrc = mpv_command(g_mpv, cmd);
