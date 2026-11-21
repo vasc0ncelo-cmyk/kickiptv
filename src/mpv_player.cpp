@@ -426,7 +426,7 @@ bool boot() {
     mpv_set_option_string(g_mpv, "dither-depth", "no");
     mpv_set_option_string(g_mpv, "interpolation", "no");
     mpv_set_option_string(g_mpv, "video-sync", "audio");
-    mpv_set_option_string(g_mpv, "vd-lavc-skiploopfilter", "all");
+    mpv_set_option_string(g_mpv, "vd-lavc-skiploopfilter", "nonref");   // "all" desligava o filtro anti-blocos: canais IPTV (pouco bitrate) ficavam quadriculados
     mpv_set_option_string(g_mpv, "vd-lavc-dr", "no");
     mpv_set_option_string(g_mpv, "framedrop", "decoder+vo");
     mpv_set_option_string(g_mpv, "vd-lavc-fast", "yes");
@@ -675,6 +675,15 @@ void poll() {
 
 // Render interno em no maximo 1280 de largura (a CPU Jaguar do PS4 gasta ~48 ms por quadro convertendo/escalando 1080p) e
 // ampliacao barata por vizinho mais proximo para o buffer da tela. Quadros repetidos ('force') reaproveitam o ultimo quadro pronto.
+// Ampliacao do quadro reduzido para a tela: horizontal com interpolacao linear (suave) e vertical por repeticao de linha. Se o PS4 nao der conta
+// (media > 14 ms por quadro), volta sozinho para o vizinho mais proximo (mais rapido, serrilhado) e avisa no log.
+static std::vector<int> g_xi;
+static std::vector<uint32_t> g_xw;
+static int g_xiW = 0, g_xiLw = 0;
+static bool g_smoothOn = true;
+static double g_smoothMs = 0;
+static int g_smoothN = 0;
+
 static void upscaleLo(uint8_t *dst, int w, int h, int stride) {
     if (g_loW == w && g_loH == h) {
         for (int y = 0; y < h; y++) memcpy(dst + (size_t)y * stride, &g_lo[(size_t)y * g_loW], (size_t)w * 4);
@@ -685,21 +694,52 @@ static void upscaleLo(uint8_t *dst, int w, int h, int stride) {
         for (int x = 0; x < w; x++) g_xmap[(size_t)x] = (int)((long long)x * g_loW / w);
         g_xmapW = w; g_xmapLw = g_loW;
     }
-    // A linha ampliada e montada numa linha de RAM e so ENTAO copiada para dst. Antes, a linha repetida era copiada LENDO a linha anterior de
-    // dst: com o mpv escrevendo direto na memoria de video (sem OSD) isso le de memoria nao-cacheada e levava ~120 ms por quadro.
+    if (g_xiW != w || g_xiLw != g_loW) {
+        g_xi.resize((size_t)w); g_xw.resize((size_t)w);
+        for (int x = 0; x < w; x++) {
+            double sx = (x + 0.5) * g_loW / w - 0.5;
+            if (sx < 0) sx = 0;
+            int i = (int)sx; if (i > g_loW - 2) i = g_loW - 2; if (i < 0) i = 0;
+            g_xi[(size_t)x] = i;
+            double f = sx - i; if (f > 1) f = 1;
+            g_xw[(size_t)x] = (uint32_t)(f * 256.0);
+        }
+        g_xiW = w; g_xiLw = g_loW;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    // A linha ampliada e montada numa linha de RAM e so ENTAO copiada para dst: nunca ler de dst (memoria de video nao-cacheada: ~120 ms por quadro).
     static std::vector<uint32_t> row;
     if (row.size() < (size_t)w) row.resize((size_t)w);
+    const bool smooth = g_smoothOn && g_loW >= 2;
     int prevSy = -1;
     for (int y = 0; y < h; y++) {
         int sy = (int)((long long)y * g_loH / h);
         if (sy != prevSy) {
             const uint32_t *src = &g_lo[(size_t)sy * g_loW];
-            const int *xm = g_xmap.data();
             uint32_t *r = row.data();
-            for (int x = 0; x < w; x++) r[x] = src[xm[x]];
+            if (smooth) {
+                const int *xi = g_xi.data(); const uint32_t *xw = g_xw.data();
+                for (int x = 0; x < w; x++) {
+                    const uint32_t a = src[xi[x]], b = src[xi[x] + 1], f = xw[x];
+                    const uint32_t rb = (((a & 0x00FF00FFu) * (256 - f) + (b & 0x00FF00FFu) * f) >> 8) & 0x00FF00FFu;
+                    const uint32_t g = (((a & 0x0000FF00u) * (256 - f) + (b & 0x0000FF00u) * f) >> 8) & 0x0000FF00u;
+                    r[x] = rb | g | (a & 0xFF000000u);
+                }
+            } else {
+                const int *xm = g_xmap.data();
+                for (int x = 0; x < w; x++) r[x] = src[xm[x]];
+            }
             prevSy = sy;
         }
         memcpy(dst + (size_t)y * stride, row.data(), (size_t)w * 4);
+    }
+    if (smooth) {
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        g_smoothMs += ms;
+        if (++g_smoothN >= 30) {
+            if (g_smoothMs / g_smoothN > 14.0) { g_smoothOn = false; char tb[96]; snprintf(tb, sizeof tb, "mpv-ampliacao: suave lenta (%.1f ms), voltando para rapida", g_smoothMs / g_smoothN); tr(tb); }
+            g_smoothMs = 0; g_smoothN = 0;
+        }
     }
 }
 
