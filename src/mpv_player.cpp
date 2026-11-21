@@ -643,12 +643,12 @@ void poll() {
     if (!g_mpv) return;
     drainEventsUnlocked(nullptr, nullptr);
     if (g_aoUpgrade.load()) applyAoUpgradeLocked();
-    // imagem parada: tocando (nao pausado, sem esperar rede) mas nenhum quadro novo ha 3 s. O video segue o RELOGIO DO AUDIO ("video-sync=audio");
+    // imagem parada: tocando (nao pausado, sem esperar rede) mas nenhum quadro novo ha 2 s. O video segue o RELOGIO DO AUDIO ("video-sync=audio");
     // se o dispositivo de audio nao entrega amostras o relogio para (pos=0, imagem congelada). Entao: 1) passa o video para o relogio do
     // sistema ("desync": a imagem volta na hora), 2) empurra 0,2 s. A proxima midia volta ao "audio".
     if (g_open && !g_paused && !g_buffering && g_stallKicks < 3) {
         const auto nw = std::chrono::steady_clock::now();
-        if (std::chrono::duration_cast<std::chrono::milliseconds>(nw - g_lastFrameT).count() >= 3000) {
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(nw - g_lastFrameT).count() >= 2000) {
             g_stallKicks++; g_lastFrameT = nw;
             char tb[120]; snprintf(tb, sizeof tb, "mpv-travado #%d: audio cb=%u (+%u) pausa=%d", g_stallKicks, g_audCb.load(), g_audCb.load() - g_audCbLast, g_audPause.load());
             tr(tb);
@@ -685,15 +685,21 @@ static void upscaleLo(uint8_t *dst, int w, int h, int stride) {
         for (int x = 0; x < w; x++) g_xmap[(size_t)x] = (int)((long long)x * g_loW / w);
         g_xmapW = w; g_xmapLw = g_loW;
     }
+    // A linha ampliada e montada numa linha de RAM e so ENTAO copiada para dst. Antes, a linha repetida era copiada LENDO a linha anterior de
+    // dst: com o mpv escrevendo direto na memoria de video (sem OSD) isso le de memoria nao-cacheada e levava ~120 ms por quadro.
+    static std::vector<uint32_t> row;
+    if (row.size() < (size_t)w) row.resize((size_t)w);
     int prevSy = -1;
     for (int y = 0; y < h; y++) {
         int sy = (int)((long long)y * g_loH / h);
-        uint32_t *d = (uint32_t *)(dst + (size_t)y * stride);
-        if (sy == prevSy && y > 0) { memcpy(d, dst + (size_t)(y - 1) * stride, (size_t)w * 4); continue; }
-        const uint32_t *src = &g_lo[(size_t)sy * g_loW];
-        const int *xm = g_xmap.data();
-        for (int x = 0; x < w; x++) d[x] = src[xm[x]];
-        prevSy = sy;
+        if (sy != prevSy) {
+            const uint32_t *src = &g_lo[(size_t)sy * g_loW];
+            const int *xm = g_xmap.data();
+            uint32_t *r = row.data();
+            for (int x = 0; x < w; x++) r[x] = src[xm[x]];
+            prevSy = sy;
+        }
+        memcpy(dst + (size_t)y * stride, row.data(), (size_t)w * 4);
     }
 }
 
@@ -769,13 +775,18 @@ const int kShGrain = 1024;
 // Instancia do audio: pertence a thread (se o fechamento nao conseguir juntar a thread a tempo, ela e solta e se apaga sozinha).
 struct ShInst {
     std::atomic<bool> run{true}, done{false}, orphan{false};
+    std::recursive_mutex *cb = new std::recursive_mutex;   // SDL_LockAudio DESTA instancia (nunca apagado: quem destrava pode chegar depois do fechamento)
+    int lockFails = 0;
+    bool warned = false;
     int port = -1;
     SDL_AudioCallback fn = nullptr;
     void *ud = nullptr;
     pthread_t th;
 };
 std::mutex g_shCtl;                         // abrir/fechar uma por vez (nunca segurado enquanto espera o callback)
-std::recursive_mutex g_shCb;                // SDL_LockAudio: RECURSIVO como no SDL real (o std::mutex do PS4 e "errorcheck": relock = EDEADLK = terminate)
+std::recursive_mutex g_shDummy;             // SDL_LockAudio sem instancia aberta. Cada instancia tem o proprio (RECURSIVO como no SDL real: o std::mutex do PS4 e "errorcheck")
+thread_local std::recursive_mutex *tlLockM = nullptr;   // mutex travado por esta thread via SDL_LockAudio
+thread_local int tlLockDepth = 0;
 std::atomic<bool> g_shInit{false}, g_shPause{true};
 ShInst *g_shCur = nullptr;
 
@@ -787,12 +798,18 @@ void *shAudioMain(void *arg) {
     if (abuf) {
         while (in->run.load()) {
             std::memset(abuf, 0, (size_t)kShGrain * 2 * sizeof(int16_t));              // pausado/sem dados = silencio
-            if (!g_shPause.load() && in->fn) {
-                // try_lock: se o mpv esta com o SDL_LockAudio (ex.: fechando o ao) NAO fica esperando (isso travava o fechamento)
-                if (g_shCb.try_lock()) {
-                    if (in->run.load()) { in->fn(in->ud, (Uint8 *)abuf, kShGrain * 4); mpv_player::g_audCb++; }
-                    g_shCb.unlock();
+            if (!g_shPause.load() && in->fn && in->run.load()) {
+                // try_lock: se o mpv esta com o SDL_LockAudio (ex.: fechando o ao) NAO fica esperando (isso travava o fechamento). Mas se o lock
+                // ficar preso (o mpv trava e nao destrava antes de fechar o dispositivo; o SDL real zera isso), o callback NUNCA era chamado:
+                // relogio de audio parado, video congelado em pos=0. Depois de 3 blocos sem conseguir, chama o callback mesmo assim.
+                const bool locked = in->cb->try_lock();
+                if (locked || ++in->lockFails >= 3) {
+                    if (locked) in->lockFails = 0;
+                    else if (!in->warned) { in->warned = true; mpv_player::tr("sdl-shim: SDL_LockAudio preso; chamando o callback mesmo assim"); }
+                    in->fn(in->ud, (Uint8 *)abuf, kShGrain * 4);
+                    mpv_player::g_audCb++;
                 }
+                if (locked) in->cb->unlock();
             }
             sceAudioOutOutput(in->port, abuf);                                         // bloqueia ate o bloco tocar: e o relogio do audio
         }
@@ -868,10 +885,15 @@ void SDL_PauseAudio(int on) { g_shPause.store(on != 0); mpv_player::g_audPause =
 void SDL_PauseAudioDevice(SDL_AudioDeviceID, int on) { g_shPause.store(on != 0); mpv_player::g_audPause = on != 0; }
 SDL_AudioStatus SDL_GetAudioStatus(void) { return !g_shCur ? SDL_AUDIO_STOPPED : g_shPause.load() ? SDL_AUDIO_PAUSED : SDL_AUDIO_PLAYING; }
 SDL_AudioStatus SDL_GetAudioDeviceStatus(SDL_AudioDeviceID) { return SDL_GetAudioStatus(); }
-void SDL_LockAudio(void) { g_shCb.lock(); }
-void SDL_UnlockAudio(void) { g_shCb.unlock(); }
-void SDL_LockAudioDevice(SDL_AudioDeviceID) { g_shCb.lock(); }
-void SDL_UnlockAudioDevice(SDL_AudioDeviceID) { g_shCb.unlock(); }
+static void shLock() {
+    if (tlLockDepth == 0) { ShInst *c = g_shCur; tlLockM = c ? c->cb : &g_shDummy; }   // o mesmo mutex ate o ultimo Unlock desta thread
+    tlLockM->lock(); tlLockDepth++;
+}
+static void shUnlock() { if (tlLockDepth > 0 && tlLockM) { tlLockM->unlock(); if (--tlLockDepth == 0) tlLockM = nullptr; } }
+void SDL_LockAudio(void) { shLock(); }
+void SDL_UnlockAudio(void) { shUnlock(); }
+void SDL_LockAudioDevice(SDL_AudioDeviceID) { shLock(); }
+void SDL_UnlockAudioDevice(SDL_AudioDeviceID) { shUnlock(); }
 void SDL_CloseAudio(void) { shClose(); }
 void SDL_CloseAudioDevice(SDL_AudioDeviceID) { shClose(); }
 }
