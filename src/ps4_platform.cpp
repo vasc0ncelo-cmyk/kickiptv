@@ -2161,6 +2161,7 @@ struct Player {
             trace("mpv-tentando");
             const bool kickLive = !kickSlug.empty() && url.find(".m3u8") != std::string::npos;
             if (kickLive) { g_kickLiveUrl = url; log.push_back("Kick: resolucao/segmentos pelo alimentador HLS"); }
+            kickAbortAllIo();   // troca de midia: corta TODA leitura de rede da midia anterior (canal, Kick, VOD) antes de o mpv abrir a nova; o mpv_player::play confirma a parada e recria o render
             if (mpv_player::play(kickLive ? std::string("kicklive://live.ts") : url)) {
                 trace("mpv-play-ok");
                 useMpv = true;

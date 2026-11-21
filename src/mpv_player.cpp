@@ -6,6 +6,7 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <vector>
 #include <thread>
 #include <chrono>
 #include <pthread.h>
@@ -69,6 +70,22 @@ std::string g_err;
 double g_pos = 0, g_dur = 0;
 StreamIo g_io{};
 bool g_cb_registered = false;
+// Troca de midia: cada arquivo carregado tem um "playlist_entry_id". Eventos (fim/erro/eof) de um arquivo ANTIGO que chegam depois que o
+// novo comecou NAO podem valer para o novo (era isso que dava EOF/falha logo apos a 1a reproducao e deixava a imagem parada).
+std::atomic<int64_t> g_curEntry{-1};
+std::atomic<bool> g_startSeen{false};
+bool g_started = false;                                  // um arquivo foi aberto e a parada ainda nao foi confirmada (mpv "idle")
+int g_stallKicks = 0;                                    // tentativas de destravar o video nesta reproducao
+std::chrono::steady_clock::time_point g_lastFrameT = std::chrono::steady_clock::now();
+// quadro reduzido (render interno <= 1280 de largura) e mapa da ampliacao: zerados a cada troca de midia
+static std::vector<uint32_t> g_lo;
+static int g_loW = 0, g_loH = 0;
+static std::vector<int> g_xmap;
+static int g_xmapW = 0, g_xmapLw = 0;
+static void resetFrameState() {
+    g_lo.clear(); g_lo.shrink_to_fit(); g_loW = g_loH = 0;
+    g_xmap.clear(); g_xmapW = g_xmapLw = 0;
+}
 
 static void setErr(const char *s) {
     g_err = s ? s : "";
@@ -267,51 +284,92 @@ static std::atomic<long long> g_renderUs{0};
 static std::atomic<int> g_renderN{0};
 static bool g_everRendered = false;     // ja desenhou um quadro desde o ultimo play (so entao 'force' faz sentido)
 
+static void handleEvent(mpv_event *ev, bool *gotLoaded, bool *gotFail) {
+    switch (ev->event_id) {
+    case MPV_EVENT_SHUTDOWN:
+        g_open = false;
+        if (gotFail) *gotFail = true;
+        break;
+    case MPV_EVENT_START_FILE: {
+        auto *sf = (mpv_event_start_file *)ev->data;
+        g_curEntry = sf ? sf->playlist_entry_id : 0;
+        g_startSeen = true;                           // daqui em diante os eventos sao do arquivo NOVO
+        g_eof = false;
+        break;
+    }
+    case MPV_EVENT_FILE_LOADED:
+        if (!g_startSeen.load()) break;
+        if (gotLoaded) *gotLoaded = true;
+        g_failed = false;
+        g_err.clear();
+        break;
+    case MPV_EVENT_END_FILE: {
+        auto *e = (mpv_event_end_file *)ev->data;
+        if (!e) break;
+        // fim de um arquivo ANTIGO (parado/abortado na troca): ignora
+        if (!g_startSeen.load() || e->playlist_entry_id != g_curEntry.load()) break;
+        if (e->reason == MPV_END_FILE_REASON_EOF) g_eof = true;
+        else if (e->reason == MPV_END_FILE_REASON_ERROR) {
+            g_failed = true;
+            g_err = std::string("end-file: ") + mpv_error_string(e->error);
+            if (gotFail) *gotFail = true;
+        }
+        break;
+    }
+    case MPV_EVENT_PROPERTY_CHANGE: {
+        auto *prop = (mpv_event_property *)ev->data;
+        if (!prop || !prop->data || !g_startSeen.load()) break;
+        if (prop->format == MPV_FORMAT_DOUBLE) {
+            if (!std::strcmp(prop->name, "time-pos")) g_pos = *(double *)prop->data;
+            if (!std::strcmp(prop->name, "duration")) {
+                g_dur = *(double *)prop->data;
+                if (gotLoaded && g_dur > 0.5) *gotLoaded = true;
+            }
+        } else if (prop->format == MPV_FORMAT_INT64) {
+            if (!std::strcmp(prop->name, "cache-buffering-state"))
+                g_bufPct = (int)*(int64_t *)prop->data;
+        } else if (prop->format == MPV_FORMAT_FLAG) {
+            if (!std::strcmp(prop->name, "paused-for-cache"))
+                g_buffering = *(int *)prop->data != 0;
+            if (!std::strcmp(prop->name, "pause")) g_paused = *(int *)prop->data != 0;
+            if (!std::strcmp(prop->name, "eof-reached")) g_eof = *(int *)prop->data != 0;
+        }
+        break;
+    }
+    default:
+        break;
+    }
+}
+
 static void drainEventsUnlocked(bool *gotLoaded, bool *gotFail) {
     while (true) {
         mpv_event *ev = mpv_wait_event(g_mpv, 0);
         if (!ev || ev->event_id == MPV_EVENT_NONE) break;
-        switch (ev->event_id) {
-        case MPV_EVENT_SHUTDOWN:
-            g_open = false;
-            if (gotFail) *gotFail = true;
-            break;
-        case MPV_EVENT_FILE_LOADED:
-            if (gotLoaded) *gotLoaded = true;
-            g_failed = false;
-            g_err.clear();
-            break;
-        case MPV_EVENT_END_FILE: {
-            auto *e = (mpv_event_end_file *)ev->data;
-            if (!e) break;
-            if (e->reason == MPV_END_FILE_REASON_EOF) g_eof = true;
-            else if (e->reason == MPV_END_FILE_REASON_ERROR) {
-                g_failed = true;
-                g_err = std::string("end-file: ") + mpv_error_string(e->error);
-                if (gotFail) *gotFail = true;
-            }
-            break;
-        }
-        case MPV_EVENT_PROPERTY_CHANGE: {
-            auto *prop = (mpv_event_property *)ev->data;
-            if (!prop || !prop->data) break;
-            if (prop->format == MPV_FORMAT_DOUBLE) {
-                if (!std::strcmp(prop->name, "time-pos")) g_pos = *(double *)prop->data;
-                if (!std::strcmp(prop->name, "duration")) g_dur = *(double *)prop->data;
-            } else if (prop->format == MPV_FORMAT_INT64) {
-                if (!std::strcmp(prop->name, "cache-buffering-state"))
-                    g_bufPct = (int)*(int64_t *)prop->data;
-            } else if (prop->format == MPV_FORMAT_FLAG) {
-                if (!std::strcmp(prop->name, "paused-for-cache"))
-                    g_buffering = *(int *)prop->data != 0;
-                if (!std::strcmp(prop->name, "pause")) g_paused = *(int *)prop->data != 0;
-                if (!std::strcmp(prop->name, "eof-reached")) g_eof = *(int *)prop->data != 0;
-            }
-            break;
-        }
-        default:
-            break;
-        }
+        handleEvent(ev, gotLoaded, gotFail);
+    }
+}
+
+// Confirma que o arquivo anterior parou DE VERDADE (mpv "idle") antes de abrir o proximo, e entao recria o contexto de render:
+// o stop() e assincrono e o loadfile seguinte corria junto com ele (imagem parada, audio morto, EOF/pos=0 na 2a reproducao).
+// Chamar com g_mx. As leituras de rede do arquivo antigo ja foram canceladas pelo app (cancel_fn / abort), entao volta rapido.
+static void quiesceLocked() {
+    if (!g_mpv || !g_started) return;
+    const char *stopc[] = {"stop", nullptr};
+    mpv_command_async(g_mpv, 0, stopc);                   // repetir e inofensivo
+    bool idle = false;
+    for (int i = 0; i < 150 && !idle; i++) {              // ate ~3 s
+        mpv_event *ev = mpv_wait_event(g_mpv, 0.02);
+        while (ev && ev->event_id != MPV_EVENT_NONE) ev = mpv_wait_event(g_mpv, 0);   // eventos do arquivo antigo: descartados
+        int f = 0;
+        if (mpv_get_property(g_mpv, "idle-active", MPV_FORMAT_FLAG, &f) >= 0 && f) idle = true;
+    }
+    if (idle) {
+        destroyRender();                                  // video novo = contexto de render novo (nada de estado do video anterior)
+        ensureRender();
+        g_started = false;
+        tr("mpv-troca: arquivo anterior parado, render recriado");
+    } else {
+        tr("mpv-troca: o stop demorou mais de 3 s; segue com o render atual");
     }
 }
 
@@ -449,6 +507,7 @@ bool play(const std::string &url) {
             return false;
         }
 
+        quiesceLocked();                                   // 1) o que tocava parou de verdade, 2) render novo
         g_eof = false;
         g_failed = false;
         g_buffering = true;
@@ -457,6 +516,9 @@ bool play(const std::string &url) {
         g_dur = 0;
         g_err.clear();
         g_everRendered = false;
+        g_startSeen = false; g_curEntry = -1;              // eventos do arquivo antigo (fim/erro/eof) nao valem para este
+        g_stallKicks = 0; g_lastFrameT = std::chrono::steady_clock::now();
+        resetFrameState();
         applyAoUpgradeLocked();       // SDL ficou pronto depois do 1o boot: este video ja abre com som
         ensureRender();
 
@@ -469,45 +531,19 @@ bool play(const std::string &url) {
             g_open = false;
             return false;
         }
+        g_started = true;
     }
     // IMPORTANTE: nao segurar g_mx enquanto o demuxer le via stream_cb
 
     bool gotLoaded = false, gotFail = false;
     for (int i = 0; i < 400 && !gotLoaded && !gotFail; i++) {
-        {
-            std::lock_guard<std::mutex> lk(g_mx);
-            if (!g_mpv) return false;
-            drainEventsUnlocked(&gotLoaded, &gotFail);
-        }
-        if (gotLoaded || gotFail) break;
-        mpv_event *ev = nullptr;
-        {
-            std::lock_guard<std::mutex> lk(g_mx);
-            if (!g_mpv) return false;
-            ev = mpv_wait_event(g_mpv, 0.1);
-            if (ev && ev->event_id != MPV_EVENT_NONE) {
-                if (ev->event_id == MPV_EVENT_FILE_LOADED) {
-                    gotLoaded = true;
-                    g_failed = false;
-                    g_err.clear();
-                } else if (ev->event_id == MPV_EVENT_END_FILE) {
-                    auto *e = (mpv_event_end_file *)ev->data;
-                    if (e && e->reason == MPV_END_FILE_REASON_ERROR) {
-                        gotFail = true;
-                        g_failed = true;
-                        g_err = std::string("end-file: ") + mpv_error_string(e->error);
-                    }
-                } else if (ev->event_id == MPV_EVENT_PROPERTY_CHANGE) {
-                    auto *prop = (mpv_event_property *)ev->data;
-                    if (prop && prop->data && prop->format == MPV_FORMAT_DOUBLE) {
-                        if (!std::strcmp(prop->name, "duration") && *(double *)prop->data > 0.5) {
-                            gotLoaded = true;
-                            g_dur = *(double *)prop->data;
-                        }
-                        if (!std::strcmp(prop->name, "time-pos")) g_pos = *(double *)prop->data;
-                    }
-                }
-            }
+        std::lock_guard<std::mutex> lk(g_mx);
+        if (!g_mpv) return false;
+        mpv_event *ev = mpv_wait_event(g_mpv, 0.1);
+        while (ev && ev->event_id != MPV_EVENT_NONE) {
+            handleEvent(ev, &gotLoaded, &gotFail);
+            if (gotLoaded || gotFail) break;
+            ev = mpv_wait_event(g_mpv, 0);
         }
     }
 
@@ -591,9 +627,11 @@ void shutdown() {
     mpv_terminate_destroy(g_mpv);
     g_mpv = nullptr;
     g_cb_registered = false;
+    g_started = false; g_startSeen = false; g_curEntry = -1;
     g_open = false;
     g_paused = false;
     g_eof = false;
+    resetFrameState();
 }
 
 void poll() {
@@ -601,6 +639,16 @@ void poll() {
     if (!g_mpv) return;
     drainEventsUnlocked(nullptr, nullptr);
     if (g_aoUpgrade.load()) applyAoUpgradeLocked();
+    // imagem parada: tocando (nao pausado, sem esperar rede) mas nenhum quadro novo ha 6 s -> reinicia o audio (o relogio de video
+    // segue o audio; com o dispositivo de audio morto o video congela em pos=0) e, se nao adiantar, empurra 0,2 s.
+    if (g_open && !g_paused && !g_buffering && g_stallKicks < 3) {
+        const auto nw = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::seconds>(nw - g_lastFrameT).count() >= 6) {
+            g_stallKicks++; g_lastFrameT = nw;
+            if (g_stallKicks == 1) { const char *c[] = {"ao-reload", nullptr}; mpv_command_async(g_mpv, 0, c); tr("mpv-travado: ao-reload"); }
+            else { const char *c[] = {"seek", "0.2", "relative", nullptr}; mpv_command_async(g_mpv, 0, c); tr("mpv-travado: seek 0.2"); }
+        }
+    }
     // a cada ~5 s grava fps real e quadros descartados em /data/kickiptv.log (para ver se o decodificador da conta)
     static auto last = std::chrono::steady_clock::now();
     auto now = std::chrono::steady_clock::now();
@@ -618,11 +666,6 @@ void poll() {
 
 // Render interno em no maximo 1280 de largura (a CPU Jaguar do PS4 gasta ~48 ms por quadro convertendo/escalando 1080p) e
 // ampliacao barata por vizinho mais proximo para o buffer da tela. Quadros repetidos ('force') reaproveitam o ultimo quadro pronto.
-static std::vector<uint32_t> g_lo;
-static int g_loW = 0, g_loH = 0;
-static std::vector<int> g_xmap;
-static int g_xmapW = 0, g_xmapLw = 0;
-
 static void upscaleLo(uint8_t *dst, int w, int h, int stride) {
     if (g_loW == w && g_loH == h) {
         for (int y = 0; y < h; y++) memcpy(dst + (size_t)y * stride, &g_lo[(size_t)y * g_loW], (size_t)w * 4);
@@ -680,6 +723,7 @@ bool renderToBgra(uint8_t *dst, int width, int height, int strideBytes, bool for
     }
     if (r >= 0) {
         g_everRendered = true;
+        g_lastFrameT = std::chrono::steady_clock::now();
         g_renderUs += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
         g_renderN++;
         if (scaled) upscaleLo(dst, width, height, strideBytes);
