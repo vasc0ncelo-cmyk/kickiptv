@@ -951,31 +951,58 @@ static void upscaleLo(uint8_t *dst, int w, int h, int stride) {
     }
     const auto t0 = std::chrono::steady_clock::now();
     // A linha ampliada e montada numa linha de RAM e so ENTAO copiada para dst: nunca ler de dst (memoria de video nao-cacheada: ~120 ms por quadro).
-    static std::vector<uint32_t> row;
+    static std::vector<uint32_t> row, rowA, rowB;
     if (row.size() < (size_t)w) row.resize((size_t)w);
     const bool smooth = g_smoothOn && g_loW >= 2;
     int prevSy = -1;
+    int ia = -1, ib = -1;                                       // linhas de origem ja ampliadas na horizontal (A = linha de cima, B = de baixo)
     double buildUs = 0;                                         // so o tempo de MONTAR as linhas (a copia para a memoria de video e lenta e nao conta)
+    // Ampliacao horizontal linear de UMA linha de origem para r[0..w)
+    auto hrow = [&](int sy, uint32_t *r) {
+        const uint32_t *src = &g_lo[(size_t)sy * g_loW];
+        const int *xi = g_xi.data(); const uint32_t *xw = g_xw.data();
+        for (int x = 0; x < w; x++) {
+            const uint32_t a = src[xi[x]], b = src[xi[x] + 1], f = xw[x];
+            const uint32_t rb = (((a & 0x00FF00FFu) * (256 - f) + (b & 0x00FF00FFu) * f) >> 8) & 0x00FF00FFu;
+            const uint32_t g = (((a & 0x0000FF00u) * (256 - f) + (b & 0x0000FF00u) * f) >> 8) & 0x0000FF00u;
+            r[x] = rb | g | (a & 0xFF000000u);
+        }
+    };
+    if (smooth) { if (rowA.size() < (size_t)w) rowA.resize((size_t)w); if (rowB.size() < (size_t)w) rowB.resize((size_t)w); }
     for (int y = 0; y < h; y++) {
-        int sy = (int)((long long)y * g_loH / h);
-        if (sy != prevSy) {
-            const auto rt0 = smooth ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
-            const uint32_t *src = &g_lo[(size_t)sy * g_loW];
+        if (smooth) {
+            // Bilinear nos DOIS eixos (antes: so horizontal; na vertical repetia a linha = aspecto "pixelizado" nas lives ampliadas)
+            const auto rt0 = std::chrono::steady_clock::now();
+            double sy = (y + 0.5) * (double)g_loH / h - 0.5;
+            if (sy < 0) sy = 0;
+            int y0 = (int)sy; if (y0 > g_loH - 2) y0 = g_loH - 2; if (y0 < 0) y0 = 0;
+            const int y1 = (y0 + 1 < g_loH) ? y0 + 1 : y0;
+            double fyd = sy - y0; if (fyd > 1) fyd = 1;
+            const uint32_t fy = (uint32_t)(fyd * 256.0);
+            if (ia != y0) { if (ib == y0) { rowA.swap(rowB); ia = ib; ib = -1; } else { hrow(y0, rowA.data()); ia = y0; } }
+            if (ib != y1) { hrow(y1, rowB.data()); ib = y1; }
             uint32_t *r = row.data();
-            if (smooth) {
-                const int *xi = g_xi.data(); const uint32_t *xw = g_xw.data();
+            if (fy == 0 || y1 == y0) {
+                memcpy(r, rowA.data(), (size_t)w * 4);
+            } else {
+                const uint32_t *ra = rowA.data(), *rb2 = rowB.data();
                 for (int x = 0; x < w; x++) {
-                    const uint32_t a = src[xi[x]], b = src[xi[x] + 1], f = xw[x];
-                    const uint32_t rb = (((a & 0x00FF00FFu) * (256 - f) + (b & 0x00FF00FFu) * f) >> 8) & 0x00FF00FFu;
-                    const uint32_t g = (((a & 0x0000FF00u) * (256 - f) + (b & 0x0000FF00u) * f) >> 8) & 0x0000FF00u;
+                    const uint32_t a = ra[x], b = rb2[x];
+                    const uint32_t rb = (((a & 0x00FF00FFu) * (256 - fy) + (b & 0x00FF00FFu) * fy) >> 8) & 0x00FF00FFu;
+                    const uint32_t g = (((a & 0x0000FF00u) * (256 - fy) + (b & 0x0000FF00u) * fy) >> 8) & 0x0000FF00u;
                     r[x] = rb | g | (a & 0xFF000000u);
                 }
-            } else {
+            }
+            buildUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - rt0).count();
+        } else {
+            int sy = (int)((long long)y * g_loH / h);
+            if (sy != prevSy) {
+                const uint32_t *src = &g_lo[(size_t)sy * g_loW];
+                uint32_t *r = row.data();
                 const int *xm = g_xmap.data();
                 for (int x = 0; x < w; x++) r[x] = src[xm[x]];
+                prevSy = sy;
             }
-            prevSy = sy;
-            if (smooth) buildUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - rt0).count();
         }
         memcpy(dst + (size_t)y * stride, row.data(), (size_t)w * 4);
     }
@@ -983,7 +1010,7 @@ static void upscaleLo(uint8_t *dst, int w, int h, int stride) {
     if (smooth) {
         g_smoothMs += buildUs / 1000.0;
         if (++g_smoothN >= 30) {
-            if (g_smoothMs / g_smoothN > 14.0) {
+            if (g_smoothMs / g_smoothN > 24.0) {   // (bilinear nos 2 eixos custa mais que o antigo: limite subiu de 14 para 24 ms)
                 if (++g_smoothSlowWin >= 3) { g_smoothOn = false; char tb[110]; snprintf(tb, sizeof tb, "mpv-ampliacao: suave lenta (%.1f ms) 3x seguidas, rapida so neste video", g_smoothMs / g_smoothN); tr(tb); }
             } else g_smoothSlowWin = 0;
             g_smoothMs = 0; g_smoothN = 0;
@@ -1062,7 +1089,7 @@ bool renderToBgra(uint8_t *dst, int width, int height, int strideBytes, bool for
                 if (avg > 32.0) {
                     const int cur = g_capW.load();
                     const int nxt = cur > 1024 ? 1024 : (cur > 854 ? 854 : 720);
-                    g_capW = nxt; g_smoothOn = false;                // e vizinho mais proximo: poupa os ~15 ms da ampliacao suave
+                    g_capW = nxt;                                       // a ampliacao suave continua ligada (ela se desliga sozinha se passar de 24 ms)
                     char tb[140]; snprintf(tb, sizeof tb, "[kick-perf] render %.0f ms/quadro: largura interna %d -> %d", avg, cur, nxt);
                     logBoth(tb);
                 }
