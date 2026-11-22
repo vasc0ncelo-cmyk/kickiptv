@@ -317,6 +317,7 @@ static std::chrono::steady_clock::time_point g_hwT0 = std::chrono::steady_clock:
 // Em HD (>720p) o canal e renderizado na resolucao cheia, sem reduzir para 1280 e ampliar de volta (isso deixava o canal mole), e o
 // decoder roda sem os atalhos de velocidade (vd-lavc-fast / skiploopfilter), que aumentam os "blocos" em canais de bitrate baixo.
 // Se a CPU nao der conta (media > 45 ms por quadro), volta sozinho ao teto de 1280 e avisa no log.
+static bool g_fullOk = false;       // live (IPTV ou Kick): pode renderizar >720p na resolucao cheia, com queda automatica se a CPU nao aguentar
 static bool g_hq = false;            // este play e um canal IPTV ao vivo
 static bool g_hqFull = true;         // ainda pode renderizar na resolucao cheia
 static int g_srcH = 0;               // altura do video de origem (0 = ainda nao sei)
@@ -585,10 +586,10 @@ bool boot() {
     // Colchao maior na frente, pouco para tras (memoria do PS4 e curta).
     // Pausa so quando o cache zera de verdade e retoma com folga (menos engasgo curto).
     mpv_set_option_string(g_mpv, "cache", "yes");
-    mpv_set_option_string(g_mpv, "demuxer-max-bytes", "64MiB");
-    mpv_set_option_string(g_mpv, "demuxer-max-back-bytes", "8MiB");
+    mpv_set_option_string(g_mpv, "demuxer-max-bytes", "48MiB");
+    mpv_set_option_string(g_mpv, "demuxer-max-back-bytes", "6MiB");
     mpv_set_option_string(g_mpv, "demuxer-readahead-secs", "45");
-    mpv_set_option_string(g_mpv, "cache-secs", "90");
+    mpv_set_option_string(g_mpv, "cache-secs", "45");
     mpv_set_option_string(g_mpv, "stream-buffer-size", "2MiB");
     mpv_set_option_string(g_mpv, "cache-pause", "yes");
     mpv_set_option_string(g_mpv, "cache-pause-initial", "no");
@@ -694,17 +695,17 @@ bool play(const std::string &url, bool live, long long startSec) {
         // (2) hwdec fica "no": o videodec2 e um decoder proprio do ffmpeg (como h264_cuvid), nao um hwaccel do mpv. Por isso o mpv
         //     escreve "No hardware decoding requested / Using software decoding" MESMO com ele ativo. Vale "Selected codec:" e [kick-hw].
         // (3) vd e threads sao reaplicados A CADA play (live: videodec2 + 1 thread; o resto: padrao) -> nada vaza para filme/serie.
-        // Filosofia GMCA: TUDO em libmpv por software (live, kicklive:// e VOD). O h264_videodec2 e o hwModulesOk() ficam FORA do fluxo normal
-        // (kUseHwDecoder=false em tempo de compilacao); o codigo do hardware continua no arquivo so como opt-in de diagnostico.
-        constexpr bool kUseHwDecoder = false;
+        // Filosofia GMCA: TUDO em libmpv por software (live, kicklive:// e VOD). O h264_videodec2 SO entra se existir /data/kickiptv_force_hw e
+        // NAO existir /data/kickiptv_nohwdec. Sem o arquivo, o hwModulesOk() nem roda (curto-circuito do &&).
+        const bool hwOff = fileThere(kHwOffFile);
+        const bool forceHw = fileThere("/data/kickiptv_force_hw") && !hwOff;
         std::string hwWhyNot;
-        g_hwSkipOnce = false;
-        const bool hwOff = true, skipOnce = false;
-        const bool hw = kUseHwDecoder && !kickLive && !g_hwBad && !hwOff && !skipOnce && hwModulesOk(hwWhyNot);
-        guardClear();                                                          // nunca deixa marcador de hardware em disco
+        const bool skipOnce = g_hwSkipOnce.exchange(false);
+        const bool hw = forceHw && !kickLive && !g_hwBad && !skipOnce && hwModulesOk(hwWhyNot);
+        if (hw) guardSet(); else guardClear();                                 // marcador em disco: se o app cair com hardware forcado, o proximo start volta ao software
         mpv_set_property_string(g_mpv, "hwdec", "no");
         const int vdRc = mpv_set_property_string(g_mpv, "vd", hw ? "h264_videodec2" : "");
-        mpv_set_property_string(g_mpv, "vd-lavc-threads", kickLive ? "4" : "6");   // software: 6 geral, 4 na Kick
+        mpv_set_property_string(g_mpv, "vd-lavc-threads", hw ? "1" : (kickLive ? "4" : "6"));   // software: 6 geral, 4 na Kick
         {
             char b[240];
             snprintf(b, sizeof b, "[kick-hw] play: live=%d pedido=%s set-rc=%d vd(lido)=%s%s%s", live ? 1 : 0, hw ? "h264_videodec2" : "software",
@@ -712,22 +713,26 @@ bool play(const std::string &url, bool live, long long startSec) {
             logBoth(b);
         }
         // ---- Qualidade: so canal IPTV ao vivo (live e nao e Kick). Reaplicado A CADA play: Kick/filme/serie voltam ao modo rapido. ----
-        g_hq = live && !kickLive;
+        g_hq = live;                                    // IPTV E Kick ao vivo: filtro anti-blocos ligado (antes a Kick ia no modo rapido = imagem quadriculada)
+        g_fullOk = live;
         g_hqFull = true; g_srcH = 0; g_srcTries = 0; g_hqMs = 0; g_hqN = 0;
         mpv_set_property_string(g_mpv, "vd-lavc-fast", g_hq ? "no" : "yes");
         mpv_set_property_string(g_mpv, "vd-lavc-skiploopfilter", g_hq ? "default" : "nonref");
         {
-            char b[160]; snprintf(b, sizeof b, "[kick-hq] play: %s (vd-lavc-fast=%s skiploopfilter=%s)", g_hq ? "canal IPTV: qualidade ligada" : "modo rapido",
+            char b[160]; snprintf(b, sizeof b, "[kick-hq] play: %s (vd-lavc-fast=%s skiploopfilter=%s)", g_hq ? "live: qualidade ligada" : "modo rapido",
                                   g_hq ? "no" : "yes", g_hq ? "default" : "nonref");
             logBoth(b);
         }
         g_hwWanted = hw; g_hwChecked = false; g_hwT0 = std::chrono::steady_clock::now();
-        std::string liveOpts = std::string("force-seekable=no,demuxer-max-bytes=24MiB,demuxer-max-back-bytes=1MiB,demuxer-readahead-secs=15,vd-lavc-threads=") + "4";
+        std::string liveOpts = std::string("force-seekable=no,demuxer-max-bytes=20MiB,demuxer-max-back-bytes=1MiB,demuxer-readahead-secs=12,vd-lavc-threads=") + (hw ? "1" : "4");
         // Opcoes SO deste arquivo (somem quando ele termina): live Kick = cache pequeno; filme/serie com ponto salvo = "start".
         std::string fileOpts = kickLive ? liveOpts : std::string();
         // Canal ao vivo do IPTV: cache pequeno (como a Kick). Filme/serie e canal usavam o cache grande do boot e enchiam a memoria aos poucos.
         if (live && !kickLive) fileOpts = "demuxer-max-bytes=32MiB,demuxer-max-back-bytes=1MiB,demuxer-readahead-secs=20";
-        if (!live && startSec > 0) fileOpts = "start=" + std::to_string(startSec);
+        if (!live) {                                                // filme/serie: teto seguro de memoria (+ ponto salvo, se houver)
+            fileOpts = "demuxer-max-bytes=48MiB,demuxer-max-back-bytes=6MiB,cache-secs=45";
+            if (startSec > 0) fileOpts += ",start=" + std::to_string(startSec);
+        }
         seekAfter = 0;
         const char *cmd[] = {"loadfile", wrap.c_str(), "replace", fileOpts.empty() ? nullptr : fileOpts.c_str(), nullptr};   // mpv 0.36: sem o indice "0"
         int lrc = mpv_command(g_mpv, cmd);
@@ -839,6 +844,7 @@ void stop() {
     g_paused = false;
     g_buffering = false;
     g_everRendered = false;
+    resetFrameState();                             // solta a copia em RAM do render (g_lo/g_xmap) ao parar: nada fica preso entre midias
 }
 
 void shutdown() {
@@ -992,7 +998,7 @@ bool renderToBgra(uint8_t *dst, int width, int height, int strideBytes, bool for
     uint64_t flags = mpv_render_context_update(g_rr);
     const bool newFrame = (flags & MPV_RENDER_UPDATE_FRAME) != 0;
     if (!newFrame && !(force && g_everRendered)) return false;
-    if (g_hq && g_srcH == 0 && g_srcTries < 40) {               // altura do video de origem (so as primeiras tentativas; chamada barata)
+    if (g_fullOk && g_srcH == 0 && g_srcTries < 40) {               // altura do video de origem (so as primeiras tentativas; chamada barata)
         g_srcTries++;
         int64_t sh = 0;
         if (mpv_get_property(g_mpv, "video-params/h", MPV_FORMAT_INT64, &sh) >= 0 && sh > 0) {
@@ -1001,7 +1007,7 @@ bool renderToBgra(uint8_t *dst, int width, int height, int strideBytes, bool for
             logBoth(tb);
         }
     }
-    const bool hqFull = g_hq && g_hqFull && g_srcH > 720;       // canal HD: sem reduzir e ampliar
+    const bool hqFull = g_fullOk && g_hqFull && g_srcH > 720;       // canal HD: sem reduzir e ampliar
     const int cap = hqFull ? width : g_capW.load();
     int lw = width, lh = height;
     if (width > cap) { lw = cap; lh = (int)((long long)height * lw / width); if (lh < 2) lh = 2; }
