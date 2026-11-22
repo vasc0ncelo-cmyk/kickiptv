@@ -17,7 +17,7 @@ if (NOT DEFINED KICK_TITLE_ID)
     set(KICK_TITLE_ID "KICK00002")
 endif ()
 if (NOT DEFINED KICK_NAME)
-    set(KICK_NAME "Kick IPTV mpv")
+    set(KICK_NAME "Kick")
 endif ()
 set(PSN_TITLE_ID "${KICK_TITLE_ID}")   # id diferente do app antigo (KICK00001): os dois podem ficar instalados
 set(APP_VERSION "01.00")
