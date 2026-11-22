@@ -1071,7 +1071,7 @@ bool renderToBgra(uint8_t *dst, int width, int height, int strideBytes, bool for
         g_renderN++;
         if (hqFull) {                                            // CPU nao da conta da resolucao cheia: volta ao teto de 1280
             g_hqMs += us / 1000.0;
-            if (++g_hqN >= 60) {
+            if (++g_hqN >= 20) {   // 20 quadros (antes 60): sai da resolucao cheia rapido se a CPU nao der conta
                 const double avg = g_hqMs / g_hqN;
                 if (avg > 45.0) {
                     g_hqFull = false;

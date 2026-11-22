@@ -1586,11 +1586,13 @@ struct AudioPump {
 // Qualidade da live (Kick): 0 Fluido = ate 30 fps (no 60 fps da Kick isso cai em 480p) | 1 Equilibrado (padrao) = 720p com o video em 60 fps
 // baixado, mas a TELA desenha 1 quadro a cada 2 (custo de CPU de 30 fps, imagem 720p); apos um congelamento volta sozinho para o Fluido |
 // 2 Maxima = 720p60 desenhando tudo | 3 Ultra = 1080p60.
-static std::atomic<int> g_quality{2};   // padrao: Maxima 720p60 (antes 1 = Equilibrado, que desenhava 1 quadro a cada 2)
+static std::atomic<int> g_quality{3};   // padrao: Ultra 1080p60. Cai sozinho para 480p/360p se a live congelar (livebuf::capHeight)
 static const int kQualityCount = 4;
 static const char *kQualityName[kQualityCount] = {"Fluido 30fps", "Equilibrado 720p", "Maxima 720p60", "Ultra 1080p60"};
 
 // Reconexao automatica: se a live congelar ou a rede/pipeline quebrar, o app reabre a transmissao sozinho (ver Player::wantReconnect).
+static std::vector<uint32_t> g_reconnectBg;  // ultimo quadro da live (copia do rascunho): fica de fundo com o spinner enquanto reconecta
+static uint32_t *g_shadowPtr = nullptr;      // rascunho de tela (preenchido no main)
 static std::string g_reconnectNote;          // motivo da ultima reconexao (mostrado na tela "Conectando...")
 static int g_autoRestarts = 0;               // quantas reconexoes automaticas ja houve (HUD)
 static double g_stallT[8] = {};              // instantes (relogio monotonico) dos ultimos congelamentos: a proxima abertura fica mais conservadora (livebuf.hpp)
@@ -3784,6 +3786,24 @@ struct Player {
 
     void renderWaiting(FbRenderer &r) {
         using namespace theme;
+        if (!failed && quietWait && !g_reconnectBg.empty() && g_reconnectBg.size() == (size_t)r.W * r.H) {
+            // Reconexao da live: mantem o ultimo quadro na tela e desenha so um spinner "carregando" no centro (nada de tela de abertura)
+            memcpy(r.fb, g_reconnectBg.data(), (size_t)r.W * r.H * 4);
+            const int cx = r.W / 2, cy = r.H / 2;
+            r.roundRect(cx - 170, cy - 110, 340, 220, 28, 0xB0000000);
+            static const float kc[12] = {1.f, .8660254f, .5f, 0.f, -.5f, -.8660254f, -1.f, -.8660254f, -.5f, 0.f, .5f, .8660254f};
+            static const float ks[12] = {0.f, .5f, .8660254f, 1.f, .8660254f, .5f, 0.f, -.5f, -.8660254f, -1.f, -.8660254f, -.5f};
+            const double tt = nowSec();
+            for (int i = 0; i < 12; i++) {
+                float xx = (float)tt * 1.3f - i / 12.0f + 4.0f;
+                float ph = xx - (float)(int)xx;
+                int al = 40 + (int)(215 * (1.0f - ph));
+                int px = cx + (int)(40 * kc[i]), py = cy - 20 + (int)(40 * ks[i]);
+                r.roundRect(px - 7, py - 7, 14, 14, 7, ((unsigned)al << 24) | 0x0053FC18);
+            }
+            uiCenter(r, cx, cy + 70, !waitLabel.empty() ? waitLabel.c_str() : "Reconectando...", TEXT, 24);
+            return;
+        }
         uiBackground(r);
         // cabecalho: spinner (ou alerta) + titulo
         const int scx = 96, scy = 112;
@@ -4135,8 +4155,11 @@ int main() {
     auto safeRestartLive = [&](const std::string &why) {
         if (player.url.empty() && player.kickSlug.empty()) return;
         trace((std::string("safe-restart:") + why).c_str());
+        if (!player.kickSlug.empty() && g_shadowPtr && player.mpvGot) {       // live da Kick: guarda o ultimo quadro para o spinner ficar POR CIMA dele
+            try { g_reconnectBg.assign(g_shadowPtr, g_shadowPtr + (size_t)W * H); } catch (...) { g_reconnectBg.clear(); }
+        } else g_reconnectBg.clear();
         player.quietWait = true;
-        player.waitLabel = "Reconectando...";
+        player.waitLabel = (why == "opts-quality" || why == "options-quality") ? "Trocando qualidade..." : "Reconectando...";
         player.showOpts = false;
         player.showInfo = false;
         player.scrubMode = false;
@@ -4187,6 +4210,7 @@ int main() {
         for (size_t i = 0; i < (size_t)W * H; i++) shadow[i] = 0xFF000000u;
     }
     trace("rascunho-ok");
+    g_shadowPtr = shadow;
     boot.line(shadow == shadowFallback.data() ? "[3] rascunho de tela: heap" : "[3] rascunho de tela: memoria direta");
     // Menu com redesenho parcial (damage.hpp): so pinta e copia para a tela o que mudou; tela parada = nada a fazer.
     MenuPainter menuPainter;
@@ -5277,6 +5301,7 @@ int main() {
             trace("player-start");
             player.start(url, title);
             player.quietWait = false; player.waitLabel.clear();   // so vale para esta abertura
+            g_reconnectBg.clear(); g_reconnectBg.shrink_to_fit();
             if (player.cancelled) { player.cancelled = false; mode = Mode::Menu; dirty = true; trace("player-cancelado"); continue; }
             trace(player.failed ? "player-falhou" : "player-aberto");
             if (player.failed) {
