@@ -4643,11 +4643,25 @@ int main() {
                 mode = Mode::Menu; dirty = true; sceKernelUsleep(16000); continue;
             }
             // videodec2 abriu mas nao entregou video: o mpv_player ja bloqueou o hardware; reabre o canal/live (volta em software).
-            if (!player.isVod && mpv_player::hwFallbackRequested()) {
+            if (mpv_player::hwFallbackRequested()) {
                 trace("mpv-hwdec: sem video no hardware -> reabrindo em software");
                 app.say("Decodificador de hardware falhou — reabrindo em software");
                 g_reconnectNote = "decodificador de hardware sem video";
+                // filme/serie: guarda o contexto (lista de episodios, historico e ponto inicial) para o restart nao perder nada
+                const bool vod = player.isVod;
+                const std::vector<std::string> keepEpU = player.epUrls, keepEpT = player.epTitles;
+                const int keepEpI = player.epIndex; const long long keepStart = player.startAtSec;
+                const std::string keepId = player.progId; const kick::ProgressMeta keepMeta = player.progMeta;
                 safeRestartLive("hardware sem video");
+                if (vod) {
+                    pf.pendingEpUrls = keepEpU; pf.pendingEpTitles = keepEpT; pf.pendingEpIndex = keepEpI; pf.pendingStartSec = keepStart;
+                    if (!keepId.empty()) {
+                        WatchRec &w = pf.pendingWatch;
+                        w = WatchRec(); w.id = keepId; w.title = keepMeta.title; w.series = keepMeta.series; w.logo = keepMeta.logo;
+                        w.season = keepMeta.season; w.episode = keepMeta.episode; w.isEpisode = keepMeta.isEpisode;
+                        pf.hasPendingWatch = true;
+                    }
+                }
                 sceKernelUsleep(50000);
                 continue;
             }

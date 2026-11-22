@@ -345,30 +345,29 @@ static bool hwModulesOk(std::string &why) {
     static const char *kMods[] = {"/system/common/lib/libSceVdecCore.sprx", "/system/common/lib/libSceVdecSavc.sprx",
                                   "/system/common/lib/libSceVdecSavc2.sprx", "/system/common/lib/libSceVdecwrap.sprx",
                                   "/system/common/lib/libSceVideodec2.sprx"};
-    bool ok = true;
+    bool ok = true, viaName = false;
     char b[220];
     for (const char *p : kMods) {
         int res = 0;
         int rc = mpvhw_LoadStartModule(p, 0, nullptr, 0, nullptr, &res);
         snprintf(b, sizeof b, "[kick-hw] preflight: %s rc=0x%08x res=%d", p, (unsigned)rc, res);
         logBoth(b);
-        if (rc < 0) {                             // 2a chance: pelo nome (pode ja estar carregado) e depois repete o caminho completo
+        bool loaded = rc >= 0;
+        if (!loaded) {                            // o caminho completo da ENOENT (sandbox): tenta pelo NOME, que o sistema resolve
             const char *base = strrchr(p, '/'); base = base ? base + 1 : p;
             const int rc2 = mpvhw_LoadStartModule(base, 0, nullptr, 0, nullptr, &res);
             snprintf(b, sizeof b, "[kick-hw] preflight: %s (pelo nome) rc=0x%08x", base, (unsigned)rc2);
             logBoth(b);
-            if (rc2 >= 0) {
-                rc = mpvhw_LoadStartModule(p, 0, nullptr, 0, nullptr, &res);
-                snprintf(b, sizeof b, "[kick-hw] preflight: %s (de novo) rc=0x%08x", p, (unsigned)rc);
-                logBoth(b);
-            }
+            if (rc2 >= 0) { loaded = true; viaName = true; }      // ficou carregado no processo: o decoder do ffmpeg acha as funcoes
         }
-        if (rc < 0) { ok = false; if (s_why.empty()) s_why = std::string("nao carregou ") + p; }
+        if (!loaded) { ok = false; if (s_why.empty()) s_why = std::string("nao carregou ") + p; }
     }
     s_state = ok ? 1 : 0;
     why = s_why;
-    logBoth(ok ? "[kick-hw] preflight OK: modulos do videodec2 carregam"
-               : "[kick-hw] preflight FALHOU: lives ficam em SOFTWARE (com estes modulos ausentes o ffmpeg derruba o app)");
+    logBoth(!ok ? "[kick-hw] preflight FALHOU: video em SOFTWARE (com estes modulos ausentes o ffmpeg derruba o app)"
+                : viaName ? "[kick-hw] preflight: modulos carregados PELO NOME (o ffmpeg ainda vai logar ENOENT no caminho completo). EXPERIMENTO: "
+                            "se o app fechar, o proximo start volta em software sozinho (/data/kickiptv_nohwdec)"
+                          : "[kick-hw] preflight OK: modulos do videodec2 carregam");
     return ok;
 }
 
@@ -660,7 +659,7 @@ bool play(const std::string &url, bool live, long long startSec) {
         // (3) vd e threads sao reaplicados A CADA play (live: videodec2 + 1 thread; o resto: padrao) -> nada vaza para filme/serie.
         const bool hwOff = fileThere(kHwOffFile);                              // chave de seguranca: arquivo vazio = tudo em software
         std::string hwWhyNot;
-        const bool hw = live && !g_hwBad && !hwOff && hwModulesOk(hwWhyNot);   // so lives chegam a tocar nos modulos do sistema
+        const bool hw = !kickLive && !g_hwBad && !hwOff && hwModulesOk(hwWhyNot);   // TUDO menos a live da Kick (que fica em software por enquanto)
         if (hw) guardSet(); else guardClear();                                 // marcador em disco: se o app cair daqui ate o 1o quadro, o proximo start vai em software
         mpv_set_property_string(g_mpv, "hwdec", "no");
         const int vdRc = mpv_set_property_string(g_mpv, "vd", hw ? "h264_videodec2" : "");
@@ -668,7 +667,7 @@ bool play(const std::string &url, bool live, long long startSec) {
         {
             char b[240];
             snprintf(b, sizeof b, "[kick-hw] play: live=%d pedido=%s set-rc=%d vd(lido)=%s%s%s", live ? 1 : 0, hw ? "h264_videodec2" : "software",
-                     vdRc, propStr("options/vd").c_str(), g_hwBad ? " [bloqueado: falhou antes]" : "", hwOff ? " [/data/kickiptv_nohwdec]" : (!hwWhyNot.empty() && live ? (" [" + hwWhyNot + "]").c_str() : ""));
+                     vdRc, propStr("options/vd").c_str(), g_hwBad ? " [bloqueado: falhou antes]" : "", hwOff ? " [/data/kickiptv_nohwdec]" : (!hwWhyNot.empty() && !kickLive ? (" [" + hwWhyNot + "]").c_str() : ""));
             logBoth(b);
         }
         // ---- Qualidade: so canal IPTV ao vivo (live e nao e Kick). Reaplicado A CADA play: Kick/filme/serie voltam ao modo rapido. ----
@@ -828,15 +827,17 @@ void poll() {
             g_hwChecked = true;
             guardClear();                                  // chegou video: o decoder nao derrubou o app
             const std::string dec = logDecoderLocked("1o-quadro");
-            if (g_hwWanted && dec.find("videodec2") == std::string::npos)
+            if (g_hwWanted && dec.find("videodec2") == std::string::npos && propStr("video-format") != "h264")
+                logBoth("[kick-hw] fonte nao e H.264 (so o H.264 tem decoder de hardware): software normal");
+            else if (g_hwWanted && dec.find("videodec2") == std::string::npos)
                 logBoth("[kick-hw] ATENCAO: pediu hardware mas o decoder real e software. Veja no mpv.log: 'Codec list:' (videodec2 deve ser o 1o), "
                         "'Opening decoder' e as linhas de erro logo depois (Could not open codec / Failed to open / profile nao suportado).");
         } else if (g_hwWanted &&
-                   std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - g_hwT0).count() > 12000) {
+                   std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - g_hwT0).count() > 20000) {
             g_hwChecked = true; g_hwBad = true; g_hwFallbackAsk = true;
             guardClear();
-            logDecoderLocked("sem-quadro-12s");
-            logBoth("[kick-hw] videodec2 ativo mas sem video em 12 s: hardware desligado ate fechar o app, reabrindo em software");
+            logDecoderLocked("sem-quadro-20s");
+            logBoth("[kick-hw] videodec2 ativo mas sem video em 20 s: hardware desligado ate fechar o app, reabrindo em software");
         }
     }
     // imagem parada: tocando (nao pausado, sem esperar rede) mas nenhum quadro novo ha 2 s. O video segue o RELOGIO DO AUDIO ("video-sync=audio");
