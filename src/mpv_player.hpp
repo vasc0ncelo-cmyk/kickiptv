@@ -36,8 +36,8 @@ bool available();
 // quando o 1o video abrir o resultado ja esta pronto e o play() nao espera. Pode chamar varias vezes.
 void prewarm();
 bool boot();
-// live=true: live da Kick ou canal ao vivo do IPTV -> tenta o decodificador de HARDWARE (h264_videodec2).
-// live=false (filme/serie/VOD): sempre software. O pedido e refeito a cada play, nada vaza de um video para o outro.
+// Sempre libmpv em SOFTWARE (hwdec=no, vd=""): live/kicklive:// = 4 threads, filme/serie/canal = 6. Sem h264_videodec2 no fluxo normal.
+// live=true: canal ao vivo / live da Kick (cache pequeno). O pedido e refeito a cada play, nada vaza de um video para o outro.
 // startSec > 0 (so filme/serie): comeca nesse ponto (opcao "start" do arquivo; se o mpv recusar, faz seek logo depois de abrir).
 bool play(const std::string &url, bool live = false, long long startSec = 0);
 // true UMA vez quando o videodec2 abriu mas nao entregou video: o app deve reabrir o canal (ja volta em software, ate fechar o app).

@@ -694,18 +694,17 @@ bool play(const std::string &url, bool live, long long startSec) {
         // (2) hwdec fica "no": o videodec2 e um decoder proprio do ffmpeg (como h264_cuvid), nao um hwaccel do mpv. Por isso o mpv
         //     escreve "No hardware decoding requested / Using software decoding" MESMO com ele ativo. Vale "Selected codec:" e [kick-hw].
         // (3) vd e threads sao reaplicados A CADA play (live: videodec2 + 1 thread; o resto: padrao) -> nada vaza para filme/serie.
-        const bool hwOff = fileThere(kHwOffFile);                              // chave de seguranca: arquivo vazio = tudo em software
+        // Filosofia GMCA: TUDO em libmpv por software (live, kicklive:// e VOD). O h264_videodec2 e o hwModulesOk() ficam FORA do fluxo normal
+        // (kUseHwDecoder=false em tempo de compilacao); o codigo do hardware continua no arquivo so como opt-in de diagnostico.
+        constexpr bool kUseHwDecoder = false;
         std::string hwWhyNot;
-        const bool skipOnce = g_hwSkipOnce.exchange(false);
-        // Medido nos logs (mesmo filme 1920x800): software = 24 fps, drop-vo=0; videodec2 = ~7 fps (drop-vo +36 a cada 5 s) mesmo com render de 19 ms.
-        // O gargalo esta no videodec2/wrapper, nao no render. Por isso filme/serie vao em software, a menos que exista /data/kickiptv_hw_vod.
-        const bool vodSw = g_vodPlay.load() && !fileThere("/data/kickiptv_hw_vod");
-        const bool hw = !kickLive && !g_hwBad && !hwOff && !skipOnce && !vodSw && hwModulesOk(hwWhyNot);
-        if (vodSw && !kickLive && !hwOff && !g_hwBad) logBoth("[kick-hw] filme/serie em SOFTWARE (videodec2 entrega ~7 fps aqui; crie /data/kickiptv_hw_vod para forcar o hardware)");   // TUDO menos a live da Kick (que fica em software por enquanto)
-        if (hw) guardSet(); else guardClear();                                 // marcador em disco: se o app cair daqui ate o 1o quadro, o proximo start vai em software
+        g_hwSkipOnce = false;
+        const bool hwOff = true, skipOnce = false;
+        const bool hw = kUseHwDecoder && !kickLive && !g_hwBad && !hwOff && !skipOnce && hwModulesOk(hwWhyNot);
+        guardClear();                                                          // nunca deixa marcador de hardware em disco
         mpv_set_property_string(g_mpv, "hwdec", "no");
         const int vdRc = mpv_set_property_string(g_mpv, "vd", hw ? "h264_videodec2" : "");
-        mpv_set_property_string(g_mpv, "vd-lavc-threads", hw ? "1" : "6");
+        mpv_set_property_string(g_mpv, "vd-lavc-threads", kickLive ? "4" : "6");   // software: 6 geral, 4 na Kick
         {
             char b[240];
             snprintf(b, sizeof b, "[kick-hw] play: live=%d pedido=%s set-rc=%d vd(lido)=%s%s%s", live ? 1 : 0, hw ? "h264_videodec2" : "software",
@@ -723,7 +722,7 @@ bool play(const std::string &url, bool live, long long startSec) {
             logBoth(b);
         }
         g_hwWanted = hw; g_hwChecked = false; g_hwT0 = std::chrono::steady_clock::now();
-        std::string liveOpts = std::string("force-seekable=no,demuxer-max-bytes=24MiB,demuxer-max-back-bytes=1MiB,demuxer-readahead-secs=15,vd-lavc-threads=") + (hw ? "1" : "4");
+        std::string liveOpts = std::string("force-seekable=no,demuxer-max-bytes=24MiB,demuxer-max-back-bytes=1MiB,demuxer-readahead-secs=15,vd-lavc-threads=") + "4";
         // Opcoes SO deste arquivo (somem quando ele termina): live Kick = cache pequeno; filme/serie com ponto salvo = "start".
         std::string fileOpts = kickLive ? liveOpts : std::string();
         // Canal ao vivo do IPTV: cache pequeno (como a Kick). Filme/serie e canal usavam o cache grande do boot e enchiam a memoria aos poucos.

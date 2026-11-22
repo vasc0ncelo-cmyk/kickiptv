@@ -3943,7 +3943,7 @@ using PadIn = PadInT<OrbisPadSrc>;
 
 int main() {
     sceUserServiceInitialize(NULL);
-    kSelfExitOnBg = !fileExists("/data/kickiptv_manter_bg");   // novo padrao: ao fechar/ir para o inicio o app SAI pelo sistema (crie /data/kickiptv_manter_bg para voltar a ficar suspenso)   // padrao: sai sozinho PELO SISTEMA ao ir para o inicio do PS4 (funciona sem erro)
+    kSelfExitOnBg = fileExists("/data/kickiptv_saida_bg");   // padrao: FICA SUSPENSO em segundo plano ao apertar PS (fecha sem erro, sem os crashes de cv/abort). Crie /data/kickiptv_saida_bg para o app sair sozinho
     int userId = 0;
     sceUserServiceGetInitialUser(&userId);
     int padInitRc = scePadInit();
@@ -4425,7 +4425,7 @@ int main() {
                 g_quitting = true;                 // workers de rede/capas param
                 if (mode == Mode::Play || player.h) {
                     try { player.stop(); } catch (...) {}
-                    mpv_player::waitStopped(1500);         // deixa o videodec2 fechar de verdade ANTES de o sistema matar/congelar o app
+                    mpv_player::waitStopped(1500);         // deixa o mpv parar de verdade ANTES de o sistema congelar o app (segundo plano)
                     mode = Mode::Menu;
                 }
                 g_covers.setPaused(true);
