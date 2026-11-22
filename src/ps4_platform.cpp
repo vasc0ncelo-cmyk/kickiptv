@@ -1586,7 +1586,7 @@ struct AudioPump {
 // Qualidade da live (Kick): 0 Fluido = ate 30 fps (no 60 fps da Kick isso cai em 480p) | 1 Equilibrado (padrao) = 720p com o video em 60 fps
 // baixado, mas a TELA desenha 1 quadro a cada 2 (custo de CPU de 30 fps, imagem 720p); apos um congelamento volta sozinho para o Fluido |
 // 2 Maxima = 720p60 desenhando tudo | 3 Ultra = 1080p60.
-static std::atomic<int> g_quality{1};
+static std::atomic<int> g_quality{2};   // padrao: Maxima 720p60 (antes 1 = Equilibrado, que desenhava 1 quadro a cada 2)
 static const int kQualityCount = 4;
 static const char *kQualityName[kQualityCount] = {"Fluido 30fps", "Equilibrado 720p", "Maxima 720p60", "Ultra 1080p60"};
 
@@ -4648,6 +4648,10 @@ int main() {
                 sceKernelUsleep(120000);   // deixa o mpv/stream_cb soltar antes do proximo start
                 mode = Mode::Menu; dirty = true;
             };
+            if ((pressed & B_CIRCLE) && (player.showOpts || player.showInfo)) {     // O fecha o menu △ / info antes de sair
+                player.showOpts = false; player.showInfo = false; player.hudUntil = tn + 8;
+                pressed &= ~B_CIRCLE;
+            }
             if (pressed & B_CIRCLE) {
                 player.stop(); player.quietWait = false;
                 player.epUrls.clear(); player.epTitles.clear(); player.epIndex = -1;
@@ -4779,7 +4783,41 @@ int main() {
                     player.muted = !player.muted; mpv_player::setMute(player.muted);
                     player.toastText = player.muted ? "Mudo" : "Som ligado"; player.toastUntil = tn + 1.2;
                 }
-                if (pressed & B_TRIANGLE) player.hudUntil = (tn <= player.hudUntil && !player.paused) ? 0 : tn + 12;
+                if (pressed & B_TRIANGLE) {
+                    if (!player.isVod) {                              // LIVE (Kick/canal): △ abre o menu de Opcoes (Qualidade / Proporcao / Audio / Info)
+                        player.showOpts = !player.showOpts;
+                        player.showInfo = false;
+                        if (player.showOpts) player.optCur = 0;
+                        player.hudUntil = tn + 30;
+                    } else player.hudUntil = (tn <= player.hudUntil && !player.paused) ? 0 : tn + 12;
+                }
+                if (player.showOpts && !player.isVod) {
+                    if (pressed & B_UP) player.optCur = (player.optCur + 4) % 5;
+                    if (pressed & B_DOWN) player.optCur = (player.optCur + 1) % 5;
+                    int dirO = 0;
+                    if (pressed & B_LEFT) dirO = -1;
+                    if (pressed & B_RIGHT) dirO = 1;
+                    if (pressed & B_CROSS) dirO = 1;
+                    if (dirO != 0) {
+                        if (player.optCur == 0) {                      // qualidade: troca e reabre a live na nova variante
+                            g_quality = (g_quality.load() + (dirO > 0 ? 1 : kQualityCount - 1)) % kQualityCount;
+                            app.say(std::string("Qualidade: ") + kQualityName[g_quality.load() % kQualityCount]);
+                            safeRestartLive("opts-quality");
+                            sceKernelUsleep(30000);
+                            continue;
+                        } else if (player.optCur == 1) {
+                            player.aspectMode = (player.aspectMode + (dirO > 0 ? 1 : 2)) % 3;
+                        } else if (player.optCur == 2) {
+                            player.muted = !player.muted; mpv_player::setMute(player.muted);
+                            player.toastText = player.muted ? "Mudo" : "Som ligado"; player.toastUntil = tn + 1.2;
+                        } else if ((pressed & B_CROSS) && player.optCur == 3) {
+                            player.showInfo = true; player.showOpts = false;
+                        } else if ((pressed & B_CROSS) && player.optCur == 4) {
+                            player.showOpts = false;
+                        }
+                    }
+                    player.hudUntil = tn + 30;
+                }
             }
             if (!player.mpvGot) {                                    // ate o 1o quadro: tela de espera com o spinner
                 static double lastW = 0;
