@@ -26,6 +26,7 @@ double hwFallbackPos() { return 0; }
 void waitStopped(int) {}
 void pause(bool) {}
 void setMute(bool) {}
+void setAspect(int) {}
 void setSpeed(double) {}
 bool seekSec(double) { return false; }
 bool seekRelative(double) { return false; }
@@ -811,6 +812,14 @@ void setMute(bool on) {
     if (!g_mpv) return;
     int f = on ? 1 : 0;
     mpv_set_property(g_mpv, "mute", MPV_FORMAT_FLAG, &f);
+}
+
+void setAspect(int mode) {
+    std::lock_guard<std::mutex> lk(g_mx);
+    if (!g_mpv) return;
+    // o render por software desenha o video na area inteira da tela: keepaspect/panscan decidem barras pretas, esticar ou cortar
+    mpv_set_property_string(g_mpv, "keepaspect", mode == 1 ? "no" : "yes");
+    mpv_set_property_string(g_mpv, "panscan", mode == 2 ? "1.0" : "0.0");
 }
 
 bool seekSec(double sec) {

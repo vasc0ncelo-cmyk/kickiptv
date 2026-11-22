@@ -2198,7 +2198,7 @@ struct Player {
     bool startImpl(const std::string &url, const std::string &title, bool allowHw) {
         log.clear(); frames = 0; vw = vh = 0; fps = 0; fpsFrames = 0; failed = false; addRc = 0; chunkMode = false; chunkIdx = 0; inactiveSince = 0;
         cancelled = false; restarts = switchesOk = 0; lastGapMs = 0; gapStartT = switchedAt = 0; curDur = 0; chunkT0 = 0; blitMs = 0;
-        paused = false; isVod = false; lastPtsMs = 0; maxPtsMs = 0; durationMs = 0; seekPendingMs = -1; waitNote.clear(); showOpts = false; optCur = 0;
+        paused = false; isVod = false; lastPtsMs = 0; maxPtsMs = 0; durationMs = 0; seekPendingMs = -1; waitNote.clear(); showOpts = false; optCur = 0; aspectMode = 0;
         scrubMode = false; scrubMs = -1; seekSkip = false; seekTargetMs = 0;
         trigScrub = false; trigDir = 0; trigBlock = true;       // trigBlock: um L2/R2 ainda apertado do menu nao vira seek
         pendJumpMs = -1; pendJumpNeed = 0; jumpPct = 0; jumpTargetMs = -1; jumpSettleUntil = 0; jumpErrors = 0;
@@ -2239,6 +2239,7 @@ struct Player {
             kickAbortAllIo();   // troca de midia: corta TODA leitura de rede da midia anterior (canal, Kick, VOD) antes de o mpv abrir a nova; o mpv_player::play confirma a parada e recria o render
             // Hardware (h264_videodec2) SO em live da Kick e canal ao vivo do IPTV; filme/serie/VOD: software.
             const bool hwLive = kickLive || (kickSlug.empty() && !urlIsVodMedia(url));
+            mpv_player::setAspect(0);                      // video novo: proporcao original (a instancia do mpv e reaproveitada)
             if (mpv_player::play(kickLive ? std::string("kicklive://live.ts") : url, hwLive, hwLive ? 0 : startAtSec)) {
                 trace("mpv-play-ok");
                 useMpv = true;
@@ -3538,11 +3539,24 @@ struct Player {
     bool showOpts = false;
     bool showInfo = false;
     int optCur = 0;
-    int aspectMode = 0;  // 0=16:9  1=Esticar  2=Zoom
+    int aspectMode = 0;  // 0=Original (barras)  1=Esticar  2=Preencher (zoom)
+    // Itens do menu de opcoes (triangulo): so aparece o que FUNCIONA para o conteudo aberto.
+    //  Qualidade: live com variantes (Kick; canal so no AvPlayer/HLS). Proporcao: SO filme e serie (nunca canal nem live da Kick).
+    enum { OPT_QUALITY = 0, OPT_ASPECT = 1, OPT_AUDIO = 2, OPT_INFO = 3, OPT_BACK = 4 };
+    bool hasQualityOpt() const { return !isVod && (!kickSlug.empty() || !useMpv); }
+    int optList(int *out) const {
+        int n = 0;
+        if (hasQualityOpt()) out[n++] = OPT_QUALITY;
+        if (isVod) out[n++] = OPT_ASPECT;
+        out[n++] = OPT_AUDIO; out[n++] = OPT_INFO; out[n++] = OPT_BACK;
+        return n;
+    }
+    int optCount() const { int t[5]; return optList(t); }
+    int optId(int i) const { int t[5]; int n = optList(t); return (i >= 0 && i < n) ? t[i] : (int)OPT_BACK; }
     bool muted = false;
     int focusCtrl = 2;   // 0=prev 1=-10 2=pause 3=+10 4=next (destaque visual)
     static const char *aspectName(int m) {
-        return m == 1 ? "Esticar" : m == 2 ? "Zoom" : "16:9";
+        return m == 1 ? "Esticar" : m == 2 ? "Preencher" : "Original";
     }
     static void fmtTime(uint64_t ms, char *buf, size_t n) {
         int s = (int)(ms / 1000); if (s < 0) s = 0;
@@ -3711,26 +3725,20 @@ struct Player {
 
         // dica dos botoes (pequena, embaixo)
         uiText(r, 48, H - 40,
-               useMpv ? std::string(isVod ? "X = pausar     L1/R1 = -10/+10 s     " : "") + "Quadrado = mudo     Triângulo = mostrar/ocultar     O = sair" :
+               useMpv ? std::string(isVod ? "X = pausar     L1/R1 = -10/+10 s     " : "") + "Quadrado = mudo     Triângulo = opções     O = sair" :
                isVod ? "Quadrado = mudo     Triângulo = opções     O = sair"
                      : (hasEpisodes() ? "L1/R1 = canal anterior/próximo     Quadrado = mudo     Triângulo = opções     O = sair" : "Quadrado = mudo     Triângulo = opções     O = sair"),
                0xFF9A9A9Au, 16);
 
         // ---- MENU OPCOES (direita) ----
         if (showOpts) {
-            const int ox = W - 440, oy = 90, ow = 400, oh = 400;
+            int ids[5]; const int nOpt = optList(ids);
+            const int ox = W - 440, oy = 90, ow = 400, oh = 72 + nOpt * 56 + 52;
             r.roundRect(ox, oy, ow, oh, 16, 0xF00C0C0C);
             r.roundRect(ox, oy, 4, oh, 2, GREEN);
             uiHeavy(r, ox + 24, oy + 22, "Opcoes", TEXT, 26);
-
-            const char *items[] = {
-                "Qualidade do video",
-                "Proporcao da tela",
-                "Audio",
-                "Informacoes",
-                "Voltar"
-            };
-            const int nOpt = 5;
+            static const char *names[5] = {"Qualidade do video", "Proporcao da tela", "Audio", "Informacoes", "Voltar"};
+            if (optCur >= nOpt) optCur = 0;
             for (int i = 0; i < nOpt; i++) {
                 int iy = oy + 72 + i * 56;
                 bool sel = (i == optCur);
@@ -3738,13 +3746,11 @@ struct Player {
                     r.roundRect(ox + 12, iy - 6, ow - 24, 48, 12, 0xFF142014);
                     r.roundRect(ox + 12, iy - 6, 3, 48, 2, GREEN);
                 }
-                uiText(r, ox + 28, iy + 10, items[i], sel ? TEXT : SOFT, 20, sel);
+                uiText(r, ox + 28, iy + 10, names[ids[i]], sel ? TEXT : SOFT, 20, sel);
                 const char *val = "";
-                char tmp[32];
-                if (i == 0) val = kQualityName[g_quality.load() % kQualityCount];
-                else if (i == 1) val = aspectName(aspectMode);
-                else if (i == 2) val = muted ? "Mudo" : "Ativo";
-                else if (i == 3) val = showInfo ? "Abrir" : "";
+                if (ids[i] == OPT_QUALITY) val = kQualityName[g_quality.load() % kQualityCount];
+                else if (ids[i] == OPT_ASPECT) val = aspectName(aspectMode);
+                else if (ids[i] == OPT_AUDIO) val = muted ? "Mudo" : "Ativo";
                 if (val && val[0]) {
                     int vw2 = r.textWidth(val, 18);
                     uiText(r, ox + ow - 28 - vw2, iy + 12, val, MUTED, 18);
@@ -3765,9 +3771,11 @@ struct Player {
             uiText(r, ox + 24, oy + 70, uiFit(r, line, 20, ow - 48), SOFT, 20);
             snprintf(line, sizeof line, "Resolucao: %ux%u", vw, vh);
             uiText(r, ox + 24, oy + 100, line, SOFT, 20);
-            snprintf(line, sizeof line, "Tipo: %s  |  Qualidade: %s", isVod ? "Filme/Serie" : "Ao vivo", kQualityName[g_quality.load() % kQualityCount]);
+            if (hasQualityOpt()) snprintf(line, sizeof line, "Tipo: Live Kick  |  Qualidade: %s", kQualityName[g_quality.load() % kQualityCount]);
+            else snprintf(line, sizeof line, "Tipo: %s", isVod ? "Filme/Serie" : "Canal ao vivo");
             uiText(r, ox + 24, oy + 130, line, SOFT, 20);
-            snprintf(line, sizeof line, "Proporcao: %s  |  Audio: %s", aspectName(aspectMode), muted ? "Mudo" : "Ativo");
+            if (isVod) snprintf(line, sizeof line, "Proporcao: %s  |  Audio: %s", aspectName(aspectMode), muted ? "Mudo" : "Ativo");
+            else snprintf(line, sizeof line, "Audio: %s", muted ? "Mudo" : "Ativo");
             uiText(r, ox + 24, oy + 160, line, SOFT, 20);
             uiText(r, ox + 24, oy + 200, "O fechar", DIM, 16);
         }
@@ -4787,7 +4795,7 @@ int main() {
             // ---- controles (como no GMCA): X pausa, L1/R1 saltam, quadrado muda o som, triangulo mostra/oculta o OSD ----
             if (pressed) player.hudUntil = tn + 12;
             if (player.mpvGot) {
-                if ((pressed & B_CROSS) && player.isVod) { mpv_player::pause(!st.paused); player.paused = !st.paused; player.hudUntil = tn + 12; }     // pausar: so filme/serie
+                if ((pressed & B_CROSS) && player.isVod && !player.showOpts) { mpv_player::pause(!st.paused); player.paused = !st.paused; player.hudUntil = tn + 12; }     // pausar: so filme/serie
                 // L2/R2: preview continuo (estilo YouTube). Seek real so ao soltar.
                 if (player.isVod && !player.showOpts) {
                     int dir = 0;
@@ -4795,7 +4803,7 @@ int main() {
                     else if (pin.held & B_R2) dir = 1;
                     player.triggerScrub(dir, tn);
                 }
-                if (player.isVod && (pressed & (B_L1 | B_R1 | B_LEFT | B_RIGHT)) && !player.trigScrub) {
+                if (player.isVod && !player.showOpts && (pressed & (B_L1 | B_R1 | B_LEFT | B_RIGHT)) && !player.trigScrub) {
                     const int d = (pressed & (B_L1 | B_LEFT)) ? -10 : 10;
                     if (tn - player.toastUntil > 0.6) player.mpvSeekAcc = 0;
                     player.mpvSeekAcc += d;
@@ -4807,37 +4815,44 @@ int main() {
                     player.muted = !player.muted; mpv_player::setMute(player.muted);
                     player.toastText = player.muted ? "Mudo" : "Som ligado"; player.toastUntil = tn + 1.2;
                 }
-                if (pressed & B_TRIANGLE) {
-                    if (!player.isVod) {                              // LIVE (Kick/canal): △ abre o menu de Opcoes (Qualidade / Proporcao / Audio / Info)
-                        player.showOpts = !player.showOpts;
-                        player.showInfo = false;
-                        if (player.showOpts) player.optCur = 0;
-                        player.hudUntil = tn + 30;
-                    } else player.hudUntil = (tn <= player.hudUntil && !player.paused) ? 0 : tn + 12;
+                if (pressed & B_TRIANGLE) {                           // △: menu de Opcoes (so com o que funciona para este conteudo)
+                    player.showOpts = !player.showOpts;
+                    player.showInfo = false;
+                    if (player.showOpts) player.optCur = 0;
+                    player.hudUntil = tn + 30;
                 }
-                if (player.showOpts && !player.isVod) {
-                    if (pressed & B_UP) player.optCur = (player.optCur + 4) % 5;
-                    if (pressed & B_DOWN) player.optCur = (player.optCur + 1) % 5;
+                if (player.showOpts) {
+                    const int nOpt = player.optCount();
+                    if (player.optCur >= nOpt) player.optCur = 0;
+                    if (pressed & B_UP) player.optCur = (player.optCur + nOpt - 1) % nOpt;
+                    if (pressed & B_DOWN) player.optCur = (player.optCur + 1) % nOpt;
                     int dirO = 0;
                     if (pressed & B_LEFT) dirO = -1;
                     if (pressed & B_RIGHT) dirO = 1;
                     if (pressed & B_CROSS) dirO = 1;
                     if (dirO != 0) {
-                        if (player.optCur == 0) {                      // qualidade: troca e reabre a live na nova variante
+                        switch (player.optId(player.optCur)) {
+                        case Player::OPT_QUALITY:                      // qualidade: troca e reabre a live na nova variante
                             g_quality = (g_quality.load() + (dirO > 0 ? 1 : kQualityCount - 1)) % kQualityCount;
                             app.say(std::string("Qualidade: ") + kQualityName[g_quality.load() % kQualityCount]);
                             safeRestartLive("opts-quality");
                             sceKernelUsleep(30000);
                             continue;
-                        } else if (player.optCur == 1) {
+                        case Player::OPT_ASPECT:                       // so filme/serie
                             player.aspectMode = (player.aspectMode + (dirO > 0 ? 1 : 2)) % 3;
-                        } else if (player.optCur == 2) {
+                            mpv_player::setAspect(player.aspectMode);
+                            player.toastText = std::string("Proporcao: ") + Player::aspectName(player.aspectMode); player.toastUntil = tn + 1.2;
+                            break;
+                        case Player::OPT_AUDIO:
                             player.muted = !player.muted; mpv_player::setMute(player.muted);
                             player.toastText = player.muted ? "Mudo" : "Som ligado"; player.toastUntil = tn + 1.2;
-                        } else if ((pressed & B_CROSS) && player.optCur == 3) {
-                            player.showInfo = true; player.showOpts = false;
-                        } else if ((pressed & B_CROSS) && player.optCur == 4) {
-                            player.showOpts = false;
+                            break;
+                        case Player::OPT_INFO:
+                            if (pressed & B_CROSS) { player.showInfo = true; player.showOpts = false; }
+                            break;
+                        default:                                       // Voltar
+                            if (pressed & B_CROSS) player.showOpts = false;
+                            break;
                         }
                     }
                     player.hudUntil = tn + 30;
@@ -4906,42 +4921,36 @@ int main() {
                 player.hudUntil = nowSec() + 30;
             }
 
-            // ---- Menu de opcoes (△) ----
+            // ---- Menu de opcoes (△): so os itens que funcionam para este conteudo ----
             if (player.showOpts) {
-                if (pressed & B_UP) { player.optCur = (player.optCur + 4) % 5; }
-                if (pressed & B_DOWN) { player.optCur = (player.optCur + 1) % 5; }
-                auto cycleOpt = [&](int dir) {
-                    if (player.optCur == 0) g_quality = (g_quality.load() + (dir > 0 ? 1 : kQualityCount - 1)) % kQualityCount;
-                    if (player.optCur == 1) {
-                        player.aspectMode = (player.aspectMode + (dir > 0 ? 1 : 2)) % 3;
-                        // aplica na hora: sai da pausa visual forcando redraw
-                        player.hudUntil = nowSec() + 30;
-                    }
-                    if (player.optCur == 2) {
+                const int nOpt = player.optCount();
+                if (player.optCur >= nOpt) player.optCur = 0;
+                if (pressed & B_UP) { player.optCur = (player.optCur + nOpt - 1) % nOpt; }
+                if (pressed & B_DOWN) { player.optCur = (player.optCur + 1) % nOpt; }
+                int dirA = 0;
+                if (pressed & B_LEFT) dirA = -1;
+                if (pressed & B_RIGHT) dirA = 1;
+                if (pressed & B_CROSS) dirA = 1;
+                if (dirA != 0) {
+                    switch (player.optId(player.optCur)) {
+                    case Player::OPT_QUALITY:
+                        g_quality = (g_quality.load() + (dirA > 0 ? 1 : kQualityCount - 1)) % kQualityCount;
+                        app.say(std::string("Qualidade: ") + kQualityName[g_quality.load() % kQualityCount]);
+                        if (!player.url.empty()) { safeRestartLive("opts-quality"); sceKernelUsleep(30000); continue; }
+                        break;
+                    case Player::OPT_ASPECT:                           // so filme/serie
+                        player.aspectMode = (player.aspectMode + (dirA > 0 ? 1 : 2)) % 3;
+                        break;
+                    case Player::OPT_AUDIO:
                         player.muted = !player.muted;
                         player.audio.muted = player.paused || player.muted;
-                    }
-                };
-                if (pressed & B_LEFT) cycleOpt(-1);
-                if (pressed & B_RIGHT) cycleOpt(+1);
-                if (pressed & B_CROSS) {
-                    if (player.optCur == 0) {
-                        if (!player.isVod && !player.url.empty()) {
-                            g_quality = (g_quality.load() + 1) % kQualityCount;
-                            app.say(std::string("Qualidade: ") + kQualityName[g_quality.load() % kQualityCount]);
-                            safeRestartLive("opts-quality");
-                            sceKernelUsleep(30000);
-                            continue;
-                        } else g_quality = (g_quality.load() + 1) % kQualityCount;
-                    } else if (player.optCur == 1) {
-                        player.aspectMode = (player.aspectMode + 1) % 3;
-                    } else if (player.optCur == 2) {
-                        player.muted = !player.muted;
-                        player.audio.muted = player.paused || player.muted;
-                    } else if (player.optCur == 3) {
-                        player.showInfo = true; player.showOpts = false;
-                    } else if (player.optCur == 4) {
-                        player.showOpts = false;
+                        break;
+                    case Player::OPT_INFO:
+                        if (pressed & B_CROSS) { player.showInfo = true; player.showOpts = false; }
+                        break;
+                    default:                                           // Voltar
+                        if (pressed & B_CROSS) player.showOpts = false;
+                        break;
                     }
                 }
                 player.hudUntil = nowSec() + 30;

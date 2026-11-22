@@ -49,6 +49,8 @@ double hwFallbackPos();
 void waitStopped(int maxMs);
 void pause(bool on);
 void setMute(bool on);
+// Proporcao da tela (so filmes/series): 0 = original (barras pretas), 1 = esticar (preenche distorcendo), 2 = preencher/zoom (corta as bordas)
+void setAspect(int mode);
 void setSpeed(double rate);
 bool seekSec(double sec);
 bool seekRelative(double deltaSec);
