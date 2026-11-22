@@ -291,6 +291,12 @@ static std::atomic<long long> g_renderUs{0};
 static std::atomic<int> g_renderN{0};
 static bool g_everRendered = false;     // ja desenhou um quadro desde o ultimo play (so entao 'force' faz sentido)
 
+// Ampliacao suave (linear) do quadro de 1280 para a tela. So desliga se a CONTA da ampliacao for lenta 3 janelas seguidas, e volta a ligar
+// a cada video novo (antes: ficava desligada ate fechar o app e TODO video seguinte, inclusive as lives da Kick, saia serrilhado).
+static bool g_smoothOn = true;
+static double g_smoothMs = 0;
+static int g_smoothN = 0, g_smoothSlowWin = 0;
+
 // ---------- Decodificador de HARDWARE (h264_videodec2): so lives da Kick e canais ao vivo ----------
 static bool g_hwWanted = false;                    // ESTE play pediu o videodec2
 static bool g_hwChecked = false;                   // o decoder REAL deste play ja foi conferido e logado
@@ -545,10 +551,10 @@ bool boot() {
     // Colchao maior na frente, pouco para tras (memoria do PS4 e curta).
     // Pausa so quando o cache zera de verdade e retoma com folga (menos engasgo curto).
     mpv_set_option_string(g_mpv, "cache", "yes");
-    mpv_set_option_string(g_mpv, "demuxer-max-bytes", "160MiB");
+    mpv_set_option_string(g_mpv, "demuxer-max-bytes", "64MiB");
     mpv_set_option_string(g_mpv, "demuxer-max-back-bytes", "8MiB");
     mpv_set_option_string(g_mpv, "demuxer-readahead-secs", "45");
-    mpv_set_option_string(g_mpv, "cache-secs", "180");
+    mpv_set_option_string(g_mpv, "cache-secs", "90");
     mpv_set_option_string(g_mpv, "stream-buffer-size", "2MiB");
     mpv_set_option_string(g_mpv, "cache-pause", "yes");
     mpv_set_option_string(g_mpv, "cache-pause-initial", "no");
@@ -630,6 +636,7 @@ bool play(const std::string &url, bool live, long long startSec) {
         g_dur = 0;
         g_err.clear();
         g_everRendered = false;
+        g_smoothOn = true; g_smoothMs = 0; g_smoothN = 0; g_smoothSlowWin = 0;      // cada video comeca com a ampliacao suave
         g_startSeen = false; g_curEntry = -1;              // eventos do arquivo antigo (fim/erro/eof) nao valem para este
         g_stallKicks = 0; g_lastFrameT = std::chrono::steady_clock::now();
         mpv_set_property_string(g_mpv, "video-sync", "audio");     // a anterior pode ter caido para "desync" (relogio de audio parado)
@@ -678,6 +685,8 @@ bool play(const std::string &url, bool live, long long startSec) {
         std::string liveOpts = std::string("force-seekable=no,demuxer-max-bytes=24MiB,demuxer-max-back-bytes=1MiB,demuxer-readahead-secs=15,vd-lavc-threads=") + (hw ? "1" : "4");
         // Opcoes SO deste arquivo (somem quando ele termina): live Kick = cache pequeno; filme/serie com ponto salvo = "start".
         std::string fileOpts = kickLive ? liveOpts : std::string();
+        // Canal ao vivo do IPTV: cache pequeno (como a Kick). Filme/serie e canal usavam o cache grande do boot e enchiam a memoria aos poucos.
+        if (live && !kickLive) fileOpts = "demuxer-max-bytes=32MiB,demuxer-max-back-bytes=1MiB,demuxer-readahead-secs=20";
         if (!live && startSec > 0) fileOpts = "start=" + std::to_string(startSec);
         seekAfter = 0;
         const char *cmd[] = {"loadfile", wrap.c_str(), "replace", fileOpts.empty() ? nullptr : fileOpts.c_str(), nullptr};   // mpv 0.36: sem o indice "0"
@@ -854,7 +863,8 @@ void poll() {
         mpv_get_property(g_mpv, "decoder-frame-drop-count", MPV_FORMAT_INT64, &dec);
         int rn = g_renderN.exchange(0); long long ru = g_renderUs.exchange(0);
         unsigned cb = g_audCb.load();
-        char b[200]; snprintf(b, sizeof b, "mpv-perf fps=%.1f drop-vo=%lld drop-dec=%lld pos=%.0f render=%.0fms(n=%d) audio-cb=%u pausa=%d", fps, (long long)vo, (long long)dec, g_pos, rn ? ru / 1000.0 / rn : 0.0, rn, cb - g_audCbLast, g_audPause.load());
+        const std::string cacheB = propStr("demuxer-cache-state/total-bytes");     // cresce sem parar = vazamento do cache; deve ficar abaixo do limite
+        char b[230]; snprintf(b, sizeof b, "mpv-perf fps=%.1f drop-vo=%lld drop-dec=%lld pos=%.0f render=%.0fms(n=%d) audio-cb=%u pausa=%d cache=%sB smooth=%d", fps, (long long)vo, (long long)dec, g_pos, rn ? ru / 1000.0 / rn : 0.0, rn, cb - g_audCbLast, g_audPause.load(), cacheB.c_str(), g_smoothOn ? 1 : 0);
         g_audCbLast = cb;
         tr(b);
     }
@@ -867,9 +877,6 @@ void poll() {
 static std::vector<int> g_xi;
 static std::vector<uint32_t> g_xw;
 static int g_xiW = 0, g_xiLw = 0;
-static bool g_smoothOn = true;
-static double g_smoothMs = 0;
-static int g_smoothN = 0;
 
 static void upscaleLo(uint8_t *dst, int w, int h, int stride) {
     if (g_loW == w && g_loH == h) {
@@ -899,9 +906,11 @@ static void upscaleLo(uint8_t *dst, int w, int h, int stride) {
     if (row.size() < (size_t)w) row.resize((size_t)w);
     const bool smooth = g_smoothOn && g_loW >= 2;
     int prevSy = -1;
+    double buildUs = 0;                                         // so o tempo de MONTAR as linhas (a copia para a memoria de video e lenta e nao conta)
     for (int y = 0; y < h; y++) {
         int sy = (int)((long long)y * g_loH / h);
         if (sy != prevSy) {
+            const auto rt0 = smooth ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
             const uint32_t *src = &g_lo[(size_t)sy * g_loW];
             uint32_t *r = row.data();
             if (smooth) {
@@ -917,14 +926,17 @@ static void upscaleLo(uint8_t *dst, int w, int h, int stride) {
                 for (int x = 0; x < w; x++) r[x] = src[xm[x]];
             }
             prevSy = sy;
+            if (smooth) buildUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - rt0).count();
         }
         memcpy(dst + (size_t)y * stride, row.data(), (size_t)w * 4);
     }
+    (void)t0;
     if (smooth) {
-        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-        g_smoothMs += ms;
+        g_smoothMs += buildUs / 1000.0;
         if (++g_smoothN >= 30) {
-            if (g_smoothMs / g_smoothN > 14.0) { g_smoothOn = false; char tb[96]; snprintf(tb, sizeof tb, "mpv-ampliacao: suave lenta (%.1f ms), voltando para rapida", g_smoothMs / g_smoothN); tr(tb); }
+            if (g_smoothMs / g_smoothN > 14.0) {
+                if (++g_smoothSlowWin >= 3) { g_smoothOn = false; char tb[110]; snprintf(tb, sizeof tb, "mpv-ampliacao: suave lenta (%.1f ms) 3x seguidas, rapida so neste video", g_smoothMs / g_smoothN); tr(tb); }
+            } else g_smoothSlowWin = 0;
             g_smoothMs = 0; g_smoothN = 0;
         }
     }
