@@ -22,6 +22,8 @@ void prewarm() {}
 bool boot() { return false; }
 bool play(const std::string &, bool, long long) { return false; }
 bool hwFallbackRequested() { return false; }
+double hwFallbackPos() { return 0; }
+void waitStopped(int) {}
 void pause(bool) {}
 void setMute(bool) {}
 void setSpeed(double) {}
@@ -301,6 +303,13 @@ static int g_smoothN = 0, g_smoothSlowWin = 0;
 static bool g_hwWanted = false;                    // ESTE play pediu o videodec2
 static bool g_hwChecked = false;                   // o decoder REAL deste play ja foi conferido e logado
 static bool g_hwBad = false;                       // videodec2 abriu mas nao deu video: software ate fechar o app
+static std::atomic<bool> g_hwSkipOnce{false};      // filme/serie: o videodec2 errou -> SO o proximo play (a reabertura) vai em software
+static std::atomic<int> g_hwErrCount{0};           // erros "Decode failed" do videodec2 na janela atual
+static std::chrono::steady_clock::time_point g_hwErrT0 = std::chrono::steady_clock::now();
+static std::atomic<double> g_hwFallbackPos{0};
+static std::atomic<bool> g_vodPlay{false};         // este play e filme/serie (nao live)
+static std::atomic<bool> g_endSeen{true};          // o mpv terminou o arquivo atual (decoder ja fechado)
+static std::atomic<int> g_capW{1280};              // teto da largura do render interno (desce sozinho se a CPU nao der conta)
 static std::atomic<bool> g_hwFallbackAsk{false};   // pedido (1 vez) para o app reabrir o canal em software
 static std::chrono::steady_clock::time_point g_hwT0 = std::chrono::steady_clock::now();
 
@@ -381,9 +390,10 @@ static void guardClear() { remove(kHwGuard); }
 static std::string logDecoderLocked(const char *tag) {
     const std::string dec = propStr("current-tracks/video/decoder");
     const bool isHw = dec.find("videodec2") != std::string::npos;
+    const bool unknown = (dec == "-");           // o mpv 0.36 nao informa o decoder: NAO e prova de software ('Selected codec:' no mpv.log vale)
     char b[320];
     snprintf(b, sizeof b, "[kick-hw] %s: decoder-real=%s => %s | hwdec-current=%s | options: vd=%s hwdec=%s threads=%s",
-             tag, dec.c_str(), isHw ? "HARDWARE" : "SOFTWARE", propStr("hwdec-current").c_str(), propStr("options/vd").c_str(),
+             tag, dec.c_str(), isHw ? "HARDWARE" : (unknown ? (g_hwWanted ? "HARDWARE(pedido; mpv nao informa)" : "software") : "SOFTWARE"), propStr("hwdec-current").c_str(), propStr("options/vd").c_str(),
              propStr("options/hwdec").c_str(), propStr("options/vd-lavc-threads").c_str());
     logBoth(b);
     snprintf(b, sizeof b, "[kick-hw] %s: %s | codec=%s | fmt=%s hw-fmt=%s | %sx%s | fps=%s drop-dec=%s",
@@ -395,8 +405,32 @@ static std::string logDecoderLocked(const char *tag) {
     return dec;
 }
 
+static const char *kHwGuardPath = "/data/kickiptv_hwdec_guard";
+
 static void handleEvent(mpv_event *ev, bool *gotLoaded, bool *gotFail) {
     switch (ev->event_id) {
+    case MPV_EVENT_LOG_MESSAGE: {
+        // So chega nivel "error". O videodec2 devolve "Decode failed (0x811d....)" e NAO se recupera sozinho: sem referencias o resto do GOP
+        // sai todo borrado/em blocos (foi a imagem quebrada do filme). Filme/serie: 1 erro ja derruba para software NA MESMA posicao.
+        // Canal ao vivo: tolera erros isolados (o proximo IDR chega em ~1-2 s) e so desiste com 3 erros em 10 s.
+        auto *lm = (mpv_event_log_message *)ev->data;
+        if (!lm || !lm->text || !g_hwWanted || g_hwBad) break;
+        if (!std::strstr(lm->text, "videodec2")) break;
+        if (!std::strstr(lm->text, "failed") && !std::strstr(lm->text, "Failed") && !std::strstr(lm->text, "error")) break;
+        const auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::seconds>(now - g_hwErrT0).count() > 10) { g_hwErrCount = 0; g_hwErrT0 = now; }
+        const int n = ++g_hwErrCount;
+        { char b[200]; snprintf(b, sizeof b, "[kick-hw] erro do videodec2 (%d): %.120s", n, lm->text); tr(b); }
+        const bool vod = g_vodPlay.load();
+        if (vod || n >= 3) {
+            g_hwFallbackPos = g_pos;
+            if (vod) g_hwSkipOnce = true; else g_hwBad = true;
+            g_hwFallbackAsk = true;
+            tr(vod ? "[kick-hw] filme/serie: erro no videodec2 -> reabrindo em software na mesma posicao"
+                   : "[kick-hw] canal: erros repetidos no videodec2 -> hardware desligado ate fechar o app");
+        }
+        break;
+    }
     case MPV_EVENT_SHUTDOWN:
         g_open = false;
         if (gotFail) *gotFail = true;
@@ -416,6 +450,7 @@ static void handleEvent(mpv_event *ev, bool *gotLoaded, bool *gotFail) {
         break;
     case MPV_EVENT_END_FILE: {
         auto *e = (mpv_event_end_file *)ev->data;
+        g_endSeen = true;                              // decoder/demuxer do arquivo anterior ja fecharam
         if (!e) break;
         // fim de um arquivo ANTIGO (parado/abortado na troca): ignora
         if (!g_startSeen.load() || e->playlist_entry_id != g_curEntry.load()) break;
@@ -578,6 +613,7 @@ bool boot() {
     // stream_cb e tratado como arquivo: evita lavf tentar reabrir como http
     mpv_set_option_string(g_mpv, "demuxer", "lavf");
 
+    mpv_request_log_messages(g_mpv, "error");
     if (chk(mpv_initialize(g_mpv)) < 0) {
         mpv_terminate_destroy(g_mpv);
         g_mpv = nullptr;
@@ -636,6 +672,7 @@ bool play(const std::string &url, bool live, long long startSec) {
         g_err.clear();
         g_everRendered = false;
         g_smoothOn = true; g_smoothMs = 0; g_smoothN = 0; g_smoothSlowWin = 0;      // cada video comeca com a ampliacao suave
+        g_capW = 1280; g_hwErrCount = 0; g_hwErrT0 = std::chrono::steady_clock::now(); g_endSeen = false; g_vodPlay = !live;
         g_startSeen = false; g_curEntry = -1;              // eventos do arquivo antigo (fim/erro/eof) nao valem para este
         g_stallKicks = 0; g_lastFrameT = std::chrono::steady_clock::now();
         mpv_set_property_string(g_mpv, "video-sync", "audio");     // a anterior pode ter caido para "desync" (relogio de audio parado)
@@ -659,7 +696,8 @@ bool play(const std::string &url, bool live, long long startSec) {
         // (3) vd e threads sao reaplicados A CADA play (live: videodec2 + 1 thread; o resto: padrao) -> nada vaza para filme/serie.
         const bool hwOff = fileThere(kHwOffFile);                              // chave de seguranca: arquivo vazio = tudo em software
         std::string hwWhyNot;
-        const bool hw = !kickLive && !g_hwBad && !hwOff && hwModulesOk(hwWhyNot);   // TUDO menos a live da Kick (que fica em software por enquanto)
+        const bool skipOnce = g_hwSkipOnce.exchange(false);
+        const bool hw = !kickLive && !g_hwBad && !hwOff && !skipOnce && hwModulesOk(hwWhyNot);   // TUDO menos a live da Kick (que fica em software por enquanto)
         if (hw) guardSet(); else guardClear();                                 // marcador em disco: se o app cair daqui ate o 1o quadro, o proximo start vai em software
         mpv_set_property_string(g_mpv, "hwdec", "no");
         const int vdRc = mpv_set_property_string(g_mpv, "vd", hw ? "h264_videodec2" : "");
@@ -789,7 +827,8 @@ void stop() {
     // NAO bloqueia: o "stop" sincrono esperava o demuxer do mpv sair de uma leitura de rede (ate dezenas de segundos) com g_mx preso,
     // travando a thread principal (poll/render pedem g_mx) -> vigia derrubava o app. Assincrono: o mpv encerra em segundo plano.
     std::lock_guard<std::mutex> lk(g_mx);
-    guardClear();                                  // parada normal: nao foi queda
+    if (g_mpv && g_open.load()) g_endSeen = false;   // waitStopped() espera o END_FILE deste arquivo
+    guardClear();                                  // parada normal: nao foi queda (waitStopped rearma o guard enquanto o videodec2 fecha)
     if (!g_mpv) return;
     const char *cmd[] = {"stop", nullptr};
     mpv_command_async(g_mpv, 0, cmd);
@@ -827,9 +866,9 @@ void poll() {
             g_hwChecked = true;
             guardClear();                                  // chegou video: o decoder nao derrubou o app
             const std::string dec = logDecoderLocked("1o-quadro");
-            if (g_hwWanted && dec.find("videodec2") == std::string::npos && propStr("video-format") != "h264")
+            if (g_hwWanted && dec != "-" && dec.find("videodec2") == std::string::npos && propStr("video-format") != "h264")
                 logBoth("[kick-hw] fonte nao e H.264 (so o H.264 tem decoder de hardware): software normal");
-            else if (g_hwWanted && dec.find("videodec2") == std::string::npos)
+            else if (g_hwWanted && dec != "-" && dec.find("videodec2") == std::string::npos)
                 logBoth("[kick-hw] ATENCAO: pediu hardware mas o decoder real e software. Veja no mpv.log: 'Codec list:' (videodec2 deve ser o 1o), "
                         "'Opening decoder' e as linhas de erro logo depois (Could not open codec / Failed to open / profile nao suportado).");
         } else if (g_hwWanted &&
@@ -960,7 +999,7 @@ bool renderToBgra(uint8_t *dst, int width, int height, int strideBytes, bool for
         }
     }
     const bool hqFull = g_hq && g_hqFull && g_srcH > 720;       // canal HD: sem reduzir e ampliar
-    const int cap = hqFull ? width : 1280;
+    const int cap = hqFull ? width : g_capW.load();
     int lw = width, lh = height;
     if (width > cap) { lw = cap; lh = (int)((long long)height * lw / width); if (lh < 2) lh = 2; }
     const bool scaled = (lw != width || lh != height);
@@ -1006,6 +1045,20 @@ bool renderToBgra(uint8_t *dst, int width, int height, int strideBytes, bool for
                 g_hqMs = 0; g_hqN = 0;
             }
         }
+        if (!hqFull && g_capW.load() > 720) {                    // CPU lenta no swscale: reduz o render interno (~7 fps virava slideshow); a ampliacao cobre a tela
+            static double capMs = 0; static int capN = 0;
+            capMs += us / 1000.0;
+            if (++capN >= 30) {
+                const double avg = capMs / capN; capMs = 0; capN = 0;
+                if (avg > 24.0) {
+                    const int cur = g_capW.load();
+                    const int nxt = cur > 1024 ? 1024 : (cur > 854 ? 854 : 720);
+                    g_capW = nxt; g_smoothOn = false;                // e vizinho mais proximo: poupa os ~15 ms da ampliacao suave
+                    char tb[140]; snprintf(tb, sizeof tb, "[kick-perf] render %.0f ms/quadro: largura interna %d -> %d", avg, cur, nxt);
+                    logBoth(tb);
+                }
+            }
+        }
         if (viaLo) upscaleLo(dst, width, height, strideBytes);
     }
     return r >= 0;
@@ -1028,6 +1081,25 @@ Status status() {
 bool isOpen() { return g_open.load(); }
 
 bool hwFallbackRequested() { return g_hwFallbackAsk.exchange(false); }
+double hwFallbackPos() { return g_hwFallbackPos.exchange(0); }
+
+void waitStopped(int maxMs) {
+    // Sem segurar g_mx entre as voltas (o render/poll precisam dele). mpv_wait_event(0) nao bloqueia o app mesmo que o core esteja ocupado.
+    const auto t0 = std::chrono::steady_clock::now();
+    bool armed = false;
+    while (std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count() < maxMs) {
+        {
+            std::lock_guard<std::mutex> lk(g_mx);
+            if (!g_mpv) return;
+            drainEventsUnlocked(nullptr, nullptr);
+            if (g_endSeen.load()) { if (armed) remove(kHwGuardPath); tr("mpv-parou-de-verdade"); return; }
+            // videodec2 ainda fechando: se o sistema matar o app agora, o proximo start abre em software (guard)
+            if (!armed && g_hwWanted) { armed = true; FILE *gf = fopen(kHwGuardPath, "wb"); if (gf) { fputs("fechando videodec2", gf); fclose(gf); } }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    tr("mpv-waitStopped: tempo esgotado");
+}
 
 } // namespace mpv_player
 

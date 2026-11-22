@@ -4417,6 +4417,7 @@ int main() {
                 g_quitting = true;                 // workers de rede/capas param
                 if (mode == Mode::Play || player.h) {
                     try { player.stop(); } catch (...) {}
+                    mpv_player::waitStopped(1500);         // deixa o videodec2 fechar de verdade ANTES de o sistema matar/congelar o app
                     mode = Mode::Menu;
                 }
                 g_covers.setPaused(true);
@@ -4463,7 +4464,17 @@ int main() {
                         app.say(resumeSnap.startSec > 0 ? "Retomando de " + UI::fmtTime(resumeSnap.startSec) : std::string("Retomando..."));
                     }
                 };
-                if (!stopReq && wasUi) { wasUi = false; if (!bg) { g_quitting = false; g_covers.setPaused(false); dirty = true; resumeAfterPs(); } }
+                static double psOkSince = -1;
+                if (stopReq) psOkSince = -1;
+                if (!stopReq && wasUi) {
+                    // So retoma depois de 2 s estavel na frente: logo apos o menu do PS e quando o usuario escolhe "Fechar aplicativo";
+                    // retomar na hora abria o videodec2 e o sistema o derrubava no meio da abertura.
+                    if (psOkSince < 0) psOkSince = nowSec();
+                    if (nowSec() - psOkSince >= 2.0) {
+                        psOkSince = -1; wasUi = false;
+                        if (!bg) { g_quitting = false; g_covers.setPaused(false); dirty = true; resumeAfterPs(); }
+                    }
+                }
                 {   // "Fechar aplicativo" do PS4 manda o app ao segundo plano SEM passar pelo menu do PS (ovl=0): estavel por 1,5 s = sai PELO SISTEMA
                     static double bgAnySince = -1; static bool keepAny = false;
                     if (bgAny) { if (bgAnySince < 0) { bgAnySince = nowSec(); keepAny = fileExists(kKeepBgFile); } } else bgAnySince = -1;
@@ -4650,7 +4661,8 @@ int main() {
                 // filme/serie: guarda o contexto (lista de episodios, historico e ponto inicial) para o restart nao perder nada
                 const bool vod = player.isVod;
                 const std::vector<std::string> keepEpU = player.epUrls, keepEpT = player.epTitles;
-                const int keepEpI = player.epIndex; const long long keepStart = player.startAtSec;
+                const int keepEpI = player.epIndex; long long keepStart = player.startAtSec;
+                { const double hp = mpv_player::hwFallbackPos(); if (vod && hp > 5.0) keepStart = (long long)hp - 2; }   // reabre em software onde o hardware errou
                 const std::string keepId = player.progId; const kick::ProgressMeta keepMeta = player.progMeta;
                 safeRestartLive("hardware sem video");
                 if (vod) {

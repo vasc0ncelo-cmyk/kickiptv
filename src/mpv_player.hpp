@@ -42,6 +42,11 @@ bool boot();
 bool play(const std::string &url, bool live = false, long long startSec = 0);
 // true UMA vez quando o videodec2 abriu mas nao entregou video: o app deve reabrir o canal (ja volta em software, ate fechar o app).
 bool hwFallbackRequested();
+// Posicao (s) em que o videodec2 falhou num filme/serie: o app reabre em software a partir dela (0 = desconhecida).
+double hwFallbackPos();
+// Espera (ate maxMs) o mpv terminar de PARAR de verdade (decoder/demuxer fechados). Usar ao ir para segundo plano / sair:
+// o videodec2 tem memoria de GPU e fila de compute que nao pode ser derrubada no meio pelo sistema.
+void waitStopped(int maxMs);
 void pause(bool on);
 void setMute(bool on);
 void setSpeed(double rate);
