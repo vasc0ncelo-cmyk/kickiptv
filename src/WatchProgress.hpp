@@ -7,14 +7,25 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace kick {
 
+// Dados para listar em "Assistido recentemente" (titulo, serie, capa...). Gravados junto com a posicao.
+struct ProgressMeta {
+    std::string title, series, logo;
+    int season = 0, episode = 0;
+    bool isEpisode = false;
+};
+
 struct ProgressEntry {
-    std::string id;           // ID do VOD / episodio
+    std::string id;           // ID do VOD / episodio (a URL)
     int64_t positionSec = 0;  // currentTime em segundos
     int64_t durationSec = 0;  // duracao total (0 = desconhecida)
     int64_t updatedAt = 0;    // epoch (usado para limpar os mais antigos)
+    std::string title, series, logo;
+    int season = 0, episode = 0;
+    bool isEpisode = false;
 };
 
 class WatchProgress {
@@ -41,7 +52,10 @@ public:
     // kSaveIntervalSec. Use force=true ao pausar, parar, sair, fechar o player
     // ou suspender o app.
     void Update(const std::string& id, int64_t positionSec, int64_t durationSec,
-                bool force = false);
+                bool force = false, const ProgressMeta* meta = nullptr);
+
+    // Itens que ainda da para retomar (>= kMinResumeSec e fora do final), do mais recente para o mais antigo.
+    std::vector<ProgressEntry> List(size_t maxN = 60) const;
 
     void Clear(const std::string& id);  // remove (ex.: "marcar como assistido")
     void Flush();                       // forca gravacao se houver mudancas

@@ -115,6 +115,12 @@ bool ParseItem(Cur& c, ProgressEntry& it) {
         else if (key == "pos") { if (!ParseNumber(c, it.positionSec)) return false; }
         else if (key == "dur") { if (!ParseNumber(c, it.durationSec)) return false; }
         else if (key == "ts")  { if (!ParseNumber(c, it.updatedAt)) return false; }
+        else if (key == "t")   { if (!ParseString(c, it.title)) return false; }
+        else if (key == "sr")  { if (!ParseString(c, it.series)) return false; }
+        else if (key == "lg")  { if (!ParseString(c, it.logo)) return false; }
+        else if (key == "se")  { int64_t v = 0; if (!ParseNumber(c, v)) return false; it.season = (int)v; }
+        else if (key == "ep")  { int64_t v = 0; if (!ParseNumber(c, v)) return false; it.episode = (int)v; }
+        else if (key == "ie")  { int64_t v = 0; if (!ParseNumber(c, v)) return false; it.isEpisode = v != 0; }
         else if (!SkipValue(c)) return false;
     }
 }
@@ -262,7 +268,7 @@ bool WatchProgress::GetResumePoint(const std::string& id, int64_t& outSec) const
 }
 
 void WatchProgress::Update(const std::string& id, int64_t positionSec, int64_t durationSec,
-                           bool force) {
+                           bool force, const ProgressMeta* meta) {
     if (id.empty() || positionSec < 0) return;
 
     bool shouldSave = false;
@@ -283,6 +289,14 @@ void WatchProgress::Update(const std::string& id, int64_t positionSec, int64_t d
                 e.updatedAt = static_cast<int64_t>(time(nullptr));
                 dirty_ = true;
             }
+            if (meta) {   // titulo/serie/capa para a lista "Assistido recentemente"
+                if (e.title != meta->title || e.series != meta->series || e.logo != meta->logo || e.season != meta->season ||
+                    e.episode != meta->episode || e.isEpisode != meta->isEpisode) {
+                    e.title = meta->title; e.series = meta->series; e.logo = meta->logo;
+                    e.season = meta->season; e.episode = meta->episode; e.isEpisode = meta->isEpisode;
+                    dirty_ = true;
+                }
+            }
             if (entries_.size() > kMaxEntries) Prune();
         }
 
@@ -294,6 +308,22 @@ void WatchProgress::Update(const std::string& id, int64_t positionSec, int64_t d
         }
     }
     if (shouldSave) Flush();
+}
+
+std::vector<ProgressEntry> WatchProgress::List(size_t maxN) const {
+    std::vector<ProgressEntry> out;
+    {
+        std::lock_guard<std::mutex> lk(mutex_);
+        for (const auto& kv : entries_) {
+            const ProgressEntry& e = kv.second;
+            if (e.positionSec < kMinResumeSec || IsNearEnd(e.positionSec, e.durationSec)) continue;
+            if (e.title.empty()) continue;   // sem titulo (gravado por versao antiga): nao da para listar
+            out.push_back(e);
+        }
+    }
+    std::sort(out.begin(), out.end(), [](const ProgressEntry& a, const ProgressEntry& b) { return a.updatedAt > b.updatedAt; });
+    if (out.size() > maxN) out.resize(maxN);
+    return out;
 }
 
 void WatchProgress::Clear(const std::string& id) {
@@ -343,9 +373,13 @@ std::string WatchProgress::Serialize() const {
         first = false;
         s += "{\"id\":";
         AppendEscaped(s, e.id);
-        snprintf(num, sizeof(num), ",\"pos\":%lld,\"dur\":%lld,\"ts\":%lld}",
-                 (long long)e.positionSec, (long long)e.durationSec, (long long)e.updatedAt);
+        snprintf(num, sizeof(num), ",\"pos\":%lld,\"dur\":%lld,\"ts\":%lld,\"se\":%d,\"ep\":%d,\"ie\":%d",
+                 (long long)e.positionSec, (long long)e.durationSec, (long long)e.updatedAt, e.season, e.episode, e.isEpisode ? 1 : 0);
         s += num;
+        s += ",\"t\":";  AppendEscaped(s, e.title);
+        s += ",\"sr\":"; AppendEscaped(s, e.series);
+        s += ",\"lg\":"; AppendEscaped(s, e.logo);
+        s += '}';
     }
     s += "]}";
     return s;

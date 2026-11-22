@@ -20,7 +20,7 @@ void setTrace(void (*)(const char *)) {}
 bool available() { return false; }
 void prewarm() {}
 bool boot() { return false; }
-bool play(const std::string &, bool) { return false; }
+bool play(const std::string &, bool, long long) { return false; }
 bool hwFallbackRequested() { return false; }
 void pause(bool) {}
 void setMute(bool) {}
@@ -297,6 +297,17 @@ static bool g_hwChecked = false;                   // o decoder REAL deste play 
 static bool g_hwBad = false;                       // videodec2 abriu mas nao deu video: software ate fechar o app
 static std::atomic<bool> g_hwFallbackAsk{false};   // pedido (1 vez) para o app reabrir o canal em software
 static std::chrono::steady_clock::time_point g_hwT0 = std::chrono::steady_clock::now();
+
+// ---------- Modo qualidade: canais ao vivo do IPTV (a Kick e os filmes/series ficam como antes) ----------
+// Em HD (>720p) o canal e renderizado na resolucao cheia, sem reduzir para 1280 e ampliar de volta (isso deixava o canal mole), e o
+// decoder roda sem os atalhos de velocidade (vd-lavc-fast / skiploopfilter), que aumentam os "blocos" em canais de bitrate baixo.
+// Se a CPU nao der conta (media > 45 ms por quadro), volta sozinho ao teto de 1280 e avisa no log.
+static bool g_hq = false;            // este play e um canal IPTV ao vivo
+static bool g_hqFull = true;         // ainda pode renderizar na resolucao cheia
+static int g_srcH = 0;               // altura do video de origem (0 = ainda nao sei)
+static int g_srcTries = 0;
+static double g_hqMs = 0;
+static int g_hqN = 0;
 
 static bool fileThere(const char *p) { FILE *f = fopen(p, "rb"); if (!f) return false; fclose(f); return true; }
 
@@ -590,12 +601,13 @@ bool boot() {
     return true;
 }
 
-bool play(const std::string &url, bool live) {
+bool play(const std::string &url, bool live, long long startSec) {
     if (!boot()) return false;
     if (url.empty()) {
         setErr("URL vazia");
         return false;
     }
+    long long seekAfter = 0;                                        // >0: o "start" foi recusado, fazer seek depois de abrir
 
     {
         std::lock_guard<std::mutex> lk(g_mx);
@@ -652,13 +664,28 @@ bool play(const std::string &url, bool live) {
                      vdRc, propStr("options/vd").c_str(), g_hwBad ? " [bloqueado: falhou antes]" : "", hwOff ? " [/data/kickiptv_nohwdec]" : (!hwWhyNot.empty() && live ? (" [" + hwWhyNot + "]").c_str() : ""));
             logBoth(b);
         }
+        // ---- Qualidade: so canal IPTV ao vivo (live e nao e Kick). Reaplicado A CADA play: Kick/filme/serie voltam ao modo rapido. ----
+        g_hq = live && !kickLive;
+        g_hqFull = true; g_srcH = 0; g_srcTries = 0; g_hqMs = 0; g_hqN = 0;
+        mpv_set_property_string(g_mpv, "vd-lavc-fast", g_hq ? "no" : "yes");
+        mpv_set_property_string(g_mpv, "vd-lavc-skiploopfilter", g_hq ? "default" : "nonref");
+        {
+            char b[160]; snprintf(b, sizeof b, "[kick-hq] play: %s (vd-lavc-fast=%s skiploopfilter=%s)", g_hq ? "canal IPTV: qualidade ligada" : "modo rapido",
+                                  g_hq ? "no" : "yes", g_hq ? "default" : "nonref");
+            logBoth(b);
+        }
         g_hwWanted = hw; g_hwChecked = false; g_hwT0 = std::chrono::steady_clock::now();
         std::string liveOpts = std::string("force-seekable=no,demuxer-max-bytes=24MiB,demuxer-max-back-bytes=1MiB,demuxer-readahead-secs=15,vd-lavc-threads=") + (hw ? "1" : "4");
-        const char *cmd[] = {"loadfile", wrap.c_str(), "replace", kickLive ? liveOpts.c_str() : nullptr, nullptr};   // mpv 0.36: sem o indice "0"
+        // Opcoes SO deste arquivo (somem quando ele termina): live Kick = cache pequeno; filme/serie com ponto salvo = "start".
+        std::string fileOpts = kickLive ? liveOpts : std::string();
+        if (!live && startSec > 0) fileOpts = "start=" + std::to_string(startSec);
+        seekAfter = 0;
+        const char *cmd[] = {"loadfile", wrap.c_str(), "replace", fileOpts.empty() ? nullptr : fileOpts.c_str(), nullptr};   // mpv 0.36: sem o indice "0"
         int lrc = mpv_command(g_mpv, cmd);
-        if (lrc < 0 && kickLive) {                                  // opcao nao aceita nesta versao: abre sem elas
+        if (lrc < 0 && !fileOpts.empty()) {                         // opcao nao aceita nesta versao: abre sem elas
             const char *cmd2[] = {"loadfile", wrap.c_str(), "replace", nullptr};
             lrc = mpv_command(g_mpv, cmd2);
+            if (lrc >= 0 && !live && startSec > 0) seekAfter = startSec;     // ... e pula para o ponto salvo assim que abrir
         }
         if (chk(lrc) < 0) {
             g_open = false;
@@ -698,6 +725,10 @@ bool play(const std::string &url, bool live) {
     g_buffering = false;
     g_failed = false;
     g_err.clear();
+    if (seekAfter > 0) {
+        std::lock_guard<std::mutex> lk(g_mx);
+        if (g_mpv) { const std::string ss = std::to_string(seekAfter); const char *sk[] = {"seek", ss.c_str(), "absolute", nullptr}; mpv_command_async(g_mpv, 0, sk); }
+    }
     {
         std::lock_guard<std::mutex> lk(g_mx);
         g_hwT0 = std::chrono::steady_clock::now();         // o relogio do "sem video" conta a partir de agora (abertura ja terminou)
@@ -906,15 +937,27 @@ bool renderToBgra(uint8_t *dst, int width, int height, int strideBytes, bool for
     uint64_t flags = mpv_render_context_update(g_rr);
     const bool newFrame = (flags & MPV_RENDER_UPDATE_FRAME) != 0;
     if (!newFrame && !(force && g_everRendered)) return false;
+    if (g_hq && g_srcH == 0 && g_srcTries < 40) {               // altura do video de origem (so as primeiras tentativas; chamada barata)
+        g_srcTries++;
+        int64_t sh = 0;
+        if (mpv_get_property(g_mpv, "video-params/h", MPV_FORMAT_INT64, &sh) >= 0 && sh > 0) {
+            g_srcH = (int)sh;
+            char tb[120]; snprintf(tb, sizeof tb, "[kick-hq] fonte %dp -> %s", g_srcH, g_srcH > 720 ? "render na resolucao cheia" : "teto de 1280 (SD/720p)");
+            logBoth(tb);
+        }
+    }
+    const bool hqFull = g_hq && g_hqFull && g_srcH > 720;       // canal HD: sem reduzir e ampliar
+    const int cap = hqFull ? width : 1280;
     int lw = width, lh = height;
-    if (width > 1280) { lw = 1280; lh = (int)((long long)height * lw / width); if (lh < 2) lh = 2; }
+    if (width > cap) { lw = cap; lh = (int)((long long)height * lw / width); if (lh < 2) lh = 2; }
     const bool scaled = (lw != width || lh != height);
-    if (!newFrame && force && g_everRendered && scaled && g_loW == lw && g_loH == lh && !g_lo.empty()) {
+    const bool viaLo = scaled || hqFull;                         // desenha numa copia em RAM e depois leva para a tela (nunca escreve direto na memoria de video)
+    if (!newFrame && force && g_everRendered && viaLo && g_loW == lw && g_loH == lh && !g_lo.empty()) {
         upscaleLo(dst, width, height, strideBytes);       // so repinta o ultimo quadro (OSD mudou): custo minimo
         return true;
     }
     uint8_t *target = dst; int tstride = strideBytes;
-    if (scaled) {
+    if (viaLo) {
         if (g_loW != lw || g_loH != lh || g_lo.size() < (size_t)lw * lh) { g_lo.assign((size_t)lw * lh, 0); g_loW = lw; g_loH = lh; }
         target = (uint8_t *)g_lo.data(); tstride = lw * 4;
     }
@@ -935,9 +978,22 @@ bool renderToBgra(uint8_t *dst, int width, int height, int strideBytes, bool for
     if (r >= 0) {
         g_everRendered = true;
         g_lastFrameT = std::chrono::steady_clock::now();
-        g_renderUs += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+        const long long us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+        g_renderUs += us;
         g_renderN++;
-        if (scaled) upscaleLo(dst, width, height, strideBytes);
+        if (hqFull) {                                            // CPU nao da conta da resolucao cheia: volta ao teto de 1280
+            g_hqMs += us / 1000.0;
+            if (++g_hqN >= 60) {
+                const double avg = g_hqMs / g_hqN;
+                if (avg > 45.0) {
+                    g_hqFull = false;
+                    char tb[140]; snprintf(tb, sizeof tb, "[kick-hq] render cheio lento (%.0f ms/quadro): voltando ao teto de 1280", avg);
+                    logBoth(tb);
+                }
+                g_hqMs = 0; g_hqN = 0;
+            }
+        }
+        if (viaLo) upscaleLo(dst, width, height, strideBytes);
     }
     return r >= 0;
 }

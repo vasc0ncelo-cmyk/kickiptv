@@ -26,6 +26,7 @@ struct Category {
     std::vector<std::string> series; // so series (ordenadas)
     // Painel Xtream: a categoria so tem nome e id; os itens sao baixados quando ela abre (App::ensureCategory).
     std::string id;
+    bool recent = false;             // "Assistido recentemente": categoria criada pelo app com o historico (clicar retoma no minuto salvo)
     bool lazy = false, loaded = true;
     bool unloaded() const { return lazy && !loaded; }
     size_t size() const { return items.empty() ? series.size() : items.size(); }

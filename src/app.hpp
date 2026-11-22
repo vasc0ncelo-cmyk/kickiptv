@@ -48,6 +48,16 @@ inline std::string bodyPreview(const std::string &b, size_t maxLen = 90) {
 }
 
 // A camada PS4 (src/ps4_platform.cpp) implementa isto.
+// Um item do historico ("Assistido recentemente"): filme ou episodio com o ponto onde parou.
+struct WatchRec {
+    std::string id;                 // URL do video (chave)
+    std::string title;              // titulo que aparece no player / na lista
+    std::string series, logo;       // serie (so episodio) e capa
+    int season = 0, episode = 0;
+    bool isEpisode = false;
+    long long pos = 0, dur = 0;     // segundos
+};
+
 struct Platform {
     virtual ~Platform() {}
     virtual bool httpGet(const std::string &url, std::string &body) = 0;
@@ -60,6 +70,9 @@ struct Platform {
     }
     virtual bool wasCancelled() { return false; }   // o ultimo httpStream foi cancelado pelo usuario?
     virtual void play(const std::string &url, const std::string &title) = 0;
+    virtual void playAt(const std::string &url, const std::string &title, long long /*startSec*/) { play(url, title); }   // comeca no minuto indicado
+    virtual void watchBegin(const WatchRec & /*meta*/) {}                    // avisa o que vai tocar (para gravar o historico); chamar ANTES de play/playAt
+    virtual void watchList(std::vector<WatchRec> & /*out*/) {}               // historico, do mais recente para o mais antigo
     // Opcional: lista de episodios da temporada (para L1/R1 pular no player). Padrao: limpa.
     virtual void setEpisodeList(const std::vector<std::string> & /*urls*/,
                                 const std::vector<std::string> & /*titles*/, int /*index*/) {}

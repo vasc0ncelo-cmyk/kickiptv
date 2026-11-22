@@ -656,6 +656,10 @@ struct UI {
     int catCur[4] = {0, 0, 0, 0}, catScroll[4] = {0, 0, 0, 0};   // categoria escolhida (barra da esquerda) em cada aba
     bool inItems = false;     // false = foco na barra de categorias, true = foco nos itens (Filmes/Series/Canais)
     std::string curSeries;
+    // "Assistido recentemente" (Filmes e Series): vem do historico gravado pelo player; clicar retoma no minuto em que parou.
+    std::vector<WatchRec> recMovies;               // mesma ordem dos itens da categoria de Filmes
+    std::map<std::string, WatchRec> recSeries;     // nome da serie -> episodio em andamento
+    std::string recSig;                            // assinatura do que ja foi montado (evita refazer a toa)
     int curSeason = 0;
     std::string kickLast;     // ultimo @ pesquisado
     // Tela Kick: 0 = menu | 1 = Lives agora (API oficial) | 2 = Favoritos | 3 = Historico
@@ -681,6 +685,8 @@ struct UI {
     int detailSeasonIdx = 0;
     int detailFocus = 0;       // 0 Assistir, 1 temporadas, 2 episodios
     int detailEpCur = 0;
+    // Aberta por "Assistido recentemente": dois botoes ("Continuar de MM:SS" e "Assistir do inicio"); detailBtn: 0 continuar, 1 inicio
+    long long detailResumeSec = 0; std::string detailResumeUrl, detailResumeTitle; int detailBtn = 0;
     int detailEpScroll = 0, detailSeaScroll = 0;   // primeiro cartao / aba visivel
     std::vector<int> detailSeasons;
     DetailMeta detailMeta;
@@ -925,7 +931,9 @@ struct UI {
             if (!eps.empty() && !eps[0].logo.empty()) return eps[0].logo;
         }
         auto ri = app.list.seriesInfo.find(name);      // painel Xtream: a capa vem na lista de series
-        return ri == app.list.seriesInfo.end() ? "" : ri->second.cover;
+        if (ri != app.list.seriesInfo.end() && !ri->second.cover.empty()) return ri->second.cover;
+        auto rs = recSeries.find(name);                // "Assistido recentemente": a capa guardada no historico
+        return rs == recSeries.end() ? "" : rs->second.logo;
     }
     // pede as capas da tela atual (so quando algo mudou) e das proximas paginas, para ja estarem prontas
     void wantCovers(int firstVisible, int visibleCount) {
@@ -995,6 +1003,64 @@ struct UI {
     }
     std::string catLabel(int i) const { const auto &v = cats(tab); return i >= 0 && i < (int)v.size() ? v[i].name : ""; }
     size_t catSize(int i) const { const auto &v = cats(tab); return i >= 0 && i < (int)v.size() ? v[i].size() : 0; }
+
+    static std::string fmtTime(long long sec) {
+        if (sec < 0) sec = 0;
+        long long h = sec / 3600, m = (sec % 3600) / 60, s = sec % 60;
+        char b[32];
+        if (h > 0) snprintf(b, sizeof b, "%lld:%02lld:%02lld", h, m, s); else snprintf(b, sizeof b, "%lld:%02lld", m, s);
+        return b;
+    }
+    // (Re)monta a categoria "Assistido recentemente" no topo de Filmes e de Series, com o historico do player.
+    // Filme que nao esta na lista carregada (painel Xtream so baixa a categoria aberta) entra como item avulso, com a URL guardada.
+    void refreshRecents() {
+        std::vector<WatchRec> recs;
+        app.pf.watchList(recs);
+        Playlist &p = app.list;
+        std::string sig;
+        for (const auto &r : recs) { sig += r.id; sig += '|'; sig += std::to_string(r.pos); sig += ';'; }
+        sig += std::to_string(p.movieCats.size()) + "," + std::to_string(p.seriesCats.size()) + "," + std::to_string(p.movies.size()) + "," + std::to_string(p.seriesTree.size());
+        if (sig == recSig) return;
+        auto drop = [&](std::vector<Category> &v, Tab t) { if (!v.empty() && v[0].recent) { v.erase(v.begin()); if (catCur[(int)t] > 0) catCur[(int)t]--; } };
+        auto put = [&](std::vector<Category> &v, Tab t, Category &&c) { v.insert(v.begin(), std::move(c)); if (catCur[(int)t] > 0) catCur[(int)t]++; };
+        drop(p.movieCats, Tab::Movies); drop(p.seriesCats, Tab::Series);
+        recMovies.clear(); recSeries.clear();
+        Category cm, cs;
+        cm.name = cs.name = "Assistido recentemente"; cm.recent = cs.recent = true;
+        const bool hasMv = !p.movieCats.empty(), hasSr = !p.seriesCats.empty();     // sem lista carregada: nada a mostrar
+        for (const auto &r : recs) {
+            if (r.id.empty()) continue;
+            if (!r.isEpisode) {
+                if (!hasMv || cm.items.size() >= 30) continue;
+                uint32_t idx = (uint32_t)p.movies.size();
+                for (size_t i = 0; i < p.movies.size(); i++) if (p.movies[i].url == r.id) { idx = (uint32_t)i; break; }
+                if (idx == (uint32_t)p.movies.size()) { Entry e; e.kind = Kind::Movie; e.name = r.title; e.url = r.id; e.logo = r.logo; p.movies.push_back(std::move(e)); }
+                cm.items.push_back(idx); recMovies.push_back(r);
+            } else if (hasSr && !r.series.empty() && !recSeries.count(r.series) && cs.series.size() < 30) {
+                cs.series.push_back(r.series); recSeries[r.series] = r;
+            }
+        }
+        if (!cm.items.empty()) put(p.movieCats, Tab::Movies, std::move(cm));
+        if (!cs.series.empty()) put(p.seriesCats, Tab::Series, std::move(cs));
+        recSig = sig;
+        lastBatchKey.clear();
+    }
+    // Poster de "Assistido recentemente": faixa com o ponto onde parou + barra de progresso.
+    void drawRecentBadge(Renderer &r, int px, int py, int pw, int ph, int idx) const {
+        const Category *c = curCat();
+        if (!c || !c->recent) return;
+        const WatchRec *w = nullptr;
+        std::string txt;
+        if (tab == Tab::Movies) { if (idx >= 0 && idx < (int)recMovies.size()) w = &recMovies[idx]; }
+        else if (tab == Tab::Series && idx >= 0 && idx < (int)c->series.size()) { auto it = recSeries.find(c->series[idx]); if (it != recSeries.end()) w = &it->second; }
+        if (!w) return;
+        txt = (w->isEpisode ? "T" + std::to_string(w->season < 1 ? 1 : w->season) + " E" + std::to_string(w->episode) + " " : std::string()) + fmtTime(w->pos);
+        r.fillRect(px, py + ph - 40, pw, 40, 0xCC000000);
+        uiText(r, px + 8, py + ph - 36, uiFit(r, txt, 17, pw - 16), theme::TEXT, 17, true);
+        uiText(r, px + 8, py + ph - 20, uiFit(r, "parou aqui", 14, pw - 16), theme::SOFT, 14);
+        r.fillRect(px, py + ph - 6, pw, 6, 0x88000000);
+        if (w->dur > 0) { long long f = w->pos * pw / w->dur; if (f < 3) f = 3; if (f > pw) f = pw; r.fillRect(px, py + ph - 6, (int)f, 6, theme::GREEN); }
+    }
 
 
     static bool nameMatch(const std::string &name, const std::string &q) {
@@ -1196,11 +1262,11 @@ struct UI {
 
     // categoria de um filme / serie (quando aberto pela busca)
     std::string movieCategoryOf(uint32_t idx) const {
-        for (const auto &c : app.list.movieCats) for (uint32_t i : c.items) if (i == idx) return c.name;
+        for (const auto &c : app.list.movieCats) { if (c.recent) continue; for (uint32_t i : c.items) if (i == idx) return c.name; }
         return "";
     }
     std::string seriesCategoryOf(const std::string &name) const {
-        for (const auto &c : app.list.seriesCats) for (const auto &n : c.series) if (n == name) return c.name;
+        for (const auto &c : app.list.seriesCats) { if (c.recent) continue; for (const auto &n : c.series) if (n == name) return c.name; }
         return "";
     }
 
@@ -1296,7 +1362,7 @@ private:
 
     bool autoWant = false; int autoFrames = 0;
     void wantAutoOpen() { autoFrames = 0; autoWant = app.xt.active && browsable(tab) && curCat() && curCat()->unloaded(); }
-    void openTab(Tab t) { tab = t; screen = t == Tab::Kick ? Screen::Kick : Screen::List; level = 0; inItems = false; searchQ.clear(); searchHits.clear(); wantAutoOpen(); if (t == Tab::Kick) kickEnter(); }
+    void openTab(Tab t) { tab = t; screen = t == Tab::Kick ? Screen::Kick : Screen::List; level = 0; inItems = false; searchQ.clear(); searchHits.clear(); if (t == Tab::Movies || t == Tab::Series) refreshRecents(); wantAutoOpen(); if (t == Tab::Kick) kickEnter(); }
     void resetBrowse() {
         for (int i = 0; i < 4; i++) cursor[i] = scroll[i] = catCur[i] = catScroll[i] = 0;
         level = 0; inItems = false;
@@ -1652,6 +1718,7 @@ private:
                         r.roundRect(bx - 22, by - 22, 44, 44, 22, GREEN);
                         for (int j = 0; j < 22; j++) { int d = 2 * j + 1 - 22; if (d < 0) d = -d; int ww = 18 * (22 - d) / 22; if (ww > 0) r.fillRect(bx - 6, by - 11 + j, ww, 1, BLACK); }
                     }
+                    drawRecentBadge(r, px, py, pw, ph, idx);
                     uiText(r, px, py + ph + 10, uiFit(r, label, 20, pw + gap - 6), sel ? TEXT : SOFT, 20, sel);
                 }
             if (n > kCols * kGridRows) {
@@ -1899,7 +1966,51 @@ public:
     // Pagina de detalhes (detailpage.hpp)
     void openMovieDetail(const Entry &e, const std::string &category);
     void openSeriesDetail(const std::string &name, const std::string &category);
-    void playSeriesEpisode(int epIndex);
+    void playSeriesEpisode(int epIndex, long long startSec = 0);
+    bool resumeEpisode(long long startSec);          // serie aberta por "Assistido recentemente": toca o episodio salvo (false = nao achou)
+    // Toca o item de "Assistido recentemente" no minuto salvo (serie: abre a serie so para ter a lista de episodios do proximo/anterior).
+    void playRecent(int c) {
+        const Category *cat = curCat();
+        if (!cat) return;
+        if (tab == Tab::Movies) {
+            if (c < 0 || c >= (int)recMovies.size()) return;
+            const WatchRec r = recMovies[c];
+            if (cat->items[c] < app.list.movies.size()) {       // abre os detalhes com os 2 botoes: Continuar de MM:SS / Assistir do inicio
+                openMovieDetail(app.list.movies[cat->items[c]], "");
+                detailResumeSec = r.pos; detailResumeUrl = r.id; detailResumeTitle = r.title; detailBtn = 0; detailFocus = 0;
+                return;
+            }
+            app.pf.watchBegin(r);
+            app.pf.playAt(r.id, r.title, r.pos);
+            app.say("Continuando de " + fmtTime(r.pos));
+            return;
+        }
+        if (tab != Tab::Series || c < 0 || c >= (int)cat->series.size()) return;
+        const std::string nm = cat->series[c];
+        auto it = recSeries.find(nm);
+        if (it == recSeries.end()) return;
+        const WatchRec r = it->second;
+        const bool known = app.list.seriesTree.count(nm) || app.list.seriesInfo.count(nm);
+        if (known && app.ensureSeries(nm) && app.list.seriesTree.count(nm)) {
+            openSeriesDetail(nm, "");
+            for (int si = 0; si < (int)detailSeasons.size(); si++) {          // acha o episodio salvo e deixa a pagina nele, com os 2 botoes
+                detailSeasonIdx = si; curSeason = detailSeasons[si];
+                auto eps = detailEpisodes();
+                for (int ei = 0; ei < (int)eps.size(); ei++)
+                    if (eps[ei].url == r.id) {
+                        detailEpCur = ei;
+                        detailEpScroll = ei >= kDetEps ? ei - kDetEps + 1 : 0;
+                        detailSeaScroll = si >= kDetTabs ? si - kDetTabs + 1 : 0;
+                        detailResumeSec = r.pos; detailResumeUrl = r.id; detailResumeTitle = r.title; detailBtn = 0; detailFocus = 0;
+                        return;
+                    }
+            }
+            detailSeasonIdx = 0; detailSeaScroll = 0; if (!detailSeasons.empty()) curSeason = detailSeasons[0];
+        }
+        app.pf.watchBegin(r);                                // serie fora da lista (ou episodio nao achado): toca so o episodio salvo
+        app.pf.playAt(r.id, r.title, r.pos);
+        app.say("Continuando de " + fmtTime(r.pos));
+    }
     void handleDetail(Input in);
     void renderDetail(Renderer &r);
     std::vector<Entry> detailEpisodes() const;
@@ -1953,6 +2064,7 @@ private:
         }
         const Category *cat = curCat();
         if (!cat || c >= n) return;
+        if (cat->recent) { playRecent(c); return; }          // "Assistido recentemente": toca direto, no minuto em que parou
         if (tab == Tab::Channels) {
             playChannelFrom(cat->items, c);
         } else if (tab == Tab::Movies) {

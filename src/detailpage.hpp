@@ -48,6 +48,7 @@ inline void star(Renderer &r, float cx, float cy, float R, unsigned c) {
 
 // ---------------- Abrir ----------------
 inline void UI::openMovieDetail(const Entry &e, const std::string &category) {
+    detailResumeSec = 0; detailBtn = 0;
     detailBackHome = false;
     detailSeries = false;
     std::string y, q;
@@ -65,6 +66,7 @@ inline void UI::openMovieDetail(const Entry &e, const std::string &category) {
     app.say(e.url.empty() ? "Este filme nao tem link de video" : "Detalhes do filme");
 }
 inline void UI::openSeriesDetail(const std::string &name, const std::string &category) {
+    detailResumeSec = 0; detailBtn = 0;
     detailBackHome = false;
     detailSeries = true;
     std::string y, q;
@@ -97,7 +99,7 @@ inline std::vector<Entry> UI::detailEpisodes() const {
     return sortedEps(it->second);
 }
 
-inline void UI::playSeriesEpisode(int epIndex) {
+inline void UI::playSeriesEpisode(int epIndex, long long startSec) {
     auto eps = detailEpisodes();
     if (epIndex < 0 || epIndex >= (int)eps.size()) return;
     if (eps[epIndex].url.empty()) { app.say("Episodio sem link"); return; }
@@ -106,17 +108,41 @@ inline void UI::playSeriesEpisode(int epIndex) {
         urls.push_back(eps[i].url);
         titles.push_back(detailTitle + " - " + detailEpisodeLabel(curSeries, eps[i].name, eps[i].episode, (int)i + 1));
     }
-    app.pf.play(urls[epIndex], titles[epIndex]);
+    {   // historico ("Assistido recentemente"): o player grava a posicao com estes dados
+        WatchRec w; w.id = urls[epIndex]; w.title = titles[epIndex]; w.series = curSeries; w.logo = detailLogo;
+        w.season = curSeason; w.episode = eps[epIndex].episode; w.isEpisode = true;
+        app.pf.watchBegin(w);
+    }
+    if (startSec > 0) app.pf.playAt(urls[epIndex], titles[epIndex], startSec);
+    else app.pf.play(urls[epIndex], titles[epIndex]);
     app.pf.setEpisodeList(urls, titles, epIndex);
+}
+
+inline bool UI::resumeEpisode(long long startSec) {
+    const int oldSeason = detailSeasonIdx, oldCur = curSeason;
+    for (int si = 0; si < (int)detailSeasons.size(); si++) {
+        detailSeasonIdx = si; curSeason = detailSeasons[si];
+        auto eps = detailEpisodes();
+        for (int ei = 0; ei < (int)eps.size(); ei++)
+            if (eps[ei].url == detailResumeUrl) { detailEpCur = ei; playSeriesEpisode(ei, startSec); return true; }
+    }
+    detailSeasonIdx = oldSeason; curSeason = oldCur;
+    return false;
 }
 
 // ---------------- Controle ----------------
 inline void UI::handleDetail(Input in) {
-    if (in == Input::Back) { screen = detailBackHome ? Screen::Home : Screen::List; detailBackHome = false; lastBatchKey.clear(); return; }
+    if (in == Input::Back) { screen = detailBackHome ? Screen::Home : Screen::List; detailBackHome = false; lastBatchKey.clear(); refreshRecents(); return; }
     if (!detailSeries) {
+        if (detailResumeSec > 0 && (in == Input::Left || in == Input::Right)) { detailBtn = in == Input::Left ? 0 : 1; return; }    // 2 botoes
         if (in == Input::Confirm) {
             if (detailUrl.empty()) app.say("Sem link de video");
-            else app.pf.play(detailUrl, detailTitle);
+            else {
+                WatchRec w; w.id = detailUrl; w.title = detailTitle; w.logo = detailLogo; w.isEpisode = false;     // historico
+                app.pf.watchBegin(w);
+                const long long st = (detailResumeSec > 0 && detailBtn == 0) ? detailResumeSec : 0;                // Continuar x Assistir do inicio
+                if (st > 0) app.pf.playAt(detailUrl, detailTitle, st); else app.pf.play(detailUrl, detailTitle);
+            }
         }
         return;
     }
@@ -147,14 +173,17 @@ inline void UI::handleDetail(Input in) {
         if (detailFocus == 0) detailFocus = nSea > 0 ? 1 : (nEp > 0 ? 2 : 0);
         else if (detailFocus == 1 && nEp > 0) detailFocus = 2;
         break;
-    case Input::Left:  if (detailFocus == 1) setSeason(detailSeasonIdx - 1); else if (detailFocus == 2) setEp(detailEpCur - 1); break;
-    case Input::Right: if (detailFocus == 1) setSeason(detailSeasonIdx + 1); else if (detailFocus == 2) setEp(detailEpCur + 1); break;
+    case Input::Left:  if (detailFocus == 0 && detailResumeSec > 0) detailBtn = 0; else if (detailFocus == 1) setSeason(detailSeasonIdx - 1); else if (detailFocus == 2) setEp(detailEpCur - 1); break;
+    case Input::Right: if (detailFocus == 0 && detailResumeSec > 0) detailBtn = 1; else if (detailFocus == 1) setSeason(detailSeasonIdx + 1); else if (detailFocus == 2) setEp(detailEpCur + 1); break;
     case Input::PrevTab: setSeason(detailSeasonIdx - 1); break;     // L1 / R1: troca de temporada de qualquer lugar
     case Input::NextTab: setSeason(detailSeasonIdx + 1); break;
     case Input::PageUp: if (detailFocus == 2) setEp(detailEpCur - kDetEps); break;
     case Input::PageDown: if (detailFocus == 2) setEp(detailEpCur + kDetEps); break;
     case Input::Confirm:
-        if (detailFocus == 0) { if (nEp > 0) playSeriesEpisode(0); else app.say("Sem episodios"); }
+        if (detailFocus == 0 && detailResumeSec > 0) {          // aberta por "Assistido recentemente": episodio salvo, do minuto ou do inicio
+            if (!resumeEpisode(detailBtn == 0 ? detailResumeSec : 0)) app.say("Episodio nao encontrado");
+        }
+        else if (detailFocus == 0) { if (nEp > 0) playSeriesEpisode(0); else app.say("Sem episodios"); }
         else if (detailFocus == 1) { if (nEp > 0) detailFocus = 2; }
         else playSeriesEpisode(detailEpCur);
         break;
@@ -317,15 +346,23 @@ inline void UI::renderDetail(Renderer &r) {
             ix += sansDraw(r, ix, rowCy + S(8), items[i].text, TXT, fs, SansRegular);
         }
         if (!items.empty()) blockBottom = rowCy + S(16);
-        // botao Assistir Agora
+        // botao Assistir Agora (aberta por "Assistido recentemente": dois botoes, "Continuar de MM:SS" e "Assistir do inicio")
         const int bx = tx - S(2), by = S(442), bw = S(390), bh = S(67);
-        const bool foc = detailFocus == 0;
-        if (foc) uiGlow(r, bx, by, bw, bh, S(14), GREEN, S(10), 120, false);
-        r.roundRect(bx, by, bw, bh, S(14), GREEN);
-        r.roundRect(bx + S(3), by + S(3), bw - S(6), bh - S(6), S(11), foc ? GREEN : 0xFF020604);
-        const unsigned bc = foc ? 0xFF031A06 : GREEN;
-        dp::triRight(r, F(499), F(460), F(28), F(31), bc);
-        sansDraw(r, S(552), S(484), "Assistir Agora", bc, F(25.3f), SansBold);
+        auto drawBtn = [&](int x, int w, const std::string &label, bool foc, float tri, float txt, float fs) {
+            if (foc) uiGlow(r, x, by, w, bh, S(14), GREEN, S(10), 120, false);
+            r.roundRect(x, by, w, bh, S(14), GREEN);
+            r.roundRect(x + S(3), by + S(3), w - S(6), bh - S(6), S(11), foc ? GREEN : 0xFF020604);
+            const unsigned bc = foc ? 0xFF031A06 : GREEN;
+            dp::triRight(r, x + S(tri), F(460), F(28), F(31), bc);
+            sansDraw(r, x + S(txt), S(484), sansFit(label, F(fs), SansBold, w - S(txt) - S(16)), bc, F(fs), SansBold);
+        };
+        if (detailResumeSec > 0) {            // 2 botoes: mais largos e com letra menor, para caber "Continuar de 1:02:05"
+            const int w2 = S(450);
+            drawBtn(bx, w2, "Continuar de " + fmtTime(detailResumeSec), detailFocus == 0 && detailBtn == 0, 40, 92, 23.5f);
+            drawBtn(bx + w2 + S(24), w2, "Assistir do início", detailFocus == 0 && detailBtn == 1, 40, 92, 23.5f);
+        } else {
+            drawBtn(bx, bw, "Assistir Agora", detailFocus == 0, 78, 131, 25.3f);
+        }
         if (!detailSeries) {
             // filme: sem temporadas / episodios
         }

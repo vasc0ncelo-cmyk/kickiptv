@@ -32,6 +32,7 @@
 #include "aes128.hpp"
 #include "nativeplayer.hpp"
 #include "mpv_player.hpp"
+#include "WatchProgress.hpp"
 #include "streambuf.hpp"
 #include "netstream.hpp"
 #include "httpfile.hpp"
@@ -690,6 +691,7 @@ static void kickMpvRegisterIo() {
 static ImgCache &g_covers = *new ImgCache;
 static NetGate g_coverGate(3, 2);                // no maximo 3 capas baixando juntas; o lote de fundo usa no maximo 2 (sempre sobra vaga para a tela)
 static std::atomic<bool> g_quitting{false};
+static bool g_recentsDirty = false;                // o video comecou: ao voltar ao menu, atualiza "Assistido recentemente"
 
 // ---------- Plataforma ----------
 struct Ps4Platform : Platform {
@@ -702,6 +704,8 @@ struct Ps4Platform : Platform {
 
     std::vector<std::string> pendingEpUrls, pendingEpTitles;
     int pendingEpIndex = -1;
+    long long pendingStartSec = 0;           // ponto (s) em que o proximo filme/episodio comeca (retomar)
+    WatchRec pendingWatch; bool hasPendingWatch = false;     // dados do historico do que vai tocar
     std::atomic<int> lastStatus_{0};
     bool httpGet(const std::string &url, std::string &body) override {
         int st = 0;
@@ -808,12 +812,21 @@ struct Ps4Platform : Platform {
         return ok;
     }
     void play(const std::string &url, const std::string &title) override {
-        pendingPlayUrl = url; pendingPlayTitle = title;
+        pendingPlayUrl = url; pendingPlayTitle = title; pendingStartSec = 0;
         // play() simples (canal/filme/kick): limpa lista de episodios
         pendingEpUrls.clear(); pendingEpTitles.clear(); pendingEpIndex = -1;
     }
     void setEpisodeList(const std::vector<std::string> &urls, const std::vector<std::string> &titles, int index) override {
         pendingEpUrls = urls; pendingEpTitles = titles; pendingEpIndex = index;
+    }
+    void playAt(const std::string &url, const std::string &title, long long startSec) override { play(url, title); pendingStartSec = startSec > 0 ? startSec : 0; }
+    void watchBegin(const WatchRec &m) override { pendingWatch = m; hasPendingWatch = true; }
+    void watchList(std::vector<WatchRec> &out) override {     // historico gravado pelo player (WatchProgress), do mais recente para o mais antigo
+        for (const auto &e : kick::WatchProgress::Instance().List()) {
+            WatchRec r; r.id = e.id; r.title = e.title; r.series = e.series; r.logo = e.logo; r.season = e.season; r.episode = e.episode;
+            r.isEpisode = e.isEpisode; r.pos = e.positionSec; r.dur = e.durationSec;
+            out.push_back(std::move(r));
+        }
     }
     void requestText(const std::string &) override { kbdRequested = true; }
     // dados guardados em /data (lista M3U, ultimo streamer). Leitura via libkernel (o app nao usa fread).
@@ -2034,6 +2047,11 @@ struct Player {
     // Episodios da mesma temporada (para L1/R1 pular)
     std::vector<std::string> epUrls, epTitles;
     int epIndex = -1;
+    // Historico / retomar (so filme e serie): a posicao e gravada a cada segundo e ao parar.
+    std::string progId;                  // URL (vazio = nao grava)
+    kick::ProgressMeta progMeta;         // titulo/serie/capa para "Assistido recentemente"
+    long long startAtSec = 0;            // ponto em que ESTE video comeca
+    int progEpIdx = -1;                  // indice do episodio em epUrls quando o historico foi montado (para proximo/anterior)
 
     // ---- modo "pedacos": o AvPlayer toca arquivos locais (provado pelo teste F); no ao vivo, a cada fim de arquivo
     //      gravamos os segmentos mais novos em outro arquivo e abrimos de novo.
@@ -2211,7 +2229,7 @@ struct Player {
             kickAbortAllIo();   // troca de midia: corta TODA leitura de rede da midia anterior (canal, Kick, VOD) antes de o mpv abrir a nova; o mpv_player::play confirma a parada e recria o render
             // Hardware (h264_videodec2) SO em live da Kick e canal ao vivo do IPTV; filme/serie/VOD: software.
             const bool hwLive = kickLive || (kickSlug.empty() && !urlIsVodMedia(url));
-            if (mpv_player::play(kickLive ? std::string("kicklive://live.ts") : url, hwLive)) {
+            if (mpv_player::play(kickLive ? std::string("kicklive://live.ts") : url, hwLive, hwLive ? 0 : startAtSec)) {
                 trace("mpv-play-ok");
                 useMpv = true;
                 mpvGot = false; mpvT0 = nowSec(); mpvLastOv = 0; mpvLastHud = false; mpvSeekAcc = 0; toastUntil = 0;
@@ -2725,6 +2743,13 @@ struct Player {
     }
     // Desmonta TUDO em segundo plano: o botao O volta ao menu na hora (antes travava ate a rede responder).
     void stop() {
+        if (useMpv && isVod && !progId.empty() && mpvGot) {          // grava o ponto onde parou ("Assistido recentemente")
+            try {
+                const auto s = mpv_player::status();
+                if (s.open && s.positionSec > 0)
+                    kick::WatchProgress::Instance().Update(progId, (int64_t)s.positionSec, (int64_t)s.durationSec, true, &progMeta);
+            } catch (...) {}
+        }
         if (useMpv) {
             kickAbortAllIo();                                // 1o corta a rede: o stop do mpv nao pode ficar esperando uma leitura
             try { mpv_player::stop(); } catch (...) {}
@@ -4301,6 +4326,7 @@ int main() {
     // Teste do audio SDL em segundo plano desde ja (nao bloqueia nada): quando o 1o video abrir o resultado ja esta pronto.
     mpv_player::setTrace([](const char *st) { trace(st); });
     mpv_player::prewarm();
+    kick::WatchProgress::Instance().Init("/data/kickiptv_progress.json");      // historico: "Assistido recentemente" / retomar
     trace("loop-inicio");
     startWatchdog();
     double hbNext = monoSec() + 60, hbT0 = monoSec();
@@ -4357,9 +4383,37 @@ int main() {
         {
             static bool wasBg = false, seenFg = false, keepBg = false, wasUi = false;
             static double bgSince = 0;
+            // Botao PS: o app para tudo (o sistema suspende o processo), mas guarda O QUE estava tocando e o minuto; ao voltar ele reabre
+            // o mesmo video no mesmo ponto (ou a live/canal de novo), em vez de largar o usuario na tela do filme/serie/canal.
+            struct ResumeSnap {
+                bool valid = false;
+                std::string url, title, slug;
+                long long startSec = 0;
+                std::vector<std::string> epUrls, epTitles;
+                int epIndex = -1;
+                WatchRec meta; bool hasMeta = false;
+            };
+            static ResumeSnap resumeSnap;
             // para TUDO de uma vez: video, capas, download da lista, alimentadores de rede
             auto stopAllNow = [&](const char *why) {
                 trace(why);
+                if (mode == Mode::Play && player.useMpv && !player.failed && !player.url.empty() && !resumeSnap.valid) {
+                    resumeSnap = ResumeSnap();
+                    resumeSnap.valid = true;
+                    resumeSnap.url = player.url; resumeSnap.title = player.title; resumeSnap.slug = player.kickSlug;
+                    resumeSnap.epUrls = player.epUrls; resumeSnap.epTitles = player.epTitles; resumeSnap.epIndex = player.epIndex;
+                    if (player.isVod && player.mpvGot) {
+                        long long p = (long long)mpv_player::status().positionSec;
+                        resumeSnap.startSec = p > 3 ? p - 3 : 0;                 // volta 3 s para pegar o contexto da cena
+                        if (!player.progId.empty()) {
+                            WatchRec &m = resumeSnap.meta;
+                            m.id = player.progId; m.title = player.progMeta.title; m.series = player.progMeta.series; m.logo = player.progMeta.logo;
+                            m.season = player.progMeta.season; m.episode = player.progMeta.episode; m.isEpisode = player.progMeta.isEpisode;
+                            resumeSnap.hasMeta = true;
+                        }
+                    }
+                    trace("ps-guardou-reproducao");
+                }
                 g_quitting = true;                 // workers de rede/capas param
                 if (mode == Mode::Play || player.h) {
                     try { player.stop(); } catch (...) {}
@@ -4395,7 +4449,21 @@ int main() {
                 bool bgAny = trip && g_sys.bg;
                 bool stopReq = ovl || bgAny;
                 if (stopReq && !wasUi && !bg) { wasUi = true; stopAllNow(ovl ? "sistema-menu-ps" : "sistema-bg-parar"); }       // para tudo, mas o app continua aberto
-                if (!stopReq && wasUi) { wasUi = false; if (!bg) { g_quitting = false; g_covers.setPaused(false); dirty = true; } }
+                auto resumeAfterPs = [&]() {
+                    if (!resumeSnap.valid) return;
+                    resumeSnap.valid = false;
+                    trace("ps-retomando");
+                    pf.pendingEpUrls = resumeSnap.epUrls; pf.pendingEpTitles = resumeSnap.epTitles; pf.pendingEpIndex = resumeSnap.epIndex;
+                    if (!resumeSnap.slug.empty()) {                     // live da Kick: pede um link novo (o antigo pode ter vencido)
+                        pf.pendingPlayTitle = "@" + resumeSnap.slug; pf.pendingKickSlug = resumeSnap.slug; pf.pendingPlayUrl.clear();
+                        app.say("Retomando @" + resumeSnap.slug + "...");
+                    } else {
+                        pf.pendingPlayUrl = resumeSnap.url; pf.pendingPlayTitle = resumeSnap.title; pf.pendingStartSec = resumeSnap.startSec;
+                        if (resumeSnap.hasMeta) { pf.pendingWatch = resumeSnap.meta; pf.hasPendingWatch = true; }
+                        app.say(resumeSnap.startSec > 0 ? "Retomando de " + UI::fmtTime(resumeSnap.startSec) : std::string("Retomando..."));
+                    }
+                };
+                if (!stopReq && wasUi) { wasUi = false; if (!bg) { g_quitting = false; g_covers.setPaused(false); dirty = true; resumeAfterPs(); } }
                 {   // "Fechar aplicativo" do PS4 manda o app ao segundo plano SEM passar pelo menu do PS (ovl=0): estavel por 1,5 s = sai PELO SISTEMA
                     static double bgAnySince = -1; static bool keepAny = false;
                     if (bgAny) { if (bgAnySince < 0) { bgAnySince = nowSec(); keepAny = fileExists(kKeepBgFile); } } else bgAnySince = -1;
@@ -4420,6 +4488,7 @@ int main() {
                     g_quitting = false;
                     g_covers.setPaused(false);
                     dirty = true;
+                    resumeAfterPs();
                 }
                 wasBg = bg;
                 // Enquanto estiver em background: nao toca video nem redesenha menu pesado
@@ -4542,6 +4611,13 @@ int main() {
             player.paused = st.paused;
             player.bufPaused = st.buffering && player.mpvGot;
             player.bufPct = st.bufferPct;
+            if (player.isVod && !player.progId.empty() && player.mpvGot && !st.paused && st.positionSec > 0) {      // posicao 1x por segundo (grava no disco a cada 10 s)
+                static double lastProg = 0;
+                if (tn - lastProg >= 1.0) {
+                    lastProg = tn;
+                    kick::WatchProgress::Instance().Update(player.progId, (int64_t)st.positionSec, (int64_t)st.durationSec, false, &player.progMeta);
+                }
+            }
             // volta ao menu (ou enfileira outra URL, como os botoes L1/R1 do ao vivo fazem)
             auto requeue = [&](const std::string &u, const std::string &t, int ep) {
                 pf.pendingPlayUrl = u; pf.pendingPlayTitle = t; pf.pendingEpIndex = ep;
@@ -5094,6 +5170,27 @@ int main() {
             } else {
                 player.epUrls.clear(); player.epTitles.clear(); player.epIndex = -1;
             }
+            {   // historico + retomar (so filme/serie): pf.watchBegin/playAt foram chamados pela interface
+                const long long startSec = pf.pendingStartSec; pf.pendingStartSec = 0;
+                const bool vodUrl = urlIsVodMedia(url) && (title.empty() || title[0] != '@');
+                if (vodUrl && pf.hasPendingWatch && pf.pendingWatch.id == url) {
+                    const WatchRec &w = pf.pendingWatch;
+                    player.progId = url;
+                    player.progMeta = kick::ProgressMeta();
+                    player.progMeta.title = w.title; player.progMeta.series = w.series; player.progMeta.logo = w.logo;
+                    player.progMeta.season = w.season; player.progMeta.episode = w.episode; player.progMeta.isEpisode = w.isEpisode;
+                } else if (vodUrl && !player.progId.empty() && player.progMeta.isEpisode && player.epIndex >= 0 && player.progEpIdx >= 0) {
+                    // proximo/anterior episodio (botoes do player ou auto-avanco): mesma serie, numero ajustado
+                    player.progMeta.title = title; player.progMeta.episode += player.epIndex - player.progEpIdx;
+                    player.progId = url;
+                } else {
+                    player.progId.clear();
+                }
+                player.progEpIdx = player.epIndex;
+                pf.hasPendingWatch = false;
+                player.startAtSec = vodUrl ? startSec : 0;
+                g_recentsDirty = true;
+            }
             g_sfx.suspend();                     // fecha a porta de som da interface: o audio do video fica com a porta so dele
             mode = Mode::Play; gotFrame = false; lastWaitDraw = 0;
             g_sys.reset();                       // abrir video pode acender o aviso do sistema por engano: so vale depois de 1,5 s calmo
@@ -5130,6 +5227,7 @@ int main() {
         }
         if (mode == Mode::Menu) {
             g_sfx.resume();
+            if (g_recentsDirty && !g_quitting) { g_recentsDirty = false; ui.refreshRecents(); dirty = true; }     // voltou do video: posicao/ordem novas em "Assistido recentemente"
             // So redesenha quando ha algo a mostrar: animacao em andamento (~30 quadros/s), banner que passa sozinho,
             // ou dados que chegaram de threads (backdrop do banner). Tela parada = 0% de CPU.
             static double lastAnim = 0, lastPoll = 0;
