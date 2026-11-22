@@ -112,6 +112,14 @@ static std::atomic<uint64_t> g_mainTick{0};      // sobe a cada volta do loop pr
     // O sistema recusou: NAO volta ao main nem usa _Exit (os dois dariam CE-34878-0). Fica parado; o menu do PS4 ainda consegue fechar o app.
     for (;;) sceKernelUsleep(1000000);
 }
+// Saida por ir para segundo plano (PS -> Fechar aplicativo): fecha o mpv/videodec2/SDL de verdade ANTES de pedir a saida ao sistema.
+// Antes o app ficava suspenso com todas as threads vivas e o sistema o matava assim (CE-34878-0). Se o mpv travar ao fechar, sai em 1,5 s.
+[[noreturn]] static void bgCleanExit(const char *why) {
+    try { std::thread([] { sceKernelUsleep(1500000); ps4Exit("bg-saida-forcada"); }).detach(); } catch (...) {}
+    try { mpv_player::waitStopped(600); } catch (...) {}
+    try { mpv_player::shutdown(); trace("bg-mpv-fechado"); } catch (...) {}
+    ps4Exit(why);
+}
 // Marcadores finos do download da lista M3U: se o app fechar, a proxima abertura mostra o ULTIMO passo que foi gravado.
 static bool g_traceHttp = false;                 // so durante o download da lista M3U
 static const char *g_m3uTag = "m3u-t-";          // "t" = thread de rede | "s" = modo seguro (mesma thread)
@@ -3935,7 +3943,7 @@ using PadIn = PadInT<OrbisPadSrc>;
 
 int main() {
     sceUserServiceInitialize(NULL);
-    kSelfExitOnBg = fileExists("/data/kickiptv_saida_bg");   // padrao: sai sozinho PELO SISTEMA ao ir para o inicio do PS4 (funciona sem erro)
+    kSelfExitOnBg = !fileExists("/data/kickiptv_manter_bg");   // novo padrao: ao fechar/ir para o inicio o app SAI pelo sistema (crie /data/kickiptv_manter_bg para voltar a ficar suspenso)   // padrao: sai sozinho PELO SISTEMA ao ir para o inicio do PS4 (funciona sem erro)
     int userId = 0;
     sceUserServiceGetInitialUser(&userId);
     int padInitRc = scePadInit();
@@ -4482,7 +4490,7 @@ int main() {
                         // O sistema congela o processo em menos de 0,25 s depois de bg=1 (os logs terminavam em "bg-aguardando-sistema"):
                         // tudo ja foi parado no menu do PS, entao pede a saida AGORA, sem juntar threads.
                         g_quitting = true;
-                        ps4Exit("bg-saida-imediata");
+                        bgCleanExit("bg-saida-imediata");
                     }
                 }
                 if (bg && !wasBg) {
@@ -4511,7 +4519,7 @@ int main() {
                         // Nao da _Exit seco: depois de assistir video ainda existem threads (download do filme, rede, decodificador, capas).
                         // Matar o processo com elas rodando derruba o app (CE-34878-0). Vai para o encerramento limpo (junta todas as threads).
                         g_quitting = true;
-                        ps4Exit("bg-saida-imediata2");
+                        bgCleanExit("bg-saida-imediata2");
                     }
                     { static bool said = false; if (!said) { said = true; trace("bg-aguardando-sistema"); } }
                     {   // o processo ficou congelado e acordou ainda em segundo plano: o sistema esta fechando o app -> sai pelo sistema

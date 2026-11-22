@@ -697,7 +697,11 @@ bool play(const std::string &url, bool live, long long startSec) {
         const bool hwOff = fileThere(kHwOffFile);                              // chave de seguranca: arquivo vazio = tudo em software
         std::string hwWhyNot;
         const bool skipOnce = g_hwSkipOnce.exchange(false);
-        const bool hw = !kickLive && !g_hwBad && !hwOff && !skipOnce && hwModulesOk(hwWhyNot);   // TUDO menos a live da Kick (que fica em software por enquanto)
+        // Medido nos logs (mesmo filme 1920x800): software = 24 fps, drop-vo=0; videodec2 = ~7 fps (drop-vo +36 a cada 5 s) mesmo com render de 19 ms.
+        // O gargalo esta no videodec2/wrapper, nao no render. Por isso filme/serie vao em software, a menos que exista /data/kickiptv_hw_vod.
+        const bool vodSw = g_vodPlay.load() && !fileThere("/data/kickiptv_hw_vod");
+        const bool hw = !kickLive && !g_hwBad && !hwOff && !skipOnce && !vodSw && hwModulesOk(hwWhyNot);
+        if (vodSw && !kickLive && !hwOff && !g_hwBad) logBoth("[kick-hw] filme/serie em SOFTWARE (videodec2 entrega ~7 fps aqui; crie /data/kickiptv_hw_vod para forcar o hardware)");   // TUDO menos a live da Kick (que fica em software por enquanto)
         if (hw) guardSet(); else guardClear();                                 // marcador em disco: se o app cair daqui ate o 1o quadro, o proximo start vai em software
         mpv_set_property_string(g_mpv, "hwdec", "no");
         const int vdRc = mpv_set_property_string(g_mpv, "vd", hw ? "h264_videodec2" : "");
@@ -1050,7 +1054,7 @@ bool renderToBgra(uint8_t *dst, int width, int height, int strideBytes, bool for
             capMs += us / 1000.0;
             if (++capN >= 30) {
                 const double avg = capMs / capN; capMs = 0; capN = 0;
-                if (avg > 24.0) {
+                if (avg > 32.0) {
                     const int cur = g_capW.load();
                     const int nxt = cur > 1024 ? 1024 : (cur > 854 ? 854 : 720);
                     g_capW = nxt; g_smoothOn = false;                // e vizinho mais proximo: poupa os ~15 ms da ampliacao suave
