@@ -174,13 +174,13 @@ jobs:
           make clean
           # 2) PKG com mpv (id diferente: KICK00002). Sem fallback silencioso: o log completo vai para a Release
           if [ "${HAVE_PACBREW:-0}" = "1" ] && [ -n "${PACBREW:-}" ]; then
-            make TITLE="Kick IPTV mpv" TITLE_ID=KICK00002 CONTENT_ID=IV0000-KICK00002_00-KICKIPTV00000000 USE_LIBMPV=1 PACBREW="$PACBREW" 2>&1 | tee mpv-build-log.txt
+            make TITLE="Kick" TITLE_ID=KICK00002 CONTENT_ID=IV0000-KICK00002_00-KICKIPTV00000000 USE_LIBMPV=1 PACBREW="$PACBREW" 2>&1 | tee mpv-build-log.txt
             nm -n build/app.elf > mpv-symbols.txt 2>/dev/null || llvm-nm -n build/app.elf > mpv-symbols.txt 2>/dev/null || true   # para resolver os enderecos do kickiptv_crash.log
-            if ls build/*.pkg >/dev/null 2>&1; then mv build/*.pkg out/Kick-IPTV-mpv.pkg; echo "OK mpv"; else echo "mpv: LINK/BUILD FALHOU (veja mpv-build-log.txt)"; grep -n -E "error|undefined|cannot find|unable" mpv-build-log.txt | head -40; fi
+            if ls build/*.pkg >/dev/null 2>&1; then mv build/*.pkg out/Kick-IPTV-mpv.pkg; rm -f out/Kick-IPTV.pkg; echo "OK mpv (PKG antigo sem mpv NAO e publicado)"; else echo "mpv: LINK/BUILD FALHOU (veja mpv-build-log.txt)"; grep -n -E "error|undefined|cannot find|unable" mpv-build-log.txt | head -40; fi
           else
             echo "pacbrew indisponivel: sem build mpv" | tee mpv-build-log.txt
           fi
-          cp out/Kick-IPTV.pkg build/Kick-IPTV.pkg
+          [ -f out/Kick-IPTV.pkg ] && cp out/Kick-IPTV.pkg build/Kick-IPTV.pkg   # so existe se o build com mpv falhou (reserva)
           ls -l out
       - name: Conferir o PKG
         run: |

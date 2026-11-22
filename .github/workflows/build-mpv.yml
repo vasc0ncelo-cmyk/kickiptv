@@ -100,7 +100,7 @@ jobs:
           }
           variant build-a OFF OFF KICK00003 "Kick IPTV teste A" "A-sem-mpv.pkg"
           variant build-b ON  OFF KICK00004 "Kick IPTV teste B" "B-mpv-sem-piglet.pkg"
-          variant build-c ON  ON  KICK00002 "Kick IPTV mpv"     "C-mpv-completo.pkg"
+          variant build-c ON  ON  KICK00002 "Kick" "C-mpv-completo.pkg"
           ls -l out
           cat log-build-*.txt > build-log.txt
           { echo '== conteudo de build-a/ps4'; find build-a/ps4 -type f | xargs ls -l; } | tee -a pkg-contents.txt
