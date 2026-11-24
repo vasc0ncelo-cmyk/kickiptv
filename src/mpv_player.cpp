@@ -58,6 +58,9 @@ extern "C" {
 #endif
 #endif
 
+#ifdef KICK_SDL_SHIM
+extern "C" void kickAudioUnblock(void);                  // definido no shim de audio (fim do arquivo)
+#endif
 namespace mpv_player {
 namespace {
 
@@ -82,6 +85,26 @@ bool g_started = false;                                  // um arquivo foi abert
 std::atomic<unsigned> g_audCb{0};                        // vezes que o backend de audio chamou o callback do mpv (diagnostico)
 std::atomic<int> g_audPause{1};                          // estado de pausa que o mpv pediu ao audio (1 = pausado)
 unsigned g_audCbLast = 0;
+// ---- Reconexao automatica (live da Kick, canal IPTV, filme/serie) ----
+// Queda (end-file com erro), fim inesperado ou imagem parada: reabre a MESMA URL no mpv, sem voltar ao app. Live = volta ao ponto ao vivo; VOD =
+// continua da posicao em que parou. Tentativas com espera crescente; a troca de midia (play/stop/shutdown) CANCELA qualquer tentativa pendente.
+// Enquanto reconecta, status() esconde failed/eof e mostra buffering=true (o app mostra o "carregando" em vez de fechar/reabrir tudo).
+std::atomic<int> g_reconSt{0};                           // 0 nada, 1 esperando a proxima tentativa, 2 carregando, 3 desistiu (erro exposto ao app)
+struct ReconInfo {
+    int attempts = 0;
+    std::chrono::steady_clock::time_point at, okAt;
+    std::string reason;
+};
+ReconInfo g_recon;
+std::string g_curWrap, g_curBaseOpts;                    // ultimo loadfile (url + opcoes sem "start")
+bool g_curLive = false, g_curKick = false;
+long long g_curStart = 0;
+double g_lastGoodPos = 0;                                // ultima posicao boa (VOD): de onde retomar
+const int kReconMax = 6;
+// ---- Vigia do audio (so com o shim sceAudioOut) ----
+unsigned g_audWatchCb = 0;
+std::chrono::steady_clock::time_point g_audWatchT = std::chrono::steady_clock::now(), g_audLastRecT = std::chrono::steady_clock::now();
+int g_audRecN = 0;
 int g_stallKicks = 0;                                    // tentativas de destravar o video nesta reproducao
 std::chrono::steady_clock::time_point g_lastFrameT = std::chrono::steady_clock::now();
 // quadro reduzido (render interno <= 1280 de largura) e mapa da ampliacao: zerados a cada troca de midia
@@ -89,9 +112,18 @@ static std::vector<uint32_t> g_lo;
 static int g_loW = 0, g_loH = 0;
 static std::vector<int> g_xmap;
 static int g_xmapW = 0, g_xmapLw = 0;
+static std::vector<int> g_xi;                                    // mapa da ampliacao suave (horizontal)
+static std::vector<uint32_t> g_xw;
+static int g_xiW = 0, g_xiLw = 0;
+static std::vector<uint32_t> g_rowBuf, g_rowA, g_rowB;           // linhas de trabalho da ampliacao (antes "static" dentro da funcao: nunca eram soltas)
+static void freeVec(std::vector<int> &v) { std::vector<int>().swap(v); }
+static void freeVec(std::vector<uint32_t> &v) { std::vector<uint32_t>().swap(v); }
+// Limpeza rigorosa: TODA memoria de quadro/mapa volta ao sistema (troca de midia, stop, shutdown). Nada fica preso entre videos.
 static void resetFrameState() {
-    g_lo.clear(); g_lo.shrink_to_fit(); g_loW = g_loH = 0;
-    g_xmap.clear(); g_xmapW = g_xmapLw = 0;
+    freeVec(g_lo); g_loW = g_loH = 0;
+    freeVec(g_xmap); g_xmapW = g_xmapLw = 0;
+    freeVec(g_xi); freeVec(g_xw); g_xiW = g_xiLw = 0;
+    freeVec(g_rowBuf); freeVec(g_rowA); freeVec(g_rowB);
 }
 
 static void setErr(const char *s) {
@@ -446,6 +478,13 @@ static void handleEvent(mpv_event *ev, bool *gotLoaded, bool *gotFail) {
     }
     case MPV_EVENT_FILE_LOADED:
         if (!g_startSeen.load()) break;
+        if (g_reconSt.load() == 2) {                     // reabertura automatica deu certo
+            g_reconSt = 0;
+            g_recon.okAt = std::chrono::steady_clock::now();
+            g_lastFrameT = g_recon.okAt; g_stallKicks = 0;
+            g_audWatchT = g_recon.okAt; g_audWatchCb = g_audCb.load();
+            tr("mpv-reconectado: arquivo reaberto");
+        }
         if (gotLoaded) *gotLoaded = true;
         g_failed = false;
         g_err.clear();
@@ -518,6 +557,79 @@ static void quiesceLocked() {
         tr("mpv-troca: arquivo anterior parado, render recriado");
     } else {
         tr("mpv-troca: o stop demorou mais de 3 s; segue com o render atual");
+    }
+}
+
+// ---- reconexao (chamar com g_mx) ----
+static void reconResetLocked() {                         // troca de midia / parada: cancela tentativa pendente e esquece a URL
+    g_reconSt = 0;
+    g_recon = ReconInfo();
+    g_curWrap.clear(); g_curBaseOpts.clear();
+    g_curLive = g_curKick = false; g_curStart = 0; g_lastGoodPos = 0;
+}
+static void reconScheduleLocked(const std::string &why) {
+    if (!g_mpv || g_curWrap.empty()) return;
+    if (g_recon.attempts >= kReconMax) {
+        g_reconSt = 3;
+        g_failed = true;
+        g_err = "reconexao esgotada (" + why + ")";
+        tr(("mpv-reconecta: desistiu apos " + std::to_string(kReconMax) + " tentativas: " + why).c_str());
+        return;
+    }
+    static const int kBackoffMs[kReconMax] = {500, 1500, 3000, 6000, 10000, 15000};
+    const int d = kBackoffMs[g_recon.attempts++];
+    g_recon.reason = why;
+    g_recon.at = std::chrono::steady_clock::now() + std::chrono::milliseconds(d);
+    g_reconSt = 1;
+    g_failed = false; g_eof = false; g_err.clear(); g_buffering = true;
+    char b[220]; snprintf(b, sizeof b, "mpv-reconecta #%d em %d ms (%s) pos=%.0f", g_recon.attempts, d, why.c_str(), std::max(g_pos, g_lastGoodPos));
+    tr(b);
+}
+static void reconRunLocked() {
+    g_startSeen = false; g_curEntry = -1;                // eventos do arquivo que caiu nao valem para o novo
+    std::string opts = g_curBaseOpts;
+    if (!g_curLive) {                                    // filme/serie: retoma de onde parou (nunca antes do ponto salvo original)
+        double p = std::max(g_pos, g_lastGoodPos);
+        if (p < (double)g_curStart) p = (double)g_curStart;
+        if (p > 1.0) opts += std::string(opts.empty() ? "" : ",") + "start=" + std::to_string((long long)p);
+    }
+    const char *cmd[] = {"loadfile", g_curWrap.c_str(), "replace", opts.empty() ? nullptr : opts.c_str(), nullptr};
+    const int rc = mpv_command_async(g_mpv, 0, cmd);
+    g_lastFrameT = std::chrono::steady_clock::now(); g_stallKicks = 0;
+    if (rc < 0) { reconScheduleLocked(std::string("loadfile recusado: ") + mpv_error_string(rc)); return; }
+    g_recon.at = g_lastFrameT + std::chrono::seconds(25);        // prazo para o FILE_LOADED
+    g_reconSt = 2;
+}
+static void reconTickLocked() {
+    if (!g_mpv || !g_open.load() || g_curWrap.empty()) return;
+    const int st = g_reconSt.load();
+    if (st == 3) return;
+    const auto now = std::chrono::steady_clock::now();
+    auto msSince = [&](std::chrono::steady_clock::time_point t) { return (long long)std::chrono::duration_cast<std::chrono::milliseconds>(now - t).count(); };
+    if (st == 1) { if (now >= g_recon.at) reconRunLocked(); return; }
+    if (st == 2) {
+        if (g_failed.load()) reconScheduleLocked("falha ao reabrir: " + g_err);
+        else if (g_eof.load()) reconScheduleLocked("fim ao reabrir");
+        else if (now >= g_recon.at) reconScheduleLocked("reabertura sem resposta em 25 s");
+        return;
+    }
+    // st == 0: acompanhando a reproducao
+    if (g_recon.attempts > 0 && msSince(g_recon.okAt) >= 30000 && msSince(g_lastFrameT) < 3000) g_recon.attempts = 0;   // estavel: zera as tentativas
+    if (!g_paused.load() && g_pos > g_lastGoodPos) g_lastGoodPos = g_pos;
+    if (!g_everRendered) return;                          // falha antes do 1o quadro: quem abriu (play) trata
+    if (g_failed.load()) { reconScheduleLocked("erro: " + g_err); return; }
+    if (g_eof.load()) {
+        bool legit;                                       // fim de verdade?
+        if (g_curKick) legit = true;                      // fim da live da Kick: o app sabe (streamEnded) e renova o link
+        else if (g_curLive) legit = false;                // canal ao vivo nao termina: foi queda
+        else legit = g_dur <= 0 || g_dur < 60 || g_pos >= g_dur - 5.0;
+        if (!legit) { char b[80]; snprintf(b, sizeof b, "fim inesperado pos=%.0f/%.0f", g_pos, g_dur); reconScheduleLocked(b); }
+        return;
+    }
+    const long long limit = g_curLive ? 15000 : 25000;
+    if (!g_paused.load() && msSince(g_lastFrameT) >= limit) {
+        char b[80]; snprintf(b, sizeof b, "sem quadros ha %lld s", msSince(g_lastFrameT) / 1000);
+        reconScheduleLocked(b);
     }
 }
 
@@ -677,6 +789,8 @@ bool play(const std::string &url, bool live, long long startSec) {
         g_capW = 1280; g_hwErrCount = 0; g_hwErrT0 = std::chrono::steady_clock::now(); g_endSeen = false; g_vodPlay = !live;
         g_startSeen = false; g_curEntry = -1;              // eventos do arquivo antigo (fim/erro/eof) nao valem para este
         g_stallKicks = 0; g_lastFrameT = std::chrono::steady_clock::now();
+        reconResetLocked();                                // midia nova: tentativas da anterior canceladas
+        g_audWatchCb = g_audCb.load(); g_audWatchT = g_lastFrameT; g_audLastRecT = g_lastFrameT; g_audRecN = 0;
         mpv_set_property_string(g_mpv, "video-sync", "audio");     // a anterior pode ter caido para "desync" (relogio de audio parado)
         resetFrameState();
         applyAoUpgradeLocked();       // SDL ficou pronto depois do 1o boot: este video ja abre com som
@@ -730,10 +844,9 @@ bool play(const std::string &url, bool live, long long startSec) {
         std::string fileOpts = kickLive ? liveOpts : std::string();
         // Canal ao vivo do IPTV: cache pequeno (como a Kick). Filme/serie e canal usavam o cache grande do boot e enchiam a memoria aos poucos.
         if (live && !kickLive) fileOpts = "demuxer-max-bytes=32MiB,demuxer-max-back-bytes=1MiB,demuxer-readahead-secs=20";
-        if (!live) {                                                // filme/serie: teto seguro de memoria (+ ponto salvo, se houver)
-            fileOpts = "demuxer-max-bytes=48MiB,demuxer-max-back-bytes=6MiB,cache-secs=45";
-            if (startSec > 0) fileOpts += ",start=" + std::to_string(startSec);
-        }
+        if (!live) fileOpts = "demuxer-max-bytes=48MiB,demuxer-max-back-bytes=6MiB,cache-secs=45";   // filme/serie: teto seguro de memoria
+        g_curWrap = wrap; g_curBaseOpts = fileOpts; g_curLive = live; g_curKick = kickLive; g_curStart = startSec;   // para a reconexao automatica
+        if (!live && startSec > 0) fileOpts += ",start=" + std::to_string(startSec);                // ponto salvo, se houver
         seekAfter = 0;
         const char *cmd[] = {"loadfile", wrap.c_str(), "replace", fileOpts.empty() ? nullptr : fileOpts.c_str(), nullptr};   // mpv 0.36: sem o indice "0"
         int lrc = mpv_command(g_mpv, cmd);
@@ -846,6 +959,7 @@ void stop() {
     std::lock_guard<std::mutex> lk(g_mx);
     if (g_mpv && g_open.load()) g_endSeen = false;   // waitStopped() espera o END_FILE deste arquivo
     guardClear();                                  // parada normal: nao foi queda (waitStopped rearma o guard enquanto o videodec2 fecha)
+    reconResetLocked();                            // parada pedida pelo app: nenhuma reconexao pendente sobrevive
     if (!g_mpv) return;
     const char *cmd[] = {"stop", nullptr};
     mpv_command_async(g_mpv, 0, cmd);
@@ -859,6 +973,7 @@ void stop() {
 void shutdown() {
     std::lock_guard<std::mutex> lk(g_mx);
     guardClear();
+    reconResetLocked();
     if (!g_mpv) return;
     mpv_command_string(g_mpv, "quit");
     destroyRender();
@@ -877,6 +992,7 @@ void poll() {
     if (!g_mpv) return;
     drainEventsUnlocked(nullptr, nullptr);
     if (g_aoUpgrade.load()) applyAoUpgradeLocked();
+    reconTickLocked();                                      // quedas/travamentos: reabre sozinho (live ao vivo, VOD na posicao)
     // Confere o decoder REAL no 1o quadro e vigia o videodec2: se abriu mas nao entregou video em 12 s, trava o hardware (software ate
     // fechar o app) e pede ao app para reabrir o canal (hwFallbackRequested). Se o mpv ja caiu sozinho no h264 (nao abriu), so avisa.
     if (g_open && !g_hwChecked) {
@@ -910,6 +1026,23 @@ void poll() {
             else { const char *c[] = {"seek", "0.2", "relative", nullptr}; mpv_command_async(g_mpv, 0, c); }
         }
     }
+#ifdef KICK_SDL_SHIM
+    // Audio parado: o mpv esta tocando (sem pausa, sem esperar rede) e o callback do audio nao e chamado ha 3 s -> o dispositivo sceAudioOut
+    // travou/caiu. Pede a REABERTURA SO da porta de audio (a thread do shim fecha e abre de novo); o video e o mpv nao sao tocados.
+    {
+        const auto nw = std::chrono::steady_clock::now();
+        const unsigned cb = g_audCb.load();
+        const bool expect = g_open && !g_paused && !g_buffering && g_everRendered && g_audPause.load() == 0 && g_reconSt.load() == 0;
+        if (!expect || cb != g_audWatchCb) { g_audWatchCb = cb; g_audWatchT = nw; }
+        else if (std::chrono::duration_cast<std::chrono::milliseconds>(nw - g_audWatchT).count() >= 3000 &&
+                 std::chrono::duration_cast<std::chrono::milliseconds>(nw - g_audLastRecT).count() >= 5000 && g_audRecN < 8) {
+            g_audRecN++; g_audLastRecT = nw; g_audWatchT = nw;
+            char tb[100]; snprintf(tb, sizeof tb, "mpv-audio-parado #%d: cb=%u -> reabrindo a porta de audio", g_audRecN, cb);
+            tr(tb);
+            kickAudioUnblock();
+        }
+    }
+#endif
     // a cada ~5 s grava fps real e quadros descartados em /data/kickiptv.log (para ver se o decodificador da conta)
     static auto last = std::chrono::steady_clock::now();
     auto now = std::chrono::steady_clock::now();
@@ -932,9 +1065,6 @@ void poll() {
 // ampliacao barata por vizinho mais proximo para o buffer da tela. Quadros repetidos ('force') reaproveitam o ultimo quadro pronto.
 // Ampliacao do quadro reduzido para a tela: horizontal com interpolacao linear (suave) e vertical por repeticao de linha. Se o PS4 nao der conta
 // (media > 14 ms por quadro), volta sozinho para o vizinho mais proximo (mais rapido, serrilhado) e avisa no log.
-static std::vector<int> g_xi;
-static std::vector<uint32_t> g_xw;
-static int g_xiW = 0, g_xiLw = 0;
 
 static void upscaleLo(uint8_t *dst, int w, int h, int stride) {
     if (g_loW == w && g_loH == h) {
@@ -960,7 +1090,7 @@ static void upscaleLo(uint8_t *dst, int w, int h, int stride) {
     }
     const auto t0 = std::chrono::steady_clock::now();
     // A linha ampliada e montada numa linha de RAM e so ENTAO copiada para dst: nunca ler de dst (memoria de video nao-cacheada: ~120 ms por quadro).
-    static std::vector<uint32_t> row, rowA, rowB;
+    std::vector<uint32_t> &row = g_rowBuf, &rowA = g_rowA, &rowB = g_rowB;
     if (row.size() < (size_t)w) row.resize((size_t)w);
     const bool smooth = g_smoothOn && g_loW >= 2;
     int prevSy = -1;
@@ -1120,6 +1250,8 @@ Status status() {
     s.positionSec = g_pos;
     s.durationSec = g_dur;
     s.error = g_err;
+    const int rs = g_reconSt.load();
+    if (rs == 1 || rs == 2) { s.failed = false; s.eof = false; s.buffering = true; s.error.clear(); }   // reconectando: o app mostra "carregando" e espera
     return s;
 }
 
@@ -1162,7 +1294,10 @@ struct ShInst {
     std::recursive_mutex *cb = new std::recursive_mutex;   // SDL_LockAudio DESTA instancia (nunca apagado: quem destrava pode chegar depois do fechamento)
     int lockFails = 0;
     bool warned = false;
-    int port = -1;
+    std::atomic<int> port{-1};                              // pode ser trocada pela thread ao reabrir o dispositivo
+    std::atomic<long long> outSince{0};                     // ms (relogio monotonico) em que a thread entrou no sceAudioOutOutput; 0 = fora dele
+    std::atomic<bool> reopenReq{false};                     // pedido (vigia do poll) para reabrir a porta
+    int outFails = 0;
     SDL_AudioCallback fn = nullptr;
     void *ud = nullptr;
     pthread_t th;
@@ -1173,6 +1308,32 @@ thread_local std::recursive_mutex *tlLockM = nullptr;   // mutex travado por est
 thread_local int tlLockDepth = 0;
 std::atomic<bool> g_shInit{false}, g_shPause{true};
 ShInst *g_shCur = nullptr;
+std::atomic<int> g_shReopens{0};
+long long shNowMs() { return (long long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+
+// Recupera o dispositivo de audio SEM mexer no mpv nem no video: fecha a porta (ignora erro: pode ja estar invalida) e abre outra.
+// Chamada so pela thread de audio. Se nao conseguir abrir, tenta de novo no proximo ciclo (a thread nunca gira sem dormir).
+void shReopenPort(ShInst *in) {
+    const int old = in->port.load();
+    sceAudioOutClose(old);
+    int p = -1;
+    for (int t = 0; t < 5 && in->run.load(); t++) {
+        p = sceAudioOutOpen(0xFF, ORBIS_AUDIO_OUT_PORT_TYPE_MAIN, 0, kShGrain, 48000, ORBIS_AUDIO_OUT_PARAM_FORMAT_S16_STEREO);
+        if (p > 0) break;
+        sceKernelUsleep(200000);
+    }
+    in->reopenReq.store(false);
+    in->outFails = 0;
+    char b[96];
+    if (p > 0) {
+        in->port.store(p);
+        snprintf(b, sizeof b, "sdl-shim: audio reaberto port=%d (antes %d) #%d", p, old, ++g_shReopens);
+    } else {
+        snprintf(b, sizeof b, "sdl-shim: reabrir o audio falhou rc=%d (tenta de novo)", p);
+        sceKernelUsleep(500000);
+    }
+    mpv_player::tr(b);
+}
 
 void *shAudioMain(void *arg) {
     ShInst *in = (ShInst *)arg;
@@ -1195,7 +1356,12 @@ void *shAudioMain(void *arg) {
                 }
                 if (locked) in->cb->unlock();
             }
-            sceAudioOutOutput(in->port, abuf);                                         // bloqueia ate o bloco tocar: e o relogio do audio
+            in->outSince.store(shNowMs());
+            const int orc = sceAudioOutOutput(in->port.load(), abuf);                  // bloqueia ate o bloco tocar: e o relogio do audio
+            in->outSince.store(0);
+            if (!in->run.load()) break;
+            if (orc < 0) { in->outFails++; sceKernelUsleep(20000); } else in->outFails = 0;   // erro: nao gira sem dormir
+            if (in->reopenReq.load() || in->outFails >= 3) shReopenPort(in);           // porta caiu/travou: abre outra (so o audio)
         }
         free(abuf);
     }
@@ -1251,6 +1417,17 @@ void shClose() {
     mpv_player::tr("sdl-shim: audio fechado");
 }
 }  // namespace
+
+// Chamado pelo poll() do player quando o callback de audio parou: marca a reabertura e, se a thread esta presa dentro do sceAudioOutOutput
+// ha mais de 1,5 s, fecha a porta de FORA (o Output volta com erro e a propria thread abre outra).
+extern "C" void kickAudioUnblock(void) {
+    ShInst *in = nullptr;
+    { std::lock_guard<std::mutex> cl(g_shCtl); in = g_shCur; }
+    if (!in || !in->run.load()) return;
+    in->reopenReq.store(true);
+    const long long since = in->outSince.load();
+    if (since != 0 && shNowMs() - since > 1500) sceAudioOutClose(in->port.load());
+}
 
 extern "C" {
 int SDL_InitSubSystem(Uint32 flags) { if (flags & SDL_INIT_AUDIO) g_shInit.store(true); return 0; }
