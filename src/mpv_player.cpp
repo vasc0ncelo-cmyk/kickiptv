@@ -692,8 +692,11 @@ bool boot() {
     mpv_set_option_string(g_mpv, "video-sync", "audio");
     mpv_set_option_string(g_mpv, "vd-lavc-skiploopfilter", "nonref");   // "all" desligava o filtro anti-blocos: canais IPTV (pouco bitrate) ficavam quadriculados
     mpv_set_option_string(g_mpv, "vd-lavc-dr", "no");
-    mpv_set_option_string(g_mpv, "framedrop", "decoder+vo");
-    mpv_set_option_string(g_mpv, "vd-lavc-fast", "yes");
+    mpv_set_option_string(g_mpv, "framedrop", "vo");                    // NUNCA descartar quadros no DECODER: pular quadro H.264 quebra as referencias e o video
+                                                                         // vira borrao de blocos (macroblocos) ate o proximo quadro-chave. So o vo descarta (quadro ja decodificado).
+    mpv_set_option_string(g_mpv, "vd-lavc-skipframe", "default");
+    mpv_set_option_string(g_mpv, "vd-lavc-skipidct", "default");
+    mpv_set_option_string(g_mpv, "vd-lavc-fast", "no");              // "fast" aproxima o decode e acumula erro nos quadros de referencia
     // ---- CACHE ----
     // Leitura em blocos grandes (o HTTP do app ja busca 1 MB por vez); a memoria "de tras" so precisa cobrir os saltos de +-10 s;
     // Colchao maior na frente, pouco para tras (memoria do PS4 e curta).
@@ -831,11 +834,11 @@ bool play(const std::string &url, bool live, long long startSec) {
         g_hq = live;                                    // IPTV E Kick ao vivo: filtro anti-blocos ligado (antes a Kick ia no modo rapido = imagem quadriculada)
         g_fullOk = live;
         g_hqFull = true; g_srcH = 0; g_srcTries = 0; g_hqMs = 0; g_hqN = 0;
-        mpv_set_property_string(g_mpv, "vd-lavc-fast", g_hq ? "no" : "yes");
+        mpv_set_property_string(g_mpv, "vd-lavc-fast", "no");              // sempre exato (o modo rapido gerava blocos/borrao)
         mpv_set_property_string(g_mpv, "vd-lavc-skiploopfilter", g_hq ? "default" : "nonref");
         {
             char b[160]; snprintf(b, sizeof b, "[kick-hq] play: %s (vd-lavc-fast=%s skiploopfilter=%s)", g_hq ? "live: qualidade ligada" : "modo rapido",
-                                  g_hq ? "no" : "yes", g_hq ? "default" : "nonref");
+                                  "no", g_hq ? "default" : "nonref");
             logBoth(b);
         }
         g_hwWanted = hw; g_hwChecked = false; g_hwT0 = std::chrono::steady_clock::now();
